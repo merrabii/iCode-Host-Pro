@@ -1,0 +1,18 @@
+// Prisma schema — Phase 0 socle (ADR-014).
+// Deliberately declares NO business models: no artificial/test domain table.
+// Database & Prisma connectivity is proven at runtime by a real raw query
+// (SELECT 1) from the health endpoint.
+//
+// The only database artifact produced by `prisma migrate dev` here is Prisma's
+// own `_prisma_migrations` tracking table, which establishes the real migration
+// baseline for future phases. Any future table requires a genuine architectural
+// justification in its phase.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}

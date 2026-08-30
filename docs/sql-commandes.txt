@@ -13,3 +13,62 @@ IMPORTANT SQL / COMMANDS:
 VALIDATION QUERIES:
 RESULT:
 ROLLBACK NOTES:
+
+================================================================
+PHASE 0 — ARCHITECTURE & FOUNDATIONS (socle)
+================================================================
+
+DATE: 2026-08-30
+PHASE: 0.4 — Persistance (Docker + PostgreSQL + Prisma)
+OBJECTIVE:
+  Bring up a real PostgreSQL instance for development and prove end-to-end
+  connectivity (API → Prisma → PostgreSQL) WITHOUT creating any business table.
+  Governed by ADR-012 (PostgreSQL only, no Redis) and ADR-014 (zero business
+  tables in Phase 0).
+
+DATABASE ACTIONS:
+  - Started PostgreSQL 16 via Docker Compose (service `postgres`).
+    Container: icode-postgres. Named volume: icode_pg_data (persistent).
+    Database: icode_host_pro. User: icode. Password: icode (dev only).
+    Port published: 5432.
+  - Prisma schema (apps/api/prisma/schema.prisma) declares ONLY a generator +
+    datasource. NO models (zero business tables — ADR-014).
+
+MIGRATIONS:
+  - `prisma migrate dev` reported: "Already in sync, no schema change or pending
+    migration was found."
+  - Consequently NO migration folder and NO database tables (including Prisma's
+    `_prisma_migrations` tracking table) were created. This is the intended,
+    truthful state for a zero-model Phase 0. A migration baseline will be
+    introduced when the first real domain schema arrives (future phase).
+  - Prisma Client generated: v6.19.3.
+
+IMPORTANT SQL / COMMANDS:
+  - Container up:            docker compose up -d postgres
+  - Container status:        docker compose ps
+  - Generate client:         corepack pnpm --filter @icode-host-pro/api generate
+  - Run migrations (dev):    corepack pnpm --filter @icode-host-pro/api migrate
+  - Prisma reads DATABASE_URL from apps/api/.env:
+    postgresql://icode:icode@localhost:5432/icode_host_pro?schema=public
+
+VALIDATION QUERIES:
+  - Connectivity is proven at runtime by the health endpoint performing a real
+    raw query against the pool:  `await prisma.$queryRaw\`SELECT 1\``
+  - e2e test `GET /api/health` asserts status `ok` + database `ok`
+    => PASS (verified 2026-08-30). This exercises a genuine DB round-trip.
+
+RESULT:
+  - PostgreSQL up and reachable from the API. Real DB connectivity proven by the
+    health check. No business tables exist (conforms to ADR-014). No data stored.
+
+ROLLBACK NOTES:
+  - Stop/remove dev DB:  docker compose down            (keeps volume)
+  - Full cleanup (data): docker compose down -v         (deletes icode_pg_data)
+  - No migrations to roll back (none created in Phase 0).
+
+REMARKS FOR FUTURE AI:
+  - All domain tables/migrations belong to a FUTURE phase, each requiring a real
+    architectural justification. When the first models are added, run
+    `corepack pnpm --filter @icode-host-pro/api migrate` and record here.
+  - Do NOT treat Phase 0's empty schema as a mistake: it implements ADR-014.
+================================================================

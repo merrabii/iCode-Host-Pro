@@ -1,0 +1,24 @@
+# iCode Host Pro — development infrastructure (Phase 0 socle).
+# ADR-012: PostgreSQL only at this stage. No Redis until the async jobs
+# architecture (ADR-007) is decided.
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: icode-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: icode
+      POSTGRES_PASSWORD: icode
+      POSTGRES_DB: icode_host_pro
+    ports:
+      - "5432:5432"
+    volumes:
+      - icode_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U icode -d icode_host_pro"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+volumes:
+  icode_pg_data:

@@ -1,0 +1,43 @@
+# --- dependencies ---
+node_modules/
+
+# --- build outputs ---
+dist/
+.next/
+out/
+build/
+*.tsbuildinfo
+
+# --- turbo ---
+.turbo/
+
+# --- environment / secrets (see ADR-011 socle; keep .env.example committed) ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+
+# --- logs ---
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-error.log*
+
+# --- tests / coverage ---
+coverage/
+coverage.lcov*
+
+# --- IDE / OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# --- database local data ---
+*.db
+*.sqlite
+*.sqlite-journal
