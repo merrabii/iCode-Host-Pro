@@ -1,0 +1,15 @@
+iCode Host Pro — Database Working History
+
+PURPOSE: phase-by-phase database reference.
+BASELINE: clean restart; no authoritative application schema yet.
+
+TEMPLATE
+DATE:
+PHASE:
+OBJECTIVE:
+DATABASE ACTIONS:
+MIGRATIONS:
+IMPORTANT SQL / COMMANDS:
+VALIDATION QUERIES:
+RESULT:
+ROLLBACK NOTES:
