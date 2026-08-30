@@ -1,12 +1,7 @@
-// Prisma schema — Phase 0 socle (ADR-014).
-// Deliberately declares NO business models: no artificial/test domain table.
-// Database & Prisma connectivity is proven at runtime by a real raw query
-// (SELECT 1) from the health endpoint.
-//
-// The only database artifact produced by `prisma migrate dev` here is Prisma's
-// own `_prisma_migrations` tracking table, which establishes the real migration
-// baseline for future phases. Any future table requires a genuine architectural
-// justification in its phase.
+// Prisma schema — Phase 1 auth domain (ADR-016).
+// Supersedes the zero-table Phase 0 (ADR-014) for the authentication domain only:
+// introduces the first real, justified business tables `User` and `RefreshToken`,
+// and the real migration baseline (`_prisma_migrations`).
 
 generator client {
   provider = "prisma-client-js"
@@ -15,4 +10,36 @@ generator client {
 datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
+}
+
+enum Role {
+  ADMIN
+  USER
+}
+
+model User {
+  id           String         @id @default(cuid())
+  email        String         @unique
+  passwordHash String
+  name         String?
+  role         Role           @default(USER)
+  isActive     Boolean        @default(true)
+  createdAt    DateTime       @default(now())
+  updatedAt    DateTime       @updatedAt
+
+  refreshTokens RefreshToken[]
+
+  @@index([email])
+}
+
+model RefreshToken {
+  id        String    @id @default(cuid())
+  tokenHash String    @unique // sha256 of the raw refresh token; raw value never stored
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
 }

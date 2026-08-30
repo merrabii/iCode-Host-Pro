@@ -1,35 +1,36 @@
 # PROJECT_STATUS — iCode Host Pro
 
 ## Overall status
-**PHASE 0 COMPLETE — VALIDATED BY OWNER (2026-08-30)**
+**PHASE 1 COMPLETE & OWNER-VALIDATED — AUTHENTICATION & FIRST TABLES**
 
 ## Current phase
-**Phase 0 — Architecture & Foundations. COMPLETE. Owner validated in browser on 2026-08-30.**
+**Phase 1 — Authentication & first real business tables — COMPLETE, owner-validated 2026-08-31.**
 
 ## State (real, as of this update)
 - Monorepo: pnpm workspaces + Turborepo (ADR-001). `apps/web` (Next.js 15), `apps/api` (NestJS 11), `packages/` reserved.
 - API: `GET /api/health` (app + real DB connectivity via `SELECT 1`), validated startup config socle (ADR-011), global `/api` prefix, dev CORS, OpenAPI/Swagger at `/api/docs` (ADR-005).
-- Prisma: schema with **zero business models** (ADR-014); client v6.19.3 generated; no tables created.
-- DB: PostgreSQL 16 in Docker (ADR-012), container `icode-postgres`, volume `projeticodehost_icode_pg_data`. **Dev DB reset to a fresh volume** (docker compose down -v then up) per owner request; no old iCodeHost image/container/volume remains in Docker (verified). Unrelated `omniroute` app left untouched.
-- Web: diagnostic page calling `/api/health`.
+- **Auth (Phase 1, ADR-015)**: stateless JWT Bearer access token (short-lived `15m`) + refresh token in httpOnly cookie (rotated, revocable, persisted hashed in DB, sha256). bcryptjs hashing. Minimal RBAC role `ADMIN | USER` + guards. Open registration (Phase 1 scope). Endpoints: `POST /api/auth/register`, `/api/auth/login`, `/api/auth/refresh`, `/api/auth/logout`, `GET /api/users/me` (protected). Swagger carries a Bearer JWT scheme.
+- DB (Phase 1, ADR-016): first real business tables `users` + `refresh_tokens` created via migration `20260830053420_init_auth` (first migration baseline; `_prisma_migrations` now exists). Prisma client v6.19.3.
+- `@nestjs/jwt` pinned to **^11.0.2** (CJS dist) — v12 ships ESM-only dist that breaks our CJS jest/toolchain.
+- Web: login/register page at `/auth` (client auth form), same-origin `/api/*` rewrite/proxy (API_UPSTREAM) so the httpOnly refresh cookie works through :3000. Homepage still shows the diagnostic + link to /auth.
+- Docker Postgres 16 (ADR-012) up and healthy.
 
-## Verified (real checks, not assumed)
-- `corepack pnpm --filter @icode-host-pro/api test` → **2/2 pass**.
-- `corepack pnpm --filter @icode-host-pro/api test:e2e` → **1/1 pass** (after fixing supertest import).
-- `corepack pnpm build` → **2/2 pass** (nest build + next build).
-- Live: `GET /api/health` → `200 {"status":"ok","database":"ok",...}`.
-- Live: `/api/docs` (Swagger UI) → 200; `/api/docs-json` → 200, path `/api/health` present.
-- Live: web homepage `http://localhost:3000` → 200, shows diagnostic page.
+## Verified (real checks, not assumed) — 2026-08-31
+- `corepack pnpm --filter @icode-host-pro/api test` → **2/2 unit pass**.
+- `corepack pnpm --filter @icode-host-pro/api test:e2e` → **6/6 pass, 2 suites** (health + auth full flow: register 201, /users/me with token 200, /users/me without token 401, wrong password 401, refresh).
+- `corepack pnpm --filter @icode-host-pro/api build` → PASS; `--filter @icode-host-pro/web build` → PASS (incl. `/auth` route).
+- Live smoke on :3001 `/api`: register→201 [accessToken+refresh cookie ✓], `GET /users/me` with Bearer → 200 (email ok, passwordHash absent), no token → 401, refresh → 201 new accessToken, `GET /users/me` with refreshed token → 200, logout → 201, refresh after logout (revoked) → 401.
+- Live: `/api/docs` (Swagger) → 200, spec declares `bearer`/`bearerFormat: JWT` securityScheme.
+- Live web proxy: `GET http://localhost:3000/api/health` → 200 `{"status":"ok","database":"ok",...}` (rewrite works); `/auth` page → 200.
 
 ## Pending
-- Commit of the Phase 0 baseline (on owner request — nothing committed yet).
-- Proposal and plan for Phase 1.
+- Proposal for Phase 2 (on owner request).
 
 ## Decisions
-- ADR-001..005, 011..014: **APPROVED** (Phase 0 GO, 2026-08-30). ADR-006 full, 007, 008, 009, 010: **PROPOSED** (untouched). See DECISIONS.md.
+- ADR-001..005, 011..014: **APPROVED** (Phase 0). ADR-015 (auth) + ADR-016 (auth tables): **APPROVED** (Phase 1 GO, 2026-08-30). ADR-006 full, 007, 008, 009, 010: **PROPOSED** (untouched). See DECISIONS.md.
 
 ## Next action
-Commit the Phase 0 baseline if requested, then propose Phase 1.
+Present Phase 1 validation steps to owner; on validation, close Phase 1 and commit.
 
 ## Out of scope (do not build yet)
-Auth, dashboard/portal, providers (Coolify/Hestia), jobs/Redis, billing, OAuth, licensing, product catalog.
+Dashboard/portal, providers (Coolify/Hestia), jobs/Redis, billing, OAuth, licensing, product catalog.

@@ -71,4 +71,107 @@ REMARKS FOR FUTURE AI:
     architectural justification. When the first models are added, run
     `corepack pnpm --filter @icode-host-pro/api migrate` and record here.
   - Do NOT treat Phase 0's empty schema as a mistake: it implements ADR-014.
+
+================================================================
+PHASE 1 — AUTHENTICATION & FIRST TABLES (User + RefreshToken)
+================================================================
+
+DATE: 2026-08-31
+PHASE: 1.2 — First real business tables (ADR-016)
+OBJECTIVE:
+  Introduce the first business tables — `users` and `refresh_tokens` — to back
+  the Phase 1 JWT authentication (ADR-015): stateless Bearer access token +
+  refresh token persisted in DB (sha256-hashed, rotated & revocable). Governed
+  by ADR-016 (auth tables) and ADR-015 (auth architecture).
+
+DATABASE ACTIONS:
+  - Created Prisma models `User` and `RefreshToken` in
+    apps/api/prisma/schema.prisma:
+      * enum `Role` (ADMIN | USER)
+      * `users`: id (cuid PK), email (unique), passwordHash, name?, role
+        (default USER), isActive (default true), createdAt, updatedAt.
+      * `refresh_tokens`: id (cuid PK), tokenHash (unique), userId (FK -> users,
+        onDelete: Cascade), expiresAt, revokedAt?, createdAt.
+  - Migration applied on the local dev DB. Created Prisma migration baseline
+    `_prisma_migrations` AND the `users` + `refresh_tokens` tables.
+
+MIGRATIONS:
+  - Migration folder: apps/api/prisma/migrations/20260830053420_init_auth/
+  - Name: `init_auth`. Applied via
+    `corepack pnpm --filter @icode-host-pro/api run migrate --name init_auth`.
+    NOTE: avoid passing the literal `--`; use the `--name init_auth` form so the
+    CLI does not drop into an interactive name prompt (hung when run with `--`).
+  - First migration on the project => created `_prisma_migrations` tracking
+    table (Phase 0 had none, per ADR-014). Confirmed: `prisma migrate status`
+    reports DB is in sync.
+  - Troubleshooting note: a stale pg advisory lock (P1002) can block `migrate
+    dev` after a killed migration; cleared with `docker compose restart postgres`
+    (drops all in-flight advisory locks) then re-ran the migration.
+
+IMPORTANT SQL / COMMANDS:
+  - Migration (dev):  corepack pnpm --filter @icode-host-pro/api run migrate --name <name>
+  - Deployment:       corepack pnpm --filter @icode-host-pro/api run migrate:deploy
+  - The two tables created (mirror of Prisma schema; quoted names as generated
+    by Prisma):
+
+    CREATE TYPE "Role" AS ENUM ('ADMIN', 'USER');
+    ,
+    CREATE TABLE "users" (
+        "id"          TEXT NOT NULL,
+        "email"       TEXT NOT NULL,
+        "passwordHash" TEXT NOT NULL,
+        "name"        TEXT,
+        "role"        "Role" NOT NULL DEFAULT 'USER',
+        "isActive"    BOOLEAN NOT NULL DEFAULT true,
+        "createdAt"   TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        "updatedAt"   TIMESTAMP(3) NOT NULL,
+        CONSTRAINT "users_pkey" PRIMARY KEY ("id")
+    );
+    CREATE UNIQUE INDEX "users_email_key" ON "users"("email");
+    CREATE INDEX "users_email_idx" ON "users"("email");
+
+    CREATE TABLE "refresh_tokens" (
+        "id"          TEXT NOT NULL,
+        "tokenHash"   TEXT NOT NULL,
+        "userId"      TEXT NOT NULL,
+        "expiresAt"   TIMESTAMP(3) NOT NULL,
+        "revokedAt"   TIMESTAMP(3),
+        "createdAt"   TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        CONSTRAINT "refresh_tokens_pkey" PRIMARY KEY ("id")
+    );
+    CREATE UNIQUE INDEX "refresh_tokens_tokenHash_key" ON "refresh_tokens"("tokenHash");
+    CREATE INDEX "refresh_tokens_userId_idx" ON "refresh_tokens"("userId");
+    ALTER TABLE "refresh_tokens" ADD CONSTRAINT "refresh_tokens_userId_fkey"
+        FOREIGN KEY ("userId") REFERENCES "users"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+VALIDATION QUERIES:
+  - `SELECT id, email, role, "isActive" FROM users;`  -> rows returned after a
+    register/login (each issue-time row for users).
+  - `SELECT "tokenHash", "userId", "revokedAt", "expiresAt" FROM refresh_tokens;`
+    -> one row per issued token; `revokedAt` becomes non-null after refresh
+    rotation or logout.
+  - Live e2e + smoke test proved writes/reads: register persisted a user row,
+    refresh rotated (old token revoked, new one issued), logout revoked the
+    presented token (subsequent refresh returned 401).
+  - NOTE: token hashes are stored, never the raw refresh token (ADR-015 sha256).
+
+RESULT:
+  - First business tables `users` + `refresh_tokens` created with migration
+    baseline. Auth flow fully backed by real tables (register/login/refresh/
+    logout). No seed data inserted (not required in Phase 1).
+
+ROLLBACK NOTES:
+  - To revert this migration on dev (destructive, removes data):
+        corepack pnpm --filter @icode-host-pro/api run migrate:deploy  # (not a rollback)
+    A true rollback would require a down-migration; none authored. For dev a
+    full reset is acceptable:
+        docker compose down -v && docker compose up -d postgres
+    which drops icode_pg_data + recreates the empty DB (re-run `migrate dev`
+    afterwards to re-apply all migrations).
+
+REMARKS FOR FUTURE AI:
+  - All future domain tables follow this pattern: model in schema.prisma, then a
+    named migration, recording the SQL here.
+  - `refresh_tokens` stores only sha256 hashes — never raw tokens, secrets or
+    session dumps.
 ================================================================

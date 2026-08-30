@@ -85,6 +85,49 @@ Do not log only important work. Record all meaningful actions, including small c
 - Files modified: DECISIONS.md (approvals + ADR-011..014), PROJECT_STATUS.md (Phase 0 implemented, awaiting owner validation), README.md (monorepo layout + quick start), docs/sql-commandes.txt (Phase 0 DB entry), TASKS.md, CHANGELOG.md.
 - Awaiting: owner browser validation to close Phase 0.
 
+# PHASE 1 — AUTHENTICATION & FIRST TABLES (owner-validated 2026-08-31) ✓
+
+## 2026-08-31 — 1.6 Close & commit
+- Action: owner validated Phase 1 in browser ("validé").
+- Files modified: PROJECT_STATUS.md (Phase 1 ✓), TASKS.md, CHANGELOG.md, HANDOVER.md.
+- Command: git add + commit (Phase 1 baseline).
+
+## 2026-08-30 — 1.0 Direction & GO
+- Action: Asked the owner to choose the Phase 1 direction among proposals; owner selected **"Auth + 1res tables"**; explicit GO given.
+- Reason: Owner picks phase scope; Auth is the natural first domain slice after the Phase 0 socle.
+- Decisions APPROVED at GO: ADR-015 (auth architecture: stateless JWT Bearer access + httpOnly refresh cookie, rotated/hashed/revocable, bcryptjs, minimal ADMIN/USER RBAC), ADR-016 (User + RefreshToken tables).
+- Files modified: DECISIONS.md.
+
+## 2026-08-31 — 1.1 First business tables + migration (ADR-016)
+- Files created: `apps/api/prisma/schema.prisma` models `User` + `RefreshToken` (+ enum `Role` ADMIN/USER); migration `apps/api/prisma/migrations/20260830053420_init_auth/`.
+- Files modified: `apps/api/.env` / `.env.example` (added `JWT_SECRET`, `JWT_EXPIRES_IN=15m`, `REFRESH_EXPIRES_IN_DAYS=30`, `COOKIE_NAME=ihp_refresh`); `apps/api/src/config/configuration.ts` (load + fail-early require `JWT_SECRET`; expose jwtSecret/jwtExpiresIn/refreshExpiresInDays/cookieName).
+- Commands: `corepack pnpm --filter @icode-host-pro/api run migrate --name init_auth` (first migration baseline — `_prisma_migrations` + `users` + `refresh_tokens` created). `prisma migrate status` → in sync.
+- Troubleshooting: a P1002 advisory-lock stale session from a killed migrate blocked `migrate dev`; cleared via `docker compose restart postgres`.
+- DOC for future AI: do NOT pass the literal `--` to the migrate script (drops into an interactive name prompt); use `--name <name>`.
+
+## 2026-08-31 — 1.2 Auth + users modules (ADR-015)
+- Files created (apps/api/src/auth): `types.ts` (JwtPayload{sub,email,role}, AuthTokens), `dto/register.dto.ts` + `dto/login.dto.ts` (class-validator IsEmail/MinLength(8)), `guards/jwt-auth.guard.ts` (verifyAsync → attaches req.user, `AuthedRequest`), `guards/roles.guard.ts` (Reflector + ROLES_KEY), `decorators/roles.decorator.ts` + `current-user.decorator.ts`, `auth.service.ts` (register/login/refresh/logout; bcrypt cost 10; randomBytes(48) base64url refresh; sha256 hashToken; signAsync), `auth.controller.ts` (register/login/refresh/logout; httpOnly cookie read/set/clear), `auth.module.ts`.
+- Files created (apps/api/src/users): `users.service.ts` (getProfile strips passwordHash), `users.controller.ts` (`GET /api/users/me` under JwtAuthGuard + @CurrentUser), `users.module.ts` (imports AuthModule).
+- Files modified: `apps/api/src/main.ts` (cookieParser, enableCors credentials, Swagger addBearerAuth), `apps/api/src/app.module.ts` (import AuthModule + UsersModule).
+- Endpoints: register, login, refresh, logout, users/me.
+
+## 2026-08-31 — 1.3 Web auth page + /api proxy
+- Files created: `apps/web/src/app/auth/page.tsx` (client login/register form → `/api/auth/...` with credentials:'include'; then GET `/api/users/me` with Bearer; logout).
+- Files modified: `apps/web/next.config.mjs` (same-origin rewrites `/api/:path*` → `${API_UPSTREAM ?? 'http://localhost:3001'}/api/:path*`; keeps httpOnly cookie working), `apps/web/src/app/page.tsx` (link → /auth).
+
+## 2026-08-31 — 1.4 Build + fix CJS/ESM issue with @nestjs/jwt
+- Commands: `corepack pnpm --filter @icode-host-pro/api build` PASS.
+- Blocker: `test:e2e` failed at import — `@nestjs/jwt@12` ships an ESM-only dist (`import jsonwebtoken from 'jsonwebtoken'`) that CJS jest cannot parse ("Cannot use import statement outside a module"). Both e2e suites failed.
+- Fix: pinned `@nestjs/jwt@^11.0.2` (CJS dist, tailored for Nest 11) via `corepack pnpm --filter @icode-host-pro/api add "@nestjs/jwt@^11.0.0"`.
+- Fix 2 (auth correctness found by e2e): `JwtModule.register({})` was empty, so the guard's `verifyAsync` used the default secret while `AuthService` signed with an explicit one → `GET /users/me` returned 401. Registered the secret via `JwtModule.registerAsync` (inject ConfigService, `getOrThrow('jwtSecret')`, signOptions.expiresIn from config) in `auth.module.ts`, and simplified `issueTokens` to `signAsync(payload)` (secret+expire from module config) — signing and verification now share one config.
+
+## 2026-08-31 — 1.5 Tests + live smoke (all PASS)
+- Commands: `test` → 2/2; `test:e2e` → **6/6, 2 suites** (health + auth full flow); `build` API + web PASS.
+- Live smoke on `http://localhost:3001/api` (node fetch): register 201 [accessToken + refresh cookie ✓] → `GET /users/me` 200 (email ok, passwordHash absent) → no token 401 → refresh 201 (new accessToken) → `/users/me` with refreshed token 200 → logout 201 → refresh after logout 401 (revocation verified).
+- Live: Swagger `/api/docs` 200, spec securityScheme `bearer`/JWT; web proxy `GET localhost:3000/api/health` 200 (rewrite works); web `/auth` 200.
+- Restarted dev servers (killed stale :3000 PID 5780 that predated the /api rewrite; API run stopped to fix e2e) — api `dev` (bipix4gz3, :3001) and web `dev` (b3gyb601z, :3000) running in background.
+- Docs to be updated: sql-commandes.txt (done: Phase 1 DB entry), PROJECT_STATUS.md (done), TASKS.md (this entry), CHANGELOG.md, HANDOVER.md.
+
 # EXECUTION ENTRY TEMPLATE
 ## YYYY-MM-DD — Phase X
 - Action:
@@ -99,7 +142,7 @@ Do not log only important work. Record all meaningful actions, including small c
 - Follow-up:
 
 # OPEN ITEMS
-- [ ] Authentication architecture (deferred beyond Phase 0).
+- [x] Authentication architecture (ADR-015 APPROVED — Phase 1).
 - [ ] Async jobs architecture (ADR-007).
 - [ ] Redis requirement (depends on ADR-007).
 - [ ] Coolify API verification.
@@ -109,8 +152,8 @@ Do not log only important work. Record all meaningful actions, including small c
 - [ ] Asset storage.
 - [ ] Reverse proxy/SSL.
 - [ ] Observability.
-- [ ] Toolchain activation on this machine pending (corepack/pnpm) before any install/test can run.
 
 # COMPLETED HISTORY
 - Clean baseline (Pre-Phase 0): documentation pack + first AI orientation.
 - Phase 0: source tree and config files authored; runtime execution (install, generate, migrate, tests) pending toolchain availability.
+- Phase 1: Auth + first tables (User + RefreshToken) — implemented & machine-verified; awaiting owner validation.

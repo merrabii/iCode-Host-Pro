@@ -1,6 +1,8 @@
+import { ValidationPipe } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { ConfigService } from '@nestjs/config';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
+import * as cookieParser from 'cookie-parser';
 import { AppModule } from './app.module';
 import { GlobalPrefix } from './config/constants';
 
@@ -13,14 +15,23 @@ async function bootstrap() {
 
   // Development CORS: allow the web app origin. Tighten before production.
   const webOrigin = config.get<string>('WEB_ORIGIN') ?? 'http://localhost:3000';
-  app.enableCors({ origin: webOrigin });
+  app.enableCors({ origin: webOrigin, credentials: true });
 
-  // OpenAPI contract (ADR-005, sub-phase 0.6) served under the API prefix.
+  // DTO validation with unknown-property stripping (Phase 1).
+  app.useGlobalPipes(new ValidationPipe({ whitelist: true, transform: true }));
+
+  // Refresh token httpOnly cookie parsing.
+  app.use(cookieParser());
+
+  // OpenAPI contract (ADR-005) + Bearer auth scheme (ADR-015).
   const swaggerConfig = new DocumentBuilder()
     .setTitle('iCode Host Pro API')
-    .setDescription('Control plane REST contract — Phase 0 socle')
+    .setDescription('Control plane REST contract — Phase 1')
     .setVersion('0.1.0')
+    .addTag('auth')
+    .addTag('users')
     .addTag('health')
+    .addBearerAuth()
     .build();
   const document = SwaggerModule.createDocument(app, swaggerConfig);
   SwaggerModule.setup(`${GlobalPrefix}/docs`, app, document);

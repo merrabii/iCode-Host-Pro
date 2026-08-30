@@ -24,6 +24,9 @@ export default function Home() {
   return (
     <main style={{ maxWidth: 640, margin: '4rem auto', padding: '0 1rem' }}>
       <h1>iCode Host Pro — diagnostic</h1>
+      <p>
+        <a href="/auth">→ Authentication (Phase 1)</a>
+      </p>
       <p className="muted">
         Frontend ↔ API connectivity check (Phase 0 socle).
       </p>

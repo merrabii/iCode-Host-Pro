@@ -62,6 +62,8 @@ Direction: fine-grained capability interfaces and provider isolation. Coolify/He
 - ADR-012 Docker dev Phase 0 (below) — 2026-08-30.
 - ADR-013 Conventions nommage (below) — 2026-08-30.
 - ADR-014 Zero table métier en Phase 0 (below) — 2026-08-30.
+- ADR-015 Approche authentication (below) — 2026-08-30.
+- ADR-016 Modèle de données Phase 1 (below) — 2026-08-30.
 
 ## ADR-011 — Socle config minimal (Phase 0)
 **Status: APPROVED** (2026-08-30, Phase 0 GO)
@@ -78,6 +80,14 @@ Decision: root package `icode-host-pro`; applications in `apps/web` (frontend, N
 ## ADR-014 — Zero table métier en Phase 0
 **Status: APPROVED** (2026-08-30, Phase 0 GO)
 Decision: no artificial domain table (no HealthCheck). The Phase 0 Prisma schema declares no business models. DB/Prisma connectivity is proven by a real raw query (`SELECT 1`) in the health check. The only database artifact is Prisma's own `_prisma_migrations` framework table (baseline for the real migration chain). Any future table requires a real architectural justification in its phase.
+
+## ADR-015 — Approche authentication (Phase 1)
+**Status: APPROVED** (2026-08-30, Phase 1 GO)
+Decision: stateless JWT Bearer access token (short-lived) + refresh token in a httpOnly cookie (rotated, revocable, persisted in DB). Password hashing with bcrypt. RBAC minimal: `role` (ADMIN/USER) on User + guards. Registration open in Phase 1 (to be tightened later). OAuth, MFA, password-reset, email verification fully deferred.
+
+## ADR-016 — Modèle de données Phase 1
+**Status: APPROVED** (2026-08-30, Phase 1 GO)
+Decision: first real justified business tables — `User` (email unique, password hash, name, role, active) and `RefreshToken` (hashed token, FK user, expiry, revocation, for rotation). Introduces the real migration baseline (`_prisma_migrations`), superseding the zero-table Phase 0 (ADR-014) for the auth domain only. No provider credentials, no other domain tables yet.
 
 # REJECTED
 None recorded in this clean baseline.
