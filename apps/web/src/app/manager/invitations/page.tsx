@@ -1,21 +1,30 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import Link from 'next/link';
-import { useRouter } from 'next/navigation';
 import {
   apiError,
   createInvitation,
-  fetchMe,
-  getAccessToken,
   inviteLink,
   Invitation,
   listInvitations,
-  Me,
   revokeInvitation,
-} from '../../../lib/api';
-
-type Phase = 'loading' | 'denied' | 'ready';
+} from '@/lib/api';
+import { useAdminSession } from '@/lib/session';
+import { AppShell } from '@/components/app-shell';
+import { ADMIN_NAV } from '@/config/nav';
+import {
+  Alert,
+  Badge,
+  Button,
+  Denied,
+  EmptyState,
+  Field,
+  Input,
+  PageIntro,
+  PageLoading,
+  Panel,
+} from '@/components/ui';
+import { IconCopy, IconKey } from '@/components/icons';
 
 const STATUS_LABEL: Record<string, string> = {
   pending: 'En attente',
@@ -24,18 +33,15 @@ const STATUS_LABEL: Record<string, string> = {
   expired: 'Expirée',
 };
 
-const STATUS_COLOR: Record<string, string> = {
-  pending: 'var(--ok, #1a7f37)',
-  used: 'var(--muted, #666)',
-  revoked: 'var(--danger)',
-  expired: 'var(--danger)',
+const STATUS_TONE: Record<string, 'ok' | 'neutral' | 'danger'> = {
+  pending: 'ok',
+  used: 'neutral',
+  revoked: 'danger',
+  expired: 'danger',
 };
 
 export default function ManagerInvitationsPage() {
-  const router = useRouter();
-  const [phase, setPhase] = useState<Phase>('loading');
-  const [me, setMe] = useState<Me | null>(null);
-  const [token, setToken] = useState('');
+  const { phase, me, token } = useAdminSession();
   const [invites, setInvites] = useState<Invitation[]>([]);
   const [email, setEmail] = useState('');
   const [created, setCreated] = useState<{
@@ -58,23 +64,9 @@ export default function ManagerInvitationsPage() {
   }
 
   useEffect(() => {
-    (async () => {
-      const t = await getAccessToken();
-      if (!t) {
-        router.replace('/auth');
-        return;
-      }
-      const m = await fetchMe(t);
-      if (!m || m.role !== 'ADMIN') {
-        setPhase('denied');
-        return;
-      }
-      setToken(t);
-      setMe(m);
-      setPhase('ready');
-      void load(t);
-    })();
-  }, [router]);
+    if (phase === 'ready' && token) void load(token);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phase, token]);
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
@@ -119,120 +111,118 @@ export default function ManagerInvitationsPage() {
     }
   }
 
-  if (phase !== 'ready') {
-    const denied = phase === 'denied';
+  if (phase === 'loading') {
     return (
-      <main style={{ maxWidth: 720, margin: '4rem auto', padding: '0 1rem' }}>
-        <h1>Invitations (Phase 5)</h1>
-        {denied ? (
-          <p style={{ color: 'var(--danger)' }}>Accès refusé : réservé aux administrateurs.</p>
-        ) : (
-          <p className="muted">Connexion…</p>
-        )}
-        <p>
-          <Link href={denied ? '/auth' : '/manager'}>← Retour</Link>
-        </p>
-      </main>
+      <AppShell me={null} nav={ADMIN_NAV}>
+        <PageLoading />
+      </AppShell>
+    );
+  }
+
+  if (phase === 'denied') {
+    return (
+      <AppShell me={null} nav={ADMIN_NAV}>
+        <Denied />
+      </AppShell>
     );
   }
 
   return (
-    <main style={{ maxWidth: 720, margin: '2rem auto', padding: '0 1rem' }}>
-      <h1>Invitations (Phase 5)</h1>
-      <p className="muted">
-        ADR-020 — l&apos;inscription libre est fermée. Envoie un lien d&apos;invitation à une
-        nouvelle adresse : connecté en tant que {me?.email} ·{' '}
-        <Link href="/manager">← Retour au manager</Link>
-      </p>
+    <AppShell me={me} nav={ADMIN_NAV} tenant={{ label: 'Administration' }}>
+      <div className="wrap-sm">
+        <PageIntro
+          eyebrow="Administration"
+          title="Invitations"
+          sub="L’inscription libre est fermée (ADR-020) : un compte se crée uniquement par invitation à une adresse email."
+        />
 
-      {message && <p style={{ color: 'var(--ok, #1a7f37)' }}>{message}</p>}
-      {error && <p style={{ color: 'var(--danger)' }}>{error}</p>}
+        {message && <Alert tone="ok">{message}</Alert>}
+        {error && <Alert tone="error">{error}</Alert>}
 
-      <form onSubmit={submit} style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
-        <label>
-          Email à inviter
-          <input
-            type="email"
-            required
-            value={email}
-            onChange={(e) => setEmail(e.target.value)}
-            style={{ padding: '6px 8px', boxSizing: 'border-box', width: 260 }}
-          />
-        </label>
-        <button type="submit">Créer l&apos;invitation</button>
-      </form>
+        <Panel title="Créer une invitation" sub="Envoie un email si la configuration mail est active ; sinon le lien est affiché ici.">
+          <form className="inline-form" onSubmit={submit}>
+            <Field label="Email à inviter" required>
+              <Input
+                type="email"
+                required
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                placeholder="client@exemple.com"
+              />
+            </Field>
+            <Button type="submit">Créer l&apos;invitation</Button>
+          </form>
 
-      {created && (
-        <div
-          className="card"
-          style={{
-            marginTop: 16,
-            padding: 12,
-            border: '1px solid var(--ok, #1a7f37)',
-            wordBreak: 'break-all',
-          }}
-        >
-          {created.emailSent ? (
-            <p style={{ color: 'var(--ok, #1a7f37)', margin: '0 0 8px' }}>
-              ✅ Email d&apos;invitation envoyé à {created.email}.
-            </p>
-          ) : (
-            <p style={{ color: 'var(--danger)', margin: '0 0 8px' }}>
-              ⚠️ Envoi automatique absent ou en échec — transmets ce lien manuellement
-              (configure le SMTP dans « Configuration mail »).
-            </p>
+          {created && (
+            <div className="stack mb mt">
+              {created.emailSent ? (
+                <Alert tone="ok" title="Email d’invitation envoyé">
+                  à {created.email}.
+                </Alert>
+              ) : (
+                <Alert tone="warn" title="Envoi automatique absent ou en échec">
+                  transmets ce lien manuellement (configure le SMTP dans « Configuration mail »).
+                </Alert>
+              )}
+              <div className="alert">
+                <b>{created.emailSent ? 'Lien de secours à transmettre à ' : 'Lien à transmettre à '}{created.email} :</b>
+                <div className="row mt-sm">
+                  <Input readOnly value={window.location.origin + created.link} className="input-mono flex-1" />
+                  <Button size="sm" variant="secondary" onClick={() => copy(window.location.origin + created.link)}>
+                    <IconCopy size={14} />
+                    Copier le lien
+                  </Button>
+                </div>
+                <div className="muted cell-sub mt-sm">
+                  <IconKey size={12} /> Jeton à usage unique : <code>{created.token}</code>
+                </div>
+              </div>
+            </div>
           )}
-          <strong>
-            {created.emailSent ? 'Lien de secours à transmettre à ' : 'Lien à transmettre à '}
-            {created.email} :
-          </strong>
-          <div style={{ marginTop: 6 }}>
-            <a href={created.link}>{window.location.origin + created.link}</a>
-          </div>
-          <div className="muted" style={{ margin: '4px 0' }}>
-            Token : <code>{created.token}</code>
-          </div>
-          <button type="button" onClick={() => copy(window.location.origin + created.link)}>
-            Copier le lien
-          </button>
-        </div>
-      )}
+        </Panel>
 
-      <section style={{ marginTop: '2rem' }}>
-        <h2>Invitations émises</h2>
-        {invites.length === 0 ? (
-          <p className="muted">Aucune invitation pour l&apos;instant.</p>
-        ) : (
-          <ul style={{ listStyle: 'none', padding: 0 }}>
-            {invites.map((inv) => (
-              <li
-                key={inv.id}
-                style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: 10,
-                  padding: '6px 0',
-                  borderBottom: '1px solid var(--border, #e2e2e2)',
-                  flexWrap: 'wrap',
-                }}
-              >
-                <span>{inv.email}</span>
-                <span style={{ color: STATUS_COLOR[inv.status] }}>
-                  {STATUS_LABEL[inv.status] ?? inv.status}
-                </span>
-                <span className="muted">
-                  ⏳ {new Date(inv.expiresAt).toLocaleDateString()}
-                </span>
-                {inv.status === 'pending' && (
-                  <button type="button" onClick={() => revoke(inv.id)}>
-                    Révoquer
-                  </button>
-                )}
-              </li>
-            ))}
-          </ul>
-        )}
-      </section>
-    </main>
+        <div className="mt">
+          <Panel
+            title="Invitations émises"
+            sub={invites.length > 0 ? `${invites.length} invitation(s)` : undefined}
+          >
+            {invites.length === 0 ? (
+              <EmptyState>Aucune invitation pour l’instant.</EmptyState>
+            ) : (
+              <div className="table-wrap">
+                <table className="table">
+                  <thead>
+                    <tr>
+                      <th>Email</th>
+                      <th>Statut</th>
+                      <th>Expire le</th>
+                      <th className="ta-right">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {invites.map((inv) => (
+                      <tr key={inv.id}>
+                        <td className="cell-title">{inv.email}</td>
+                        <td>
+                          <Badge tone={STATUS_TONE[inv.status] ?? 'neutral'}>{STATUS_LABEL[inv.status] ?? inv.status}</Badge>
+                        </td>
+                        <td className="muted nowrap">{new Date(inv.expiresAt).toLocaleDateString()}</td>
+                        <td className="ta-right">
+                          {inv.status === 'pending' && (
+                            <Button size="sm" variant="danger" onClick={() => revoke(inv.id)}>
+                              Révoquer
+                            </Button>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </Panel>
+        </div>
+      </div>
+    </AppShell>
   );
 }

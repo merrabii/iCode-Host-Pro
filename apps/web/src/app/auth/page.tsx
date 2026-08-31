@@ -2,6 +2,8 @@
 
 import { useEffect, useState } from 'react';
 import { acceptInvite, apiError } from '@/lib/api';
+import { AppShell } from '@/components/app-shell';
+import { Alert, Button, Field, Input } from '@/components/ui';
 
 type Mode = 'login' | 'invite';
 
@@ -100,84 +102,78 @@ export default function AuthPage() {
   }
 
   return (
-    <main style={{ maxWidth: 520, margin: '4rem auto', padding: '0 1rem' }}>
-      <h1>iCode Host Pro — Connexion</h1>
-      <p className="muted">
-        Phase 5 (ADR-020) : inscription libre fermée. Un compte se crée uniquement par invitation.
-      </p>
+    <AppShell me={null} nav={[]} bare>
+      <div className="wrap-sm">
+        <div className="auth-card">
+          <h2>{mode === 'login' ? 'Connexion' : 'Accepter l’invitation'}</h2>
+          <p>
+            Phase 5 (ADR-020) : inscription libre fermée — un compte se crée uniquement par
+            invitation.
+          </p>
 
-      <form onSubmit={submit} style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-        {mode === 'invite' && (
-          <label>
-            Jeton d&apos;invitation (rempli depuis le lien reçu)
-            <input
-              value={token}
-              onChange={(e) => setToken(e.target.value)}
-              style={inputStyle}
-            />
-          </label>
-        )}
-        <label>
-          Email
-          <input
-            type="email"
-            required
-            value={email}
-            onChange={(e) => setEmail(e.target.value)}
-            style={inputStyle}
-          />
-        </label>
-        {mode === 'invite' && (
-          <label>
-            Nom (optionnel)
-            <input value={name} onChange={(e) => setName(e.target.value)} style={inputStyle} />
-          </label>
-        )}
-        <label>
-          Mot de passe
-          <input
-            type="password"
-            required
-            minLength={8}
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            style={inputStyle}
-          />
-        </label>
-        <button type="submit">{mode === 'login' ? 'Connexion' : 'Créer mon compte via invitation'}</button>
-      </form>
+          <form className="auth-form" onSubmit={submit}>
+            {mode === 'invite' && (
+              <Field label="Jeton d’invitation (rempli depuis le lien reçu)" required>
+                <Input value={token} onChange={(e) => setToken(e.target.value)} className="input-mono" />
+              </Field>
+            )}
+            <Field label="Email" required>
+              <Input
+                type="email"
+                required
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+              />
+            </Field>
+            {mode === 'invite' && (
+              <Field label="Nom (optionnel)">
+                <Input value={name} onChange={(e) => setName(e.target.value)} />
+              </Field>
+            )}
+            <Field label="Mot de passe" required>
+              <Input
+                type="password"
+                required
+                minLength={8}
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+              />
+            </Field>
+            <Button type="submit">{mode === 'login' ? 'Connexion' : 'Créer mon compte via invitation'}</Button>
+          </form>
 
-      <p>
-        <button type="button" onClick={() => setMode(mode === 'login' ? 'invite' : 'login')}>
-          {mode === 'login'
-            ? 'J’ai une invitation — accepter un jeton'
-            : 'J’ai déjà un compte — se connecter'}
-        </button>
-      </p>
+          <div className="auth-meta">
+            <Button variant="secondary" onClick={() => setMode(mode === 'login' ? 'invite' : 'login')}>
+              {mode === 'login'
+                ? 'J’ai une invitation — accepter un jeton'
+                : 'J’ai déjà un compte — se connecter'}
+            </Button>
+          </div>
 
-      {message && <p style={{ color: 'var(--ok, #1a7f37)' }}>{message}</p>}
-      {error && <p style={{ color: 'var(--danger)' }}>{error}</p>}
+          {message && <Alert tone="ok" title="✅">{message}</Alert>}
+          {error && <Alert tone="error">{error}</Alert>}
 
-      {accessToken && !profile && (
-        <button type="button" onClick={fetchMe}>
-          Appeler /api/users/me (protégé)
-        </button>
-      )}
+          {accessToken && !profile && (
+            <div className="mt">
+              <Button variant="secondary" onClick={fetchMe}>
+                Appeler /api/users/me (protégé)
+              </Button>
+            </div>
+          )}
 
-      {profile && <pre>{JSON.stringify(profile, null, 2)}</pre>}
+          {profile && (
+            <pre className="mt">{JSON.stringify(profile, null, 2)}</pre>
+          )}
 
-      {(accessToken || profile) && (
-        <button type="button" onClick={logout}>
-          Déconnexion
-        </button>
-      )}
-    </main>
+          {(accessToken || profile) && (
+            <div className="mt">
+              <Button variant="danger" onClick={logout}>
+                Déconnexion
+              </Button>
+            </div>
+          )}
+        </div>
+      </div>
+    </AppShell>
   );
 }
-
-const inputStyle: React.CSSProperties = {
-  width: '100%',
-  padding: '8px 10px',
-  marginTop: 4,
-  boxSizing: 'border-box',
-};

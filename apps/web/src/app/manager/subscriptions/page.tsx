@@ -1,22 +1,31 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import Link from 'next/link';
-import { useRouter } from 'next/navigation';
 import {
   adminListServices,
   adminListSubscriptions,
   adminUpdateService,
   adminUpdateSubscription,
   apiError,
-  fetchMe,
-  getAccessToken,
-  Me,
   Service,
   Subscription,
-} from '../../../lib/api';
-
-type Phase = 'loading' | 'denied' | 'ready';
+} from '@/lib/api';
+import { useAdminSession } from '@/lib/session';
+import { AppShell } from '@/components/app-shell';
+import { ADMIN_NAV } from '@/config/nav';
+import {
+  Alert,
+  Badge,
+  Button,
+  Denied,
+  EmptyState,
+  PageIntro,
+  PageLoading,
+  Panel,
+  Select,
+  statusTone,
+} from '@/components/ui';
+import { IconServer } from '@/components/icons';
 
 const SUB_STATUS_LABEL: Record<string, string> = {
   PENDING: 'En attente',
@@ -42,10 +51,7 @@ interface ServerItem {
 }
 
 export default function ManagerSubscriptionsPage() {
-  const router = useRouter();
-  const [phase, setPhase] = useState<Phase>('loading');
-  const [me, setMe] = useState<Me | null>(null);
-  const [token, setToken] = useState('');
+  const { phase, me, token } = useAdminSession();
   const [subs, setSubs] = useState<Subscription[]>([]);
   const [services, setServices] = useState<Service[]>([]);
   const [servers, setServers] = useState<ServerItem[]>([]);
@@ -77,23 +83,9 @@ export default function ManagerSubscriptionsPage() {
   }
 
   useEffect(() => {
-    (async () => {
-      const t = await getAccessToken();
-      if (!t) {
-        router.replace('/auth');
-        return;
-      }
-      const m = await fetchMe(t);
-      if (!m || m.role !== 'ADMIN') {
-        setPhase('denied');
-        return;
-      }
-      setToken(t);
-      setMe(m);
-      setPhase('ready');
-      void load(t);
-    })();
-  }, [router]);
+    if (phase === 'ready' && token) void load(token);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phase, token]);
 
   function flash(m: string) {
     setMessage(m);
@@ -114,144 +106,159 @@ export default function ManagerSubscriptionsPage() {
     void load(token);
   }
 
-  if (phase !== 'ready') {
-    const denied = phase === 'denied';
+  if (phase === 'loading') {
     return (
-      <main style={{ maxWidth: 820, margin: '4rem auto', padding: '0 1rem' }}>
-        <h1>Souscriptions &amp; services (Phase 5)</h1>
-        {denied ? (
-          <p style={{ color: 'var(--danger)' }}>Accès refusé : réservé aux administrateurs.</p>
-        ) : (
-          <p className="muted">Connexion…</p>
-        )}
-        <p>
-          <Link href={denied ? '/auth' : '/manager'}>← Retour</Link>
-        </p>
-      </main>
+      <AppShell me={null} nav={ADMIN_NAV}>
+        <PageLoading />
+      </AppShell>
+    );
+  }
+
+  if (phase === 'denied') {
+    return (
+      <AppShell me={null} nav={ADMIN_NAV}>
+        <Denied />
+      </AppShell>
     );
   }
 
   return (
-    <main style={{ maxWidth: 820, margin: '2rem auto', padding: '0 1rem' }}>
-      <h1>Souscriptions &amp; services (Phase 5)</h1>
-      <p className="muted">
-        ADR-021 — le client garde le contrôle de ses souscriptions/services ; l&apos;admin approuve
-        et affecte une infrastructure (serveur). {me?.email} ·{' '}
-        <Link href="/manager">← Retour au manager</Link>
-      </p>
+    <AppShell me={me} nav={ADMIN_NAV} tenant={{ label: 'Administration' }}>
+      <div className="wrap-md">
+        <PageIntro
+          eyebrow="Administration"
+          title="Souscriptions & services"
+          sub="Le client garde le contrôle de ses souscriptions/services ; l’admin approuve et affecte une infrastructure (serveur)."
+        />
 
-      {message && <p style={{ color: 'var(--ok, #1a7f37)' }}>{message}</p>}
-      {error && <p style={{ color: 'var(--danger)' }}>{error}</p>}
+        {message && <Alert tone="ok">{message}</Alert>}
+        {error && <Alert tone="error">{error}</Alert>}
 
-      <section>
-        <h2>Souscriptions client</h2>
-        {subs.length === 0 ? (
-          <p className="muted">Aucune souscription pour l&apos;instant.</p>
-        ) : (
-          <ul style={{ listStyle: 'none', padding: 0 }}>
-            {subs.map((s) => (
-              <li
-                key={s.id}
-                style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: 10,
-                  padding: '6px 0',
-                  borderBottom: '1px solid var(--border, #e2e2e2)',
-                  flexWrap: 'wrap',
-                }}
-              >
-                <span>
-                  <strong>{s.product?.name ?? s.productId}</strong>{' '}
-                  <span className="muted">par {s.user?.email ?? '?'}</span>
-                </span>
-                <span className="muted">[{SUB_STATUS_LABEL[s.status] ?? s.status}]</span>
-                {s.status === 'PENDING' && (
-                  <>
-                    <button type="button" onClick={() => changeSub(s.id, 'ACTIVE')}>Approuver</button>
-                    <button type="button" onClick={() => changeSub(s.id, 'REJECTED')}>Rejeter</button>
-                  </>
-                )}
-                {s.status === 'ACTIVE' && (
-                  <button type="button" onClick={() => changeSub(s.id, 'SUSPENDED')}>Suspendre</button>
-                )}
-                {s.status === 'SUSPENDED' && (
-                  <button type="button" onClick={() => changeSub(s.id, 'ACTIVE')}>Réactiver</button>
-                )}
-              </li>
-            ))}
-          </ul>
-        )}
-      </section>
+        <Panel title="Souscriptions client" sub="Approbation / rejet / suspension par transaction d’état.">
+          {subs.length === 0 ? (
+            <EmptyState>Aucune souscription pour l’instant.</EmptyState>
+          ) : (
+            <div className="table-wrap">
+              <table className="table">
+                <thead>
+                  <tr>
+                    <th>Offre</th>
+                    <th>Client</th>
+                    <th>Statut</th>
+                    <th className="ta-right">Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {subs.map((s) => (
+                    <tr key={s.id}>
+                      <td className="cell-title">{s.product?.name ?? s.productId}</td>
+                      <td className="muted">{s.user?.email ?? '?'}</td>
+                      <td>
+                        <Badge tone={statusTone(s.status)}>{SUB_STATUS_LABEL[s.status] ?? s.status}</Badge>
+                      </td>
+                      <td>
+                        <div className="row ta-right">
+                          {s.status === 'PENDING' && (
+                            <>
+                              <Button size="sm" onClick={() => changeSub(s.id, 'ACTIVE')}>Approuver</Button>
+                              <Button size="sm" variant="secondary" onClick={() => changeSub(s.id, 'REJECTED')}>Rejeter</Button>
+                            </>
+                          )}
+                          {s.status === 'ACTIVE' && (
+                            <Button size="sm" variant="danger" onClick={() => changeSub(s.id, 'SUSPENDED')}>Suspendre</Button>
+                          )}
+                          {s.status === 'SUSPENDED' && (
+                            <Button size="sm" onClick={() => changeSub(s.id, 'ACTIVE')}>Réactiver</Button>
+                          )}
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </Panel>
 
-      <section style={{ marginTop: '2rem' }}>
-        <h2>Services demandés</h2>
-        {services.length === 0 ? (
-          <p className="muted">Aucun service pour l&apos;instant.</p>
-        ) : (
-          <ul style={{ listStyle: 'none', padding: 0 }}>
-            {services.map((svc) => (
-              <li
-                key={svc.id}
-                style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: 10,
-                  padding: '6px 0',
-                  borderBottom: '1px solid var(--border, #e2e2e2)',
-                  flexWrap: 'wrap',
-                }}
-              >
-                <span>
-                  <strong>{svc.name}</strong>{' '}
-                  <span className="muted">
-                    · {svc.subscription?.user?.email ?? '?'} · {svc.subscription?.product?.name ?? ''}
-                  </span>
-                </span>
-                <span className="muted">[{SERVICE_STATUS_LABEL[svc.status] ?? svc.status}]</span>
-                {(svc.status === 'REQUESTED' || svc.status === 'PROVISIONING') && (
-                  <>
-                    <label className="muted">
-                      Serveur
-                      <select
-                        value={serverChoice[svc.id] ?? ''}
-                        onChange={(e) =>
-                          setServerChoice({ ...serverChoice, [svc.id]: e.target.value })
-                        }
-                        style={{ padding: '4px 6px' }}
-                      >
-                        <option value="">—</option>
-                        {servers.map((s) => (
-                          <option key={s.id} value={s.id}>
-                            {s.name} ({s.hostname})
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-                    <button
-                      type="button"
-                      disabled={!serverChoice[svc.id]}
-                      onClick={() =>
-                        changeService(svc.id, {
-                          status: svc.status === 'REQUESTED' ? 'PROVISIONING' : 'ACTIVE',
-                          serverId: serverChoice[svc.id],
-                        })
-                      }
-                    >
-                      {svc.status === 'REQUESTED' ? 'Affecter & provisionner' : 'Activer (stub)'}
-                    </button>
-                  </>
-                )}
-              </li>
-            ))}
-          </ul>
-        )}
-        {services.some((s) => s.server?.id) && (
-          <p className="muted">
-            Serveurs affectés : {services.filter((s) => s.server?.id).map((s) => s.server?.name).join(', ')}
-          </p>
-        )}
-      </section>
-    </main>
+        <div className="mt">
+          <Panel
+            title="Services demandés"
+            sub="Affecter un serveur existant puis provisionner (stub). Aucune infrastructure n’est exposée au client."
+          >
+            {services.length === 0 ? (
+              <EmptyState>Aucun service pour l’instant.</EmptyState>
+            ) : (
+              <div className="table-wrap">
+                <table className="table">
+                  <thead>
+                    <tr>
+                      <th>Service</th>
+                      <th>Client</th>
+                      <th>Statut</th>
+                      <th className="ta-right">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {services.map((svc) => (
+                      <tr key={svc.id}>
+                        <td className="cell-title">
+                          {svc.name}
+                          <div className="muted cell-sub">{svc.subscription?.product?.name ?? ''}</div>
+                        </td>
+                        <td className="muted">{svc.subscription?.user?.email ?? '?'}</td>
+                        <td>
+                          <Badge tone={statusTone(svc.status)}>{SERVICE_STATUS_LABEL[svc.status] ?? svc.status}</Badge>
+                        </td>
+                        <td>
+                          {(svc.status === 'REQUESTED' || svc.status === 'PROVISIONING') && (
+                            <div className="row ta-right">
+                              <Select
+                                className="select-sm"
+                                value={serverChoice[svc.id] ?? ''}
+                                onChange={(e) => setServerChoice({ ...serverChoice, [svc.id]: e.target.value })}
+                                aria-label="serveur"
+                              >
+                                <option value="">—</option>
+                                {servers.map((s) => (
+                                  <option key={s.id} value={s.id}>
+                                    {s.name} ({s.hostname})
+                                  </option>
+                                ))}
+                              </Select>
+                              <Button
+                                size="sm"
+                                disabled={!serverChoice[svc.id]}
+                                onClick={() =>
+                                  changeService(svc.id, {
+                                    status: svc.status === 'REQUESTED' ? 'PROVISIONING' : 'ACTIVE',
+                                    serverId: serverChoice[svc.id],
+                                  })
+                                }
+                              >
+                                <IconServer size={14} />
+                                {svc.status === 'REQUESTED' ? 'Affecter & provisionner' : 'Activer (stub)'}
+                              </Button>
+                            </div>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+            {services.some((s) => s.server?.id) && (
+              <p className="muted cell-sub mt-sm">
+                Serveurs affectés :{' '}
+                {services
+                  .filter((s) => s.server?.id)
+                  .map((s) => s.server?.name)
+                  .join(', ')}
+              </p>
+            )}
+          </Panel>
+        </div>
+      </div>
+    </AppShell>
   );
 }

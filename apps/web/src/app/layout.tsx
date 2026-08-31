@@ -1,16 +1,22 @@
 import type { Metadata } from 'next';
 import './globals.css';
+import { brand } from '@/config/brand';
 
 export const metadata: Metadata = {
-  title: 'iCode Host Pro',
-  description: 'Self-hosted hosting control plane — Phase 0 diagnostic',
+  title: brand.name,
+  description: brand.sub,
 };
+
+const themeInit = `try{var t=localStorage.getItem('ihp-theme');if(t!=='light'&&t!=='dark'){t='dark'}document.documentElement.setAttribute('data-theme',t);}catch(e){document.documentElement.setAttribute('data-theme','dark');}`;
 
 export default function RootLayout({
   children,
 }: Readonly<{ children: React.ReactNode }>) {
   return (
-    <html lang="en">
+    <html lang="fr" suppressHydrationWarning>
+      <head>
+        <script dangerouslySetInnerHTML={{ __html: themeInit }} />
+      </head>
       <body>{children}</body>
     </html>
   );

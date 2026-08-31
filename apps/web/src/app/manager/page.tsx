@@ -1,17 +1,23 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import Link from 'next/link';
-import { useRouter } from 'next/navigation';
+import { apiError, apiJson, getManagerSummary, ManagerSummary } from '@/lib/api';
+import { useAdminSession } from '@/lib/session';
+import { AppShell } from '@/components/app-shell';
+import { ADMIN_NAV } from '@/config/nav';
 import {
-  apiError,
-  apiJson,
-  fetchMe,
-  getAccessToken,
-  getManagerSummary,
-  ManagerSummary,
-  Me,
-} from '../../lib/api';
+  Alert,
+  Button,
+  Denied,
+  EmptyState,
+  Field,
+  Input,
+  PageLoading,
+  Panel,
+  Select,
+  StatCard,
+} from '@/components/ui';
+import { IconBox, IconCheck, IconPlus, IconServer, IconUsers, IconX } from '@/components/icons';
 
 interface Product {
   id: string;
@@ -27,27 +33,11 @@ interface ServerItem {
   status: string;
 }
 
-type Phase = 'loading' | 'denied' | 'ready';
-
 const PRODUCT_STATUSES = ['DRAFT', 'ACTIVE', 'SUSPENDED', 'DISABLED'];
 const SERVER_STATUSES = ['UNKNOWN', 'PROVISIONING', 'ACTIVE', 'PROBLEM', 'REMOVED'];
 
-const inputStyle: React.CSSProperties = { padding: '6px 8px', boxSizing: 'border-box' };
-const selectStyle: React.CSSProperties = { ...inputStyle, width: 150 };
-const rowStyle: React.CSSProperties = {
-  display: 'flex',
-  alignItems: 'center',
-  gap: 10,
-  padding: '6px 0',
-  borderBottom: '1px solid var(--border, #e2e2e2)',
-  flexWrap: 'wrap',
-};
-
 export default function ManagerPage() {
-  const router = useRouter();
-  const [phase, setPhase] = useState<Phase>('loading');
-  const [me, setMe] = useState<Me | null>(null);
-  const [token, setToken] = useState('');
+  const { phase, me, token } = useAdminSession();
   const [summary, setSummary] = useState<ManagerSummary | null>(null);
   const [products, setProducts] = useState<Product[]>([]);
   const [servers, setServers] = useState<ServerItem[]>([]);
@@ -57,23 +47,9 @@ export default function ManagerPage() {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    (async () => {
-      const t = await getAccessToken();
-      if (!t) {
-        router.replace('/auth');
-        return;
-      }
-      const m = await fetchMe(t);
-      if (!m || m.role !== 'ADMIN') {
-        setPhase('denied');
-        return;
-      }
-      setToken(t);
-      setMe(m);
-      setPhase('ready');
-      void loadAll(t);
-    })();
-  }, [router]);
+    if (phase === 'ready' && token) void loadAll(token);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phase, token]);
 
   async function loadAll(t: string) {
     try {
@@ -166,22 +142,17 @@ export default function ManagerPage() {
 
   if (phase === 'loading') {
     return (
-      <main style={{ maxWidth: 820, margin: '4rem auto', padding: '0 1rem' }}>
-        <h1>iCode Host Pro — Manager</h1>
-        <p className="muted">Connexion…</p>
-      </main>
+      <AppShell me={null} nav={ADMIN_NAV}>
+        <PageLoading />
+      </AppShell>
     );
   }
 
   if (phase === 'denied') {
     return (
-      <main style={{ maxWidth: 820, margin: '4rem auto', padding: '0 1rem' }}>
-        <h1>iCode Host Pro — Manager</h1>
-        <p style={{ color: 'var(--danger)' }}>Accès refusé : réservé aux administrateurs de la plateforme.</p>
-        <p>
-          <a href="/auth">→ Retour à l&apos;authentification</a>
-        </p>
-      </main>
+      <AppShell me={null} nav={ADMIN_NAV}>
+        <Denied />
+      </AppShell>
     );
   }
 
@@ -189,105 +160,172 @@ export default function ManagerPage() {
   const serversByStatus = summary?.servers.byStatus ?? {};
 
   return (
-    <main style={{ maxWidth: 820, margin: '2rem auto', padding: '0 1rem' }}>
-      <h1>iCode Host Pro — Manager</h1>
-      <p className="muted">
-        Console d&apos;administration (Phase 3) — connecté en tant que {me?.email} ·{' '}
-        <Link href="/manager/utilisateurs">Utilisateurs →</Link> ·{' '}
-        <Link href="/manager/journal">Journal d&apos;audit →</Link> ·{' '}
-        <Link href="/manager/invitations">Invitations →</Link> ·{' '}
-        <Link href="/manager/mail">Configuration mail →</Link> ·{' '}
-        <Link href="/manager/subscriptions">Souscriptions &amp; services →</Link>
-      </p>
-
-      {message && <p style={{ color: 'var(--ok, #1a7f37)' }}>{message}</p>}
-      {error && <p style={{ color: 'var(--danger)' }}>{error}</p>}
-
-      <section>
-        <h2>Tableau de bord</h2>
-        <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
-          <div className="card">
-            <strong>{summary?.products.total ?? '—'}</strong> produits
-            <div className="muted">ACTIVE {productsByStatus.ACTIVE ?? 0}</div>
-          </div>
-          <div className="card">
-            <strong>{summary?.servers.total ?? '—'}</strong> serveurs
-            <div className="muted">ACTIVE {serversByStatus.ACTIVE ?? 0}</div>
-          </div>
-          <div className="card">
-            <strong>{summary?.users.active ?? '—'}</strong> utilisateurs actifs
-            <div className="muted">/{summary?.users.total ?? '—'} comptes</div>
+    <AppShell me={me} nav={ADMIN_NAV} tenant={{ label: 'Administration' }} info={['Système opérationnel']}>
+      <div className="wrap-md">
+        <div className="hero">
+          <div className="hero-eyebrow">Console d&apos;administration</div>
+          <h1>Infrastructure &amp; catalogue</h1>
+          <p>
+            Pilotage de la plateforme : produits, serveurs et comptes. Chaque modification est
+            tracée dans le journal d&apos;audit.
+          </p>
+          <div className="hero-cta">
+            <a className="btn btn-primary" href="#servers">
+              <IconServer size={15} />
+              Ajouter un serveur
+            </a>
+            <a className="btn btn-secondary" href="#products">
+              <IconBox size={15} />
+              Ajouter un produit
+            </a>
           </div>
         </div>
-      </section>
 
-      <section style={{ marginTop: '2rem' }}>
-        <h2>Serveurs (infrastructure)</h2>
-        <form onSubmit={createServer} style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
-          <label>Nom
-            <input value={drafts.serverName} onChange={(e) => setDrafts({ ...drafts, serverName: e.target.value })} required style={inputStyle} />
-          </label>
-          <label>Hostname
-            <input value={drafts.serverHostname} onChange={(e) => setDrafts({ ...drafts, serverHostname: e.target.value })} required style={inputStyle} />
-          </label>
-          <button type="submit">Ajouter</button>
-        </form>
-        <ul style={{ listStyle: 'none', padding: 0 }}>
-          {servers.map((s) => (
-            <li key={s.id} style={rowStyle}>
-              <span>
-                {s.name}{' '}
-                <input
-                  value={hostnameEdits[s.id] ?? s.hostname}
-                  onChange={(e) => setHostnameEdits({ ...hostnameEdits, [s.id]: e.target.value })}
-                  style={{ ...inputStyle, width: 180 }}
-                  aria-label="hostname"
+        <div className="stats-grid">
+          <StatCard
+            label="Produits (catalogue)"
+            value={summary?.products.total ?? '—'}
+            tone="primary"
+            icon={<IconBox />}
+            sub={`${productsByStatus.ACTIVE ?? 0} actif(s)`}
+          />
+          <StatCard
+            label="Serveurs (infrastructure)"
+            value={summary?.servers.total ?? '—'}
+            tone="info"
+            icon={<IconServer />}
+            sub={`${serversByStatus.ACTIVE ?? 0} actif(s)`}
+          />
+          <StatCard
+            label="Utilisateurs actifs"
+            value={summary?.users.active ?? '—'}
+            tone="violet"
+            icon={<IconUsers />}
+            sub={`sur ${summary?.users.total ?? '—'} comptes`}
+          />
+        </div>
+
+        {message && <Alert tone="ok">{message}</Alert>}
+        {error && <Alert tone="error">{error}</Alert>}
+
+        <div className="bottom-grid">
+          <Panel
+            title="Serveurs (infrastructure)"
+            sub="Hôtes gérés par la plateforme — statut et hostname modifiables"
+          >
+            <form className="inline-form mb" onSubmit={createServer}>
+              <Field label="Nom">
+                <Input
+                  value={drafts.serverName}
+                  onChange={(e) => setDrafts({ ...drafts, serverName: e.target.value })}
+                  placeholder="prod-01"
                 />
-                <button onClick={() => saveServerHostname(s.id, hostnameEdits[s.id] ?? s.hostname)}>✓</button>
-              </span>
-              <select
-                value={s.status}
-                onChange={(e) => changeServerStatus(s.id, e.target.value)}
-                style={selectStyle}
-              >
-                {SERVER_STATUSES.map((st) => (
-                  <option key={st} value={st}>{st}</option>
-                ))}
-              </select>
-              <button onClick={() => deleteServer(s.id)}>✕</button>
-            </li>
-          ))}
-        </ul>
-        {servers.length === 0 && <p className="muted">Aucun serveur enregistré.</p>}
-      </section>
+              </Field>
+              <Field label="Hostname">
+                <Input
+                  value={drafts.serverHostname}
+                  onChange={(e) => setDrafts({ ...drafts, serverHostname: e.target.value })}
+                  placeholder="node1.exemple.com"
+                />
+              </Field>
+              <Button type="submit">
+                <IconPlus size={14} />
+                Ajouter
+              </Button>
+            </form>
 
-      <section style={{ marginTop: '2rem' }}>
-        <h2>Produits (catalogue)</h2>
-        <form onSubmit={createProduct} style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
-          <label>Nom du produit
-            <input value={drafts.productName} onChange={(e) => setDrafts({ ...drafts, productName: e.target.value })} required style={inputStyle} />
-          </label>
-          <button type="submit">Ajouter</button>
-        </form>
-        <ul style={{ listStyle: 'none', padding: 0 }}>
-          {products.map((p) => (
-            <li key={p.id} style={rowStyle}>
-              <span>{p.name} <span className="muted">({p.kind})</span></span>
-              <select
-                value={p.status}
-                onChange={(e) => changeProductStatus(p.id, e.target.value)}
-                style={selectStyle}
-              >
-                {PRODUCT_STATUSES.map((st) => (
-                  <option key={st} value={st}>{st}</option>
+            {servers.length === 0 ? (
+              <EmptyState>Aucun serveur enregistré.</EmptyState>
+            ) : (
+              <div className="stack">
+                {servers.map((s) => (
+                  <div key={s.id} className="status-row">
+                    <span className={`status-icon${s.status === 'PROBLEM' ? ' amber' : s.status === 'ACTIVE' ? '' : ' info'}`}>
+                      <IconServer />
+                    </span>
+                    <div className="status-row-main">
+                      <div className="status-row-title">{s.name}</div>
+                      <div className="status-row-sub mono">{s.hostname}</div>
+                    </div>
+                    <Input
+                      className="input-sm"
+                      value={hostnameEdits[s.id] ?? s.hostname}
+                      onChange={(e) => setHostnameEdits({ ...hostnameEdits, [s.id]: e.target.value })}
+                      aria-label="hostname"
+                    />
+                    <Button size="sm" variant="secondary" onClick={() => saveServerHostname(s.id, hostnameEdits[s.id] ?? s.hostname)} title="Enregistrer l'hostname">
+                      <IconCheck size={14} />
+                    </Button>
+                    <Select
+                      className="select-sm"
+                      value={s.status}
+                      onChange={(e) => changeServerStatus(s.id, e.target.value)}
+                      aria-label="statut"
+                    >
+                      {SERVER_STATUSES.map((st) => (
+                        <option key={st} value={st}>{st}</option>
+                      ))}
+                    </Select>
+                    <Button size="sm" variant="danger" onClick={() => deleteServer(s.id)} title="Supprimer le serveur">
+                      <IconX size={14} />
+                    </Button>
+                  </div>
                 ))}
-              </select>
-              <button onClick={() => deleteProduct(p.id)}>✕</button>
-            </li>
-          ))}
-        </ul>
-        {products.length === 0 && <p className="muted">Aucun produit enregistré.</p>}
-      </section>
-    </main>
+              </div>
+            )}
+          </Panel>
+
+          <Panel
+            title="Produits (catalogue)"
+            sub="Offres de référence proposées aux clients"
+          >
+            <form className="inline-form mb" onSubmit={createProduct}>
+              <Field label="Nom du produit">
+                <Input
+                  value={drafts.productName}
+                  onChange={(e) => setDrafts({ ...drafts, productName: e.target.value })}
+                  placeholder="Hébergement web — Starter"
+                />
+              </Field>
+              <Button type="submit">
+                <IconPlus size={14} />
+                Ajouter
+              </Button>
+            </form>
+
+            {products.length === 0 ? (
+              <EmptyState>Aucun produit enregistré.</EmptyState>
+            ) : (
+              <div className="stack">
+                {products.map((p) => (
+                  <div key={p.id} className="status-row">
+                    <span className="status-icon violet">
+                      <IconBox />
+                    </span>
+                    <div className="status-row-main">
+                      <div className="status-row-title">{p.name}</div>
+                      <div className="status-row-sub">type {p.kind} · statut {p.status}</div>
+                    </div>
+                    <Select
+                      className="select-sm"
+                      value={p.status}
+                      onChange={(e) => changeProductStatus(p.id, e.target.value)}
+                      aria-label="statut"
+                    >
+                      {PRODUCT_STATUSES.map((st) => (
+                        <option key={st} value={st}>{st}</option>
+                      ))}
+                    </Select>
+                    <Button size="sm" variant="danger" onClick={() => deleteProduct(p.id)} title="Supprimer le produit">
+                      <IconX size={14} />
+                    </Button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </Panel>
+        </div>
+      </div>
+    </AppShell>
   );
 }

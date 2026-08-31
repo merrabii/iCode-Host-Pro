@@ -70,6 +70,7 @@ Direction: fine-grained capability interfaces and provider isolation. Coolify/He
 - ADR-020 Inscription fermée + invitations (below) — 2026-08-31.
 - ADR-021 Espace client : Souscription + Service (below) — 2026-08-31.
 - ADR-022 Configuration mail + emails d'invitation (below) — 2026-08-31.
+- ADR-023 Design system de l'interface (below) — 2026-08-31.
 
 ## ADR-011 — Socle config minimal (Phase 0)
 **Status: APPROVED** (2026-08-30, Phase 0 GO)
@@ -244,6 +245,36 @@ un mail de test ; quand l'envoi est activé, chaque invitation émet un email
   section test SMTP), messages `emailSent` dans `/manager/invitations`.
 - Hors périmètre (inchangés) : OAuth/MFA/Turnstile (différés par le propriétaire),
   billing, deploy réel (ADR-010), jobs async (ADR-007), storage d'assets, ADR-008 complet.
+
+## ADR-023 — Design system de l'interface (Phase 7)
+**Status: APPROVED** (2026-08-31, GO explicite du propriétaire : « Ne copier que le style
+et couleurs complet (sidebar + topbar + cartes…) de la page html envoyée et oublier tout
+le reste. le system ne doit absolument pas etre liée a une brand et tout doit etre
+modifiable. »)
+Decision: reproduction **à l'identique** du style et des couleurs de la page HTML fournie
+par le propriétaire (dashboard d'hébergement, thèmes dark/light, vert marque `#00b377`).
+Tout le contenu métier de la référence est ignoré (aucune marque tierce). La console
+iCode Host Pro passe du style inline ad hoc à ce design system.
+- **Tokens = variables CSS** (`apps/web/src/app/globals.css`) : palette dark/light
+  complète extraite de la référence (bg/sidebar/header/card/border/text/active…),
+  teintes badges/icônes, polices `--font`/`--mono`, dimensions sidebar 280px / topbar
+  64px, rayons, ombres, breakpoints. Source : `docs/design/DESIGN_SYSTEM.md`.
+- **Brand-agnostic** : aucun élément de design ne porte de marque. La marque vit
+  uniquement dans `apps/web/src/config/brand.ts` + tokens `--brand-primary*` (rebrand
+  différé « iCode Host Pro → Code Diali » = modifier uniquement ces deux endroits).
+- **Tout modifiable** : chaque couleur/dimension/police/effet est une variable CSS ;
+  aucun style inline métier dans les pages.
+- Thème `data-theme` sur `<html>`, **dark par défaut**, persisté (`localStorage
+  ihp-theme`), **script anti-FOUC** inline dans `layout.tsx`, bascule dans la topbar.
+- Composants : shell + topbar + sidebar + nav, héros, stats, panneaux, boutons, badges,
+  inputs/selects/tables, alertes — classes globales réutilisables + fins wrappers
+  (`components/ui.tsx`, `components/app-shell.tsx`, `components/icons.tsx`).
+- Toutes les pages (`/`, `/auth`, `/manager*`, `/client`) sont refactorées avec le
+  design system, **logique métier inchangée** (mêmes appels/états/handlers).
+- Pas de framework CSS, pas de Tailwind, pas de dépendance côté style (comme la
+  référence). Aucune table, aucune migration, aucun changement API.
+- Hors périmètre : redesign du contenu métier de la référence (non copié), tout
+  autre changement visuel au-delà des tokens copiés.
 
 # REJECTED
 None recorded in this clean baseline.

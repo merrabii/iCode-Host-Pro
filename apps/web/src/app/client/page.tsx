@@ -1,7 +1,6 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import {
   apiError,
@@ -15,7 +14,22 @@ import {
   Me,
   Service,
   Subscription,
-} from '../../lib/api';
+} from '@/lib/api';
+import { AppShell } from '@/components/app-shell';
+import { CLIENT_NAV } from '@/config/nav';
+import {
+  Alert,
+  Badge,
+  Button,
+  EmptyState,
+  Field,
+  Input,
+  PageIntro,
+  PageLoading,
+  Panel,
+  statusTone,
+} from '@/components/ui';
+import { IconBox } from '@/components/icons';
 
 type Phase = 'loading' | 'denied' | 'ready';
 
@@ -58,9 +72,7 @@ export default function ClientPage() {
     setError(null);
     try {
       const [p, s, svc] = await Promise.all([
-        fetch('/api/products', { headers: { Authorization: `Bearer ${t}` } }).then((r) =>
-          r.json(),
-        ),
+        fetch('/api/products', { headers: { Authorization: `Bearer ${t}` } }).then((r) => r.json()),
         listMySubscriptions(t),
         listMyServices(t),
       ]);
@@ -120,182 +132,155 @@ export default function ClientPage() {
     void load(token);
   }
 
-  if (phase !== 'ready') {
-    const denied = phase === 'denied';
+  if (phase === 'loading') {
     return (
-      <main style={{ maxWidth: 840, margin: '4rem auto', padding: '0 1rem' }}>
-        <h1>Espace client (Phase 5)</h1>
-        {denied ? (
-          <p style={{ color: 'var(--danger)' }}>Connexion requise.</p>
-        ) : (
-          <p className="muted">Chargement…</p>
-        )}
-        <p>
-          <Link href="/auth">← Retour à l&apos;authentification</Link>
-        </p>
-      </main>
+      <AppShell me={null} nav={CLIENT_NAV}>
+        <PageLoading />
+      </AppShell>
+    );
+  }
+
+  if (phase === 'denied') {
+    return (
+      <AppShell me={null} nav={CLIENT_NAV} tenant={{ label: 'Espace client' }}>
+        <div className="auth-wrap">
+          <div className="auth-card">
+            <h2>Connexion requise</h2>
+            <p>Connecte-toi pour accéder à ton espace client.</p>
+            <a className="btn-primary" href="/auth">
+              Se connecter
+            </a>
+          </div>
+        </div>
+      </AppShell>
     );
   }
 
   const activeSubs = subs.filter((s) => s.status === 'ACTIVE');
 
   return (
-    <main style={{ maxWidth: 840, margin: '2rem auto', padding: '0 1rem' }}>
-      <h1>Espace client (Phase 5)</h1>
-      <p className="muted">
-        Connecté en tant que {me?.email} ({me?.role}) ·{' '}
-        <Link href="/auth">Déconnexion</Link>
-      </p>
+    <AppShell me={me} nav={CLIENT_NAV} tenant={{ label: 'Espace client' }}>
+      <div className="wrap-md">
+        <PageIntro
+          eyebrow="Espace client"
+          title="Mes services"
+          sub="Catalogue, souscriptions et services. L’hébergement (serveur) est géré par l’administrateur : aucune donnée d’infrastructure ne t’est exposée."
+        />
 
-      {message && <p style={{ color: 'var(--ok, #1a7f37)' }}>{message}</p>}
-      {error && <p style={{ color: 'var(--danger)' }}>{error}</p>}
+        {message && <Alert tone="ok">{message}</Alert>}
+        {error && <Alert tone="error">{error}</Alert>}
 
-      <section>
-        <h2>Catalogue produits</h2>
-        {products.length === 0 ? (
-          <p className="muted">Aucun produit disponible.</p>
-        ) : (
-          <ul style={{ listStyle: 'none', padding: 0 }}>
-            {products
-              .filter((p) => p.status === 'ACTIVE' || p.status === 'SUSPENDED')
-              .map((p) => (
-                <li
-                  key={p.id}
-                  style={{
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: 10,
-                    padding: '6px 0',
-                    borderBottom: '1px solid var(--border, #e2e2e2)',
-                    flexWrap: 'wrap',
-                  }}
-                >
-                  <span>
-                    {p.name}{' '}
-                    <span className="muted">
-                      ({p.kind}
-                      {p.status !== 'ACTIVE' ? `, ${p.status}` : ''})
+        <Panel title="Catalogue produits" sub={products.length > 0 ? `${products.filter((p) => p.status === 'ACTIVE' || p.status === 'SUSPENDED').length} offre(s) disponible(s)` : undefined}>
+          {products.length === 0 ? (
+            <EmptyState>Aucun produit disponible.</EmptyState>
+          ) : (
+            <div className="stack">
+              {products
+                .filter((p) => p.status === 'ACTIVE' || p.status === 'SUSPENDED')
+                .map((p) => (
+                  <div key={p.id} className="status-row">
+                    <span className="status-icon">
+                      <IconBox />
                     </span>
-                  </span>
-                  <button type="button" onClick={() => subscribe(p.id)}>
-                    Souscrire
-                  </button>
-                </li>
-              ))}
-          </ul>
-        )}
-      </section>
+                    <div className="status-row-main">
+                      <div className="status-row-title">{p.name}</div>
+                      <div className="status-row-sub">
+                        type {p.kind}
+                        {p.status !== 'ACTIVE' ? ` · ${p.status}` : ''}
+                      </div>
+                    </div>
+                    <Button size="sm" onClick={() => subscribe(p.id)}>Souscrire</Button>
+                  </div>
+                ))}
+            </div>
+          )}
+        </Panel>
 
-      <section style={{ marginTop: '2rem' }}>
-        <h2>Mes souscriptions</h2>
-        {subs.length === 0 ? (
-          <p className="muted">Aucune souscription. Demande l&apos;une des offres ci-dessus.</p>
-        ) : (
-          <ul style={{ listStyle: 'none', padding: 0 }}>
-            {subs.map((s) => (
-              <li
-                key={s.id}
-                style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: 10,
-                  padding: '6px 0',
-                  borderBottom: '1px solid var(--border, #e2e2e2)',
-                  flexWrap: 'wrap',
-                }}
-              >
-                <span>
-                  <strong>{s.product?.name ?? s.productId}</strong>{' '}
-                  <span className="muted">[{SUB_STATUS_LABEL[s.status] ?? s.status}]</span>
-                </span>
-                {['PENDING', 'ACTIVE', 'SUSPENDED'].includes(s.status) && (
-                  <button type="button" onClick={() => cancelSub(s.id)}>
-                    Annuler
-                  </button>
-                )}
-              </li>
-            ))}
-          </ul>
-        )}
-      </section>
+        <div className="mt">
+          <Panel title="Mes souscriptions" sub="Une offre demandée reste en attente jusqu’à l’approbation par l’admin.">
+            {subs.length === 0 ? (
+              <EmptyState>Demande l&apos;une des offres ci-dessus.</EmptyState>
+            ) : (
+              <div className="stack">
+                {subs.map((s) => (
+                  <div key={s.id} className="status-row">
+                    <div className="status-row-main">
+                      <div className="status-row-title">{s.product?.name ?? s.productId}</div>
+                      <div className="status-row-sub">Souscription</div>
+                    </div>
+                    <Badge tone={statusTone(s.status)}>{SUB_STATUS_LABEL[s.status] ?? s.status}</Badge>
+                    {['PENDING', 'ACTIVE', 'SUSPENDED'].includes(s.status) && (
+                      <Button size="sm" variant="secondary" onClick={() => cancelSub(s.id)}>
+                        Annuler
+                      </Button>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </Panel>
+        </div>
 
-      <section style={{ marginTop: '2rem' }}>
-        <h2>Demander un service (souscription active)</h2>
-        {activeSubs.length === 0 ? (
-          <p className="muted">
-            Aucune souscription active. Une fois une souscription approuvée par l&apos;admin,
-            tu pourras demander un service ici.
-          </p>
-        ) : (
-          <ul style={{ listStyle: 'none', padding: 0 }}>
-            {activeSubs.map((s) => (
-              <li
-                key={s.id}
-                style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: 10,
-                  padding: '6px 0',
-                  borderBottom: '1px solid var(--border, #e2e2e2)',
-                  flexWrap: 'wrap',
-                }}
-              >
-                <span>
-                  <strong>{s.product?.name ?? s.productId}</strong>
-                </span>
-                <input
-                  placeholder="Nom du service"
-                  value={serviceName[s.id] ?? ''}
-                  onChange={(e) => setServiceName({ ...serviceName, [s.id]: e.target.value })}
-                  style={{ padding: '6px 8px', boxSizing: 'border-box', width: 220 }}
-                />
-                <button
-                  type="button"
-                  disabled={!(serviceName[s.id] ?? '').trim()}
-                  onClick={() => requestService(s.id)}
-                >
-                  Demander
-                </button>
-              </li>
-            ))}
-          </ul>
-        )}
-      </section>
+        <div className="mt">
+          <Panel title="Demander un service" sub="Uniquement sur une souscription active.">
+            {activeSubs.length === 0 ? (
+              <EmptyState>
+                Aucune souscription active. Une fois une souscription approuvée par l&apos;admin,
+                tu pourras demander un service ici.
+              </EmptyState>
+            ) : (
+              <div className="stack">
+                {activeSubs.map((s) => (
+                  <div key={s.id} className="status-row">
+                    <div className="status-row-main">
+                      <div className="status-row-title">{s.product?.name ?? s.productId}</div>
+                      <div className="status-row-sub">Souscription active</div>
+                    </div>
+                    <Input
+                      className="input-sm"
+                      placeholder="Nom du service"
+                      value={serviceName[s.id] ?? ''}
+                      onChange={(e) => setServiceName({ ...serviceName, [s.id]: e.target.value })}
+                    />
+                    <Button
+                      size="sm"
+                      disabled={!(serviceName[s.id] ?? '').trim()}
+                      onClick={() => requestService(s.id)}
+                    >
+                      Demander
+                    </Button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </Panel>
+        </div>
 
-      <section style={{ marginTop: '2rem' }}>
-        <h2>Mes services</h2>
-        {services.length === 0 ? (
-          <p className="muted">Aucun service pour l&apos;instant.</p>
-        ) : (
-          <ul style={{ listStyle: 'none', padding: 0 }}>
-            {services.map((svc) => (
-              <li
-                key={svc.id}
-                style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: 10,
-                  padding: '6px 0',
-                  borderBottom: '1px solid var(--border, #e2e2e2)',
-                  flexWrap: 'wrap',
-                }}
-              >
-                <span>
-                  <strong>{svc.name}</strong>{' '}
-                  <span className="muted">
-                    · {svc.subscription?.product?.name ?? ''}
-                  </span>
-                </span>
-                <span className="muted">[{SERVICE_STATUS_LABEL[svc.status] ?? svc.status}]</span>
-              </li>
-            ))}
-          </ul>
-        )}
-        <p className="muted">
-          L&apos;hébergement (serveur) est géré par l&apos;administrateur : aucune donnée
-          d&apos;infrastructure ne t&apos;est exposée.
-        </p>
-      </section>
-    </main>
+        <div className="mt">
+          <Panel title="Mes services" sub="Les serveurs ne sont jamais exposés côté client.">
+            {services.length === 0 ? (
+              <EmptyState>Aucun service pour l&apos;instant.</EmptyState>
+            ) : (
+              <div className="stack">
+                {services.map((svc) => (
+                  <div key={svc.id} className="status-row">
+                    <div className="status-row-main">
+                      <div className="status-row-title">
+                        {svc.name}
+                        {svc.subscription?.product?.name && (
+                          <span className="muted cell-sub"> · {svc.subscription.product.name}</span>
+                        )}
+                      </div>
+                      <div className="status-row-sub">Service</div>
+                    </div>
+                    <Badge tone={statusTone(svc.status)}>{SERVICE_STATUS_LABEL[svc.status] ?? svc.status}</Badge>
+                  </div>
+                ))}
+              </div>
+            )}
+          </Panel>
+        </div>
+      </div>
+    </AppShell>
   );
 }

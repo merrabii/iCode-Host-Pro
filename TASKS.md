@@ -359,6 +359,49 @@ Do not log only important work. Record all meaningful actions, including small c
 - Reste en option (non bloquant) : un test live d'**invitation avec email** (créer une invite → l'email arrive avec le lien `/auth?invite=…` → accept de bout en bout).
 - **Rebrand (note owner, différé)** : changer la marque **iCode Host Pro → Code Diali** / `codediali.com` **une fois le projet terminé**.
 
+# PHASE 7 — DESIGN SYSTEM DE L'INTERFACE (ADR-023 — implémenté 2026-08-31, pas encore commité/poussé)
+
+## 2026-08-31 — GO + décision
+- Action: le propriétaire a fourni une page HTML de référence (dashboard d'hébergement, thèmes dark/light) et donné un GO explicite : « Ne copier que le style et couleurs complet (sidebar + topbar + cartes…) et oublier tout le reste. Le système ne doit absolument pas être lié à une brand et tout doit être modifiable. »
+- Décision: **ADR-023 APPROVED** (DECISIONS.md) — reproduction à l'identique du style/couleurs de la référence, brand-agnostic, tout modifiable via variables CSS. Pas de Tailwind, pas de framework CSS.
+
+## Doc du design system
+- Created: `docs/design/DESIGN_SYSTEM.md` — origine/référence, tokens dark/light exacts (copiés), typographie/dimensions/rayons, composants, layout des zones, règles d'écriture AI, config marque (rebrand différé Code Diali).
+
+## Tokens + classes (apps/web/src/app/globals.css — réécrit de ~30 lignes à ~1100)
+- Tokens dark (défaut) : `--bg #070c1f`, `--sidebar-bg #030718`, `--header-bg #0d1526`, `--card-bg #0d1629`, `--card-bg-2 #0b1322`, `--border #1c2740`, `--border-soft #16203a`, `--text-primary #fff`, `--text-secondary #94a3b8`, `--text-muted #5b6b85`, `--active-bg rgba(0,179,119,.14)`, `--active-text #34d399`, `--hover-bg #0f1930`, `--input-bg #0c1425`, `--shadow`, teintes badges/icônes (green/blue/violet/amber/cyan/pink/gray) + **rouge ajouté** (absent de la référence, même langage) pour les erreurs.
+- Tokens light : `--bg #f8fafc`, sidebar `#f9fafc`, header/card `#fff`, border `#e7eaf0`, text `#10151f`, etc.
+- Marque (`--brand-primary #00b377` = `--green` référence, `--brand-primary-dark #009966`, `--brand-accent`, `--brand-gradient`, glow bouton) — tout modifiable.
+- Classes : topbar (logo/gradient, brand-title/sub, pill-tag, info-pill, user-chip/avatar, icon-btn, theme-toggle), sidebar (tenant, nav, nav-item.active, nav-badge, refresh, foot), shell/main, hero (eyebrow, cta), stats-grid/stat-card (icon primary/info/violet/amber…), bottom-grid/panel/status-row/status-pill, badge variants, boutons (primary/secondary/danger), inputs/selects/fields/check, table, alerts, empty/spinner/loading, page-head, auth-card, utils (row/stack/mt/mb/nowrap/ta-right/…), responsive (<1100 stats 2col + bottom 1col, <900 sidebar masquée, <600 stats 1col), :focus-visible/:disabled.
+
+## Thème + layout
+- `apps/web/src/app/layout.tsx` : `<html lang="fr">`, script **anti-FOUC** inline (lit `localStorage ihp-theme`, défaut dark, pose `data-theme` avant peinture), metadata depuis brand.
+- Created: `apps/web/src/components/theme-toggle.tsx` (bascule dark/light, persiste `ihp-theme`).
+
+## Composants partagés
+- Created: `apps/web/src/config/brand.ts` (nom/sous-titre/tag/initials + commentaire rebrand Code Diali), `apps/web/src/config/nav.ts` (ADMIN_NAV 6 entrées + Espace client, CLIENT_NAV).
+- Created: `apps/web/src/components/icons.tsx` (~20 icônes svg inline, style de la référence, zéro dépendance).
+- Created: `apps/web/src/components/app-shell.tsx` (topbar + sidebar + nav active via usePathname + foot + thème + logout ; mode `bare` pour écrans centrés).
+- Created: `apps/web/src/components/ui.tsx` (Button primary/secondary/danger, Badge, Alert, Panel, StatCard, Field/Input/Select, PageLoading, EmptyState, PageIntro, Denied, statusTone).
+- Created: `apps/web/src/lib/session.ts` (`useAdminSession` — bootstrap identique au code répété des 6 pages admin : redirect /auth si pas de jeton, denied si non-ADMIN).
+
+## Refactor des pages (logique métier inchangée — mêmes appels/états/handlers)
+- `src/app/manager/page.tsx` : hero (eyebrow + h1 + CTA) + 3 StatCards (produits/serveurs/utilisateurs) + 2 panneaux bottom-grid (serveurs : hostname éditable + statut select + delete ; produits : statut + delete) dans la coquille.
+- `src/app/manager/utilisateurs/page.tsx` : table (compte/rôle badge/statut badge/actions promo-demote activer-désactiver), busy par ligne.
+- `src/app/manager/journal/page.tsx` : filtres (select resource/input action) + table (Quand/Acteur/Action/Ressource) + pagination.
+- `src/app/manager/invitations/page.tsx` : formulaire email + bloc created (alert emailSent/lien + token + copier) + table des invitations (statuts en badges).
+- `src/app/manager/mail/page.tsx` : badge Configuré/Non configuré + warning hasPassword + formulaire SMTP (enabled/host/port/secure/user/password/fromEmail/fromName) + section test SMTP.
+- `src/app/manager/subscriptions/page.tsx` : tables souscriptions (approuver/rejeter/suspendre/réactiver) + services (affecter serveur + provisionner stub).
+- `src/app/client/page.tsx` : coquille Espace client + panneaux catalogue (statut-rows + Souscrire) / mes souscriptions / demander un service / mes services (badges de statut).
+- `src/app/auth/page.tsx` : mode bare (topbar seule) + auth-card centrée (login/invite, pré-remplissage ?invite, fetchMe, logout).
+- `src/app/page.tsx` : diagnostic `/api/health` dans la coquille bare (badges + pre).
+
+## Vérifications
+- `npx tsc --noEmit` dans apps/web → **PASS (exit 0)**.
+- `corepack pnpm --filter @icode-host-pro/web build` → **PASS** (10 routes, exit 0). Note : dev web arrêté le temps du build (risque de corruption `.next`), l'API :3001 est restée up.
+- Smoke HTTP :3000 → 200 sur `/`, `/auth`, `/manager`, `/manager/utilisateurs`, `/manager/journal`, `/manager/invitations`, `/manager/mail`, `/manager/subscriptions`, `/client`. HTML servi : `lang="fr"`, script `ihp-theme` présent ; CSS servi contient les tokens du design system (29 Ko, brand `#00b377`, fonds dark/light).
+- Aucun changement API/DB : pas de migration, pas de test API touché.
+
 # OPEN ITEMS
 - [x] Authentication architecture (ADR-015 APPROVED — Phase 1).
 - [x] Inscription par invitation / fermeture de l'inscription ouverte (ADR-020 APPROVED — Phase 5 : `POST /api/auth/register` → 410, `POST /api/auth/accept-invite` + `Invitation`).
@@ -385,3 +428,4 @@ Do not log only important work. Record all meaningful actions, including small c
 - Phase 4: journal d'audit « qui a fait quoi » (ADR-019) — owner-validated 2026-08-31, commitée.
 - Phase 5: espace client + accès sécurisé (ADR-020 invitations 410 + ADR-021 Subscription/Service) — owner-validated 2026-08-31, tests 62/62 + 51/51 verts, builds PASS.
 - Phase 6: configuration mail admin + emails d'invitation (ADR-022) — owner-validated 2026-08-31 (SMTP Brevo réel, domaine codediali.com, événements `delivered`), tests 90/90 unit + 61/61 e2e (8 suites), builds PASS, commitée (47838c1), push en attente d'instruction.
+- Phase 7: design system de l'interface (ADR-023) — réécriture visuelle complète (tokens dark/light de la référence copiés à l'identique, brand-agnostic, thème + anti-FOUC, composants AppShell/ui/icons, 9 pages refactorées logique intacte) — 2026-08-31, typecheck + build PASS, pas encore commitée/poussée.

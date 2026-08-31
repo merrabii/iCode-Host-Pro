@@ -1,31 +1,17 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import Link from 'next/link';
-import { useRouter } from 'next/navigation';
-import {
-  apiError,
-  fetchMe,
-  getAccessToken,
-  getMailSettings,
-  MailSettings,
-  Me,
-  sendTestMail,
-  updateMailSettings,
-} from '../../../lib/api';
-
-type Phase = 'loading' | 'denied' | 'ready';
-
-const inputStyle: React.CSSProperties = { padding: '6px 8px', boxSizing: 'border-box', width: 280 };
+import { apiError, getMailSettings, MailSettings, sendTestMail, updateMailSettings } from '@/lib/api';
+import { useAdminSession } from '@/lib/session';
+import { AppShell } from '@/components/app-shell';
+import { ADMIN_NAV } from '@/config/nav';
+import { Alert, Badge, Button, Denied, Field, Input, PageIntro, PageLoading, Panel } from '@/components/ui';
 
 // Phase 6 (ADR-022): SMTP configuration administrée. Le mot de passe n'est
 // JAMAIS renvoyé par l'API (hasPassword seulement) — le champ reste vide à
 // l'édition et « inchangé si vide » à l'enregistrement.
 export default function ManagerMailPage() {
-  const router = useRouter();
-  const [phase, setPhase] = useState<Phase>('loading');
-  const [me, setMe] = useState<Me | null>(null);
-  const [token, setToken] = useState('');
+  const { phase, me, token } = useAdminSession();
   const [settings, setSettings] = useState<MailSettings | null>(null);
   const [form, setForm] = useState({
     enabled: false,
@@ -43,23 +29,9 @@ export default function ManagerMailPage() {
   const [testResult, setTestResult] = useState<{ ok: boolean; text: string } | null>(null);
 
   useEffect(() => {
-    (async () => {
-      const t = await getAccessToken();
-      if (!t) {
-        router.replace('/auth');
-        return;
-      }
-      const m = await fetchMe(t);
-      if (!m || m.role !== 'ADMIN') {
-        setPhase('denied');
-        return;
-      }
-      setToken(t);
-      setMe(m);
-      setPhase('ready');
-      void load(t);
-    })();
-  }, [router]);
+    if (phase === 'ready' && token) void load(token);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phase, token]);
 
   async function load(t: string) {
     setError(null);
@@ -134,175 +106,137 @@ export default function ManagerMailPage() {
     }
     setTestResult({
       ok: true,
-      text: (
-        (r.data as { message?: string })?.message ??
-        `Email de test envoyé à ${testTo.trim()}.`
-      ),
+      text: (r.data as { message?: string })?.message ?? `Email de test envoyé à ${testTo.trim()}.`,
     });
   }
 
-  if (phase !== 'ready') {
-    const denied = phase === 'denied';
+  if (phase === 'loading') {
     return (
-      <main style={{ maxWidth: 720, margin: '4rem auto', padding: '0 1rem' }}>
-        <h1>Configuration mail (Phase 6)</h1>
-        {denied ? (
-          <p style={{ color: 'var(--danger)' }}>Accès refusé : réservé aux administrateurs.</p>
-        ) : (
-          <p className="muted">Connexion…</p>
-        )}
-        <p>
-          <Link href={denied ? '/auth' : '/manager'}>← Retour</Link>
-        </p>
-      </main>
+      <AppShell me={null} nav={ADMIN_NAV}>
+        <PageLoading />
+      </AppShell>
+    );
+  }
+
+  if (phase === 'denied') {
+    return (
+      <AppShell me={null} nav={ADMIN_NAV}>
+        <Denied />
+      </AppShell>
     );
   }
 
   const configured = !!(settings?.host || form.host.trim());
 
   return (
-    <main style={{ maxWidth: 720, margin: '2rem auto', padding: '0 1rem' }}>
-      <h1>Configuration mail (Phase 6)</h1>
-      <p className="muted">
-        ADR-022 — saisie du SMTP + envoi automatique des emails d&apos;invitation. Connecté en tant
-        que {me?.email} · <Link href="/manager">← Retour au manager</Link>
-      </p>
+    <AppShell me={me} nav={ADMIN_NAV} tenant={{ label: 'Administration' }}>
+      <div className="wrap-sm">
+        <PageIntro
+          eyebrow="Administration"
+          title="Configuration mail"
+          sub="Saisie du serveur SMTP + envoi automatique des emails d’invitation (ADR-022). Le mot de passe est chiffré au repos et jamais réaffiché."
+        />
 
-      {message && <p style={{ color: 'var(--ok, #1a7f37)' }}>{message}</p>}
-      {error && <p style={{ color: 'var(--danger)' }}>{error}</p>}
+        {message && <Alert tone="ok">{message}</Alert>}
+        {error && <Alert tone="error">{error}</Alert>}
 
-      <div style={{ marginBottom: 16 }}>
-        <span
-          className="card"
-          style={{
-            padding: '4px 10px',
-            color: configured ? 'var(--ok, #1a7f37)' : 'var(--danger)',
-          }}
-        >
-          {configured ? '● Configuré' : '● Non configuré'}
-        </span>
-        {settings?.hasPassword ? (
-          <span className="muted" style={{ marginLeft: 8 }}>
-            Mot de passe SMTP enregistré (chiffré) — champ vide = inchangé.
-          </span>
-        ) : (
-          <span className="muted" style={{ marginLeft: 8 }}>
-            Aucun mot de passe SMTP enregistré.
-          </span>
-        )}
-      </div>
-
-      <form onSubmit={save} style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-        <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <input
-            type="checkbox"
-            checked={form.enabled}
-            onChange={(e) => setForm({ ...form, enabled: e.target.checked })}
-          />
-          Activer l&apos;envoi automatique des emails d&apos;invitation
-        </label>
-        <label>
-          Serveur SMTP (host) *
-          <input
-            type="text"
-            value={form.host}
-            onChange={(e) => setForm({ ...form, host: e.target.value })}
-            style={inputStyle}
-            placeholder="smtp.gmail.com"
-          />
-        </label>
-        <label>
-          Port
-          <input
-            type="number"
-            min={1}
-            max={65535}
-            value={form.port}
-            onChange={(e) => setForm({ ...form, port: Number(e.target.value) })}
-            style={{ ...inputStyle, width: 120 }}
-          />
-          <span className="muted" style={{ marginLeft: 8 }}>
-            convention : 465 = TLS implicite, 587 = STARTTLS (défaut), 25 = SMTP
-          </span>
-        </label>
-        <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <input
-            type="checkbox"
-            checked={form.secure}
-            onChange={(e) => setForm({ ...form, secure: e.target.checked })}
-          />
-          Connexion sécurisée (TLS implicite)
-        </label>
-        <label>
-          Utilisateur (login)
-          <input
-            type="text"
-            value={form.user}
-            onChange={(e) => setForm({ ...form, user: e.target.value })}
-            style={inputStyle}
-            placeholder="optionnel — vide = effacé"
-          />
-        </label>
-        <label>
-          Mot de passe
-          <input
-            type="password"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            style={inputStyle}
-            placeholder="inchangé si vide — chiffré au repos (AES-256-GCM)"
-          />
-        </label>
-        <label>
-          Email expéditeur (from) *
-          <input
-            type="email"
-            value={form.fromEmail}
-            onChange={(e) => setForm({ ...form, fromEmail: e.target.value })}
-            style={inputStyle}
-            placeholder="no-reply@exemple.com"
-          />
-        </label>
-        <label>
-          Nom de l&apos;expéditeur
-          <input
-            type="text"
-            value={form.fromName}
-            onChange={(e) => setForm({ ...form, fromName: e.target.value })}
-            style={inputStyle}
-            placeholder="optionnel — iCode Host Pro"
-          />
-        </label>
-        <div>
-          <button type="submit">Enregistrer la configuration</button>
+        <div className="row mb">
+          <Badge tone={configured ? 'ok' : 'danger'}>{configured ? '● Configuré' : '● Non configuré'}</Badge>
+          {settings?.hasPassword ? (
+            <span className="muted cell-sub">Mot de passe SMTP enregistré (chiffré) — champ vide = inchangé.</span>
+          ) : (
+            <span className="muted cell-sub">Aucun mot de passe SMTP enregistré.</span>
+          )}
         </div>
-      </form>
 
-      <section style={{ marginTop: '2rem' }}>
-        <h2>Envoyer un mail de test</h2>
-        <p className="muted">
-          Utilise la configuration enregistrée (même si l&apos;envoi automatique est désactivé).
-        </p>
-        <form onSubmit={sendTest} style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
-          <label>
-            Destinataire du test
-            <input
-              type="email"
-              value={testTo}
-              onChange={(e) => setTestTo(e.target.value)}
-              style={inputStyle}
-              placeholder="toi@exemple.com"
-            />
-          </label>
-          <button type="submit">Envoyer un mail de test</button>
-        </form>
-        {testResult && (
-          <p style={{ color: testResult.ok ? 'var(--ok, #1a7f37)' : 'var(--danger)', marginTop: 8 }}>
-            {testResult.ok ? '✅ ' : '❌ '}
-            {testResult.text}
-          </p>
-        )}
-      </section>
-    </main>
+        <Panel title="Paramètres SMTP" sub="Utilisé pour envoyer les emails d’invitation et le mail de test.">
+          <form className="stack" onSubmit={save}>
+            <label className="check-row">
+              <input
+                type="checkbox"
+                checked={form.enabled}
+                onChange={(e) => setForm({ ...form, enabled: e.target.checked })}
+              />
+              Activer l&apos;envoi automatique des emails d&apos;invitation
+            </label>
+
+            <div className="row-end">
+              <Field label="Serveur SMTP (host)" required className="flex-1">
+                <Input value={form.host} onChange={(e) => setForm({ ...form, host: e.target.value })} placeholder="smtp.gmail.com" />
+              </Field>
+              <Field label="Port" required className="input-sm">
+                <Input
+                  type="number"
+                  min={1}
+                  max={65535}
+                  value={form.port}
+                  onChange={(e) => setForm({ ...form, port: Number(e.target.value) })}
+                />
+              </Field>
+            </div>
+            <span className="muted cell-sub">Ports usuels : 465 = TLS implicite · 587 = STARTTLS (défaut) · 25 = SMTP.</span>
+
+            <label className="check-row">
+              <input
+                type="checkbox"
+                checked={form.secure}
+                onChange={(e) => setForm({ ...form, secure: e.target.checked })}
+              />
+              Connexion sécurisée (TLS implicite)
+            </label>
+
+            <Field label="Utilisateur (login)">
+              <Input value={form.user} onChange={(e) => setForm({ ...form, user: e.target.value })} placeholder="optionnel — vide = effacé" />
+            </Field>
+
+            <Field label="Mot de passe">
+              <Input
+                type="password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                placeholder="inchangé si vide — chiffré au repos (AES-256-GCM)"
+              />
+            </Field>
+
+            <div className="row-end">
+              <Field label="Email expéditeur (from)" required className="flex-1">
+                <Input type="email" value={form.fromEmail} onChange={(e) => setForm({ ...form, fromEmail: e.target.value })} placeholder="no-reply@exemple.com" />
+              </Field>
+              <Field label="Nom de l’expéditeur" className="flex-1">
+                <Input value={form.fromName} onChange={(e) => setForm({ ...form, fromName: e.target.value })} placeholder="optionnel — iCode Host Pro" />
+              </Field>
+            </div>
+
+            <div className="row">
+              <Button type="submit">Enregistrer la configuration</Button>
+            </div>
+          </form>
+        </Panel>
+
+        <div className="mt">
+          <Panel
+            title="Envoyer un mail de test"
+            sub="Utilise la configuration enregistrée (même si l’envoi automatique est désactivé)."
+          >
+            <form className="inline-form" onSubmit={sendTest}>
+              <Field label="Destinataire du test" required>
+                <Input type="email" value={testTo} onChange={(e) => setTestTo(e.target.value)} placeholder="toi@exemple.com" />
+              </Field>
+              <Button type="submit">Envoyer un mail de test</Button>
+            </form>
+            {testResult &&
+              (testResult.ok ? (
+                <Alert tone="ok" title="✅ Envoyé">
+                  {testResult.text}
+                </Alert>
+              ) : (
+                <Alert tone="error" title="❌ Échec">
+                  {testResult.text}
+                </Alert>
+              ))}
+          </Panel>
+        </div>
+      </div>
+    </AppShell>
   );
 }

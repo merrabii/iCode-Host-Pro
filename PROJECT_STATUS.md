@@ -1,10 +1,10 @@
 # PROJECT_STATUS — iCode Host Pro
 
 ## Overall status
-**PHASE 6 OWNER-VALIDATED 2026-08-31 — CONFIGURATION MAIL ADMIN + EMAILS D'INVITATION (ADR-022). Validation live avec SMTP Brevo réel maîtrisé (domaine codediali.com lié/validé, événements `delivered`). Commit unique fait (47838c1). Push en attente d'instruction.**
+**PHASE 7 IMPLÉMENTÉE 2026-08-31 — DESIGN SYSTEM DE L'INTERFACE (ADR-023). Réécriture visuelle complète : palette dark/light de la référence copiée à l'identique, brand-agnostic, tout modifiable. Typecheck + build PASS. Pas encore commitée/poussée.**
 
 ## Current phase
-**Phase 6 — Configuration SMTP gérée depuis /manager + mail de test + emails d'invitation automatiques. OWNER-VALIDATED (2026-08-31) avec SMTP Brevo réel. En attente du push puis de la proposition Phase 7.**
+**Phase 7 — Design system (ADR-023). Implémenté et vérifié localement (typecheck + build + smoke HTTP). Prochaine étape : commit unique puis proposition de validation propriétaire (et push des Phases 6 + 7 en attente d'instruction).**
 
 ## State (real, as of this update)
 - Monorepo: pnpm workspaces + Turborepo (ADR-001). `apps/web` (Next.js 15), `apps/api` (NestJS 11), `packages/` reserved.
@@ -16,6 +16,12 @@
 - Routes ADMIN `GET/PUT /api/admin/mail` (PATCH-semantics ; `enabled=true` requiert host+fromEmail → 400 ; `''` = effacé sur user/fromName) + `POST /api/admin/mail/test` (utilise la config enregistrée, indépendant de `enabled` ; remonte l'erreur SMTP dans un 400). `MailService` sans état (évite le cycle de providers), `MailTransportFactory` = couture de test overridée en e2e (aucun SMTP réel). Audit `mail.settings.update` (masqué) / `mail.test` (ok/error).
 - Web: **`/manager/mail`** (formulaire SMTP : Activer, host, port 465/587/25, secure, user, password « inchangé si vide », fromEmail, fromName ; badge Configuré/Non configuré + warning hasPassword ; section test SMTP). `/manager/invitations` : ✅ email envoyé à X sinon ⚠️ bannière + lien manuel toujours copiable. Nav `/manager` + lien « Configuration mail ».
 - **Module wiring**: `MailModule` (AuthModule via `forwardRef` — cycle d'import Mail→Auth→Invitations→Mail), `CryptoModule` (non-global). Invitations → MailSettingsService (best-effort, never throw). `publicBaseUrl` (`PUBLIC_BASE_URL`) pour les liens absolus des emails, défaut localhost:3000.
+- **Design system (Phase 7, ADR-023)** — réécriture visuelle complète du front (aucun changement API/DB) :
+  - **Tokens CSS** (`apps/web/src/app/globals.css`, ~1 100 lignes) : palette dark/light de la référence copiée **à l'identique** (bg `#070c1f` / light `#f8fafc`, sidebar, header, card, borders, text, active…), teintes badges/icônes (green/blue/violet/amber/cyan/pink/gray + rouge ajouté pour les erreurs), tokens marque `--brand-primary #00b377` / `--brand-primary-dark #009966` / gradient / glow, polices, sidebar 280px / topbar 64px, rayons, ombres, breakpoints responsive (<1100 / <900 / <600). Classes composants : topbar, sidebar, nav active, hero, stats, panels, table, badges, boutons, inputs, alertes, empty/spinner, auth-card, utils.
+  - **Brand-agnostic** : la marque vit uniquement dans `apps/web/src/config/brand.ts` + tokens `--brand-primary*`. Rebrand différé Code Diali = modifier ces deux endroits seulement.
+  - **Thème** : `data-theme` sur `<html>` (dark par défaut), persisté `localStorage 'ihp-theme'`, **script anti-FOUC** inline dans `layout.tsx`, bascule `ThemeToggle` dans la topbar. `layout.tsx` `<html lang="fr">`.
+  - **Composants partagés** : `components/icons.tsx` (~20 icônes SVG inline), `components/ui.tsx` (Button/Badge/Alert/Panel/StatCard/Field/Input/Select/PageLoading/EmptyState/PageIntro/Denied/statusTone), `components/app-shell.tsx` (topbar + sidebar + nav + logout + mode `bare`), `components/theme-toggle.tsx`, `lib/session.ts` (`useAdminSession` — bootstrap admin dédupliqué des 6 pages), `config/nav.ts` (ADMIN_NAV 6 entrées + Espace client).
+  - **9 pages refactorées** (`/`, `/auth`, `/manager`, `/manager/utilisateurs`, `/manager/journal`, `/manager/invitations`, `/manager/mail`, `/manager/subscriptions`, `/client`) — **logique métier inchangée** (mêmes appels/états/handlers), zéro style inline métier. Documentation : `docs/design/DESIGN_SYSTEM.md`.
 - Docker Postgres 16 (ADR-012) up and healthy.
 
 ## Verified (Phase 6 — real checks, 2026-08-31)
@@ -29,16 +35,22 @@
 - Incidents Brevo maîtrisés pendant la validation (côté compte Brevo, remontés correctement par l'app) : **525 Unauthorized IP** (autoriser l'IP publique dans Brevo — IP ADSL **dynamique**, à réautoriser au changement) ; **sender non validé** → rejet ASYNCHRONE post-250 (l'API montrait `ok:true` ; vu en Brevo Logs→SMTP event `error` « sender not valid ») — fix avec expéditeur validé `contact@codediali.com`.
 - **Rebrand (note owner, différé)** : « iCode Host Pro » → **Code Diali** (`codediali.com`) une fois le projet terminé.
 
+## Verified (Phase 7 — real checks, 2026-08-31)
+- `npx tsc --noEmit` dans `apps/web` → **PASS (exit 0)**.
+- `corepack pnpm --filter @icode-host-pro/web build` → **PASS** (10 routes, exit 0). Dev web arrêté pendant le build (risque de corruption `.next` — pratique établie Phase 2) ; API :3001 restée up.
+- Smoke HTTP :3000 → **200** sur `/`, `/auth`, `/manager`, `/manager/utilisateurs`, `/manager/journal`, `/manager/invitations`, `/manager/mail`, `/manager/subscriptions`, `/client`. HTML servi : `lang="fr"`, script `ihp-theme` (anti-FOUC) présent ; CSS servi contient les tokens du design system (29 Ko, marque `#00b377`, fonds dark/light).
+- **Aucun changement API/DB** : pas de migration, aucun test API touché (unit 90/90 + e2e 61/61 inchangés depuis la Phase 6).
+
 ## Pending
-- Push Phase 6 (on owner request) — le commit unique `47838c1` est prêt à partir.
-- (Optionnel) test live d'invitation avec email : créer une invite → l'email arrive avec le lien `/auth?invite=…` → accept de bout en bout.
-- Proposition Phase 7.
+- **Validation propriétaire Phase 7** (style/couleurs dark/light, sidebar + topbar + cartes) — la logique métier de toutes les pages est inchangée.
+- **Commit unique Phase 7** (prêt) + **push** des Phases 6 (47838c1) et 7 sur instruction.
+- (Optionnel, Phase 6) test live d'invitation avec email : créer une invite → l'email arrive avec le lien `/auth?invite=…` → accept de bout en bout.
 
 ## Decisions
-- ADR-001..005, 011..014: **APPROVED** (Phase 0). ADR-015+016: **APPROVED** (Phase 1). ADR-017: **APPROVED** (Phase 2). ADR-018: **APPROVED** (Phase 3). ADR-019: **APPROVED** (Phase 4). ADR-020+021: **APPROVED** (Phase 5 GO). **ADR-022 (configuration mail + emails d'invitation) : APPROVED** (Phase 6 GO, 2026-08-31) — valide un périmètre étroit d'ADR-008 (chiffrement applicatif au repos). ADR-006 full, 007, 008 complet, 009, 010: **PROPOSED** (untouched). See DECISIONS.md.
+- ADR-001..005, 011..014: **APPROVED** (Phase 0). ADR-015+016: **APPROVED** (Phase 1). ADR-017: **APPROVED** (Phase 2). ADR-018: **APPROVED** (Phase 3). ADR-019: **APPROVED** (Phase 4). ADR-020+021: **APPROVED** (Phase 5 GO). **ADR-022 (configuration mail + emails d'invitation) : APPROVED** (Phase 6 GO, 2026-08-31) — valide un périmètre étroit d'ADR-008 (chiffrement applicatif au repos). **ADR-023 (design system de l'interface) : APPROVED** (Phase 7 GO, 2026-08-31 — « copier le style et couleurs complet, brand-agnostic, tout modifiable »). ADR-006 full, 007, 008 complet, 009, 010: **PROPOSED** (untouched). See DECISIONS.md.
 
 ## Next action
-Push Phase 6 (on owner request) → proposition Phase 7.
+Commit Phase 7 (sur instruction) → validation propriétaire du design (dark + light, toutes les pages) → push Phases 6 + 7 → proposition Phase 8.
 
 ## Out of scope (do not build yet)
 Déploiement réel chez un provider (ADR-010), jobs/Redis (ADR-007), OAuth / MFA / Turnstile (différés par le propriétaire au profit du « Mail seul »), billing/paiements, `Deployment` (reste différé), asset storage, reverse proxy/SSL, observability, ADR-008 complet (gestion de secrets / config persistée).

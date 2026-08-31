@@ -1,5 +1,20 @@
 # CHANGELOG
 
+## Phase 7 — DESIGN SYSTEM DE L'INTERFACE (ADR-023) — IMPLEMENTED 2026-08-31, not yet committed/pushed
+Owner GO: « Ne copier que le style et couleurs complet (sidebar + topbar + cartes…) de la page html envoyée et oublier tout le reste. Le système ne doit absolument pas être lié à une brand et tout doit être modifiable. » — copied the reference dashboard's dark/light style EXACTLY, ignored all third-party content, everything stays brand-agnostic + editable via CSS vars.
+### Added
+- **Design tokens** (`apps/web/src/app/globals.css`, réécrit ~30 → ~1 100 lignes) : palette dark/light complète de la référence (bg/sidebar/header/card/border/text/active…), teintes badges/icônes (green/blue/violet/amber/cyan/pink/gray + **rouge** ajouté pour les erreurs), tokens marque `--brand-primary #00b377`/`--brand-primary-dark`/`--brand-accent`/gradient/glow, fonts, sidebar 280px / topbar 64px, rayons, ombres, breakpoints (<1100/<900/<600). Source : `docs/design/DESIGN_SYSTEM.md`.
+- **Thème** : `data-theme` sur `<html>` (dark par défaut), persistance `localStorage 'ihp-theme'`, **script anti-FOUC** inline dans `layout.tsx` (avant peinture), `<html lang="fr">`, bascule `ThemeToggle` dans la topbar.
+- **Composants partagés** (`apps/web/src/components/`) : `icons.tsx` (~20 icônes SVG inline, style référence, zéro dépendance), `ui.tsx` (Button/Badge/Alert/Panel/StatCard/Field/Input/Select/PageLoading/EmptyState/PageIntro/Denied/statusTone), `app-shell.tsx` (topbar + sidebar + nav active + logout + mode `bare`), `theme-toggle.tsx` ; `apps/web/src/config/brand.ts` (marque uniquement ici), `config/nav.ts` (ADMIN_NAV 6 entrées + Espace client), `lib/session.ts` (`useAdminSession` dédupliqué).
+- **9 pages refactorées** (`/`, `/auth`, `/manager`, `/manager/utilisateurs`, `/manager/journal`, `/manager/invitations`, `/manager/mail`, `/manager/subscriptions`, `/client`) — **logique métier inchangée** (mêmes appels/états/handlers), aucun style inline métier.
+### Changed
+- DECISIONS.md : **ADR-023 APPROVED** (Phase 7 GO, 2026-08-31). `layout.tsx` (lang=fr + anti-FOUC), `globals.css` (tokens+classes), toutes les pages sous `src/app/`, nouveau `src/config/`, `src/components/`, `src/lib/session.ts`. `docs/design/DESIGN_SYSTEM.md` créé (spécification complète + règles d'écriture AI + section marque).
+- **Aucun changement API/DB** : pas de migration, aucun test API modifié.
+### Verified (2026-08-31)
+- `npx tsc --noEmit` apps/web **PASS** (exit 0) ; `web build` **PASS** (10 routes) ; smoke HTTP :3000 **200** sur les 9 pages (HTML `lang="fr"` + script `ihp-theme`, CSS 29 Ko avec tokens `#00b377` dark/light).
+### Pending
+- Validation propriétaire du design (dark + light) ; commit + push Phases 6 + 7 (sur instruction).
+
 ## Phase 6 — COMPLETE and owner-validated (2026-08-31)
 Owner picked scope « **Mail seul** » (AskUserQuestion) — SMTP config admin + test email + emails d'invitation automatiques — and password storage « **Chiffré au repos** » (AES-256-GCM). OAuth/MFA/Turnstile deferred.
 ### Added
