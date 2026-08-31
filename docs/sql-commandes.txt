@@ -174,4 +174,89 @@ REMARKS FOR FUTURE AI:
     named migration, recording the SQL here.
   - `refresh_tokens` stores only sha256 hashes — never raw tokens, secrets or
     session dumps.
+
+================================================================
+PHASE 2 — CORE MODEL: Product + Server (platform-global reference entities)
+================================================================
+
+DATE: 2026-08-31
+PHASE: 2.0/2.2 — Core domain tables (ADR-017)
+OBJECTIVE:
+  Introduce the two platform-GLOBAL reference entities `Product` (catalogue)
+  and `Server` (infrastructure host), each possessed by the PLATFORM, NOT by a
+  client. They carry NO ownerId. Client-owned resources (Subscription/Service/
+  Deployment…) are deliberately deferred to future phases when a real workflow
+  needs them. RBAC is ADMIN/USER via existing Role enum (ADR-015).
+
+DATABASE ACTIONS:
+  - Added enums `ProductStatus` (DRAFT/ACTIVE/SUSPENDED/DISABLED) and
+    `ServerStatus` (UNKNOWN/PROVISIONING/ACTIVE/PROBLEM/REMOVED).
+  - Added models `Product` and `Server` (no relation to User; global).
+  - Migration applied locally on the dev DB (containers: icode-postgres,
+    database icode_host_pro).
+
+MIGRATIONS:
+  - Migration folder: apps/api/prisma/migrations/20260831000649_init_core/
+  - Name: `init_core`. Applied via
+    `corepack pnpm --filter @icode-host-pro/api run migrate --name init_core`.
+  - `prisma migrate dev` regenerated the Prisma Client (v6.19.3) automatically.
+
+IMPORTANT SQL / COMMANDS:
+  - The migration SQL (mirror of Prisma schema):
+
+    CREATE TYPE "ProductStatus" AS ENUM ('DRAFT', 'ACTIVE', 'SUSPENDED', 'DISABLED');
+    CREATE TYPE "ServerStatus"  AS ENUM ('UNKNOWN', 'PROVISIONING', 'ACTIVE', 'PROBLEM', 'REMOVED');
+
+    CREATE TABLE "Product" (
+        "id"        TEXT NOT NULL,
+        "name"      TEXT NOT NULL,
+        "kind"      TEXT NOT NULL DEFAULT 'generic',
+        "status"    "ProductStatus" NOT NULL DEFAULT 'ACTIVE',
+        "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        "updatedAt" TIMESTAMP(3) NOT NULL,
+        CONSTRAINT "Product_pkey" PRIMARY KEY ("id")
+    );
+    CREATE UNIQUE INDEX "Product_name_key" ON "Product"("name");
+
+    CREATE TABLE "Server" (
+        "id"        TEXT NOT NULL,
+        "name"      TEXT NOT NULL,
+        "hostname"  TEXT NOT NULL,
+        "status"    "ServerStatus" NOT NULL DEFAULT 'UNKNOWN',
+        "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        "updatedAt" TIMESTAMP(3) NOT NULL,
+        CONSTRAINT "Server_pkey" PRIMARY KEY ("id")
+    );
+    CREATE UNIQUE INDEX "Server_name_key" ON "Server"("name");
+
+  - Run migrations (dev):  corepack pnpm --filter @icode-host-pro/api run migrate --name <name>
+  - Admin bootstrap seed:  corepack pnpm --filter @icode-host-pro/api run db:seed
+    Idempotent; creates/promotes the ADMIN from ADMIN_EMAIL/ADMIN_PASSWORD in
+    apps/api/.env (gitignored). Placeholders only in .env.example.
+
+VALIDATION QUERIES:
+  - `SELECT id, name, kind, status FROM "Product";`   -> catalogue rows.
+  - `SELECT id, name, hostname, status FROM "Server";` -> infra rows.
+  - `SELECT id, email, role FROM "User" WHERE role='ADMIN';` -> the seeded admin.
+
+RESULT:
+  - `Product` + `Server` tables created (platform-global, no ownerId). RBAC
+    enforced at API level (Product read = any authenticated; Product mutation &
+    all Server routes = ADMIN). Verified live: USER can GET /products (200) but
+    POST /products and GET/POST /servers are 403; unauthenticated is 401.
+
+ROLLBACK NOTES:
+  - A down-migration is not authored. To drop these tables on dev (destructive):
+        corepack pnpm --filter @icode-host-pro/api run migrate:deploy  # no-op
+    A full dev reset drops everything instead:
+        docker compose down -v && docker compose up -d postgres
+    then re-run `migrate dev` to re-apply all migrations (init_auth, init_core).
+
+REMARKS FOR FUTURE AI:
+  - Product/Server are reference data for the PLATFORM. Do NOT later add ownerId
+    or a User relation to them for "client ownership": a client's relationship
+    to a product/server belongs to FUTURE client-owned entities (Subscription/
+    Service/Deployment), to be introduced only when a real workflow needs them.
+  - `Product.kind` is a String (not an enum) by design — the product-kind list
+    is immature; promote to an enum when the list settles.
 ================================================================

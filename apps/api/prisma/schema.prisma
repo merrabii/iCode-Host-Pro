@@ -43,3 +43,44 @@ model RefreshToken {
 
   @@index([userId])
 }
+
+// ── Phase 2 — core domain (ADR-017): platform-global reference entities ──────
+// Product (catalog item) and Server (infrastructure host) are GLOBAL platform
+// data, administered by the platform in /manager. They carry NO ownerId: they are
+// NOT client-owned. Client-owned resources (Subscription/Service/Deployment…) are
+// deliberately deferred to future phases when a real workflow needs them.
+// Access: Product readable by any authenticated; soldered mutations ADMIN-only.
+// Server fully ADMIN-only (internal infrastructure must not be exposed to clients).
+
+enum ProductStatus {
+  DRAFT
+  ACTIVE
+  SUSPENDED
+  DISABLED
+}
+
+enum ServerStatus {
+  UNKNOWN
+  PROVISIONING
+  ACTIVE
+  PROBLEM
+  REMOVED
+}
+
+model Product {
+  id        String        @id @default(cuid())
+  name      String        @unique
+  kind      String        @default("generic") // not an enum yet: product-kind list is immature; promote when stable
+  status    ProductStatus @default(ACTIVE)
+  createdAt DateTime      @default(now())
+  updatedAt DateTime      @updatedAt
+}
+
+model Server {
+  id        String       @id @default(cuid())
+  name      String       @unique
+  hostname  String
+  status    ServerStatus @default(UNKNOWN)
+  createdAt DateTime     @default(now())
+  updatedAt DateTime     @updatedAt
+}

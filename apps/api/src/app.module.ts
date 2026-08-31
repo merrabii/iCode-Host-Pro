@@ -4,6 +4,8 @@ import { PrismaModule } from './prisma/prisma.module';
 import { HealthModule } from './health/health.module';
 import { AuthModule } from './auth/auth.module';
 import { UsersModule } from './users/users.module';
+import { ProductsModule } from './products/products.module';
+import { ServersModule } from './servers/servers.module';
 import { loadAppConfig } from './config/configuration';
 
 @Module({
@@ -16,6 +18,8 @@ import { loadAppConfig } from './config/configuration';
     HealthModule,
     AuthModule,
     UsersModule,
+    ProductsModule,
+    ServersModule,
   ],
 })
 export class AppModule {}

@@ -64,6 +64,7 @@ Direction: fine-grained capability interfaces and provider isolation. Coolify/He
 - ADR-014 Zero table métier en Phase 0 (below) — 2026-08-30.
 - ADR-015 Approche authentication (below) — 2026-08-30.
 - ADR-016 Modèle de données Phase 1 (below) — 2026-08-30.
+- ADR-017 Modèle cœur Phase 2 : Product + Server (below) — 2026-08-31.
 
 ## ADR-011 — Socle config minimal (Phase 0)
 **Status: APPROVED** (2026-08-30, Phase 0 GO)
@@ -88,6 +89,24 @@ Decision: stateless JWT Bearer access token (short-lived) + refresh token in a h
 ## ADR-016 — Modèle de données Phase 1
 **Status: APPROVED** (2026-08-30, Phase 1 GO)
 Decision: first real justified business tables — `User` (email unique, password hash, name, role, active) and `RefreshToken` (hashed token, FK user, expiry, revocation, for rotation). Introduces the real migration baseline (`_prisma_migrations`), superseding the zero-table Phase 0 (ADR-014) for the auth domain only. No provider credentials, no other domain tables yet.
+
+## ADR-017 — Modèle cœur Phase 2 : Product + Server (globaux plateforme)
+**Status: APPROVED** (2026-08-31, Phase 2 GO)
+Decision: the Phase 2 core domain introduces exactly TWO platform-GLOBAL reference
+entities, possessed by the PLATFORM (administered in `/manager`), carrying NO
+ownerId:
+- `Product` — catalogue item (managed offering), global reference.
+- `Server` — infrastructure host (VPS / Coolify / HestiaCP / future), global,
+  internal data.
+These are NOT client-owned. Client-owned resources (Subscription / Service /
+Deployment…) are explicitly deferred and will be introduced only when a real
+workflow needs them — NOT in Phase 2. No Provider table (deferred to a future
+Providers phase, ADR-010 remains PROPOSED), no Deployment join yet.
+Access (via existing Role, ADR-015): `Product` read = any authenticated
+(ADMIN+USER); `Product` mutation & all `Server` routes = ADMIN only (internal
+infrastructure must never be exposed to clients). Admin bootstrap via an
+idempotent seed (`db:seed`); credentials from gitignored `.env`, placeholders in
+`.env.example`, no real secret in Git. ADR-006/007/008/009/010 unchanged.
 
 # REJECTED
 None recorded in this clean baseline.

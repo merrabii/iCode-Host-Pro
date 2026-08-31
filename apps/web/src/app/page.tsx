@@ -26,6 +26,8 @@ export default function Home() {
       <h1>iCode Host Pro — diagnostic</h1>
       <p>
         <a href="/auth">→ Authentication (Phase 1)</a>
+        {' · '}
+        <a href="/manager">→ Manager (Phase 2)</a>
       </p>
       <p className="muted">
         Frontend ↔ API connectivity check (Phase 0 socle).

@@ -1,5 +1,30 @@
 # CHANGELOG
 
+## Phase 2 — COMPLETE and owner-validated (2026-08-31)
+Owner picked direction "Modèle cœur + dashboard" with the core architecture resolved: Product & Server are PLATFORM-GLOBAL reference data (NO ownerId), administration console `/manager` (ADMIN only), client-owned resources deferred.
+### Added
+- **Core model (ADR-017)** — tables `Product` (catalogue: name unique, kind string, status enum `ProductStatus`) and `Server` (infrastructure: name unique, hostname, status enum `ServerStatus`), migration `20260831000649_init_core`. Global, no ownerId.
+- **RBAC**: Product read = any authenticated; Product mutation & all Server routes = ADMIN only (internal infra never exposed to clients). 401/403 via existing JwtAuthGuard + RolesGuard.
+- **`/manager`** admin console (list + create + delete servers & products), ADMIN-gated, token minted from the httpOnly refresh cookie (no localStorage token).
+- **Admin bootstrap**: idempotent `db:seed` (prisma/seed.ts) from gitignored `.env` credentials; placeholders only in `.env.example`.
+- API `/api/products` + `/api/servers` (CRUD) with Swagger tags; DTO validation.
+
+### Changed
+- DECISIONS.md: ADR-017 APPROVED (Phase 2 GO). (ADR-015/016 already approved; ADR-006/007/008/009/010 remain PROPOSED.)
+- Web: homepage links + `/manager` route; `.next` dev cache reset (HMR corruption) and manager page relocated under `src/app/`.
+- PROJECT_STATUS.md, TASKS.md, docs/sql-commandes.txt updated.
+
+### Verified (2026-08-31)
+- Unit **11/11**; e2e **15/15, 3 suites** (health + auth + core RBAC); builds API + web pass (`/`, `/auth`, `/manager`).
+- Live RBAC smoke: seeded admin OK; USER GET /products 200, POST /products 403, GET /servers 403, GET/POST servers blocked; no token 401; ADMIN create product+server 201; lists OK.
+- Web: `/` 200, `/manager` 200, proxy `/api/health` 200.
+
+### Owner validation (2026-08-31)
+- Owner confirmed live: `/manager` admin console (admin login, create/list products & servers), `/api/docs` Swagger group with products/servers CRUD + RBAC, and the 401/403 behavior. Phase 2 closed.
+
+### Pending (not yet done)
+- Commit of Phase 2 (in progress).
+
 ## Phase 1 — COMPLETE and owner-validated (2026-08-31)
 Owner gave GO for "Auth + 1res tables", then confirmed the browser validation ("validé"). Phase 1 closed.
 ### Added
