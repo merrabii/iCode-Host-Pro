@@ -6,7 +6,7 @@ README.md → PROJECT_CONTEXT.md → PROJECT_STATUS.md → DECISIONS.md → TASK
 ## Before changing code
 Determine current phase, actual implementation, proposed versus approved decisions, blockers and owner test requirements. If unclear, analyze rather than guess.
 
-## Current state (Phase 6 — IMPLEMENTED 2026-08-31, awaiting owner live validation + push)
+## Current state (Phase 6 — OWNER-VALIDATED 2026-08-31 with real Brevo SMTP; commit 47838c1 done; push awaiting instruction)
 Implementation is current. Summary of the stack:
 - **Auth (Phase 1, ADR-015/016)**: JWT Bearer access (15m) + httpOnly refresh cookie (rotated, sha256-hashed, revocable), bcryptjs, ADMIN/USER RBAC + RolesGuard. Tables `User` + `RefreshToken` (migration `init_auth`). Web `/auth`.
 - **Core model (Phase 2, ADR-017)**: tables `Product` + `Server` — PLATFORM-GLOBAL reference data, **no ownerId** (migration `init_core`). Product read = any authenticated; Product mutation & all Server routes = ADMIN only.
@@ -23,7 +23,8 @@ Implementation is current. Summary of the stack:
 - `@nestjs/jwt` pinned `^11.0.2` (CJS) to keep jest/tsc happy. nodemailer 9.1.0 (CJS, jest-safe).
 - Tests: unit **90/90** (11 suites, +27 Phase 6), e2e **61/61 8 suites** (+mail). Existing e2e suites create test users **directly via Prisma** (register is closed), except auth e2e which exercises invite→accept→login. `testTimeout: 30000` in `test/jest-e2e.json`.
 - Dev servers: api :3001 running (nest watch, left up for owner Phase 6 validation); web :3000 on demand (start it WITHOUT running `web build` in parallel — `.next` corruption).
-- Phase 6 needs the **owner's real SMTP** for live validation (Gmail app-password / Brevo / a local relay): configure `/manager/mail`, send a test mail, create an invitation and confirm the email arrives.
+- **Phase 6 owner-validated live (2026-08-31)**: real Brevo SMTP (`smtp-relay.brevo.com:587`, user `9bda29001@smtp-brevo.com`), domain **codediali.com** bought + linked/validated in Brevo, fromEmail `contact@codediali.com` — test emails confirmed **`delivered`** in Brevo Logs→SMTP. Live lessons: (1) Brevo `525 5.7.1 Unauthorized IP address` → authorize the public IP in the Brevo account (the owner's IP is **dynamic ADSL** — will need re-authorization after IP changes); (2) **unvalidated sender** → Brevo accepts the SMTP session (API shows `ok:true`) but rejects the message ASYNCHRONOUSLY — check Brevo → Logs → SMTP (`error` event "sender not valid"); always use a validated sender/domain (e.g. the codediali.com one).
+- **Rebrand (deferred by owner)**: brand "iCode Host Pro" → **Code Diali** (`codediali.com`) once the project is finished — recorded in TASKS/PROJECT_STATUS, not yet executed.
 
 Reported decisions: ADR-001..005 + 011..014 APPROVED (Phase 0); ADR-015+016 (Phase 1); **ADR-017 (Phase 2)**; **ADR-018 (Phase 3)**; **ADR-019 (Phase 4)**; **ADR-020 + ADR-021 (Phase 5)**; **ADR-022 (mail settings + invitation emails, Phase 6 — validates a NARROW ADR-008 slice: app-level encryption at rest)** **APPROVED (2026-08-31)**; ADR-006 full, 007, 008 full, 009, 010 stay PROPOSED.
 

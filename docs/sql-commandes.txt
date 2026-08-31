@@ -619,6 +619,13 @@ RESULT:
     (10 mail tests, stub transport) + unit + API/web builds + live smoke (without
     real SMTP): defaults masked, enabled-without-host rejected, test-without-config
     400, invite emailSent reflects mail enablement, audits masked.
+  - **OWNER-VALIDATED live (2026-08-31)** avec SMTP Brevo réel : domaine
+    codediali.com lié/validé, expéditeur `contact@codediali.com`, événements
+    `delivered` dans Brevo Logs→SMTP. Incidents Brevo maîtrisés : `525 5.7.1
+    Unauthorized IP address` (autoriser l'IP publique Brevo — IP ADSL dynamique)
+    puis rejet ASYNCHRONE d'un sender non validé (l'API montre `ok:true` car Brevo
+    accepte le SMTP 250 ; vérifier Brevo → Logs → SMTP, event `error` « sender
+    not valid »).
 
 ROLLBACK NOTES:
   - No down-migration authored. Full dev reset (destructive):

@@ -313,7 +313,7 @@ Do not log only important work. Record all meaningful actions, including small c
 - Files modified: PROJECT_STATUS.md (Phase 5 ✓), TASKS.md (cette section), CHANGELOG.md, HANDOVER.md.
 - Command: git add + commit (docs owner validation). Push offert.
 
-# PHASE 6 — CONFIGURATION MAIL ADMIN + EMAILS D'INVITATION (ADR-022) — implémenté, en attente de validation live + push
+# PHASE 6 — CONFIGURATION MAIL ADMIN + EMAILS D'INVITATION (ADR-022) — implémenté + owner-validated 2026-08-31 (SMTP Brevo réel + domaine codediali.com), en attente de push
 
 ## 2026-08-31 — 6.0 GO & périmètre
 - Action: owner a demandé la stratégie email pour les invitations (« l'admin doit pouvoir ajouter/modifier/gérer la configuration de mail depuis l'interface admin (smtp, host, port…) avec possibilité de tester avec envoi de mail test »).
@@ -350,6 +350,15 @@ Do not log only important work. Record all meaningful actions, including small c
 - Fixes en cours: spec mail.service transporter capturé par test (pas mock.results[0]), spec invitations rejette avec vrais MailException, `.env` local +ENCRYPTION_KEY (e2e : PUT password sans clé → 400 de cascade).
 - Live smoke :3001: admin login OK → `GET /api/admin/mail` defaults masqués `{host:null,hasPassword:false}` → `POST /api/admin/mail/test` sans config → 400 « Configuration mail non définie. ». API dev (nest watch) laissée en cours pour la validation propriétaire.
 
+## 2026-08-31 — 6.6 Validation live propriétaire (SMTP Brevo réel) — VALIDÉ
+- Owner a acheté le domaine **codediali.com**, l'a lié/validé dans Brevo, configuré `/manager/mail` (host `smtp-relay.brevo.com:587`, user `9bda29001@smtp-brevo.com`, fromEmail **contact@codediali.com**) et **testé l'envoi → ça marche**. Validation live Phase 6 donnée par le propriétaire (« c'est validé pour la configuration de mail »).
+- Incidents diagnostiqués pendant la validation (tous côté config Brevo, pas côté code — le pipeline iCode a remonté chaque erreur correctement dans l'UI/400) :
+  1. **525 5.7.1 Unauthorized IP address** → politique « sender IP authorization » du compte Brevo : autoriser l'IP publique (`196.217.131.123` Casablanca — **IP ADSL dynamique**, à réautoriser au changement).
+  2. **Expéditeur non validé** (« Sending has been rejected because the sender ... is not valid ») — l'API affiche `ok:true` (Brevo accepte la session SMTP 250) mais Brevo rejette le message en ASYNCHRONE côté queue ; visible dans **Brevo → Logs → SMTP** (event `error` `reason: sender not valid`). Fix : utiliser un fromEmail validé (`contact@codediali.com` une fois le domaine lié/validé). Vérifié : événements **`delivered`** dans Brevo pour les 2 tests (mourad.moreno@gmail.com + mourad.errabii@gmail.com).
+- Leçon docs : le endpoint de test remonte les erreurs SMTP **synchrones** (login) ; un rejet asynchrone (sender invalid, IP, spam) peut montrer `ok:true` — vérifier **Brevo → Logs → SMTP**.
+- Reste en option (non bloquant) : un test live d'**invitation avec email** (créer une invite → l'email arrive avec le lien `/auth?invite=…` → accept de bout en bout).
+- **Rebrand (note owner, différé)** : changer la marque **iCode Host Pro → Code Diali** / `codediali.com` **une fois le projet terminé**.
+
 # OPEN ITEMS
 - [x] Authentication architecture (ADR-015 APPROVED — Phase 1).
 - [x] Inscription par invitation / fermeture de l'inscription ouverte (ADR-020 APPROVED — Phase 5 : `POST /api/auth/register` → 410, `POST /api/auth/accept-invite` + `Invitation`).
@@ -365,6 +374,7 @@ Do not log only important work. Record all meaningful actions, including small c
 - [ ] Reverse proxy/SSL.
 - [ ] Observability.
 - [ ] ADR-008 complet (gestion de secrets, architecture de config persistée — Phase 6 n'a validé qu'un périmètre étroit : chiffrement applicatif au repos).
+- [ ] Rebrand iCode Host Pro → **Code Diali** (`codediali.com`) — différé par le owner « une fois le projet terminé » (2026-08-31).
 
 # COMPLETED HISTORY
 - Clean baseline (Pre-Phase 0): documentation pack + first AI orientation.
@@ -374,4 +384,4 @@ Do not log only important work. Record all meaningful actions, including small c
 - Phase 3: gestion utilisateurs admin + dashboard /manager + catalogue enrichi — owner-validated 2026-08-31.
 - Phase 4: journal d'audit « qui a fait quoi » (ADR-019) — owner-validated 2026-08-31, commitée.
 - Phase 5: espace client + accès sécurisé (ADR-020 invitations 410 + ADR-021 Subscription/Service) — owner-validated 2026-08-31, tests 62/62 + 51/51 verts, builds PASS.
-- Phase 6: configuration mail admin + emails d'invitation (ADR-022) — implémenté 2026-08-31, tests 90/90 unit + 61/61 e2e (8 suites), builds PASS, en attente de validation live propriétaire + push.
+- Phase 6: configuration mail admin + emails d'invitation (ADR-022) — owner-validated 2026-08-31 (SMTP Brevo réel, domaine codediali.com, événements `delivered`), tests 90/90 unit + 61/61 e2e (8 suites), builds PASS, commitée (47838c1), push en attente d'instruction.

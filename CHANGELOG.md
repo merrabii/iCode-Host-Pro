@@ -1,6 +1,6 @@
 # CHANGELOG
 
-## Phase 6 — IMPLEMENTED (awaiting owner live validation + push) 2026-08-31
+## Phase 6 — COMPLETE and owner-validated (2026-08-31)
 Owner picked scope « **Mail seul** » (AskUserQuestion) — SMTP config admin + test email + emails d'invitation automatiques — and password storage « **Chiffré au repos** » (AES-256-GCM). OAuth/MFA/Turnstile deferred.
 ### Added
 - **Mail settings singleton (ADR-022)** — table `MailSetting` (migration `20260831120703_init_mail`) : `enabled` (gating de l'envoi AUTO sur invitations), `host`, `port` (587 STARTTLS défaut / 465 = `secure`), `secure` (TLS implicite), `user?`, `passwordEnc?`, `fromEmail`, `fromName?`.
@@ -15,9 +15,11 @@ Owner picked scope « **Mail seul** » (AskUserQuestion) — SMTP config admin +
 - Unit **90/90** (11 suites, +27); e2e **61/61, 8 suites** (+mail) — verts sur Postgres réel, aucun SMTP réel contacté (override MailTransportFactory).
 - Builds API + web PASS (route `/manager/mail` incluse); typecheck web PASS; `prisma migrate status` up-to-date (5 migrations).
 - Live smoke :3001: admin login → `GET /api/admin/mail` defaults masqués → `POST /api/admin/mail/test` sans config → 400 « Configuration mail non définie. ».
-### Pending
-- **Owner live validation Phase 6** (SMTP réel) — configurer `/manager/mail`, mail de test, invitation → réception de l'email, vérifier que le password n'est jamais réaffiché.
-- Commit unique Phase 6 + push (on owner request).
+### Owner live validation (2026-08-31)
+- **VALIDÉ par le propriétaire** avec SMTP **Brevo réel** : domaine **codediali.com** acheté et lié/validé dans Brevo, config SMTP `smtp-relay.brevo.com:587` + expéditeur `contact@codediali.com` depuis les résultats de test → **`delivered` confirmés dans Brevo Logs→SMTP** (mourad.moreno@gmail.com + mourad.errabii@gmail.com). Password jamais réaffiché (`hasPassword` only). « c'est validé pour la configuration de mail ».
+- Incidents résolus pendant la validation (côté compte Brevo, le pipeline iCode a remonté chaque erreur correctement) : **525 Unauthorized IP** (autoriser l'IP publique — noter IP ADSL dynamique) et **sender non validé** → rejet ASYNCHRONE après 250 (l'API montrait `ok:true` ; visible dans Brevo Logs→SMTP event `error` « sender not valid »). Fix : expéditeur validé `contact@codediali.com`. Leçon : le test endpoint remonte les erreurs SMTP synchrones ; un rejet async se vérifie côté Brevo Logs.
+- **Rebrand (note owner, différé)** : « iCode Host Pro » → **Code Diali** (`codediali.com`) une fois le projet terminé.
+- **Pending**: push Phase 6 (on owner request) ; test live optionnel d'invitation avec email (envoyer une invite → réception + accept de bout en bout) ; proposition Phase 7.
 
 ## Phase 5 — COMPLETE and owner-validated (2026-08-31)
 Owner picked direction « A puis B » (fermer l'inscription d'abord, puis l'espace client) and confirmed: « c'est l'admin qui doit ajouter et modifier et gérer les serveurs complètement mais le client ne manipule pas l'infra ».
