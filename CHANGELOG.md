@@ -1,5 +1,24 @@
 # CHANGELOG
 
+## Phase 6 — IMPLEMENTED (awaiting owner live validation + push) 2026-08-31
+Owner picked scope « **Mail seul** » (AskUserQuestion) — SMTP config admin + test email + emails d'invitation automatiques — and password storage « **Chiffré au repos** » (AES-256-GCM). OAuth/MFA/Turnstile deferred.
+### Added
+- **Mail settings singleton (ADR-022)** — table `MailSetting` (migration `20260831120703_init_mail`) : `enabled` (gating de l'envoi AUTO sur invitations), `host`, `port` (587 STARTTLS défaut / 465 = `secure`), `secure` (TLS implicite), `user?`, `passwordEnc?`, `fromEmail`, `fromName?`.
+- **Chiffrement au repos** — `CryptoService` (`apps/api/src/crypto/`, non-global) : AES-256-GCM, clé = sha256(`ENCRYPTION_KEY`), payload base64 `iv||tag||data` ; `ENCRYPTION_KEY` optionnelle au boot, **requise** à l'enregistrement d'un mdp (400 « Clé de chiffrement manquante ») ; **password jamais renvoyé par l'API** — le DTO masqué expose uniquement `hasPassword`. Valide un périmètre étroit d'ADR-008 ; ADR-008 complet reste PROPOSED.
+- **Module mail (`apps/api/src/mail/`)** — `MailTransportFactory` (couture de test, overridée en e2e → aucun SMTP réel), `MailService` **sans état** (config passée en paramètre — évite le cycle de providers), `MailSettingsService` (get masqué, `update` PATCH-semantics : `enabled=true` requiert host+fromEmail → 400 ; password `''`/absent = inchangé, valeur = chiffrée ; user/fromName `''` = effacés ; `getMailConfig` déchiffre ; `test` → ok ou 400 avec message SMTP ; `sendInvitationMail` ; `isEnabled`). Routes ADMIN `GET|PUT /api/admin/mail` + `POST /api/admin/mail/test`. Audit `mail.settings.update` (masqué) / `mail.test` (ok/error).
+- **Emails d'invitation best-effort** — `InvitationsService.create` après audit : si `enabled` → `sendInvitationMail` try/catch **never throw** ; retour enrichi `emailSent` ; **token one-shot conservé en fallback** (lien manuel toujours affiché dans `/manager/invitations`) ; audit `invite.email` `{email, emailSent, reason?}`. Lien `PUBLIC_BASE_URL + /auth?invite=<token>&email=<email>`.
+- **Web `/manager/mail`** — formulaire SMTP (Activer, host, port 465/587/25, secure, user, password « inchangé si vide », fromEmail, fromName), badge **Configuré/Non configuré** + warning `hasPassword`, section **mail de test** avec l'erreur SMTP remontée. `/manager/invitations` : ✅ « Email envoyé à X » sinon ⚠️ bannière config absente/échec + lien manuel copiable. Nav `/manager`.
+- Tests: `crypto.service.spec` (5), `mail.service.spec` (5), `mail-settings.service.spec` (14) ; `invitations.service.spec` étendu (+3, mock MailSettingsService) ; e2e `mail.e2e-spec` (10 : RBAC 401/403, defaults masqués, PUT store → `hasPassword` jamais raw, enabled sans host 400, test OK/400 message SMTP, invite email selon `enabled`, audit masqué).
+### Changed
+- DECISIONS.md : **ADR-022 APPROVED** (Phase 6 GO) + note périmètre étroit d'ADR-008. `configuration.ts` : `encryptionKey` + `publicBaseUrl` optionnels (set fail-early intact). `.env.example` + `.env` local (gitignored) : ENCRYPTION_KEY, PUBLIC_BASE_URL. `MailModule` importe `AuthModule` via `forwardRef` (cycle d'import Mail→Auth→Invitations→Mail). `package.json` : +nodemailer 9.1.0 (+@types).
+### Verified (2026-08-31)
+- Unit **90/90** (11 suites, +27); e2e **61/61, 8 suites** (+mail) — verts sur Postgres réel, aucun SMTP réel contacté (override MailTransportFactory).
+- Builds API + web PASS (route `/manager/mail` incluse); typecheck web PASS; `prisma migrate status` up-to-date (5 migrations).
+- Live smoke :3001: admin login → `GET /api/admin/mail` defaults masqués → `POST /api/admin/mail/test` sans config → 400 « Configuration mail non définie. ».
+### Pending
+- **Owner live validation Phase 6** (SMTP réel) — configurer `/manager/mail`, mail de test, invitation → réception de l'email, vérifier que le password n'est jamais réaffiché.
+- Commit unique Phase 6 + push (on owner request).
+
 ## Phase 5 — COMPLETE and owner-validated (2026-08-31)
 Owner picked direction « A puis B » (fermer l'inscription d'abord, puis l'espace client) and confirmed: « c'est l'admin qui doit ajouter et modifier et gérer les serveurs complètement mais le client ne manipule pas l'infra ».
 ### Added

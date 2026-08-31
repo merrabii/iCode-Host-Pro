@@ -196,6 +196,7 @@ export default function ManagerPage() {
         <Link href="/manager/utilisateurs">Utilisateurs →</Link> ·{' '}
         <Link href="/manager/journal">Journal d&apos;audit →</Link> ·{' '}
         <Link href="/manager/invitations">Invitations →</Link> ·{' '}
+        <Link href="/manager/mail">Configuration mail →</Link> ·{' '}
         <Link href="/manager/subscriptions">Souscriptions &amp; services →</Link>
       </p>
 

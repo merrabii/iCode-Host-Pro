@@ -69,6 +69,7 @@ Direction: fine-grained capability interfaces and provider isolation. Coolify/He
 - ADR-019 Journal d'audit (below) — 2026-08-31.
 - ADR-020 Inscription fermée + invitations (below) — 2026-08-31.
 - ADR-021 Espace client : Souscription + Service (below) — 2026-08-31.
+- ADR-022 Configuration mail + emails d'invitation (below) — 2026-08-31.
 
 ## ADR-011 — Socle config minimal (Phase 0)
 **Status: APPROVED** (2026-08-30, Phase 0 GO)
@@ -206,6 +207,43 @@ statut. Le client **ne touche jamais l'infrastructure** (aucune donnée serveur 
   existant + transitions REQUESTED→PROVISIONING→ACTIVE).
 - Le provisionnement est un **stub de transition de statut** : aucun déploiement
   réel (ADR-010), aucun job asynchrone (ADR-007) — inchangés/hors périmètre.
+
+## ADR-022 — Configuration mail + emails d'invitation (Phase 6)
+**Status: APPROVED** (2026-08-31, Phase 6 GO — propriétaire : « l'admin doit pouvoir
+ajouter/modifier/gérer la configuration de mail depuis l'interface admin (smtp, host,
+port…) avec possibilité de tester avec envoi de mail test » ; périmètre « Mail seul »
+choisi sur AskUserQuestion — OAuth/MFA/Turnstile différés)
+Decision: fin du jeton affiché manuellement quand aucune stratégie email n'existe.
+L'ADMIN gère une configuration SMTP singleton depuis `/manager/mail` et peut envoyer
+un mail de test ; quand l'envoi est activé, chaque invitation émet un email
+**best-effort** (jamais bloquant) avec le lien `/auth?invite=<token>&email=<email>`.
+- Table `MailSetting` (migration `init_mail`) — singleton géré par `firstOrCreate` :
+  `enabled` (active l'envoi AUTO sur invitations ; le test fonctionne dans tous les
+  cas), `host`, `port` (587 STARTTLS défaut, 465 = `secure`), `secure` (TLS implicite),
+  `user?`, `passwordEnc?`, `fromEmail`, `fromName?`.
+- **Chiffrement au repos** (choix propriétaire) : mot de passe SMTP chiffré
+  AES-256-GCM (clé = sha256(`ENCRYPTION_KEY`), payload base64 `iv||tag||data`) via
+  `CryptoService` (`src/crypto/`, non-global). **Jamais renvoyé par l'API** : le DTO
+  masqué expose seulement `hasPassword`. `ENCRYPTION_KEY` est optionnelle au boot
+  (comme `INVITE_EXPIRES_IN_DAYS`) ; absente → 400 clair à l'enregistrement d'un mdp.
+  - Valide un **périmètre étroit d'ADR-008** (chiffrement applicatif au repos) ; le
+    ADR-008 complet (gestion de secrets, architecture de config persistée),
+    ADR-006/007/009/010 restent PROPOSED.
+- Découplage d'envoi : `MailService` est **sans état** (config passée en paramètre) —
+  évite un cycle de providers avec `MailSettingsService` (qui possède lecture/ligne +
+  déchiffrement) ; `MailTransportFactory` est la **couture de test** que l'e2e
+  surcharge (`overrideProvider`) → aucun SMTP réel en test. L'endpoint de test (POST
+  `/api/admin/mail/test`) remonte l'erreur SMTP dans un 400 pour aider l'admin.
+- Routes (ADMIN) : `GET|PUT /api/admin/mail`, `POST /api/admin/mail/test` ;
+  PATCH-semantics (`undefined` = inchangé, `''` = effacé sur les champs nullables).
+- Invitations (`src/invitations/`) : `MailModule` importé, `sendInvitationMail`
+  best-effort (try/catch, never throw) ; le token à usage unique reste le fallback
+  affiché dans `/manager/invitations` ; retour enrichi `emailSent` ; audit
+  `mail.settings.update` / `mail.test` / `invite.email` (masqué).
+- Front : page `/manager/mail` (badge Configuré/Non configuré, warning `hasPassword`,
+  section test SMTP), messages `emailSent` dans `/manager/invitations`.
+- Hors périmètre (inchangés) : OAuth/MFA/Turnstile (différés par le propriétaire),
+  billing, deploy réel (ADR-010), jobs async (ADR-007), storage d'assets, ADR-008 complet.
 
 # REJECTED
 None recorded in this clean baseline.

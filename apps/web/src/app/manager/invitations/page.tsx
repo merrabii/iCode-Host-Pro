@@ -42,6 +42,7 @@ export default function ManagerInvitationsPage() {
     email: string;
     token: string;
     link: string;
+    emailSent: boolean;
   } | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -84,10 +85,15 @@ export default function ManagerInvitationsPage() {
       setError(apiError(r, 'Échec de la création de l’invitation.'));
       return;
     }
-    const inv = r.data as { email: string; token: string };
+    const inv = r.data as { email: string; token: string; emailSent?: boolean };
+    const emailSent = !!inv.emailSent;
     setEmail('');
-    setCreated({ email: inv.email, token: inv.token, link: inviteLink(inv.token, inv.email) });
-    setMessage('Invitation créée — copie le lien, il ne sera affiché qu’une seule fois.');
+    setCreated({ email: inv.email, token: inv.token, link: inviteLink(inv.token, inv.email), emailSent });
+    setMessage(
+      emailSent
+        ? `Invitation créée — l’email d’invitation a été envoyé à ${inv.email}. Le lien reste copiable en secours.`
+        : 'Invitation créée. Configuration mail absente ou envoi échoué : lien affiché manuellement.',
+    );
     void load(token);
   }
 
@@ -166,7 +172,20 @@ export default function ManagerInvitationsPage() {
             wordBreak: 'break-all',
           }}
         >
-          <strong>Lien à transmettre à {created.email} :</strong>
+          {created.emailSent ? (
+            <p style={{ color: 'var(--ok, #1a7f37)', margin: '0 0 8px' }}>
+              ✅ Email d&apos;invitation envoyé à {created.email}.
+            </p>
+          ) : (
+            <p style={{ color: 'var(--danger)', margin: '0 0 8px' }}>
+              ⚠️ Envoi automatique absent ou en échec — transmets ce lien manuellement
+              (configure le SMTP dans « Configuration mail »).
+            </p>
+          )}
+          <strong>
+            {created.emailSent ? 'Lien de secours à transmettre à ' : 'Lien à transmettre à '}
+            {created.email} :
+          </strong>
           <div style={{ marginTop: 6 }}>
             <a href={created.link}>{window.location.origin + created.link}</a>
           </div>

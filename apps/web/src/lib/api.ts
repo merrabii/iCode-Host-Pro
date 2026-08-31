@@ -226,6 +226,39 @@ export const listMyServices = (t: string) => apiJson('/api/client/services', t);
 export const createMyService = (t: string, subscriptionId: string, name: string) =>
   apiJson('/api/client/services', t, { method: 'POST', body: JSON.stringify({ subscriptionId, name }) });
 
+// ── Phase 6 (ADR-022) — mail settings + invitation emails ────────────────────
+/** Masked view of the SMTP settings — the stored password is NEVER exposed. */
+export interface MailSettings {
+  id: string | null;
+  enabled: boolean;
+  host: string | null;
+  port: number;
+  secure: boolean;
+  user: string | null;
+  hasPassword: boolean;
+  fromEmail: string | null;
+  fromName: string | null;
+  createdAt: string | null;
+  updatedAt: string | null;
+}
+export interface TestMailResult {
+  ok: boolean;
+  message?: string;
+}
+/** Payload returned by createInvitation (token + Phase 6 emailSent flag). */
+export interface CreatedInvitation {
+  id: string;
+  email: string;
+  expiresAt: string;
+  token: string;
+  emailSent: boolean;
+}
+export const getMailSettings = (t: string) => apiJson('/api/admin/mail', t);
+export const updateMailSettings = (t: string, dto: Partial<MailSettings> & { password?: string }) =>
+  apiJson('/api/admin/mail', t, { method: 'PUT', body: JSON.stringify(dto) });
+export const sendTestMail = (t: string, to: string) =>
+  apiJson('/api/admin/mail/test', t, { method: 'POST', body: JSON.stringify({ to }) });
+
 // Admin-scoped.
 export const adminListSubscriptions = (t: string) => apiJson('/api/admin/subscriptions', t);
 export const adminUpdateSubscription = (t: string, id: string, status: string) =>

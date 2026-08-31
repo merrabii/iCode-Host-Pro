@@ -10,6 +10,7 @@ import { ManagerModule } from './manager/manager.module';
 import { AuditModule } from './audit/audit.module';
 import { InvitationsModule } from './invitations/invitations.module';
 import { SubscriptionsModule } from './subscriptions/subscriptions.module';
+import { MailModule } from './mail/mail.module';
 import { loadAppConfig } from './config/configuration';
 
 @Module({
@@ -28,6 +29,7 @@ import { loadAppConfig } from './config/configuration';
     AuditModule,
     InvitationsModule,
     SubscriptionsModule,
+    MailModule,
   ],
 })
 export class AppModule {}

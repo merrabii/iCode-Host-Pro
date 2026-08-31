@@ -193,3 +193,26 @@ model Service {
 
   @@index([subscriptionId])
 }
+
+// ── Phase 6 — mail/SMTP configuration (ADR-022) ─────────────────────────────
+// SINGLETON row (one row, managed firstOrCreate by MailSettingsService): the
+// admin-managed SMTP configuration used to EMAIL invitation links (the Phase 5
+// manual token surfacing in /manager stays as a fallback). `enabled` gates
+// AUTOMATIC sending on invite creation; the manual "send test email" endpoint
+// works against the saved config regardless. `passwordEnc` holds the SMTP
+// password AES-256-GCM-encrypted at rest (CryptoService, master key
+// ENCRYPTION_KEY) — it is NEVER returned by the API (only `hasPassword`).
+
+model MailSetting {
+  id           String   @id @default(cuid())
+  enabled      Boolean  @default(false)
+  host         String
+  port         Int      @default(587)
+  secure       Boolean  @default(false) // true = implicit TLS (465), false = STARTTLS (587)
+  user         String?
+  passwordEnc  String?
+  fromEmail    String
+  fromName     String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}

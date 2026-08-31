@@ -313,19 +313,58 @@ Do not log only important work. Record all meaningful actions, including small c
 - Files modified: PROJECT_STATUS.md (Phase 5 ✓), TASKS.md (cette section), CHANGELOG.md, HANDOVER.md.
 - Command: git add + commit (docs owner validation). Push offert.
 
+# PHASE 6 — CONFIGURATION MAIL ADMIN + EMAILS D'INVITATION (ADR-022) — implémenté, en attente de validation live + push
+
+## 2026-08-31 — 6.0 GO & périmètre
+- Action: owner a demandé la stratégie email pour les invitations (« l'admin doit pouvoir ajouter/modifier/gérer la configuration de mail depuis l'interface admin (smtp, host, port…) avec possibilité de tester avec envoi de mail test »).
+- Périmètre choisi via AskUserQuestion : **« Mail seul »** — SMTP config admin + test email + emails d'invitation automatiques ; OAuth/MFA/Turnstile **différés**. Stockage du mot de passe : **« Chiffré au repos »** (AES-256-GCM, clé maître `ENCRYPTION_KEY`).
+- Decision APPROVED au GO : ADR-022 (singleton `MailSetting`, password AES-256-GCM, UI admin + test, emails d'invitation best-effort). Valide un périmètre ÉTROIT d'ADR-008 (chiffrement applicatif au repos) ; ADR-008 complet / ADR-006/007/009/010 restent PROPOSED.
+
+## 2026-08-31 — 6.1 Modèle + migration + crypto (ADR-022)
+- Files modified: `apps/api/prisma/schema.prisma` — modèle `MailSetting` (singleton : id, enabled Boolean @default(false), host, port Int @default(587), secure Boolean @default(false), user?, passwordEnc?, fromEmail, fromName?, timestamps).
+- Command: `corepack pnpm --filter @icode-host-pro/api run migrate --name init_mail` → migration `20260831120703_init_mail` appliquée (5 migrations, `prisma migrate status` in sync). Dev servers arrêtés avant migrate (EPERM DLL) puis vérifiés.
+- Files created: `apps/api/src/crypto/crypto.service.ts` (AES-256-GCM : clé = sha256(ENCRYPTION_KEY), payload base64 `iv||tag||data`, `MailCryptoError` si clé absente), `crypto.module.ts` (non-global, exporte CryptoService).
+- Files modified: `apps/api/src/config/configuration.ts` (+`encryptionKey`/`publicBaseUrl` optionnels — set fail-early intact), `apps/api/.env.example` (+ENCRYPTION_KEY, PUBLIC_BASE_URL), `apps/api/.env` local (gitignored) (+ENCRYPTION_KEY de dev).
+- Deps: `corepack pnpm --filter @icode-host-pro/api add nodemailer` (+`-D @types/nodemailer`) → nodemailer 9.1.0, CJS, jest-safe.
+
+## 2026-08-31 — 6.2 Backend module mail
+- Files created: `apps/api/src/mail/mail-transport.factory.ts` (couture de test — `create(cfg)` → nodemailer transporter), `mail.service.ts` (sans état : `sendMail(cfg,msg)` → `MailException` avec message SMTP ; `buildInviteMessage` = lien `/auth?invite=<token>&email=<email>` sur `publicBaseUrl`), `mail-settings.service.ts` (get masqué — jamais `passwordEnc`, `hasPassword` seulement ; `update` PATCH-semantics : `enabled=true` requiert host+fromEmail 400, password ''/absent = inchangé, valeur = chiffrée, user/fromName '' = effacés ; `getMailConfig` déchiffre ; `test` sur config enregistrée → ok ou 400 message SMTP + audit `mail.test` ; `sendInvitationMail` ; `isEnabled`), `dto/update-mail-settings.dto.ts` (tout @IsOptional), `dto/test-mail.dto.ts` (IsEmail), `mail-settings.controller.ts` (`@Controller('admin/mail')`, JwtAuthGuard+RolesGuard+@Roles(ADMIN), `GET|PUT /` + `POST /test`), `mail.module.ts`.
+- Files modified: `apps/api/src/app.module.ts` (import MailModule).
+- **Fix cycle d'import (trouvé par l'e2e)** : la chaîne Mail→Auth→Invitations→Mail est circulaire au niveau des fichiers ; `mail.module.ts` importe AuthModule via `forwardRef` (même pattern qu'Auth↔Invitations).
+- Commands: `corepack pnpm build` PASS (2 itérations — typage Prisma UpdateInput/CreateInput séparés).
+
+## 2026-08-31 — 6.3 Invitations — email automatique best-effort
+- Files modified: `apps/api/src/invitations/invitations.module.ts` (import MailModule), `invitations.service.ts` (injecte MailSettingsService ; dans `create()` après audit `invite.create` : si `isEnabled()` → `sendInvitationMail` try/catch **never throw**, retour `emailSent: boolean` (token manuel conservé), audit `invite.email` `{email, emailSent, reason?}`).
+- Le token one-shot reste le fallback affiché dans `/manager/invitations` — aucun envoi ne casse jamais la création.
+
+## 2026-08-31 — 6.4 Web
+- Files modified: `apps/web/src/lib/api.ts` (+MailSettings/TestMailResult/CreatedInvitation, getMailSettings/updateMailSettings/sendTestMail).
+- Files created: `apps/web/src/app/manager/mail/page.tsx` (ADMIN-gated : formulaire SMTP — Activer, host, port 465/587/25, secure, user, password « inchangé si vide », fromEmail, fromName ; badge Configuré/Non configuré + warning hasPassword ; section test SMTP avec erreur remontée ; validation host+fromEmail requise).
+- Files modified: `apps/web/src/app/manager/invitations/page.tsx` (après création : ✅ « Email envoyé à X » sinon ⚠️ bannière config mail absente/échec + lien manuel toujours copiable), `apps/web/src/app/manager/page.tsx` (lien « Configuration mail → »).
+
+## 2026-08-31 — 6.5 Tests + builds + live smoke (all PASS)
+- Files created: `apps/api/src/crypto/crypto.service.spec.ts` (5 unit : round-trip, IV aléatoire, mauvaise clé, payload altéré, clé manquante → MailCryptoError), `apps/api/src/mail/mail.service.spec.ts` (5 unit : message FR + lien, PUBLIC_BASE_URL, auth user / from nu, erreur → MailException), `apps/api/src/mail/mail-settings.service.spec.ts` (14 unit : defaults masqués, hasPassword jamais exposé, encrypt+store, '' = inchangé, user/fromName '' = null, enabled sans host 400, first-create, ENCRYPTION_KEY absente 400, getMailConfig déchiffre/échoue MailException, test ok/erreur/no-config, sendInvitationMail).
+- Files modified: `apps/api/src/invitations/invitations.service.spec.ts` (+mock MailSettingsService ; mail off → emailSent false, mail on → true + audit `invite.email`, send échoue → false + raison journalisée).
+- Files created: `apps/api/test/mail.e2e-spec.ts` (10 tests : 401/403 RBAC, GET defaults masqués, PUT store → GET hasPassword jamais raw, PUT enabled sans host 400, test OK via **overrideProvider(MailTransportFactory)**, test 400 message SMTP, invite email enlevé→true / désactivé→false, audit mail.settings.update masqué) — aucun SMTP réel contacté.
+- Commands: `test` → **90/90** (11 suites) ; `test:e2e` → **61/61** (8 suites) ; `build` API + web PASS (route `/manager/mail` incluse) ; `npx tsc --noEmit` apps/web PASS ; `prisma migrate status` in sync (5 migrations).
+- Fixes en cours: spec mail.service transporter capturé par test (pas mock.results[0]), spec invitations rejette avec vrais MailException, `.env` local +ENCRYPTION_KEY (e2e : PUT password sans clé → 400 de cascade).
+- Live smoke :3001: admin login OK → `GET /api/admin/mail` defaults masqués `{host:null,hasPassword:false}` → `POST /api/admin/mail/test` sans config → 400 « Configuration mail non définie. ». API dev (nest watch) laissée en cours pour la validation propriétaire.
+
 # OPEN ITEMS
 - [x] Authentication architecture (ADR-015 APPROVED — Phase 1).
 - [x] Inscription par invitation / fermeture de l'inscription ouverte (ADR-020 APPROVED — Phase 5 : `POST /api/auth/register` → 410, `POST /api/auth/accept-invite` + `Invitation`).
 - [x] Espace client : souscription + service (ADR-021 APPROVED — Phase 5 : `Subscription` + `Service`, ownership par possession, client ne touche jamais l'infra — provisionnement stub).
+- [x] Email strategy (ADR-022 APPROVED — Phase 6 : SMTP config admin + test email + emails d'invitation best-effort ; ENCRYPTION_KEY pour le password at rest ; jeton manuel conservé en fallback).
 - [ ] Async jobs architecture (ADR-007 — provisionnement réel différé).
 - [ ] Redis requirement (depends on ADR-007).
 - [ ] Coolify API verification.
 - [ ] HestiaCP API verification.
 - [ ] Turnstile details.
-- [ ] Email strategy (invitation token surfacé dans /manager — pas d'envoi email).
+- [ ] OAuth / MFA (différés par le propriétaire au profit du « Mail seul » en Phase 6).
 - [ ] Asset storage.
 - [ ] Reverse proxy/SSL.
 - [ ] Observability.
+- [ ] ADR-008 complet (gestion de secrets, architecture de config persistée — Phase 6 n'a validé qu'un périmètre étroit : chiffrement applicatif au repos).
 
 # COMPLETED HISTORY
 - Clean baseline (Pre-Phase 0): documentation pack + first AI orientation.
@@ -335,3 +374,4 @@ Do not log only important work. Record all meaningful actions, including small c
 - Phase 3: gestion utilisateurs admin + dashboard /manager + catalogue enrichi — owner-validated 2026-08-31.
 - Phase 4: journal d'audit « qui a fait quoi » (ADR-019) — owner-validated 2026-08-31, commitée.
 - Phase 5: espace client + accès sécurisé (ADR-020 invitations 410 + ADR-021 Subscription/Service) — owner-validated 2026-08-31, tests 62/62 + 51/51 verts, builds PASS.
+- Phase 6: configuration mail admin + emails d'invitation (ADR-022) — implémenté 2026-08-31, tests 90/90 unit + 61/61 e2e (8 suites), builds PASS, en attente de validation live propriétaire + push.

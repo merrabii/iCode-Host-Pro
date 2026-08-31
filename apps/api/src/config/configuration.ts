@@ -15,6 +15,13 @@ export interface AppConfig {
   /** Phase 5 (ADR-020): invite TTL in days. Optional (default 7), so the JWT
    *  fail-early set above is untouched. */
   inviteExpiresInDays: number;
+  /** Phase 6 (ADR-022): master key for app-level encryption (AES-256-GCM) of
+   *  the SMTP password. Optional — only required when an admin SAVES a mail
+   *  password (fail-early set untouched, same pattern as inviteExpiresInDays). */
+  encryptionKey: string;
+  /** Phase 6 (ADR-022): public base URL used to build absolute invitation
+   *  links in the invitation emails. Optional (default localhost:3000). */
+  publicBaseUrl: string;
 }
 
 export function loadAppConfig(): AppConfig {
@@ -38,5 +45,7 @@ export function loadAppConfig(): AppConfig {
     refreshExpiresInDays: Number(process.env.REFRESH_EXPIRES_IN_DAYS ?? 30),
     cookieName: process.env.COOKIE_NAME ?? 'ihp_refresh',
     inviteExpiresInDays: Number(process.env.INVITE_EXPIRES_IN_DAYS ?? 7),
+    encryptionKey: process.env.ENCRYPTION_KEY ?? '',
+    publicBaseUrl: process.env.PUBLIC_BASE_URL ?? 'http://localhost:3000',
   };
 }

@@ -530,7 +530,116 @@ ROLLBACK NOTES:
     then re-run `migrate dev` (re-applies init_auth, init_core, init_audit,
     init_client_access).
 
+================================================================
+PHASE 6 — CONFIGURATION MAIL + EMAILS D'INVITATION (ADR-022)
+================================================================
+
+DATE: 2026-08-31
+PHASE: 6 — Configuration SMTP gérée depuis /manager + mails de test + emails d'invitation automatiques (ADR-022)
+OBJECTIVE:
+  Let the ADMIN manage the SMTP mail configuration from the admin UI
+  (host, port, secure, user, password, fromEmail, fromName) and test it
+  with a live test email; when mail is enabled, each created invitation
+  automatically sends a best-effort invitation email (link absolute
+  `PUBLIC_BASE_URL/auth?invite=<token>&email=<email>`, never breaks the
+  creation). The SMTP password is encrypted at rest (AES-256-GCM via
+  CryptoService). Validates a NARROW slice of ADR-008 (application-level
+  encryption), outside ADR-011.
+
+DATABASE ACTIONS:
+  - Added model `MailSetting` (singleton, managed via `findFirst` +
+    `firstOrCreate` pattern in the service — exactly one row).
+      Properties: id (cuid PK), enabled (default false — gates the automatic
+      send on invitations; the test endpoint works regardless), host, port
+      (default 587), secure (default false — 465 = TLS implicit), user?
+      (nullable), passwordEnc? (nullable — ciphertext, never clear text),
+      fromEmail, fromName? (nullable), createdAt/updatedAt.
+  - Migration applied locally (containers icode-postgres, db icode_host_pro).
+  - No new enum, no relation (independent table).
+
+MIGRATIONS:
+  - Migration folder: apps/api/prisma/migrations/20260831120703_init_mail/
+  - Name: `init_mail`. Applied via
+    `corepack pnpm --filter @icode-host-pro/api run migrate --name init_mail`.
+  - `prisma migrate status` -> up to date, 5 migrations total (init_auth,
+    init_core, init_audit, init_client_access, init_mail). Client regenerated.
+  - Requires `ENCRYPTION_KEY` in apps/api/.env(.example) when a password is
+    stored (the key is optional at boot; missing at save -> 400
+    « Clé de chiffrement manquante (ENCRYPTION_KEY) » via MailCryptoError).
+    `PUBLIC_BASE_URL` also added (serves the absolute link in emails; default
+    http://localhost:3000 in the configuration; no new fail-early).
+
+IMPORTANT SQL / COMMANDS:
+  - Migration SQL (mirror of Prisma schema):
+
+    CREATE TABLE "MailSetting" (
+        "id"          TEXT NOT NULL,
+        "enabled"     BOOLEAN NOT NULL DEFAULT false,
+        "host"        TEXT NOT NULL,
+        "port"        INTEGER NOT NULL DEFAULT 587,
+        "secure"      BOOLEAN NOT NULL DEFAULT false,
+        "user"        TEXT,
+        "passwordEnc" TEXT,
+        "fromEmail"   TEXT NOT NULL,
+        "fromName"    TEXT,
+        "createdAt"   TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        "updatedAt"   TIMESTAMP(3) NOT NULL,
+        CONSTRAINT "MailSetting_pkey" PRIMARY KEY ("id")
+    );
+
+  - API (ADMIN only — JwtAuthGuard + RolesGuard(RBAC ADMIN) + @Roles(ADMIN)):
+      GET  /api/admin/mail        (masked DTO — only hasPassword, never raw)
+      PUT  /api/admin/mail        (PATCH-semantics; `enabled=true` requires
+                                  host + fromEmail -> 400; password blank =
+                                  unchanged, `''` on user/fromName = cleared)
+      POST /api/admin/mail/test   ({to: email} -> ok:true | 400 with SMTP msg;
+                                   works even when `enabled` is false; requires
+                                   a saved config, otherwise 400)
+  - Invitations: `POST /api/invitations` enriched with `emailSent: boolean`
+    (best-effort send after creation; failure journaled then emailSent false)
+    + audit `invite.email` {email, emailSent, reason?}; the one-time token
+    remains the manual fallback shown in `/manager/invitations`.
+  - Audit: `mail.settings.update` (masked flags) + `mail.test` (ok / error
+    detail). Web: `/manager/mail`.
+
+VALIDATION QUERIES:
+  - `SELECT id, enabled, host, port, secure, user, "fromEmail", "fromName",
+     "hasPassword" := ("passwordEnc" IS NOT NULL), "createdAt", "updatedAt"
+     FROM "MailSetting";` -> 0 row (default masked) or 1 masked row; the raw
+     `passwordEnc` must never be surfaced by the API (only hasPassword).
+  - `SELECT action, COUNT(*) FROM "AuditLog"
+     WHERE action LIKE 'mail.%' OR action = 'invite.email'
+     GROUP BY action;` -> mail.settings.update / mail.test / invite.email.
+  - e2e: `corepack pnpm --filter @icode-host-pro/api run test:e2e`
+    => 61/61 8 suites (mail 10 tests; overrideProvider(MailTransportFactory))
+    -> zero real SMTP contacted.
+
+RESULT:
+  - `MailSetting` singleton live (5 migrations in sync). Verified in e2e
+    (10 mail tests, stub transport) + unit + API/web builds + live smoke (without
+    real SMTP): defaults masked, enabled-without-host rejected, test-without-config
+    400, invite emailSent reflects mail enablement, audits masked.
+
+ROLLBACK NOTES:
+  - No down-migration authored. Full dev reset (destructive):
+        docker compose down -v && docker compose up -d postgres
+    then re-run `migrate dev` (re-applies init_auth, init_core, init_audit,
+    init_client_access, init_mail).
+
 REMARKS FOR FUTURE AI:
+  - PASSWORD IS NEVER EXPOSED: `MailSetting.passwordEnc` is ciphertext; the API
+    DTO exposes only `hasPassword: boolean`. Do not leak it. `CryptoService`
+    (non-global) derives a 32-byte key as sha256(ENCRYPTION_KEY) and uses Node
+    crypto AES-256-GCM (payload base64 `iv||tag||data`). ENCRYPTION_KEY must stay
+    gitignored (placeholders in .env.example, real value in apps/api/.env).
+  - TEST SEAM: `MailTransportFactory.create()` is the overridable provider
+    (`overrideProvider(MailTransportFactory)` in e2e) — no real SMTP in tests.
+    Do not replace it with direct `nodemailer.createTransport` calls in the
+    service path, otherwise tests will need network.
+  - CWYCLE: MailModule imports AuthModule via `forwardRef` (chain
+    Mail→Auth→Invitations→Mail) — same pattern as Auth→Invitations.
+    `MailService` stays stateless (config passed in) to avoid the
+    MailSettingsService↔MailService provider cycle.
   - SECURITY invariants (ADR-020/021) : raw invite token is NEVER persisted
     (sha256 only, shown once to the admin in /manager — no email sending yet);
     ownership is enforced in the SERVICE layer with `where: { userId }` (another

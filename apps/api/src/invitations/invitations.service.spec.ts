@@ -3,6 +3,7 @@ import {
   ConflictException,
   NotFoundException,
 } from '@nestjs/common';
+import { MailException } from '../mail/mail.service';
 import { InvitationsService } from './invitations.service';
 
 describe('InvitationsService', () => {
@@ -22,14 +23,17 @@ describe('InvitationsService', () => {
   };
   const mockAudit = { record: jest.fn() };
   const mockConfig = { get: jest.fn() };
+  const mockMailSettings = { isEnabled: jest.fn(), sendInvitationMail: jest.fn() };
   const actor = { sub: 'admin', email: 'admin@example.com' };
 
   beforeEach(() => {
     mockConfig.get.mockReturnValue(undefined); // default 7 days
+    mockMailSettings.isEnabled.mockResolvedValue(false); // mail off by default
     service = new InvitationsService(
       mockPrisma as never,
       mockConfig as never,
       mockAudit as never,
+      mockMailSettings as never,
     );
     jest.clearAllMocks();
   });
@@ -66,11 +70,65 @@ describe('InvitationsService', () => {
       expect(res.token.length).toBeGreaterThan(20);
       expect(res.id).toBe('inv1');
       expect(res.expiresAt.getTime()).toBeGreaterThan(Date.now());
+      expect(res.emailSent).toBe(false); // mail disabled by default
       const call = mockPrisma.invitation.create.mock.calls[0][0];
       expect(call.data.tokenHash).not.toBe(res.token); // raw never stored
       expect(call.data.tokenHash).toHaveLength(64); // sha256 hex
       expect(mockAudit.record).toHaveBeenCalledWith(
         expect.objectContaining({ action: 'invite.create', actorId: 'admin', resourceId: 'inv1' }),
+      );
+      expect(mockMailSettings.sendInvitationMail).not.toHaveBeenCalled();
+    });
+
+    it('sends the invitation email when mail is enabled → emailSent true', async () => {
+      mockPrisma.user.findUnique.mockResolvedValue(null);
+      mockPrisma.invitation.findFirst.mockResolvedValue(null);
+      mockPrisma.invitation.create.mockImplementation(async ({ data }) => ({
+        id: 'inv1',
+        email: data.email,
+        tokenHash: data.tokenHash,
+        expiresAt: data.expiresAt,
+      }));
+      mockMailSettings.isEnabled.mockResolvedValue(true);
+      mockMailSettings.sendInvitationMail.mockResolvedValue(undefined);
+
+      const res = await service.create({ email: 'a@x.com' }, actor);
+
+      expect(res.emailSent).toBe(true);
+      expect(mockMailSettings.sendInvitationMail).toHaveBeenCalledWith(
+        expect.objectContaining({ to: 'a@x.com', token: res.token, email: 'a@x.com' }),
+      );
+      expect(mockAudit.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'invite.email',
+          details: expect.objectContaining({ email: 'a@x.com', emailSent: true }),
+        }),
+      );
+    });
+
+    it('mail enabled but send fails → emailSent false, token still returned, reason journaled', async () => {
+      mockPrisma.user.findUnique.mockResolvedValue(null);
+      mockPrisma.invitation.findFirst.mockResolvedValue(null);
+      mockPrisma.invitation.create.mockImplementation(async ({ data }) => ({
+        id: 'inv1',
+        email: data.email,
+        tokenHash: data.tokenHash,
+        expiresAt: data.expiresAt,
+      }));
+      mockMailSettings.isEnabled.mockResolvedValue(true);
+      mockMailSettings.sendInvitationMail.mockRejectedValue(
+        new MailException('ECONNREFUSED smtp.example.com:587'),
+      );
+
+      const res = await service.create({ email: 'a@x.com' }, actor);
+
+      expect(res.emailSent).toBe(false);
+      expect(res.token.length).toBeGreaterThan(20); // manual fallback kept
+      expect(mockAudit.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'invite.email',
+          details: expect.objectContaining({ emailSent: false, reason: 'ECONNREFUSED smtp.example.com:587' }),
+        }),
       );
     });
   });

@@ -1,40 +1,39 @@
 # PROJECT_STATUS — iCode Host Pro
 
 ## Overall status
-**PHASE 5 COMPLETE AND OWNER-VALIDATED 2026-08-31 — ESPACE CLIENT + ACCÈS SÉCURISÉ (ADR-020 invitations, ADR-021 client workspace). En attente de push.**
+**PHASE 6 IMPLEMENTED 2026-08-31 — CONFIGURATION MAIL ADMIN + EMAILS D'INVITATION (ADR-022). Tests verts, builds PASS, smoke OK. En attente de validation live propriétaire puis push.**
+(Phase 5 reste livrée et poussée ; Phase 6 est le travail en cours.)
 
 ## Current phase
-**Phase 5 — Inscription fermée + invitations (5B) puis espace client (5A). IMPLEMENTED + tests verts + validation live propriétaire. Awaiting push.**
+**Phase 6 — Configuration SMTP gérée depuis /manager + mail de test + emails d'invitation automatiques. IMPLEMENTED + tests verts + smoke live OK. Awaiting owner live validation + push.**
 
 ## State (real, as of this update)
 - Monorepo: pnpm workspaces + Turborepo (ADR-001). `apps/web` (Next.js 15), `apps/api` (NestJS 11), `packages/` reserved.
 - API: `GET /api/health` (app + real DB connectivity via `SELECT 1`), validated startup config socle (ADR-011), global `/api` prefix, dev CORS, OpenAPI/Swagger at `/api/docs` (ADR-005).
-- **Auth (Phase 1, ADR-015)**: stateless JWT Bearer access (short-lived `15m`) + refresh httpOnly cookie (rotated, revocable, sha256-hashed). bcryptjs. RBAC `ADMIN | USER` + guards. **Phase 5 (ADR-020) : `POST /api/auth/register` → 410 Gone (inscription fermée)**; `POST /api/auth/accept-invite` (token + email + password + name) crée le compte USER. Endpoints: `login`, `refresh`, `logout`, `GET /api/users/me`.
-- DB: migrations `init_auth` (users/refresh_tokens), `init_core` (Product/Server), `init_audit` (AuditLog) et **`20260831084839_init_client_access`** (Invitation + Subscription + Service + enums SubscriptionStatus/ServiceStatus). `prisma migrate status` → up to date (4 migrations). Prisma client 6.19.3.
-- **Invitations (Phase 5B, ADR-020)**: table `Invitation` (email, `tokenHash` sha256 unique, `issuerId` FK User SetNull, `expiresAt`, usedAt/revokedAt). Routes ADMIN `GET/POST /api/invitations` + `POST /api/invitations/:id/revoke` (idempotent); jeton `randomBytes(32)` retourné une seule fois; TTL `INVITE_EXPIRES_IN_DAYS` (7). Audit `invite.create/revoke/accept`. Web **`/manager/invitations`** (créer, lien copiable 1×, statuts, révoquer).
-- **Espace client (Phase 5A, ADR-021)**: `Subscription` (userId FK User Cascade, productId FK Product Restrict, PENDING/ACTIVE/REJECTED/SUSPENDED/CANCELLED) + `Service` (name, subscriptionId FK Cascade, serverId nullable FK Server SetNull, REQUESTED/PROVISIONING/ACTIVE/PROBLEM/SUSPENDED/REMOVED). Client (tout authentifié): catalogue `GET /api/products`, `GET/POST /api/client/subscriptions`, `PATCH …/cancel`, `GET/POST /api/client/services`. Admin: `GET /api/admin/subscriptions` + `PATCH /api/admin/subscriptions/:id` (whitelist approve/reject/suspend/activate), `GET /api/admin/services` + `PATCH /api/admin/services/:id` (affecter serveur existant + REQUESTED→PROVISIONING→ACTIVE **stub**). **Ownership par possession** (id d'un autre client → 404); listing client SANS `serverId`/`server` (zéro infra). Web **`/client`** + **`/manager/subscriptions`**.
-- **Audit (Phase 4 + 5)**: événements `invite.*`, `subscription.*`, `service.*` ajoutés aux libellés du journal web.
-- Web: `/auth` (login + formulaire accept-invitation prérempli par `?invite=…&email=…`); `/client` (catalogue, s'abonner, annuler, demander un service, statuts); `/manager/invitations`; `/manager/subscriptions`; nav racine + `/manager` enrichies. Token toujours minted from the httpOnly refresh cookie, jamais en localStorage.
-- `AuthModule` ↔ `InvitationsModule` reliés via `forwardRef` (accept-invite ↔ guards). `inviteExpiresInDays` dans `configuration.ts` (optionnel).
+- **Auth (Phase 1, ADR-015)**: stateless JWT Bearer access (short-lived `15m`) + refresh httpOnly cookie (rotated, revocable, sha256-hashed). bcryptjs. RBAC `ADMIN | USER` + guards. **Phase 5 (ADR-020) : `POST /api/auth/register` → 410 Gone (inscription fermée)**; `POST /api/auth/accept-invite` crée le compte USER.
+- DB: migrations `init_auth`, `init_core`, `init_audit`, `init_client_access` et **`20260831120703_init_mail`** (**`MailSetting`**). `prisma migrate status` → up to date (**5 migrations**). Prisma client 6.19.3.
+- **Invitations (Phase 5B, ADR-020)**: jeton one-shot, TTL 7 j, routes ADMIN, web `/manager/invitations`. **Phase 6 : envoi email automatique best-effort** (`emailSent` dans le retour ; token manuel conservé en fallback si config absente/échec); audit `invite.email` `{email, emailSent, reason?}`.
+- **Mail (Phase 6, ADR-022)**: singleton `MailSetting` (enabled, host, port, secure, user, `passwordEnc`, fromEmail, fromName). **Password AES-256-GCM at rest** (`CryptoService`, clé = sha256(`ENCRYPTION_KEY`), payload base64 iv||tag||data) — **jamais renvoyé par l'API**, seulement `hasPassword`. `ENCRYPTION_KEY` optionnelle au boot, requise à l'enregistrement d'un password (400 clair sinon).
+- Routes ADMIN `GET/PUT /api/admin/mail` (PATCH-semantics ; `enabled=true` requiert host+fromEmail → 400 ; `''` = effacé sur user/fromName) + `POST /api/admin/mail/test` (utilise la config enregistrée, indépendant de `enabled` ; remonte l'erreur SMTP dans un 400). `MailService` sans état (évite le cycle de providers), `MailTransportFactory` = couture de test overridée en e2e (aucun SMTP réel). Audit `mail.settings.update` (masqué) / `mail.test` (ok/error).
+- Web: **`/manager/mail`** (formulaire SMTP : Activer, host, port 465/587/25, secure, user, password « inchangé si vide », fromEmail, fromName ; badge Configuré/Non configuré + warning hasPassword ; section test SMTP). `/manager/invitations` : ✅ email envoyé à X sinon ⚠️ bannière + lien manuel toujours copiable. Nav `/manager` + lien « Configuration mail ».
+- **Module wiring**: `MailModule` (AuthModule via `forwardRef` — cycle d'import Mail→Auth→Invitations→Mail), `CryptoModule` (non-global). Invitations → MailSettingsService (best-effort, never throw). `publicBaseUrl` (`PUBLIC_BASE_URL`) pour les liens absolus des emails, défaut localhost:3000.
 - Docker Postgres 16 (ADR-012) up and healthy.
 
-## Verified (Phase 5 — real checks, 2026-08-31)
-- Unit **62/62** (8 suites : health 2, products 5, servers 4, users 10, manager 2, audit 5, **invitations 11**, **subscriptions 16**).
-- e2e **51/51, 7 suites** (health, auth réécrit invite→accept→login, core RBAC, admin RBAC, audit RBAC, **invitations**, **client**). Les 4 suites existantes créent désormais leurs users via Prisma (register fermé). `testTimeout` e2e 30s.
-- Builds API + web PASS (routes `/`, `/auth`, `/client`, `/manager`, `/manager/invitations`, `/manager/journal`, `/manager/subscriptions`, `/manager/utilisateurs`). Typecheck web PASS.
-- Live smoke API :3001: `/api/health` ok; register → **410**; login seed admin → token; `GET /api/products` 200; `GET /api/invitations` (ADMIN) 200.
-- Migration `20260831084839_init_client_access` appliquée ; `prisma migrate status` → up to date.
-- **Owner live validation (2026-08-31)**: « validé » — parcours complet confirmé en navigateur (invitation → accept → login → `/client` s'abonner → approbation `/manager/subscriptions` → demande de service → affectation serveur → ACTIVE ; register → 410 ; client sans données serveur).
+## Verified (Phase 6 — real checks, 2026-08-31)
+- Unit **90/90** (11 suites : + crypto 5, mail 5, **mail-settings 14**, invitations 14 — mocks MailSettingsService).
+- e2e **61/61, 8 suites** (+ **mail** 10 tests avec `overrideProvider(MailTransportFactory)` : 401/403 RBAC, defaults masqués, PUT store → GET hasPassword jamais raw, PUT enabled sans host 400, test OK/400 message SMTP, invite email enlevé→true / désactivé→false, audit masqué). Aucun SMTP réel contacté.
+- Builds API + web PASS (route `/manager/mail` incluse). Typecheck web PASS. `prisma migrate status` → in sync.
+- Live smoke API :3001: admin login → `GET /api/admin/mail` defaults masqués `{host:null,hasPassword:false}` → `POST /api/admin/mail/test` sans config → 400 « Configuration mail non définie. ». API dev (nest watch) laissée en cours pour la validation propriétaire.
 
 ## Pending
-- Push of Phase 5 (on owner request).
-- Proposition Phase 6 (on owner request).
+- **Owner live validation Phase 6** (SMTP réel requis : Gmail app-password / Brevo / relais local) — configurer `/manager/mail`, envoyer un mail de test, créer une invitation et vérifier la réception de l'email, vérifier que le password n'est jamais réaffiché.
+- Commit unique Phase 6 + push (on owner request).
 
 ## Decisions
-- ADR-001..005, 011..014: **APPROVED** (Phase 0). ADR-015+016: **APPROVED** (Phase 1). ADR-017: **APPROVED** (Phase 2). ADR-018: **APPROVED** (Phase 3). ADR-019: **APPROVED** (Phase 4). **ADR-020** (inscription fermée + invitations) et **ADR-021** (espace client Subscription+Service) : **APPROVED** (Phase 5 GO, 2026-08-31). ADR-006 full, 007, 008, 009, 010: **PROPOSED** (untouched). See DECISIONS.md.
+- ADR-001..005, 011..014: **APPROVED** (Phase 0). ADR-015+016: **APPROVED** (Phase 1). ADR-017: **APPROVED** (Phase 2). ADR-018: **APPROVED** (Phase 3). ADR-019: **APPROVED** (Phase 4). ADR-020+021: **APPROVED** (Phase 5 GO). **ADR-022 (configuration mail + emails d'invitation) : APPROVED** (Phase 6 GO, 2026-08-31) — valide un périmètre étroit d'ADR-008 (chiffrement applicatif au repos). ADR-006 full, 007, 008 complet, 009, 010: **PROPOSED** (untouched). See DECISIONS.md.
 
 ## Next action
-Push of Phase 5 (on owner request), then proposition Phase 6.
+Validation live propriétaire Phase 6 (SMTP réel) → commit unique → push.
 
 ## Out of scope (do not build yet)
-Déploiement réel chez un provider (ADR-010 — le provisionnement est un stub de transition), jobs/Redis (ADR-007), stratégie email pour les invitations (token surfacé dans `/manager`), billing/paiements, OAuth/MFA/Turnstile, `Deployment` (reste différé), asset storage.
+Déploiement réel chez un provider (ADR-010), jobs/Redis (ADR-007), OAuth / MFA / Turnstile (différés par le propriétaire au profit du « Mail seul »), billing/paiements, `Deployment` (reste différé), asset storage, reverse proxy/SSL, observability, ADR-008 complet (gestion de secrets / config persistée).

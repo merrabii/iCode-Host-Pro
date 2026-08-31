@@ -9,6 +9,8 @@ import { Role, User } from '@prisma/client';
 import { createHash, randomBytes } from 'crypto';
 import * as bcrypt from 'bcryptjs';
 import { AuditService } from '../audit/audit.service';
+import { MailSettingsService } from '../mail/mail-settings.service';
+import { MailException } from '../mail/mail.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateInvitationDto } from './dto/create-invitation.dto';
 
@@ -31,6 +33,7 @@ export class InvitationsService {
     private readonly prisma: PrismaService,
     private readonly config: ConfigService,
     private readonly audit: AuditService,
+    private readonly mailSettings: MailSettingsService,
   ) {}
 
   private hashToken(token: string): string {
@@ -56,7 +59,7 @@ export class InvitationsService {
   async create(
     dto: CreateInvitationDto,
     actor: Actor,
-  ): Promise<{ id: string; email: string; expiresAt: Date; token: string }> {
+  ): Promise<{ id: string; email: string; expiresAt: Date; token: string; emailSent: boolean }> {
     const existingUser = await this.prisma.user.findUnique({
       where: { email: dto.email },
     });
@@ -87,11 +90,40 @@ export class InvitationsService {
       resourceId: invitation.id,
       details: { email: dto.email },
     });
+
+    // Phase 6 (ADR-022): automatic invitation email — BEST-EFFORT only. If the
+    // admin enabled the SMTP settings, try to send; any failure just flips
+    // emailSent and keeps the one-time token as the manual fallback. Never
+    // breaks invitation creation.
+    let emailSent = false;
+    if (await this.mailSettings.isEnabled()) {
+      const outcome: Record<string, string | boolean> = { email: dto.email, emailSent: true };
+      try {
+        await this.mailSettings.sendInvitationMail({
+          to: invitation.email,
+          token,
+          email: invitation.email,
+        });
+        emailSent = true;
+      } catch (e) {
+        outcome.emailSent = false;
+        outcome.reason = e instanceof MailException ? e.message : String(e);
+      }
+      await this.audit.record({
+        actorId: actor.sub,
+        actorEmail: actor.email,
+        action: 'invite.email',
+        resourceType: 'invitation',
+        resourceId: invitation.id,
+        details: outcome,
+      });
+    }
     return {
       id: invitation.id,
       email: invitation.email,
       expiresAt: invitation.expiresAt,
       token,
+      emailSent,
     };
   }
 
