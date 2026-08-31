@@ -1,10 +1,10 @@
 # PROJECT_STATUS — iCode Host Pro
 
 ## Overall status
-**PHASE 5 COMPLETE 2026-08-31 — ESPACE CLIENT + ACCÈS SÉCURISÉ (ADR-020 invitations, ADR-021 client workspace). En attente de validation live et de push.**
+**PHASE 5 COMPLETE AND OWNER-VALIDATED 2026-08-31 — ESPACE CLIENT + ACCÈS SÉCURISÉ (ADR-020 invitations, ADR-021 client workspace). En attente de push.**
 
 ## Current phase
-**Phase 5 — Inscription fermée + invitations (5B) puis espace client (5A). IMPLEMENTED + tests verts. Awaiting owner live validation / push.**
+**Phase 5 — Inscription fermée + invitations (5B) puis espace client (5A). IMPLEMENTED + tests verts + validation live propriétaire. Awaiting push.**
 
 ## State (real, as of this update)
 - Monorepo: pnpm workspaces + Turborepo (ADR-001). `apps/web` (Next.js 15), `apps/api` (NestJS 11), `packages/` reserved.
@@ -24,9 +24,9 @@
 - Builds API + web PASS (routes `/`, `/auth`, `/client`, `/manager`, `/manager/invitations`, `/manager/journal`, `/manager/subscriptions`, `/manager/utilisateurs`). Typecheck web PASS.
 - Live smoke API :3001: `/api/health` ok; register → **410**; login seed admin → token; `GET /api/products` 200; `GET /api/invitations` (ADMIN) 200.
 - Migration `20260831084839_init_client_access` appliquée ; `prisma migrate status` → up to date.
+- **Owner live validation (2026-08-31)**: « validé » — parcours complet confirmé en navigateur (invitation → accept → login → `/client` s'abonner → approbation `/manager/subscriptions` → demande de service → affectation serveur → ACTIVE ; register → 410 ; client sans données serveur).
 
 ## Pending
-- Owner live validation (invite → accept → login → `/client` subscribe → approve `/manager/subscriptions` → request service → assign server → ACTIVE; register → 410; client ne voit pas `/api/servers`).
 - Push of Phase 5 (on owner request).
 - Proposition Phase 6 (on owner request).
 
@@ -34,7 +34,7 @@
 - ADR-001..005, 011..014: **APPROVED** (Phase 0). ADR-015+016: **APPROVED** (Phase 1). ADR-017: **APPROVED** (Phase 2). ADR-018: **APPROVED** (Phase 3). ADR-019: **APPROVED** (Phase 4). **ADR-020** (inscription fermée + invitations) et **ADR-021** (espace client Subscription+Service) : **APPROVED** (Phase 5 GO, 2026-08-31). ADR-006 full, 007, 008, 009, 010: **PROPOSED** (untouched). See DECISIONS.md.
 
 ## Next action
-Owner live validation de la Phase 5, puis push (single commit) sur demande.
+Push of Phase 5 (on owner request), then proposition Phase 6.
 
 ## Out of scope (do not build yet)
 Déploiement réel chez un provider (ADR-010 — le provisionnement est un stub de transition), jobs/Redis (ADR-007), stratégie email pour les invitations (token surfacé dans `/manager`), billing/paiements, OAuth/MFA/Turnstile, `Deployment` (reste différé), asset storage.

@@ -1,6 +1,6 @@
 # CHANGELOG
 
-## Phase 5 — Espace client + accès sécurisé (2026-08-31)
+## Phase 5 — COMPLETE and owner-validated (2026-08-31)
 Owner picked direction « A puis B » (fermer l'inscription d'abord, puis l'espace client) and confirmed: « c'est l'admin qui doit ajouter et modifier et gérer les serveurs complètement mais le client ne manipule pas l'infra ».
 ### Added
 - **Invitations (ADR-020)** — inscription libre fermée : `POST /api/auth/register` → **410 Gone**; `POST /api/auth/accept-invite` (token + email + password + name) crée le compte USER et émet les jetons. Table `Invitation` (migration `20260831084839_init_client_access`) : `tokenHash` sha256 unique (brut jamais persisté), `issuerId` FK User SetNull, `expiresAt`, `usedAt`/`revokedAt`. Routes ADMIN `GET/POST /api/invitations` + `POST /api/invitations/:id/revoke` (idempotent); jeton `randomBytes(32)` retourné une seule fois; TTL `INVITE_EXPIRES_IN_DAYS` (défaut 7). Web `/manager/invitations` : créer par email, lien d'invitation copiable (affiché une seule fois), liste statuts, révocation.
@@ -14,9 +14,11 @@ Owner picked direction « A puis B » (fermer l'inscription d'abord, puis l'espa
 - Builds API + web PASS; typecheck web PASS; `prisma migrate status` up-to-date (4 migrations).
 - Live smoke: `/api/health` ok; register → **410**; login admin → token; `GET /api/products` 200 ; `GET /api/invitations` (ADMIN) 200.
 
+### Owner validation (2026-08-31)
+- Owner confirmed live: « validé » — parcours complet (invitation → accept → login → `/client` (s'abonner) → approbation `/manager/subscriptions` → demande de service → affectation serveur → ACTIVE) ; register → 410 ; client sans aucune donnée serveur. Phase 5 closed.
+
 ### Pending (not yet done)
 - Push of Phase 5 (on owner request).
-- Live validation web (/auth accept → /client → /manager/subscriptions).
 - Proposition Phase 6.
 
 ## Phase 4 — COMPLETE and owner-validated (2026-08-31)

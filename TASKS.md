@@ -303,10 +303,15 @@ Do not log only important work. Record all meaningful actions, including small c
 - Fixes en cours de phase: invitations spec mock call index (calls[0]→calls[0][0]), Prisma `include` scalaire→`select` (SERVICE_SELECT) + serverId scalar, client listMyServices select sans serverId, invitations e2e stray `});`, hook timeout 30s sous 7 suites, DB transient unreachable → retry.
 - Docs: DECISIONS.md (ADR-020/021 APPROVED), CHANGELOG.md (Phase 5 Added/Changed/Verified/Pending), PROJECT_STATUS.md (Phase 5 COMPLETE, 4 migrations, 62/51), docs/sql-commandes.txt (Phase 5 DB entry).
 
-## 2026-08-31 — 5.6 Close & commit (en cours)
-- Action: clôture documentaire + **commit unique** Phase 5.
-- Files modified: PROJECT_STATUS.md (Phase 5 COMPLETE), TASKS.md (cette section), CHANGELOG.md, HANDOVER.md, docs/sql-commandes.txt.
-- Command: git add -A + git commit (Bash heredoc, Co-Authored-By) — single commit `feat: Phase 5 …`. Push offert.
+## 2026-08-31 — 5.6 Close & commit (done)
+- Action: clôture documentaire + **commit unique** Phase 5 (`6f80115`).
+- Files modified: PROJECT_STATUS.md, TASKS.md, CHANGELOG.md, HANDOVER.md, docs/sql-commandes.txt.
+- Command: git add -A + git commit (Bash heredoc, Co-Authored-By) — `feat: Phase 5 — espace client + accès sécurisé (ADR-020 invitations, ADR-021 client workspace)`, 45 fichiers. Push offert.
+
+## 2026-08-31 — 5.7 Owner validation (✓)
+- Action: owner a validé la Phase 5 en live (« validé ») : invitation → accept → login → `/client` s'abonner → approbation `/manager/subscriptions` → demande de service → affectation serveur → ACTIVE ; register → 410 ; client sans données serveur. Phase 5 closed.
+- Files modified: PROJECT_STATUS.md (Phase 5 ✓), TASKS.md (cette section), CHANGELOG.md, HANDOVER.md.
+- Command: git add + commit (docs owner validation). Push offert.
 
 # OPEN ITEMS
 - [x] Authentication architecture (ADR-015 APPROVED — Phase 1).
@@ -329,4 +334,4 @@ Do not log only important work. Record all meaningful actions, including small c
 - Phase 2: Modèle cœur Product+Server globaux plateforme + console /manager — owner-validated, poussée.
 - Phase 3: gestion utilisateurs admin + dashboard /manager + catalogue enrichi — owner-validated 2026-08-31.
 - Phase 4: journal d'audit « qui a fait quoi » (ADR-019) — owner-validated 2026-08-31, commitée.
-- Phase 5: espace client + accès sécurisé (ADR-020 invitations 410 + ADR-021 Subscription/Service) — implémenté 2026-08-31, tests 62/62 + 51/51 verts, builds PASS, en attente de validation live + push.
+- Phase 5: espace client + accès sécurisé (ADR-020 invitations 410 + ADR-021 Subscription/Service) — owner-validated 2026-08-31, tests 62/62 + 51/51 verts, builds PASS.

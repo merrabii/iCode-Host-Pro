@@ -6,7 +6,7 @@ README.md → PROJECT_CONTEXT.md → PROJECT_STATUS.md → DECISIONS.md → TASK
 ## Before changing code
 Determine current phase, actual implementation, proposed versus approved decisions, blockers and owner test requirements. If unclear, analyze rather than guess.
 
-## Current state (Phase 5 — COMPLETE, implemented + green tests; awaiting owner live validation & push 2026-08-31)
+## Current state (Phase 5 — COMPLETE and owner-validated 2026-08-31; awaiting push)
 Implementation is current. Summary of the stack:
 - **Auth (Phase 1, ADR-015/016)**: JWT Bearer access (15m) + httpOnly refresh cookie (rotated, sha256-hashed, revocable), bcryptjs, ADMIN/USER RBAC + RolesGuard. Tables `User` + `RefreshToken` (migration `init_auth`). Web `/auth`.
 - **Core model (Phase 2, ADR-017)**: tables `Product` + `Server` — PLATFORM-GLOBAL reference data, **no ownerId** (migration `init_core`). Product read = any authenticated; Product mutation & all Server routes = ADMIN only.
