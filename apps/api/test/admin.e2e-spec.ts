@@ -57,10 +57,19 @@ describe('Admin management RBAC (e2e)', () => {
     });
     inactiveAdminId = inactiveAdmin.id;
 
+    // Phase 5 (ADR-020): registration is closed — create the USER directly.
+    await prisma.user.create({
+      data: {
+        email: userEmail,
+        passwordHash: await bcrypt.hash(password, 10),
+        role: Role.USER,
+        name: 'User3',
+      },
+    });
     userToken = (
       await request(app.getHttpServer())
-        .post(`/${GlobalPrefix}/auth/register`)
-        .send({ email: userEmail, password, name: 'User3' })
+        .post(`/${GlobalPrefix}/auth/login`)
+        .send({ email: userEmail, password })
         .expect(201)
     ).body.accessToken as string;
 

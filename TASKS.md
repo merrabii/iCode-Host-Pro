@@ -264,18 +264,63 @@ Do not log only important work. Record all meaningful actions, including small c
 - Result:
 - Follow-up:
 
+# PHASE 5 — ESPACE CLIENT + ACCÈS SÉCURISÉ (owner-validated direction 2026-08-31 — implémenté, en attente de validation live + push)
+
+## 2026-08-31 — 5.0 GO & périmètre
+- Action: owner chose direction **« A puis B »** (fermer l'inscription d'abord, puis l'espace client) et a confirmé « c'est l'admin qui doit ajouter et modifier et gérer les serveurs complètement mais le client ne manipule pas l'infra ».
+- Périmètre: **5B** inscription fermée + invitations (ADR-020), puis **5A** espace client Subscription+Service (ADR-021). Un seul commit à la clôture une fois les tests verts. Provisionnement = **stub de transition de statut** (pas de déploiement réel — ADR-010/007 hors périmètre). `Deployment` reste différé.
+- Decisions APPROVED au GO: ADR-020 (register 410 + Invitation), ADR-021 (Subscription+Service, ownership par possession, client ne voit jamais l'infra).
+- Files modified: DECISIONS.md (ADR-020/021 APPROVED au GO).
+
+## 2026-08-31 — 5.1 Modèle + migration (ADR-020/021)
+- Files modified: `apps/api/prisma/schema.prisma` — modèles `Invitation` (email, tokenHash sha256 unique, issuerId FK User SetNull, expiresAt, usedAt/revokedAt), `Subscription` (userId FK Cascade, productId FK Restrict, status PENDING/ACTIVE/REJECTED/SUSPENDED/CANCELLED), `Service` (name, subscriptionId FK Cascade, serverId nullable FK Server SetNull, status REQUESTED/PROVISIONING/ACTIVE/PROBLEM/SUSPENDED/REMOVED) + enums + back-relations User/Product/Server.
+- Command: `corepack pnpm --filter @icode-host-pro/api run migrate --name init_client_access` → migration `20260831084839_init_client_access` appliquée. `generate` OK (client v6.19.3). `prisma migrate status` in sync (4 migrations).
+- Files modified: `apps/api/src/config/configuration.ts` (+`inviteExpiresInDays` optionnel, défaut 7), `apps/api/.env.example` (INVITE_EXPIRES_IN_DAYS).
+
+## 2026-08-31 — 5.2 Backend invitations (ADR-020) — inscription fermée
+- Files created: `apps/api/src/invitations/dto/create-invitation.dto.ts` (email IsEmail), `invitations.service.ts` (create 409 si user ou invite pending existe, token randomBytes(32) base64url + sha256, TTL inviteExpiresInDays, list avec status dérivé pending/used/revoked/expired, revoke idempotent, **consume** par tokenHash : 400 si revoked/used/expired/email≠invited, crée USER bcrypt 10 + usedAt + audit invite.accept), `invitations.controller.ts` (POST/GET /api/invitations + POST :id/revoke, tous ADMIN via JwtAuthGuard+RolesGuard), `invitations.module.ts` (forwardRef AuthModule).
+- Files modified: `apps/api/src/auth/auth.service.ts` (register → **410 Gone** « Inscription fermée — un compte se crée uniquement via une invitation. » + `acceptInvite(dto)` → invitations.consume + issueTokens), `auth.controller.ts` (POST /api/auth/accept-invite + register 410), `auth.module.ts` (forwardRef InvitationsModule), `apps/api/src/app.module.ts` (import InvitationsModule).
+- Files created: `apps/api/src/auth/dto/accept-invite.dto.ts` (token IsString, email IsEmail, password MinLength 8, name optional IsString).
+
+## 2026-08-31 — 5.3 Backend espace client (ADR-021) — subscriptions + services
+- Files created: `apps/api/src/subscriptions/dto/create-subscription.dto.ts` (productId IsString), `create-service.dto.ts` (name MinLength 2 + subscriptionId IsString, **pas de serverId**), `update-subscription.dto.ts` (status IsEnum SubscriptionStatus), `update-service.dto.ts` (status? + serverId? IsString).
+- Files created: `apps/api/src/subscriptions/subscriptions.service.ts` — SERVICE_SELECT via `.select` (pas `.include`), transition maps SUBSCRIPTION_TRANSITIONS + SERVICE_TRANSITIONS (whitelist, idempotent), client-scopé `where:{userId}` (404 sur id d'autrui), createSubscription (refuse DRAFT/DISABLED, PENDING), listMySubscriptions, cancelMySubscription (PENDING/ACTIVE/SUSPENDED→CANCELLED), createMyService (ACTIVE own sub only, REQUESTED), listMyServices (**select explicite SANS serverId/server**), admin listAllSubscriptions/listAllServices + updateSubscription/updateService (affecter serveur existant sinon 400, audit service.assign/remove + provision/activate stub).
+- Files created: `apps/api/src/subscriptions/client.controller.ts` (GET/POST /api/client/subscriptions + PATCH :id/cancel + GET/POST /api/client/services, @UseGuards(JwtAuthGuard) any auth), `admin.controller.ts` (GET/PATCH /api/admin/subscriptions + GET/PATCH /api/admin/services, @UseGuards(JwtAuthGuard,RolesGuard)+@Roles(ADMIN)), `subscriptions.module.ts`.
+- Files modified: `apps/api/src/app.module.ts` (import SubscriptionsModule).
+
+## 2026-08-31 — 5.4 Web
+- Files modified: `apps/web/src/lib/api.ts` (+Invitation/InvitationStatus, list/create/revoke, acceptInvite POST /api/auth/accept-invite, inviteLink, ProductRef/Subscription/ServerRef/Service + helpers client/admin).
+- Files modified: `apps/web/src/app/auth/page.tsx` (réécrit : modes login|invite, useEffect lit ?invite=&email= pour préremplir, onglet register supprimé, accept via acceptInvite + fetchMe).
+- Files created: `apps/web/src/app/manager/invitations/page.tsx` (ADMIN-gated : créer par email, token+lien copiable 1×, liste statuts, révoquer), `apps/web/src/app/manager/subscriptions/page.tsx` (ADMIN-gated : subs approve/reject/suspend/activate + services assign server via GET /api/servers + provision/activate), `apps/web/src/app/client/page.tsx` (any-authenticated : catalogue ACTIVE/SUSPENDED, s'abonner, annuler, demander un service sous sub ACTIVE, lister mes services sans infra + note « hébergement géré par l'admin »).
+- Files modified: `apps/web/src/app/page.tsx` (lien → /client), `apps/web/src/app/manager/page.tsx` (liens Invitations + Souscriptions), `apps/web/src/app/manager/journal/page.tsx` (labels invite.*/subscription.*/service.* + mots ressource).
+
+## 2026-08-31 — 5.5 Tests + builds + live (all PASS — clôture)
+- Files created: `apps/api/src/invitations/invitations.service.spec.ts` (11 unit), `apps/api/src/subscriptions/subscriptions.service.spec.ts` (16 unit).
+- Files created: `apps/api/test/invitations.e2e-spec.ts` (7 tests : 401/403, token 1×, duplicate 409, list pending, expired, revoke idempotent + accept revoked 400), `apps/api/test/client.e2e-spec.ts` (13 tests : register 410, USER 403 /api/admin/*, subscribe PENDING, service non-ACTIVE 400, approve→ACTIVE, request REQUESTED, assign+provision→PROVISIONING→ACTIVE stub, client list sans server/serverId, REQUESTED→ACTIVE 400, isolation inter-clients 404, cancel CANCELLED + approve 400, reject→REJECTED puis activate 400).
+- Files modified: `apps/api/test/auth.e2e-spec.ts` (réécrit : admin via Prisma + invite 2 users via POST /api/invitations, register 410, accept 201, /users/me USER, 401 sans token, login wrong pwd 401, login après accept, **one-shot** second accept 400, wrong-email 400), `core.e2e-spec.ts`/`admin.e2e-spec.ts`/`audit.e2e-spec.ts` (USER créés direct via prisma.user.create + login ; audit attend ['auth.login'] plus ['auth.register','auth.login']), `test/jest-e2e.json` (testTimeout 30000).
+- Commands: `test` → **62/62** (8 suites) ; `test:e2e` → **51/51** (7 suites) — verts sur Postgres réel ; `build` API + web PASS (8 routes) ; `npx tsc --noEmit` apps/web PASS ; `prisma migrate status` in sync.
+- Live smoke :3001: /api/health ok ; register → 410 ; login seed admin → token ; GET /api/products 200 ; GET /api/invitations (ADMIN) 200.
+- Fixes en cours de phase: invitations spec mock call index (calls[0]→calls[0][0]), Prisma `include` scalaire→`select` (SERVICE_SELECT) + serverId scalar, client listMyServices select sans serverId, invitations e2e stray `});`, hook timeout 30s sous 7 suites, DB transient unreachable → retry.
+- Docs: DECISIONS.md (ADR-020/021 APPROVED), CHANGELOG.md (Phase 5 Added/Changed/Verified/Pending), PROJECT_STATUS.md (Phase 5 COMPLETE, 4 migrations, 62/51), docs/sql-commandes.txt (Phase 5 DB entry).
+
+## 2026-08-31 — 5.6 Close & commit (en cours)
+- Action: clôture documentaire + **commit unique** Phase 5.
+- Files modified: PROJECT_STATUS.md (Phase 5 COMPLETE), TASKS.md (cette section), CHANGELOG.md, HANDOVER.md, docs/sql-commandes.txt.
+- Command: git add -A + git commit (Bash heredoc, Co-Authored-By) — single commit `feat: Phase 5 …`. Push offert.
+
 # OPEN ITEMS
 - [x] Authentication architecture (ADR-015 APPROVED — Phase 1).
-- [ ] Async jobs architecture (ADR-007).
+- [x] Inscription par invitation / fermeture de l'inscription ouverte (ADR-020 APPROVED — Phase 5 : `POST /api/auth/register` → 410, `POST /api/auth/accept-invite` + `Invitation`).
+- [x] Espace client : souscription + service (ADR-021 APPROVED — Phase 5 : `Subscription` + `Service`, ownership par possession, client ne touche jamais l'infra — provisionnement stub).
+- [ ] Async jobs architecture (ADR-007 — provisionnement réel différé).
 - [ ] Redis requirement (depends on ADR-007).
 - [ ] Coolify API verification.
 - [ ] HestiaCP API verification.
 - [ ] Turnstile details.
-- [ ] Email strategy.
+- [ ] Email strategy (invitation token surfacé dans /manager — pas d'envoi email).
 - [ ] Asset storage.
 - [ ] Reverse proxy/SSL.
 - [ ] Observability.
-- [ ] Inscription par invitation / fermeture de l'inscription ouverte (différé EXPRÈS par décision propriétaire pendant le GO Phase 3 — à faire plus tard avec un flux d'invitation).
 
 # COMPLETED HISTORY
 - Clean baseline (Pre-Phase 0): documentation pack + first AI orientation.
@@ -284,3 +329,4 @@ Do not log only important work. Record all meaningful actions, including small c
 - Phase 2: Modèle cœur Product+Server globaux plateforme + console /manager — owner-validated, poussée.
 - Phase 3: gestion utilisateurs admin + dashboard /manager + catalogue enrichi — owner-validated 2026-08-31.
 - Phase 4: journal d'audit « qui a fait quoi » (ADR-019) — owner-validated 2026-08-31, commitée.
+- Phase 5: espace client + accès sécurisé (ADR-020 invitations 410 + ADR-021 Subscription/Service) — implémenté 2026-08-31, tests 62/62 + 51/51 verts, builds PASS, en attente de validation live + push.

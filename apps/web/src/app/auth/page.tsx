@@ -1,8 +1,9 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
+import { acceptInvite, apiError } from '@/lib/api';
 
-type Mode = 'login' | 'register';
+type Mode = 'login' | 'invite';
 
 interface Profile {
   id: string;
@@ -16,50 +17,67 @@ export default function AuthPage() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [name, setName] = useState('');
-  const [token, setToken] = useState<string | null>(null);
+  const [token, setToken] = useState('');
+  const [accessToken, setAccessToken] = useState<string | null>(null);
   const [profile, setProfile] = useState<Profile | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  // Pre-fill from an invitation link ?invite=<token>&email=<email> (§ ADR-020).
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const invite = params.get('invite');
+    const inviteEmail = params.get('email');
+    if (invite) {
+      setMode('invite');
+      setToken(invite);
+      if (inviteEmail) setEmail(inviteEmail);
+    }
+  }, []);
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
     setError(null);
     setMessage(null);
     setProfile(null);
-    setToken(null);
-    const path = mode === 'login' ? '/api/auth/login' : '/api/auth/register';
-    const body =
-      mode === 'login' ? { email, password } : { email, password, name: name || undefined };
-    try {
-      const res = await fetch(path, {
+    setAccessToken(null);
+
+    let result: { ok: boolean; accessToken?: string; message?: string };
+    if (mode === 'login') {
+      const res = await fetch('/api/auth/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
-        body: JSON.stringify(body),
+        body: JSON.stringify({ email, password }),
       });
       if (!res.ok) {
         const err = (await res.json().catch(() => null)) as { message?: string } | null;
         throw new Error(err?.message ?? `HTTP ${res.status}`);
       }
       const data = (await res.json()) as { accessToken: string };
-      setToken(data.accessToken);
-      setMessage(
-        mode === 'login'
-          ? 'Connecté. On récupère ton profil protégé…'
-          : 'Compte créé. On récupère ton profil protégé…',
-      );
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      result = { ok: true, accessToken: data.accessToken };
+    } else {
+      const res = await acceptInvite({ token, email, password, name: name || undefined });
+      if (!res.ok) throw new Error(apiError(res, 'Jeton d’invitation invalide.'));
+      const data = res.data as { accessToken: string };
+      result = { ok: true, accessToken: data.accessToken };
     }
+
+    setAccessToken(result.accessToken ?? null);
+    setMessage(
+      mode === 'login'
+        ? 'Connecté. On récupère ton profil protégé…'
+        : 'Compte créé via invitation. On récupère ton profil protégé…',
+    );
   }
 
   async function fetchMe() {
-    if (!token) return;
+    if (!accessToken) return;
     setError(null);
     setMessage(null);
     try {
       const res = await fetch('/api/users/me', {
-        headers: { Authorization: `Bearer ${token}` },
+        headers: { Authorization: `Bearer ${accessToken}` },
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       setProfile((await res.json()) as Profile);
@@ -76,17 +94,29 @@ export default function AuthPage() {
     } catch {
       /* ok */
     }
-    setToken(null);
+    setAccessToken(null);
     setProfile(null);
     setMessage('Déconnecté.');
   }
 
   return (
     <main style={{ maxWidth: 520, margin: '4rem auto', padding: '0 1rem' }}>
-      <h1>iCode Host Pro — Authentication</h1>
-      <p className="muted">Phase 1 : JWT (ADR-015).</p>
+      <h1>iCode Host Pro — Connexion</h1>
+      <p className="muted">
+        Phase 5 (ADR-020) : inscription libre fermée. Un compte se crée uniquement par invitation.
+      </p>
 
       <form onSubmit={submit} style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+        {mode === 'invite' && (
+          <label>
+            Jeton d&apos;invitation (rempli depuis le lien reçu)
+            <input
+              value={token}
+              onChange={(e) => setToken(e.target.value)}
+              style={inputStyle}
+            />
+          </label>
+        )}
         <label>
           Email
           <input
@@ -97,7 +127,7 @@ export default function AuthPage() {
             style={inputStyle}
           />
         </label>
-        {mode === 'register' && (
+        {mode === 'invite' && (
           <label>
             Nom (optionnel)
             <input value={name} onChange={(e) => setName(e.target.value)} style={inputStyle} />
@@ -114,29 +144,29 @@ export default function AuthPage() {
             style={inputStyle}
           />
         </label>
-        <button type="submit">{mode === 'login' ? 'Connexion' : 'Créer un compte'}</button>
+        <button type="submit">{mode === 'login' ? 'Connexion' : 'Créer mon compte via invitation'}</button>
       </form>
 
       <p>
-        <button type="button" onClick={() => setMode(mode === 'login' ? 'register' : 'login')}>
-          {mode === 'login' ? "Pas de compte ? S'inscrire" : 'Déjà un compte ? Se connecter'}
+        <button type="button" onClick={() => setMode(mode === 'login' ? 'invite' : 'login')}>
+          {mode === 'login'
+            ? 'J’ai une invitation — accepter un jeton'
+            : 'J’ai déjà un compte — se connecter'}
         </button>
       </p>
 
       {message && <p style={{ color: 'var(--ok, #1a7f37)' }}>{message}</p>}
       {error && <p style={{ color: 'var(--danger)' }}>{error}</p>}
 
-      {token && !profile && (
+      {accessToken && !profile && (
         <button type="button" onClick={fetchMe}>
           Appeler /api/users/me (protégé)
         </button>
       )}
 
-      {profile && (
-        <pre>{JSON.stringify(profile, null, 2)}</pre>
-      )}
+      {profile && <pre>{JSON.stringify(profile, null, 2)}</pre>}
 
-      {(token || profile) && (
+      {(accessToken || profile) && (
         <button type="button" onClick={logout}>
           Déconnexion
         </button>

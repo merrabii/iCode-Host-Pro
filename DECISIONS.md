@@ -67,6 +67,8 @@ Direction: fine-grained capability interfaces and provider isolation. Coolify/He
 - ADR-017 Modèle cœur Phase 2 : Product + Server (below) — 2026-08-31.
 - ADR-018 Console d'administration /manager (below) — 2026-08-31.
 - ADR-019 Journal d'audit (below) — 2026-08-31.
+- ADR-020 Inscription fermée + invitations (below) — 2026-08-31.
+- ADR-021 Espace client : Souscription + Service (below) — 2026-08-31.
 
 ## ADR-011 — Socle config minimal (Phase 0)
 **Status: APPROVED** (2026-08-30, Phase 0 GO)
@@ -151,6 +153,59 @@ actions ("qui a fait quoi"), readable only by ADMIN:
   éviter une dépendance circulaire avec `AuthModule`. La journalisation est
   best-effort : un échec d'écriture ne casse jamais l'opération métier.
 - ADR-006/007/008/009/010 unchanged ; registration toujours ouverte (différé).
+
+## ADR-020 — Inscription fermée + invitations (Phase 5B)
+**Status: APPROVED** (2026-08-31, Phase 5 GO — propriétaire : « A puis B », la fermeture
+de l'inscription d'abord)
+Decision: **l'inscription libre est fermée**. `POST /api/auth/register` renvoie
+**410 Gone** (« inscription fermée — utilisez une invitation »). Le seul moyen de
+créer un compte USER est d'accepter une **invitation ADMIN** :
+- Table `Invitation` (migration `init_client_access`) : `email`, `tokenHash`
+  (sha256 du jeton brut, unique — le brut n'est JAMAIS persisté, comme le refresh),
+  `issuerId` (FK → User, `onDelete: SetNull` — les invitations d'un admin supprimé
+  survivent), `expiresAt`, `usedAt`/`revokedAt` (nullable), `createdAt`,
+  `@@index([email])`.
+- Interface ADMIN-only : `GET/POST /api/invitations`, `POST /api/invitations/:id/revoke`
+  (idempotent). Jeton unique imprévisible (`randomBytes(32)` base64url), retourné
+  **une seule fois** à l'admin et surfacé dans `/manager/invitations` tant qu'aucune
+  stratégie email n'existe. Durée de vie `INVITE_EXPIRES_IN_DAYS` (défaut 7).
+- Acceptation : `POST /api/auth/accept-invite` (token + email + mot de passe + nom
+  optionnel). Refus si invalide / révoqué / utilisé / expiré / email ≠ email invité
+  (400). Crée un compte `USER`, marque `usedAt`, puis émet les jetons comme un login.
+- Événements d'audit : `invite.create`, `invite.revoke`, `invite.accept`.
+- Le seed admin (Phase 2) et tous les comptes ADMIN existants sont inchangés.
+  OAuth/MFA/password-reset/email toujours différés.
+
+## ADR-021 — Espace client : Souscription + Service (Phase 5A)
+**Status: APPROVED** (2026-08-31, Phase 5 GO — propriétaire : « c'est l'admin qui doit
+ajouter et modifier et gérer les serveurs complètement mais le client ne manipule pas
+l'infra »)
+Decision: premier **workflow client** (ADR-017 le différait faute de besoin réel) :
+un USER **souscrit** à un `Product` du catalogue ; l'ADMIN **approuve** ; le client
+**demande un `Service`** ; l'ADMIN **affecte un serveur** et (stub) fait avancer le
+statut. Le client **ne touche jamais l'infrastructure** (aucune donnée serveur exposée).
+- Tables (migration `init_client_access`) :
+  - `Subscription` (client-owned) : `userId` FK → User (`onDelete: Cascade`),
+    `productId` FK → Product (`onDelete: Restrict`), `status`
+    (`PENDING`/`ACTIVE`/`REJECTED`/`SUSPENDED`/`CANCELLED`, défaut PENDING), timestamps,
+    `@@index([userId])`, `@@index([status])`.
+  - `Service` : `name`, `subscriptionId` FK → Subscription (`onDelete: Cascade`),
+    `serverId` (nullable, FK → Server `onDelete: SetNull` — le service peut exister
+    sans serveur), `status` (`REQUESTED`/`PROVISIONING`/`ACTIVE`/`PROBLEM`/
+    `SUSPENDED`/`REMOVED`, défaut REQUESTED), `@@index([subscriptionId])`.
+- Accessibilité **par possession, couche service** : les lectures/mutations client
+  passent toujours par `where: { userId: actor }` ; l'id d'un autre client renvoie
+  **404** (pas de fuite d'existence). `Deployment` reste différé.
+- Routes client (tout authentifié) : `GET/POST /api/client/subscriptions`,
+  `PATCH /api/client/subscriptions/:id/cancel`, `GET/POST /api/client/services` (le
+  `serverId` n'est PAS dans le DTO client). Catalogue = `GET /api/products` existant.
+- Routes admin (RolesGuard ADMIN) : `GET /api/admin/subscriptions`,
+  `PATCH /api/admin/subscriptions/:id` (whitelist : approve PENDING→ACTIVE, reject
+  PENDING→REJECTED, suspend ACTIVE→SUSPENDED, activate SUSPENDED→ACTIVE),
+  `GET /api/admin/services`, `PATCH /api/admin/services/:id` (affecter un serveur
+  existant + transitions REQUESTED→PROVISIONING→ACTIVE).
+- Le provisionnement est un **stub de transition de statut** : aucun déploiement
+  réel (ADR-010), aucun job asynchrone (ADR-007) — inchangés/hors périmètre.
 
 # REJECTED
 None recorded in this clean baseline.

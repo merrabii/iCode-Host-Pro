@@ -1,7 +1,9 @@
 import {
-  ConflictException,
+  GoneException,
+  Inject,
   Injectable,
   UnauthorizedException,
+  forwardRef,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
@@ -10,8 +12,10 @@ import { User } from '@prisma/client';
 import * as bcrypt from 'bcryptjs';
 import { createHash, randomBytes } from 'crypto';
 import { AuditService } from '../audit/audit.service';
+import { InvitationsService } from '../invitations/invitations.service';
 import { RegisterDto } from './dto/register.dto';
 import { LoginDto } from './dto/login.dto';
+import { AcceptInviteDto } from './dto/accept-invite.dto';
 import { AuthTokens, JwtPayload } from './types';
 
 @Injectable()
@@ -21,31 +25,28 @@ export class AuthService {
     private readonly jwt: JwtService,
     private readonly config: ConfigService,
     private readonly audit: AuditService,
+    @Inject(forwardRef(() => InvitationsService))
+    private readonly invitations: InvitationsService,
   ) {}
 
-  async register(dto: RegisterDto): Promise<AuthTokens> {
-    const existing = await this.prisma.user.findUnique({
-      where: { email: dto.email },
-    });
-    if (existing) {
-      throw new ConflictException('Email already registered');
-    }
+  /**
+   * Phase 5 (ADR-020): inscription libre fermée. Un compte USER ne se crée plus
+   * qu'en acceptant une invitation ADMIN via /auth/accept-invite.
+   */
+  async register(_dto: RegisterDto): Promise<never> {
+    throw new GoneException(
+      'Inscription fermée — un compte se crée uniquement via une invitation.',
+    );
+  }
 
-    const passwordHash = await bcrypt.hash(dto.password, 10);
-    const user = await this.prisma.user.create({
-      data: {
-        email: dto.email,
-        passwordHash,
-        name: dto.name,
-      },
-    });
-    await this.audit.record({
-      actorId: user.id,
-      actorEmail: user.email,
-      action: 'auth.register',
-      resourceType: 'user',
-      resourceId: user.id,
-    });
+  /** Accept a one-time invitation and return a fresh token pair (+ refresh cookie). */
+  async acceptInvite(dto: AcceptInviteDto): Promise<AuthTokens> {
+    const user = await this.invitations.consume(
+      dto.token,
+      dto.email,
+      dto.password,
+      dto.name,
+    );
     return this.issueTokens(user);
   }
 

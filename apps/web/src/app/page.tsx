@@ -28,6 +28,8 @@ export default function Home() {
         <a href="/auth">→ Authentication (Phase 1)</a>
         {' · '}
         <a href="/manager">→ Manager (Phase 2)</a>
+        {' · '}
+        <a href="/client">→ Espace client (Phase 5)</a>
       </p>
       <p className="muted">
         Frontend ↔ API connectivity check (Phase 0 socle).

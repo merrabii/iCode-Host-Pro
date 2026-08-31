@@ -41,10 +41,19 @@ describe('Audit journal RBAC (e2e)', () => {
       },
     });
 
+    // Phase 5 (ADR-020): registration is closed — create the USER directly.
+    await prisma.user.create({
+      data: {
+        email: userEmail,
+        passwordHash: await bcrypt.hash(password, 10),
+        role: Role.USER,
+        name: 'User4',
+      },
+    });
     userToken = (
       await request(app.getHttpServer())
-        .post(`/${GlobalPrefix}/auth/register`)
-        .send({ email: userEmail, password, name: 'User4' })
+        .post(`/${GlobalPrefix}/auth/login`)
+        .send({ email: userEmail, password })
         .expect(201)
     ).body.accessToken as string;
 
@@ -77,21 +86,21 @@ describe('Audit journal RBAC (e2e)', () => {
     expect(res.body).toHaveProperty('total');
     expect(res.body).toHaveProperty('page', 1);
     expect(Array.isArray(res.body.items)).toBe(true);
-    // Register + admin login already produced entries.
+    // The login calls above already produced entries.
     expect(res.body.total).toBeGreaterThanOrEqual(1);
   });
 
-  it('register + login produced auth journal entries for this user', async () => {
+  it('login produced auth journal entries for this user', async () => {
     const res = await request(app.getHttpServer())
       .get(`/${GlobalPrefix}/audit?resourceType=user`)
       .set('Authorization', `Bearer ${adminToken}`)
       .expect(200);
     const actions = res.body.items.map((e: { action: string }) => e.action);
-    expect(actions).toEqual(expect.arrayContaining(['auth.register', 'auth.login']));
+    expect(actions).toEqual(expect.arrayContaining(['auth.login']));
     expect(
       res.body.items.some(
         (e: { action: string; actorEmail?: string | null }) =>
-          e.action === 'auth.register' && e.actorEmail === userEmail,
+          e.action === 'auth.login' && e.actorEmail === userEmail,
       ),
     ).toBe(true);
   });

@@ -124,3 +124,115 @@ export function listAudit(t: string, query: AuditQuery = {}): Promise<ApiResult>
   const s = q.toString();
   return apiJson(`/api/audit${s ? `?${s}` : ''}`, t);
 }
+
+// ── Phase 5 (ADR-020) — invitations ─────────────────────────────────────────
+export type InvitationStatus = 'pending' | 'used' | 'revoked' | 'expired';
+export interface Invitation {
+  id: string;
+  email: string;
+  expiresAt: string;
+  usedAt?: string | null;
+  revokedAt?: string | null;
+  createdAt: string;
+  status: InvitationStatus;
+}
+export const listInvitations = (t: string) => apiJson('/api/invitations', t);
+export const createInvitation = (t: string, email: string) =>
+  apiJson('/api/invitations', t, { method: 'POST', body: JSON.stringify({ email }) });
+export const revokeInvitation = (t: string, id: string) =>
+  apiJson(`/api/invitations/${id}/revoke`, t, { method: 'POST' });
+
+/**
+ * Public: accept a one-time invitation (no access token needed — sets the
+ * refresh cookie like login does).
+ */
+export async function acceptInvite(input: {
+  token: string;
+  email: string;
+  password: string;
+  name?: string;
+}): Promise<ApiResult> {
+  try {
+    const res = await fetch('/api/auth/accept-invite', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify(input),
+    });
+    let data: unknown = null;
+    try {
+      data = await res.json();
+    } catch {
+      /* non-JSON body */
+    }
+    return { ok: res.ok, status: res.status, data };
+  } catch (e) {
+    return { ok: false, status: 0, data: { message: String(e) } };
+  }
+}
+
+/** Build the one-time invite link surfaced in /manager/invitations. */
+export function inviteLink(token: string, email: string): string {
+  const q = new URLSearchParams({ invite: token, email });
+  return `/auth?${q.toString()}`;
+}
+
+// ── Phase 5 (ADR-021) — client workspace (Subscription / Service) ───────────
+export interface ProductRef {
+  id: string;
+  name: string;
+  kind?: string;
+  status?: string;
+}
+export interface Subscription {
+  id: string;
+  userId?: string;
+  productId: string;
+  status: string;
+  createdAt: string;
+  updatedAt: string;
+  product?: ProductRef;
+  user?: { id: string; email: string; name?: string | null };
+  services?: Array<{ id: string; name: string; status: string }>;
+}
+export interface ServerRef {
+  id: string;
+  name: string;
+  hostname: string;
+}
+export interface Service {
+  id: string;
+  name: string;
+  status: string;
+  subscriptionId: string;
+  server?: ServerRef | null;
+  subscription?: {
+    id: string;
+    status?: string;
+    product?: ProductRef;
+    user?: { id: string; email: string; name?: string | null };
+  };
+  createdAt: string;
+  updatedAt: string;
+}
+
+// Client-scoped.
+export const listMySubscriptions = (t: string) => apiJson('/api/client/subscriptions', t);
+export const createMySubscription = (t: string, productId: string) =>
+  apiJson('/api/client/subscriptions', t, { method: 'POST', body: JSON.stringify({ productId }) });
+export const cancelMySubscription = (t: string, id: string) =>
+  apiJson(`/api/client/subscriptions/${id}/cancel`, t, { method: 'PATCH' });
+export const listMyServices = (t: string) => apiJson('/api/client/services', t);
+export const createMyService = (t: string, subscriptionId: string, name: string) =>
+  apiJson('/api/client/services', t, { method: 'POST', body: JSON.stringify({ subscriptionId, name }) });
+
+// Admin-scoped.
+export const adminListSubscriptions = (t: string) => apiJson('/api/admin/subscriptions', t);
+export const adminUpdateSubscription = (t: string, id: string, status: string) =>
+  apiJson(`/api/admin/subscriptions/${id}`, t, { method: 'PATCH', body: JSON.stringify({ status }) });
+export const adminListServices = (t: string) => apiJson('/api/admin/services', t);
+export const adminUpdateService = (
+  t: string,
+  id: string,
+  patch: { status?: string; serverId?: string | null },
+) => apiJson(`/api/admin/services/${id}`, t, { method: 'PATCH', body: JSON.stringify(patch) });

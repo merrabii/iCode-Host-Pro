@@ -392,3 +392,154 @@ REMARKS FOR FUTURE AI:
   - `actorId` is a real FK (SetNull); `actorEmail` is the denormalized snapshot
     that survives user deletion/rename — always log it.
 ================================================================
+PHASE 5 — ESPACE CLIENT + ACCÈS SÉCURISÉ (ADR-020 invitations, ADR-021 client)
+================================================================
+
+DATE: 2026-08-31
+PHASE: 5.1 — Client access model: Invitation + Subscription + Service
+OBJECTIVE:
+  Close public registration (ADR-020): new USER accounts are created only via an
+  ADMIN-issued invitation (raw token shown once, sha256 stored). Then the first
+  CLIENT-OWNED workflow (ADR-021): a USER subscribes to a platform Product; after
+  ADMIN approval the client requests a Service; the ADMIN assigns a hosting Server
+  and (STUB) advances status. The client never touches infrastructure (no Server
+  data in client payloads). One migration `init_client_access` adds all three
+  tables + 2 enums.
+
+DATABASE ACTIONS:
+  - Created enums `SubscriptionStatus`
+    (PENDING/ACTIVE/REJECTED/SUSPENDED/CANCELLED) and `ServiceStatus`
+    (REQUESTED/PROVISIONING/ACTIVE/PROBLEM/SUSPENDED/REMOVED) in
+    apps/api/prisma/schema.prisma.
+  - Created models:
+    * `Invitation` — email, `tokenHash` (sha256 of raw one-time token, @unique;
+      raw never persisted), `issuerId` (nullable FK -> User, onDelete SetNull —
+      a deleted admin's pending invites survive), `expiresAt`, `usedAt?`,
+      `revokedAt?`, createdAt; @@index([email]).
+    * `Subscription` — `userId` (FK -> User, onDelete Cascade), `productId`
+      (FK -> Product, onDelete Restrict), `status` default PENDING, timestamps;
+      @@index([userId]), @@index([status]).
+    * `Service` — `name`, `subscriptionId` (FK -> Subscription, onDelete
+      Cascade), `serverId` (nullable FK -> Server, onDelete SetNull — a service
+      can exist unassigned), `status` default REQUESTED, timestamps;
+      @@index([subscriptionId]).
+  - Added back-relations: `User.subscriptions` + `User.issuedInvites`,
+    `Product.subscriptions`, `Server.services`.
+  - Migration applied locally (containers icode-postgres, db icode_host_pro).
+    `Deployment` stays deferred.
+
+MIGRATIONS:
+  - Migration folder: apps/api/prisma/migrations/20260831084839_init_client_access/
+  - Name: `init_client_access`. Applied via
+    `corepack pnpm --filter @icode-host-pro/api run migrate --name init_client_access`.
+  - `prisma migrate status` -> up to date, 4 migrations total (init_auth, init_core,
+    init_audit, init_client_access). Prisma Client regenerated v6.19.3.
+
+IMPORTANT SQL / COMMANDS:
+  - The migration SQL (mirror of Prisma schema; note ALL Prisma table names are
+    quoted in Postgres, e.g. "Subscription"):
+
+    CREATE TYPE "SubscriptionStatus" AS ENUM ('PENDING', 'ACTIVE', 'REJECTED', 'SUSPENDED', 'CANCELLED');
+    CREATE TYPE "ServiceStatus" AS ENUM ('REQUESTED', 'PROVISIONING', 'ACTIVE', 'PROBLEM', 'SUSPENDED', 'REMOVED');
+
+    CREATE TABLE "Invitation" (
+        "id"        TEXT NOT NULL,
+        "email"     TEXT NOT NULL,
+        "tokenHash" TEXT NOT NULL,
+        "issuerId"  TEXT,
+        "expiresAt" TIMESTAMP(3) NOT NULL,
+        "usedAt"    TIMESTAMP(3),
+        "revokedAt" TIMESTAMP(3),
+        "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        CONSTRAINT "Invitation_pkey" PRIMARY KEY ("id")
+    );
+    CREATE UNIQUE INDEX "Invitation_tokenHash_key" ON "Invitation"("tokenHash");
+    CREATE INDEX "Invitation_email_idx" ON "Invitation"("email");
+    ALTER TABLE "Invitation" ADD CONSTRAINT "Invitation_issuerId_fkey"
+        FOREIGN KEY ("issuerId") REFERENCES "users"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+
+    CREATE TABLE "Subscription" (
+        "id"        TEXT NOT NULL,
+        "userId"    TEXT NOT NULL,
+        "productId" TEXT NOT NULL,
+        "status"    "SubscriptionStatus" NOT NULL DEFAULT 'PENDING',
+        "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        "updatedAt" TIMESTAMP(3) NOT NULL,
+        CONSTRAINT "Subscription_pkey" PRIMARY KEY ("id")
+    );
+    CREATE INDEX "Subscription_userId_idx"   ON "Subscription"("userId");
+    CREATE INDEX "Subscription_status_idx"   ON "Subscription"("status");
+    ALTER TABLE "Subscription" ADD CONSTRAINT "Subscription_userId_fkey"
+        FOREIGN KEY ("userId") REFERENCES "users"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+    ALTER TABLE "Subscription" ADD CONSTRAINT "Subscription_productId_fkey"
+        FOREIGN KEY ("productId") REFERENCES "Product"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+    CREATE TABLE "Service" (
+        "id"             TEXT NOT NULL,
+        "name"           TEXT NOT NULL,
+        "subscriptionId" TEXT NOT NULL,
+        "serverId"       TEXT,
+        "status"         "ServiceStatus" NOT NULL DEFAULT 'REQUESTED',
+        "createdAt"      TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        "updatedAt"      TIMESTAMP(3) NOT NULL,
+        CONSTRAINT "Service_pkey" PRIMARY KEY ("id")
+    );
+    CREATE INDEX "Service_subscriptionId_idx" ON "Service"("subscriptionId");
+    ALTER TABLE "Service" ADD CONSTRAINT "Service_subscriptionId_fkey"
+        FOREIGN KEY ("subscriptionId") REFERENCES "Subscription"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+    ALTER TABLE "Service" ADD CONSTRAINT "Service_serverId_fkey"
+        FOREIGN KEY ("serverId") REFERENCES "Server"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+
+  - Env (optional): `INVITE_EXPIRES_IN_DAYS=7` (default 7) in apps/api/.env(.example).
+  - Endpoints added Phase 5:
+      PUBLIC:  POST /api/auth/accept-invite            (register -> 410 Gone)
+      ADMIN:   GET/POST /api/invitations ; POST /api/invitations/:id/revoke
+      CLIENT(any auth): GET/POST /api/client/subscriptions ;
+                 PATCH /api/client/subscriptions/:id/cancel ;
+                 GET/POST /api/client/services
+      ADMIN:   GET /api/admin/subscriptions ;
+                 PATCH /api/admin/subscriptions/:id {status}
+               GET /api/admin/services ;
+                 PATCH /api/admin/services/:id {status?, serverId?}
+
+VALIDATION QUERIES:
+  - Invitations lifecycle:
+      SELECT id, email, "tokenHash", "expiresAt", "usedAt", "revokedAt" FROM "Invitation" ORDER BY "createdAt" DESC;
+  - Client workspace (join the ownership chain):
+      SELECT s.id, s.status AS sub_status, u.email, p.name AS product,
+             sv.id AS service_id, sv.status AS service_status, sv."serverId",
+             srv.name AS server
+      FROM "Subscription" s
+      JOIN "User" u    ON u.id = s."userId"
+      JOIN "Product" p ON p.id = s."productId"
+      LEFT JOIN "Service" sv ON sv."subscriptionId" = s.id
+      LEFT JOIN "Server" srv ON srv.id = sv."serverId"
+      ORDER BY s."createdAt" DESC;
+  - Register is closed: `POST /api/auth/register` (live) -> 410 Gone. A fresh
+    account can only exist through accept-invite.
+
+RESULT:
+  - All three Phase 5 tables live (4 migrations total, up to date). Verifié en
+    e2e (51/51, 7 suites) et build API+web PASS sur Postgres réel. Live smoke:
+    /api/health ok; register -> 410; login admin -> token; GET /api/products 200;
+    GET /api/invitations (ADMIN) 200.
+
+ROLLBACK NOTES:
+  - No down-migration authored. Full dev reset (destructive):
+        docker compose down -v && docker compose up -d postgres
+    then re-run `migrate dev` (re-applies init_auth, init_core, init_audit,
+    init_client_access).
+
+REMARKS FOR FUTURE AI:
+  - SECURITY invariants (ADR-020/021) : raw invite token is NEVER persisted
+    (sha256 only, shown once to the admin in /manager — no email sending yet);
+    ownership is enforced in the SERVICE layer with `where: { userId }` (another
+    client's id -> 404, no existence leak); the client payloads SELECT away
+    `serverId`/`server` (they must never see infrastructure). Do not weaken any
+    of these without owner approval.
+  - Provisioning is a STATUS-TRANSITION STUB: no real deploy (ADR-010), no async
+    jobs (ADR-007), `Deployment` still deferred.
+  - Prisma gotcha: `include` cannot select scalar fields — use `.select`
+    (scalars + relations) when you need both (see `SERVICE_SELECT` in
+    apps/api/src/subscriptions/subscriptions.service.ts).
+================================================================

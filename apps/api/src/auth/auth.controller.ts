@@ -12,6 +12,7 @@ import { Request, Response } from 'express';
 import { AuthService } from './auth.service';
 import { RegisterDto } from './dto/register.dto';
 import { LoginDto } from './dto/login.dto';
+import { AcceptInviteDto } from './dto/accept-invite.dto';
 
 const DEFAULT_COOKIE = 'ihp_refresh';
 
@@ -30,9 +31,20 @@ export class AuthController {
   }
 
   @Post('register')
-  @ApiOperation({ summary: 'Register and obtain tokens' })
-  async register(@Body() dto: RegisterDto, @Res({ passthrough: true }) res: Response) {
-    const tokens = await this.auth.register(dto);
+  @ApiOperation({ summary: 'Closed — returns 410 Gone (invitation required)' })
+  register(): Promise<never> {
+    // Phase 5 (ADR-020): replace throws 410; kept as a route so clients get a
+    // meaningful Gone instead of 404.
+    return this.auth.register(null as unknown as RegisterDto);
+  }
+
+  @Post('accept-invite')
+  @ApiOperation({ summary: 'Accept a one-time invitation and obtain tokens' })
+  async acceptInvite(
+    @Body() dto: AcceptInviteDto,
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    const tokens = await this.auth.acceptInvite(dto);
     this.setCookie(res, tokens.refreshToken);
     return { accessToken: tokens.accessToken };
   }

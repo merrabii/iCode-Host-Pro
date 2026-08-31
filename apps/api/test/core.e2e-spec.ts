@@ -30,7 +30,8 @@ describe('Core management RBAC (e2e)', () => {
     await app.init();
     prisma = moduleRef.get(PrismaService);
 
-    // Create an ADMIN directly (register only creates USER by design).
+    // Phase 5 (ADR-020): registration is closed — seed test accounts directly
+    // via Prisma, then log in through the real API to mint same-shape tokens.
     await prisma.user.create({
       data: {
         email: adminEmail,
@@ -39,12 +40,19 @@ describe('Core management RBAC (e2e)', () => {
         name: 'Admin',
       },
     });
+    await prisma.user.create({
+      data: {
+        email: userEmail,
+        passwordHash: await bcrypt.hash(password, 10),
+        role: Role.USER,
+        name: 'User',
+      },
+    });
 
-    // USER via the public register endpoint.
     userToken = (
       await request(app.getHttpServer())
-        .post(`/${GlobalPrefix}/auth/register`)
-        .send({ email: userEmail, password, name: 'User' })
+        .post(`/${GlobalPrefix}/auth/login`)
+        .send({ email: userEmail, password })
         .expect(201)
     ).body.accessToken as string;
 

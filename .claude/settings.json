@@ -18,7 +18,10 @@
       "PowerShell(foreach \\($p in 3000,3001\\) { $c = Get-NetTCPConnection -State Listen -LocalPort $p -ErrorAction SilentlyContinue; if \\($c\\) { \"port $p LISTENING pid=$\\($c.OwningProcess -join ','\\)\" } else { \"port $p free\" } })",
       "PowerShell(docker exec icode-postgres psql -U icode -d icode_host_pro -c \"SELECT email, role, \\\\\"isActive\\\\\" FROM \\\\\"User\\\\\" ORDER BY \\\\\"createdAt\\\\\";\")",
       "PowerShell(docker exec icode-postgres psql -U icode -d icode_host_pro -tc \"SELECT email, role, \\\\\"isActive\\\\\" FROM \\\\\"User\\\\\" WHERE email='u_1788135183287@example.com';\")",
-      "PowerShell(git push origin main)"
+      "PowerShell(git push origin main)",
+      "PowerShell(corepack pnpm --filter @icode-host-pro/api run migrate --name init_client_access 2>&1)",
+      "Bash(sed -e 's/\\\\x1b\\\\[[0-9;]*m//g')",
+      "Read(//tmp/**)"
     ]
   }
 }

@@ -32,6 +32,20 @@ const ACTION_LABEL: Record<string, string> = {
   'server.create': 'Création serveur',
   'server.update': 'Modification serveur',
   'server.delete': 'Suppression serveur',
+  'invite.create': 'Émission invitation',
+  'invite.revoke': 'Révocation invitation',
+  'invite.accept': 'Acceptation invitation',
+  'subscription.create': 'Souscription',
+  'subscription.cancel': 'Annulation souscription',
+  'subscription.approve': 'Approbation souscription',
+  'subscription.reject': 'Rejet souscription',
+  'subscription.suspend': 'Suspension souscription',
+  'subscription.activate': 'Réactivation souscription',
+  'service.request': 'Demande de service',
+  'service.assign': 'Affectation serveur',
+  'service.remove': 'Retrait serveur',
+  'service.provision': 'Provisionnement (stub)',
+  'service.activate': 'Activation service',
 };
 
 const label = (a: string) => ACTION_LABEL[a] ?? a;
@@ -41,6 +55,9 @@ const RESOURCE_WORD: Record<string, string> = {
   user: 'utilisateur',
   product: 'produit',
   server: 'serveur',
+  invitation: 'invitation',
+  subscription: 'souscription',
+  service: 'service',
 };
 
 // Human-readable "Ressource" cell: the name of the affected entity when the

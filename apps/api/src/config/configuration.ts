@@ -12,6 +12,9 @@ export interface AppConfig {
   jwtExpiresIn: string;
   refreshExpiresInDays: number;
   cookieName: string;
+  /** Phase 5 (ADR-020): invite TTL in days. Optional (default 7), so the JWT
+   *  fail-early set above is untouched. */
+  inviteExpiresInDays: number;
 }
 
 export function loadAppConfig(): AppConfig {
@@ -34,5 +37,6 @@ export function loadAppConfig(): AppConfig {
     jwtExpiresIn: process.env.JWT_EXPIRES_IN ?? '15m',
     refreshExpiresInDays: Number(process.env.REFRESH_EXPIRES_IN_DAYS ?? 30),
     cookieName: process.env.COOKIE_NAME ?? 'ihp_refresh',
+    inviteExpiresInDays: Number(process.env.INVITE_EXPIRES_IN_DAYS ?? 7),
   };
 }

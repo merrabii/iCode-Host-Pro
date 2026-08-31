@@ -1,5 +1,24 @@
 # CHANGELOG
 
+## Phase 5 — Espace client + accès sécurisé (2026-08-31)
+Owner picked direction « A puis B » (fermer l'inscription d'abord, puis l'espace client) and confirmed: « c'est l'admin qui doit ajouter et modifier et gérer les serveurs complètement mais le client ne manipule pas l'infra ».
+### Added
+- **Invitations (ADR-020)** — inscription libre fermée : `POST /api/auth/register` → **410 Gone**; `POST /api/auth/accept-invite` (token + email + password + name) crée le compte USER et émet les jetons. Table `Invitation` (migration `20260831084839_init_client_access`) : `tokenHash` sha256 unique (brut jamais persisté), `issuerId` FK User SetNull, `expiresAt`, `usedAt`/`revokedAt`. Routes ADMIN `GET/POST /api/invitations` + `POST /api/invitations/:id/revoke` (idempotent); jeton `randomBytes(32)` retourné une seule fois; TTL `INVITE_EXPIRES_IN_DAYS` (défaut 7). Web `/manager/invitations` : créer par email, lien d'invitation copiable (affiché une seule fois), liste statuts, révocation.
+- **Espace client (ADR-021)** — tables `Subscription` + `Service` (client-owned, migration `init_client_access`). Routes client (tout authentifié): catalogue = `GET /api/products` existant; `GET/POST /api/client/subscriptions`, `PATCH /api/client/subscriptions/:id/cancel`, `GET/POST /api/client/services`. Routes admin: `GET /api/admin/subscriptions`, `PATCH /api/admin/subscriptions/:id` (whitelist approve/reject/suspend/activate), `GET /api/admin/services`, `PATCH /api/admin/services/:id` (affecter un serveur existant + REQUESTED→PROVISIONING→ACTIVE, **stub** — pas de déploiement réel). **Ownership par possession** (id d'un autre client → 404), aucune donnée serveur exposée au client (scalaire `serverId` exclu du listing client). Web `/client` (s'abonner, annuler, demander un service, statuts, zéro infra) + `/manager/subscriptions` (approbations + affectation serveur).
+- **Audit (Phase 5)**: événements `invite.create/revoke/accept`, `subscription.create/cancel/approve/reject/suspend/activate`, `service.request/assign/remove/provision/activate`; journal web enrichi (labels + mots de ressource invitation/souscription/service).
+- Tests: `invitations.service.spec` (11 unit), `subscriptions.service.spec` (16 unit); e2e `invitations.e2e-spec` + `client.e2e-spec` (boucle complète + isolation inter-clients + RBAC). **E2E existants reworkés** : create user direct via Prisma (register fermé) ; `auth.e2e-spec` réécrit sur le flux invite→accept→login + one-shot + email non-correspondant ; `audit.e2e-spec` attend `auth.login` (plus `auth.register`). `testTimeout` e2e 30s (loader 7 suites en parallèle).
+### Changed
+- DECISIONS.md: ADR-020 + ADR-021 APPROVED. Configuration: `inviteExpiresInDays` optionnel (`.env.example`). `AuthModule` ↔ `InvitationsModule` en `forwardRef` (accept-invite ↔ guards). `apps/web/src/lib/api.ts` : types + helpers Phase 5. `/auth` : onglet register **remplacé** par le formulaire d'acceptation (prérempli par `?invite=…&email=…`). Nav racine + `/manager`.
+### Verified (2026-08-31)
+- Unit **62/62** (8 suites, +34); e2e **51/51, 7 suites** (+2) — verts sur Postgres réel.
+- Builds API + web PASS; typecheck web PASS; `prisma migrate status` up-to-date (4 migrations).
+- Live smoke: `/api/health` ok; register → **410**; login admin → token; `GET /api/products` 200 ; `GET /api/invitations` (ADMIN) 200.
+
+### Pending (not yet done)
+- Push of Phase 5 (on owner request).
+- Live validation web (/auth accept → /client → /manager/subscriptions).
+- Proposition Phase 6.
+
 ## Phase 4 — COMPLETE and owner-validated (2026-08-31)
 Owner gave GO for direction « Audit journal »; scope includes auth events (register/login/refresh/logout) alongside admin mutations (as proposed).
 ### Added

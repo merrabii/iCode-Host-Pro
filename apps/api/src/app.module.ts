@@ -8,6 +8,8 @@ import { ProductsModule } from './products/products.module';
 import { ServersModule } from './servers/servers.module';
 import { ManagerModule } from './manager/manager.module';
 import { AuditModule } from './audit/audit.module';
+import { InvitationsModule } from './invitations/invitations.module';
+import { SubscriptionsModule } from './subscriptions/subscriptions.module';
 import { loadAppConfig } from './config/configuration';
 
 @Module({
@@ -24,6 +26,8 @@ import { loadAppConfig } from './config/configuration';
     ServersModule,
     ManagerModule,
     AuditModule,
+    InvitationsModule,
+    SubscriptionsModule,
   ],
 })
 export class AppModule {}

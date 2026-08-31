@@ -29,6 +29,8 @@ model User {
 
   refreshTokens RefreshToken[]
   auditLogs     AuditLog[]      // audit entries this user performed (Phase 4)
+  subscriptions Subscription[]  // client-owned subscriptions (Phase 5)
+  issuedInvites Invitation[]    // invitations this admin issued (Phase 5)
 
   @@index([email])
 }
@@ -75,6 +77,8 @@ model Product {
   status    ProductStatus @default(ACTIVE)
   createdAt DateTime      @default(now())
   updatedAt DateTime      @updatedAt
+
+  subscriptions Subscription[] // clients subscribing to this offering (Phase 5)
 }
 
 model Server {
@@ -84,6 +88,8 @@ model Server {
   status    ServerStatus @default(UNKNOWN)
   createdAt DateTime     @default(now())
   updatedAt DateTime     @updatedAt
+
+  services Service[] // services this host is assigned to (Phase 5)
 }
 
 // ── Phase 4 — audit journal (ADR-019) ────────────────────────────────────────
@@ -108,4 +114,82 @@ model AuditLog {
   @@index([createdAt])
   @@index([resourceType])
   @@index([action])
+}
+
+// ── Phase 5 — invitations (ADR-020) ─────────────────────────────────────────
+// Public self-registration is CLOSED (ADR-020). New USER accounts are created
+// only through an ADMIN-issued invitation. The raw invite token is shown once
+// (surfaced in /manager until an email strategy exists); only its sha256 is
+// stored, like the refresh token. issuerId is nullable + SetNull so a deleted
+// admin's pending invites survive.
+
+model Invitation {
+  id        String   @id @default(cuid())
+  email     String
+  tokenHash String   @unique // sha256 of the raw one-time token
+  issuerId  String?
+  issuer    User?    @relation(fields: [issuerId], references: [id], onDelete: SetNull)
+  expiresAt DateTime
+  usedAt    DateTime?
+  revokedAt DateTime?
+  createdAt DateTime @default(now())
+
+  @@index([email])
+}
+
+// ── Phase 5 — client workspace (ADR-021) ────────────────────────────────────
+// First CLIENT-OWNED resources (the workflow ADR-017 deferred until a real one
+// existed): a USER subscribes to a platform Product; once an ADMIN approves the
+// Subscription, the client can request a Service under it; the ADMIN assigns a
+// hosting Server (the client never touches infrastructure). Provisioning is a
+// status-transition STUB — real provider deploy (ADR-010) and async jobs
+// (ADR-007) remain OUT of scope and Deployment stays deferred.
+// Ownership is enforced in the service layer: a USER can only reach their own
+// subscriptions/services (404 for anyone else's).
+
+enum SubscriptionStatus {
+  PENDING
+  ACTIVE // approved by admin
+  REJECTED
+  SUSPENDED
+  CANCELLED
+}
+
+enum ServiceStatus {
+  REQUESTED
+  PROVISIONING // stub transition, set by admin
+  ACTIVE
+  PROBLEM
+  SUSPENDED
+  REMOVED
+}
+
+model Subscription {
+  id        String             @id @default(cuid())
+  userId    String
+  user      User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  productId String
+  product   Product            @relation(fields: [productId], references: [id], onDelete: Restrict)
+  status    SubscriptionStatus @default(PENDING)
+  createdAt DateTime           @default(now())
+  updatedAt DateTime           @updatedAt
+
+  services Service[]
+
+  @@index([userId])
+  @@index([status])
+}
+
+model Service {
+  id             String        @id @default(cuid())
+  name           String
+  subscriptionId String
+  subscription   Subscription  @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+  serverId       String?
+  server         Server?       @relation(fields: [serverId], references: [id], onDelete: SetNull)
+  status         ServiceStatus @default(REQUESTED)
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  @@index([subscriptionId])
 }
