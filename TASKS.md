@@ -172,6 +172,48 @@ Do not log only important work. Record all meaningful actions, including small c
 - Live smoke on :3001: admin login (seeded) OK; USER GET /products 200; USER POST /products 403; USER GET /servers 403 (infra hidden); no token 401; ADMIN create product 201 + server 201; admin lists both.
 - Live web: `/` 200, `/manager` 200, proxy `/api/health` 200.
 
+# PHASE 3 — CONSOLE /MANAGER COMPLÈTE : GESTION ADMINS + DASHBOARD (owner-validated 2026-08-31) ✓
+
+## 2026-08-31 — 3.6 Close & commit
+- Action: owner validated Phase 3 in browser (« tout est ok, validé »).
+- Files modified: PROJECT_STATUS.md (Phase 3 ✓), TASKS.md, CHANGELOG.md, HANDOVER.md.
+- Command: git add + commit (Phase 3 baseline). Offer push.
+
+## 2026-08-31 — 3.0 GO & périmètre
+- Owner chose direction **« Dashboard /manager + gestion admins »** (AskUserQuestion).
+- GO incluant l'exclusion explicite : **inscription par invitation / fermeture de l'inscription ouverte = HORS Phase 3** (différé, à faire plus tard avec un flux d'invitation).
+- Périmètre: gestion utilisateurs admin, catalogue /manager enrichi (transitions de statut, hostname éditable), dashboard /manager (synthèse). Aucune nouvelle table ni migration (réutilise `User.role` / `User.isActive` / `Product.status` / `Server.status`).
+
+## 2026-08-31 — 3.1 Backend: gestion utilisateurs admin (ADR-018)
+- Files created: `apps/api/src/users/dto/update-user.dto.ts` (`UpdateUserDto`: role IsEnum + isActive IsBoolean, optionnels).
+- Files modified: `apps/api/src/users/users.service.ts` (+`findAll` admin list; +`update(id,dto,actorId)` avec **règles anti-verrouillage**), `apps/api/src/users/users.controller.ts` (+`GET /api/users` et `PATCH /api/users/:id`, **ADMIN only**).
+- Anti-verrouillage: on ne peut PAS modifier son propre rôle/actif; on ne peut PAS rétrograder/désactiver le **dernier** ADMIN actif (ForbiddenException). `toPublic` strippe toujours `passwordHash`.
+- Files created: `apps/api/src/manager/manager.module.ts` + `manager.controller.ts` + `manager.service.ts` — `GET /api/manager/summary` (agrégation produits/serveurs/utilisateurs), **ADMIN only**.
+- Files modified: `apps/api/src/app.module.ts` (importe ManagerModule).
+
+## 2026-08-31 — 3.2 Tests + builds (all PASS)
+- Files created: `apps/api/src/users/users.service.spec.ts` (8 unit: profil/liste/isolation passwordHash, anti-verrouillage self, dernier admin, promotion, désactivation user), `apps/api/src/manager/manager.service.spec.ts` (2 unit: agrégation + maps zéro), `apps/api/test/admin.e2e-spec.ts` (RBAC e2e: USER 403 sur /users + /manager/summary + PATCH; ADMIN liste + summary + promotion/démotion + self-guard 403 + role invalide 400).
+- Commands: `test` → **21/21**; `test:e2e` → **23/23, 4 suites**; builds API + web PASS. Note: la ligne rouge `corepack : ...` vue en console PowerShell est un rendu de stderr, PAS un échec.
+
+## 2026-08-31 — 3.3 Web /manager (dashboard + utilisateurs + catalogue enrichi)
+- Files modified: `apps/web/src/lib/api.ts` (+`apiJson`, `apiError`, `ManagerSummary`, `UserAdmin`, `listUsers`, `updateUser`, `getManagerSummary`).
+- Files modified: `apps/web/src/app/manager/page.tsx` (dashboard synthèse via /manager/summary; serveurs: création + statut + **hostname éditable inline**; produits: création + **transition de statut** DRAFT/ACTIVE/SUSPENDED/DISABLED; lien → /manager/utilisateurs).
+- Files created: `apps/web/src/app/manager/utilisateurs/page.tsx` (liste comptes; **Promouvoir/Rétrograder** ADMIN↔USER; **Activer/Désactiver**; erreurs 403 anti-verrouillage affichées).
+
+## 2026-08-31 — 3.4 Live smoke + restart web dev
+- Live API :3001: `/api/users` & `/api/manager/summary` 401 sans token; admin login OK → `/api/users` 9 comptes (aucun `passwordHash`); `/api/manager/summary` agrège 1 produit / 1 serveur / 9 users.
+- Live: **self-guard** PATCH rôle self → 403 « Vous ne pouvez pas modifier votre propre rôle... ». Message clair.
+- Web build PASS (routes `/`, `/auth`, `/manager`, `/manager/utilisateurs`). Dev server arrêté avant le build (évite corruption `.next`), `.next` purgé, puis `next dev` relancé.
+- Live web: `/manager` 200, `/manager/utilisateurs` 200, proxy `/api/health` 200.
+
+## 2026-08-31 — 3.5 Correctif anti-verrouillage : rétrogradation d'un admin déjà inactif (bug signalé par le propriétaire)
+- **Bug signalé** : le propriétaire a promu `u_1788135183287@example.com` en ADMIN puis n'a pas pu le rétrograder — « il faut avoir au moins un admin » alors que `admin@icodehost.local` existe bien en ADMIN. Sur d'autres utilisateurs, promotion/rétrogradation fonctionnait.
+- **Diagnostic (requête DB)** : `u_1788135183287@example.com` était `role=ADMIN, isActive=false` (déjà inactif avant la promotion). Le compte ADMIN actif n'était donc que 1 (admin@icodehost.local). L'ancien garde-fou se déclenchait sur TOUTE rétrogradation/désactivation d'un ADMIN, y compris un admin DÉJÀ inactif (qui ne réduit jamais le pool d'admins actifs).
+- **Correctif** (`apps/api/src/users/users.service.ts`) : le garde-fou ne s'applique que quand la modification RETIRE un ADMIN ACTIF — `isActiveAdmin = role===ADMIN && isActive`, et `removingActiveAdmin = isActiveAdmin && (nextRole!==ADMIN || nextActive===false)`. Rétrograder/désactiver un admin déjà inactif est désormais toujours permis (pas d'appel à `count`).
+- **Tests de régression** : 2 unit (`apps/api/src/users/users.service.spec.ts` — garde-fou ne doit PAS se déclencher, `count` non appelé) + 1 e2e (`apps/api/test/admin.e2e-spec.ts` — ADMIN peut rétrograder un admin déjà inactif, 200).
+- **Commandes** : `test` → **23/23** (5 suites); `test:e2e` → **24/24** (4 suites).
+- **Résultat** : le propriétaire peut désormais rétrograder `u_1788135183287@example.com` via l'UI (fix live sur l'API de dev :3001).
+
 # EXECUTION ENTRY TEMPLATE
 ## YYYY-MM-DD — Phase X
 - Action:
@@ -196,8 +238,11 @@ Do not log only important work. Record all meaningful actions, including small c
 - [ ] Asset storage.
 - [ ] Reverse proxy/SSL.
 - [ ] Observability.
+- [ ] Inscription par invitation / fermeture de l'inscription ouverte (différé EXPRÈS par décision propriétaire pendant le GO Phase 3 — à faire plus tard avec un flux d'invitation).
 
 # COMPLETED HISTORY
 - Clean baseline (Pre-Phase 0): documentation pack + first AI orientation.
 - Phase 0: source tree and config files authored; runtime execution (install, generate, migrate, tests) pending toolchain availability.
-- Phase 1: Auth + first tables (User + RefreshToken) — implemented & machine-verified; awaiting owner validation.
+- Phase 1: Auth + first tables (User + RefreshToken) — owner-validated, poussée.
+- Phase 2: Modèle cœur Product+Server globaux plateforme + console /manager — owner-validated, poussée.
+- Phase 3: gestion utilisateurs admin + dashboard /manager + catalogue enrichi — owner-validated 2026-08-31.

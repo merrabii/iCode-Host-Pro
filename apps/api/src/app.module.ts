@@ -6,6 +6,7 @@ import { AuthModule } from './auth/auth.module';
 import { UsersModule } from './users/users.module';
 import { ProductsModule } from './products/products.module';
 import { ServersModule } from './servers/servers.module';
+import { ManagerModule } from './manager/manager.module';
 import { loadAppConfig } from './config/configuration';
 
 @Module({
@@ -20,6 +21,7 @@ import { loadAppConfig } from './config/configuration';
     UsersModule,
     ProductsModule,
     ServersModule,
+    ManagerModule,
   ],
 })
 export class AppModule {}

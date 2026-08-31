@@ -65,6 +65,7 @@ Direction: fine-grained capability interfaces and provider isolation. Coolify/He
 - ADR-015 Approche authentication (below) — 2026-08-30.
 - ADR-016 Modèle de données Phase 1 (below) — 2026-08-30.
 - ADR-017 Modèle cœur Phase 2 : Product + Server (below) — 2026-08-31.
+- ADR-018 Console d'administration /manager (below) — 2026-08-31.
 
 ## ADR-011 — Socle config minimal (Phase 0)
 **Status: APPROVED** (2026-08-30, Phase 0 GO)
@@ -107,6 +108,24 @@ Access (via existing Role, ADR-015): `Product` read = any authenticated
 infrastructure must never be exposed to clients). Admin bootstrap via an
 idempotent seed (`db:seed`); credentials from gitignored `.env`, placeholders in
 `.env.example`, no real secret in Git. ADR-006/007/008/009/010 unchanged.
+
+## ADR-018 — Console d'administration /manager (Phase 3)
+**Status: APPROVED** (2026-08-31, Phase 3 GO)
+Decision: complete the admin console (`/manager`) WITHOUT touching the data
+model (reuses `User.role`/`isActive`, `Product.status`, `Server.status`; no new
+table, no migration):
+- Account management — ADMIN only: `GET /api/users` (list, no passwordHash),
+  `PATCH /api/users/:id` (promote/demote `ADMIN↔USER`, activate/deactivate).
+  **Anti-lock-out guards**: you may never change your own role or deactivate your
+  own account; the platform must keep at least one active ADMIN (refusing the
+  demotion/deactivation of the last active ADMIN). Both are ForbiddenException.
+- Dashboard — ADMIN only: `GET /api/manager/summary` aggregates product/server/
+  user counts by status/role.
+- `Product` status transitions and `Server` status/hostname editing remain
+  ADMIN-only via the existing `PATCH /products/:id` and `PATCH /servers/:id`.
+Registration remains OPEN (deferred from ADR-015) — the owner explicitly kept
+closing registration / an invitation flow OUT of Phase 3 ("plus tard"). Providers
+(ADR-010), jobs/Redis (ADR-007), OAuth and client ownership (ADR-017) unchanged.
 
 # REJECTED
 None recorded in this clean baseline.

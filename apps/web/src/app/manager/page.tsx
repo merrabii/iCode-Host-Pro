@@ -1,8 +1,17 @@
 'use client';
 
 import { useEffect, useState } from 'react';
+import Link from 'next/link';
 import { useRouter } from 'next/navigation';
-import { getAccessToken, fetchMe, Me } from '../../lib/api';
+import {
+  apiError,
+  apiJson,
+  fetchMe,
+  getAccessToken,
+  getManagerSummary,
+  ManagerSummary,
+  Me,
+} from '../../lib/api';
 
 interface Product {
   id: string;
@@ -20,11 +29,18 @@ interface ServerItem {
 
 type Phase = 'loading' | 'denied' | 'ready';
 
-const inputStyle: React.CSSProperties = {
-  width: '100%',
-  padding: '8px 10px',
-  marginTop: 4,
-  boxSizing: 'border-box',
+const PRODUCT_STATUSES = ['DRAFT', 'ACTIVE', 'SUSPENDED', 'DISABLED'];
+const SERVER_STATUSES = ['UNKNOWN', 'PROVISIONING', 'ACTIVE', 'PROBLEM', 'REMOVED'];
+
+const inputStyle: React.CSSProperties = { padding: '6px 8px', boxSizing: 'border-box' };
+const selectStyle: React.CSSProperties = { ...inputStyle, width: 150 };
+const rowStyle: React.CSSProperties = {
+  display: 'flex',
+  alignItems: 'center',
+  gap: 10,
+  padding: '6px 0',
+  borderBottom: '1px solid var(--border, #e2e2e2)',
+  flexWrap: 'wrap',
 };
 
 export default function ManagerPage() {
@@ -32,9 +48,11 @@ export default function ManagerPage() {
   const [phase, setPhase] = useState<Phase>('loading');
   const [me, setMe] = useState<Me | null>(null);
   const [token, setToken] = useState('');
+  const [summary, setSummary] = useState<ManagerSummary | null>(null);
   const [products, setProducts] = useState<Product[]>([]);
   const [servers, setServers] = useState<ServerItem[]>([]);
-  const [f, setF] = useState({ productName: '', serverName: '', serverHostname: '' });
+  const [drafts, setDrafts] = useState({ productName: '', serverName: '', serverHostname: '' });
+  const [hostnameEdits, setHostnameEdits] = useState<Record<string, string>>({});
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -65,66 +83,90 @@ export default function ManagerPage() {
       ]);
       setProducts(p as Product[]);
       setServers(s as ServerItem[]);
+      const sum = await getManagerSummary(t);
+      setSummary((sum.data as ManagerSummary) ?? null);
     } catch {
       setError('Impossible de charger les données.');
     }
   }
 
+  function flash(m: string) {
+    setMessage(m);
+    setError(null);
+  }
+
+  async function changeProductStatus(id: string, status: string) {
+    const r = await apiJson(`/api/products/${id}`, token, {
+      method: 'PATCH',
+      body: JSON.stringify({ status }),
+    });
+    if (!r.ok) return setError(apiError(r, 'Échec de la mise à jour du produit.'));
+    flash('Statut du produit mis à jour.');
+    void loadAll(token);
+  }
+
+  async function changeServerStatus(id: string, status: string) {
+    const r = await apiJson(`/api/servers/${id}`, token, {
+      method: 'PATCH',
+      body: JSON.stringify({ status }),
+    });
+    if (!r.ok) return setError(apiError(r, 'Échec de la mise à jour du serveur.'));
+    flash('Statut du serveur mis à jour.');
+    void loadAll(token);
+  }
+
+  async function saveServerHostname(id: string, hostname: string) {
+    if (!hostname.trim()) return;
+    const r = await apiJson(`/api/servers/${id}`, token, {
+      method: 'PATCH',
+      body: JSON.stringify({ hostname: hostname.trim() }),
+    });
+    if (!r.ok) return setError(apiError(r, 'Échec de la mise à jour de l’hostname.'));
+    flash('Hostname du serveur mis à jour.');
+    void loadAll(token);
+  }
+
   async function createProduct(e: React.FormEvent) {
     e.preventDefault();
-    setError(null);
-    setMessage(null);
-    const res = await fetch('/api/products', {
+    const r = await apiJson('/api/products', token, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-      body: JSON.stringify({ name: f.productName, kind: 'generic' }),
+      body: JSON.stringify({ name: drafts.productName, kind: 'generic' }),
     });
-    if (!res.ok) return setError('Échec de la création du produit.');
-    setF((x) => ({ ...x, productName: '' }));
-    setMessage('Produit créé.');
+    if (!r.ok) return setError(apiError(r, 'Échec de la création du produit.'));
+    setDrafts((x) => ({ ...x, productName: '' }));
+    flash('Produit créé.');
     void loadAll(token);
   }
 
   async function deleteProduct(id: string) {
-    setError(null);
-    const res = await fetch(`/api/products/${id}`, {
-      method: 'DELETE',
-      headers: { Authorization: `Bearer ${token}` },
-    });
-    if (!res.ok) return setError('Échec de la suppression du produit.');
-    setMessage('Produit supprimé.');
+    const r = await apiJson(`/api/products/${id}`, token, { method: 'DELETE' });
+    if (!r.ok) return setError(apiError(r, 'Échec de la suppression du produit.'));
+    flash('Produit supprimé.');
     void loadAll(token);
   }
 
   async function createServer(e: React.FormEvent) {
     e.preventDefault();
-    setError(null);
-    setMessage(null);
-    const res = await fetch('/api/servers', {
+    const r = await apiJson('/api/servers', token, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-      body: JSON.stringify({ name: f.serverName, hostname: f.serverHostname }),
+      body: JSON.stringify({ name: drafts.serverName, hostname: drafts.serverHostname }),
     });
-    if (!res.ok) return setError('Échec de la création du serveur.');
-    setF((x) => ({ ...x, serverName: '', serverHostname: '' }));
-    setMessage('Serveur créé.');
+    if (!r.ok) return setError(apiError(r, 'Échec de la création du serveur.'));
+    setDrafts((x) => ({ ...x, serverName: '', serverHostname: '' }));
+    flash('Serveur créé.');
     void loadAll(token);
   }
 
   async function deleteServer(id: string) {
-    setError(null);
-    const res = await fetch(`/api/servers/${id}`, {
-      method: 'DELETE',
-      headers: { Authorization: `Bearer ${token}` },
-    });
-    if (!res.ok) return setError('Échec de la suppression du serveur.');
-    setMessage('Serveur supprimé.');
+    const r = await apiJson(`/api/servers/${id}`, token, { method: 'DELETE' });
+    if (!r.ok) return setError(apiError(r, 'Échec de la suppression du serveur.'));
+    flash('Serveur supprimé.');
     void loadAll(token);
   }
 
   if (phase === 'loading') {
     return (
-      <main style={{ maxWidth: 640, margin: '4rem auto', padding: '0 1rem' }}>
+      <main style={{ maxWidth: 820, margin: '4rem auto', padding: '0 1rem' }}>
         <h1>iCode Host Pro — Manager</h1>
         <p className="muted">Connexion…</p>
       </main>
@@ -133,7 +175,7 @@ export default function ManagerPage() {
 
   if (phase === 'denied') {
     return (
-      <main style={{ maxWidth: 640, margin: '4rem auto', padding: '0 1rem' }}>
+      <main style={{ maxWidth: 820, margin: '4rem auto', padding: '0 1rem' }}>
         <h1>iCode Host Pro — Manager</h1>
         <p style={{ color: 'var(--danger)' }}>Accès refusé : réservé aux administrateurs de la plateforme.</p>
         <p>
@@ -143,30 +185,72 @@ export default function ManagerPage() {
     );
   }
 
+  const productsByStatus = summary?.products.byStatus ?? {};
+  const serversByStatus = summary?.servers.byStatus ?? {};
+
   return (
-    <main style={{ maxWidth: 800, margin: '2rem auto', padding: '0 1rem' }}>
+    <main style={{ maxWidth: 820, margin: '2rem auto', padding: '0 1rem' }}>
       <h1>iCode Host Pro — Manager</h1>
-      <p className="muted">Console d&apos;administration (Phase 2) — connecté en tant que {me?.email}.</p>
+      <p className="muted">
+        Console d&apos;administration (Phase 3) — connecté en tant que {me?.email} ·{' '}
+        <Link href="/manager/utilisateurs">Gestion des utilisateurs →</Link>
+      </p>
 
       {message && <p style={{ color: 'var(--ok, #1a7f37)' }}>{message}</p>}
       {error && <p style={{ color: 'var(--danger)' }}>{error}</p>}
 
       <section>
+        <h2>Tableau de bord</h2>
+        <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
+          <div className="card">
+            <strong>{summary?.products.total ?? '—'}</strong> produits
+            <div className="muted">ACTIVE {productsByStatus.ACTIVE ?? 0}</div>
+          </div>
+          <div className="card">
+            <strong>{summary?.servers.total ?? '—'}</strong> serveurs
+            <div className="muted">ACTIVE {serversByStatus.ACTIVE ?? 0}</div>
+          </div>
+          <div className="card">
+            <strong>{summary?.users.active ?? '—'}</strong> utilisateurs actifs
+            <div className="muted">/{summary?.users.total ?? '—'} comptes</div>
+          </div>
+        </div>
+      </section>
+
+      <section style={{ marginTop: '2rem' }}>
         <h2>Serveurs (infrastructure)</h2>
         <form onSubmit={createServer} style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
           <label>Nom
-            <input value={f.serverName} onChange={(e) => setF({ ...f, serverName: e.target.value })} required style={inputStyle} />
+            <input value={drafts.serverName} onChange={(e) => setDrafts({ ...drafts, serverName: e.target.value })} required style={inputStyle} />
           </label>
           <label>Hostname
-            <input value={f.serverHostname} onChange={(e) => setF({ ...f, serverHostname: e.target.value })} required style={inputStyle} />
+            <input value={drafts.serverHostname} onChange={(e) => setDrafts({ ...drafts, serverHostname: e.target.value })} required style={inputStyle} />
           </label>
           <button type="submit">Ajouter</button>
         </form>
-        <ul>
+        <ul style={{ listStyle: 'none', padding: 0 }}>
           {servers.map((s) => (
-            <li key={s.id}>
-              {s.name} <span className="muted">({s.hostname})</span> — {s.status}
-              <button onClick={() => deleteServer(s.id)} style={{ marginLeft: 8 }}>✕</button>
+            <li key={s.id} style={rowStyle}>
+              <span>
+                {s.name}{' '}
+                <input
+                  value={hostnameEdits[s.id] ?? s.hostname}
+                  onChange={(e) => setHostnameEdits({ ...hostnameEdits, [s.id]: e.target.value })}
+                  style={{ ...inputStyle, width: 180 }}
+                  aria-label="hostname"
+                />
+                <button onClick={() => saveServerHostname(s.id, hostnameEdits[s.id] ?? s.hostname)}>✓</button>
+              </span>
+              <select
+                value={s.status}
+                onChange={(e) => changeServerStatus(s.id, e.target.value)}
+                style={selectStyle}
+              >
+                {SERVER_STATUSES.map((st) => (
+                  <option key={st} value={st}>{st}</option>
+                ))}
+              </select>
+              <button onClick={() => deleteServer(s.id)}>✕</button>
             </li>
           ))}
         </ul>
@@ -177,15 +261,24 @@ export default function ManagerPage() {
         <h2>Produits (catalogue)</h2>
         <form onSubmit={createProduct} style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
           <label>Nom du produit
-            <input value={f.productName} onChange={(e) => setF({ ...f, productName: e.target.value })} required style={inputStyle} />
+            <input value={drafts.productName} onChange={(e) => setDrafts({ ...drafts, productName: e.target.value })} required style={inputStyle} />
           </label>
           <button type="submit">Ajouter</button>
         </form>
-        <ul>
+        <ul style={{ listStyle: 'none', padding: 0 }}>
           {products.map((p) => (
-            <li key={p.id}>
-              {p.name} <span className="muted">({p.kind})</span> — {p.status}
-              <button onClick={() => deleteProduct(p.id)} style={{ marginLeft: 8 }}>✕</button>
+            <li key={p.id} style={rowStyle}>
+              <span>{p.name} <span className="muted">({p.kind})</span></span>
+              <select
+                value={p.status}
+                onChange={(e) => changeProductStatus(p.id, e.target.value)}
+                style={selectStyle}
+              >
+                {PRODUCT_STATUSES.map((st) => (
+                  <option key={st} value={st}>{st}</option>
+                ))}
+              </select>
+              <button onClick={() => deleteProduct(p.id)}>✕</button>
             </li>
           ))}
         </ul>

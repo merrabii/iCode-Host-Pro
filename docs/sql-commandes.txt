@@ -259,4 +259,67 @@ REMARKS FOR FUTURE AI:
     Service/Deployment), to be introduced only when a real workflow needs them.
   - `Product.kind` is a String (not an enum) by design — the product-kind list
     is immature; promote to an enum when the list settles.
+
+================================================================
+PHASE 3 — CONSOLE /MANAGER : GESTION ADMINS + DASHBOARD (no schema change)
+================================================================
+
+DATE: 2026-08-31
+PHASE: 3 — Account management + dashboard (ADR-018)
+OBJECTIVE:
+  Complete the `/manager` admin console WITHOUT touching the data model.
+  Reuses the existing `users.role` / `users.isActive`, `Product.status` and
+  `Server.status` columns. No new table, no enum, no migration.
+
+DATABASE ACTIONS:
+  - NONE required. Phase 3 only adds API endpoints + UI over existing tables.
+  - Admin account management operates on the `users` table columns `role`
+    (ADMIN/USER) and `isActive`.
+  - Product status transitions operate on `Product.status` (ProductStatus enum);
+    server status transitions + hostname edits on `Server.status` / `Server.hostname`.
+
+MIGRATIONS:
+  - None. `prisma migrate status` remains in sync (init_auth + init_core only).
+
+IMPORTANT SQL / COMMANDS:
+  - No DDL. For reference, the columns exercised by Phase 3:
+    users:      role (enum Role), isActive (boolean)
+    Product:    status (enum ProductStatus), name, kind
+    Server:     status (enum ServerStatus), hostname, name
+  - Admin endpoints (ADMIN only): GET /api/users; PATCH /api/users/:id {role?,
+    isActive?}; GET /api/manager/summary.
+
+VALIDATION QUERIES:
+  - `SELECT id, email, role, "isActive" FROM "User";`       -> the account list
+    served by GET /api/users (passwordHash never selected/returned).
+  - `SELECT status, COUNT(*) FROM "Product" GROUP BY status;` (similarly for
+    Server) -> matches /api/manager/summary.byStatus.
+  - `SELECT role, COUNT(*) FROM "User" GROUP BY role;` and
+    `SELECT "isActive" FROM "User";` -> matches /api/manager/summary.users.
+  - Live check (via API): self-demotion attempt (PATCH own role -> USER) -> 403
+    "Vous ne pouvez pas modifier votre propre rôle..." (anti-lockout guard).
+
+RESULT:
+  - Phase 3 verified live with 9 seeded/registered accounts: summary returned
+    1 product (ACTIVE) / 1 server (UNKNOWN) / 9 users (1 ADMIN, 8 USER, 9
+    active); GET /api/users returned 9 profiles with no passwordHash; the
+    self-demote anti-lockout guard returned 403. No rows mutated by validation
+    (guard refused the write).
+
+ROLLBACK NOTES:
+  - No migration to roll back. If Phase 3 API behavior must be reverted, it is a
+    code-only revert (endpoints + UI). Data stays as-is.
+
+REMARKS FOR FUTURE AI:
+  - Phase 3 intentionally adds NO schema. Registration remains OPEN
+    (ADR-015 deferred); closing registration / an invitation flow is a FUTURE
+    feature the owner explicitly excluded from Phase 3.
+  - The anti-lockout guards live in the API service (UsersService.update): never
+    weaken them without the owner's approval — they prevent a locked-out platform.
+  - FIX 2026-08-31 (bug signalé) : le garde-fou ne s'applique que quand la modif
+    RETIRE un ADMIN ACTIF. Rétrograder/désactiver un admin DÉJÀ inactif est
+    toujours permis (ne réduit jamais le pool d'admins actifs). Cas réel:
+    u_1788135183287@example.com était role=ADMIN, isActive=false (déjà inactif)
+    → la rétrogradation était refusée à tort. Vérifié par requête:
+      SELECT id, email, role, "isActive" FROM "User" WHERE role='ADMIN';
 ================================================================

@@ -1,5 +1,29 @@
 # CHANGELOG
 
+## Phase 3 — COMPLETE and owner-validated (2026-08-31)
+Owner gave GO for direction « Dashboard /manager + gestion admins »; explicitly kept closing registration / an invitation flow OUT of this phase.
+### Added
+- **Account management (ADR-018)**: `GET /api/users` (list, ADMIN only) + `PATCH /api/users/:id` (promote/demote `ADMIN↔USER`, activate/deactivate, ADMIN only). **Anti-lockout guards**: cannot change your own role, cannot demote/deactivate the last active ADMIN.
+- **Dashboard (ADR-018)**: `GET /api/manager/summary` (product/server/user counts by status/role), ADMIN only.
+- **`/manager` console**: dashboard summary cards; servers now with **status transition + editable hostname** inline; products with **status transition** (DRAFT/ACTIVE/SUSPENDED/DISABLED); new **`/manager/utilisateurs`** page (promote/demote, activate/deactivate, surfaces 403 guard messages). Web `lib/api` helpers (`apiJson`, `listUsers`, `updateUser`, `getManagerSummary`).
+- Tests: `users.service.spec` (8 unit), `manager.service.spec` (2 unit), `admin.e2e-spec` (RBAC e2e).
+### Changed
+- DECISIONS.md: ADR-018 APPROVED. (Data model UNCHANGED — no migration.)
+- TASKS.md: Phase 3 journal; OPEN ITEMS notes registration invitation flow deferred.
+### Verified (2026-08-31)
+- Unit **23/23**; e2e **24/24, 4 suites**; builds API + web PASS (routes `/`, `/auth`, `/manager`, `/manager/utilisateurs`).
+- Live: `/api/users` & `/api/manager/summary` 401 unauth; admin list 9 users (no `passwordHash`); summary aggregates 1 product/1 server/9 users; **self-demote guard → 403** with clear message; web `/manager` + `/manager/utilisateurs` 200.
+
+### Fixed (2026-08-31, bug reporté par le propriétaire)
+- Anti-lockout over-guard : rétrograder/désactiver un admin DÉJÀ inactif était refusé à tort (le pool d'admins actifs n'était jamais réduit). Le garde-fou ne s'applique désormais que quand la modification retire un ADMIN **actif**. Regression tests unit (2) + e2e (1). Root cause : le compte promu était `role=ADMIN, isActive=false`.
+
+### Owner validation (2026-08-31)
+- Owner confirmed live: promotion/rétrogradation/activation/désactivation des comptes, dashboard `/manager`, catalogue enrichi et transitions de statut. Phase 3 closed.
+
+### Pending (not yet done)
+- Push of Phase 3 (on owner request).
+- Proposal for Phase 4.
+
 ## Phase 2 — COMPLETE and owner-validated (2026-08-31)
 Owner picked direction "Modèle cœur + dashboard" with the core architecture resolved: Product & Server are PLATFORM-GLOBAL reference data (NO ownerId), administration console `/manager` (ADMIN only), client-owned resources deferred.
 ### Added
