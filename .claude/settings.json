@@ -21,7 +21,8 @@
       "PowerShell(git push origin main)",
       "PowerShell(corepack pnpm --filter @icode-host-pro/api run migrate --name init_client_access 2>&1)",
       "Bash(sed -e 's/\\\\x1b\\\\[[0-9;]*m//g')",
-      "Read(//tmp/**)"
+      "Read(//tmp/**)",
+      "PowerShell(foreach \\($p in 3000,3001\\) { $c = Get-NetTCPConnection -State Listen -LocalPort $p -ErrorAction SilentlyContinue; if \\($c\\) { \"port $p LISTENING pid=$\\($c.OwningProcess -join ','\\)\" } else { \"port $p free\" } }; docker compose ps 2>&1 | Select-Object -First 6)"
     ]
   }
 }
