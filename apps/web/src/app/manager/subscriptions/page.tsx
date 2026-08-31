@@ -11,10 +11,10 @@ import {
   Subscription,
 } from '@/lib/api';
 import { useAdminSession } from '@/lib/session';
+import { useToast } from '@/components/toast';
 import { AppShell } from '@/components/app-shell';
 import { ADMIN_NAV } from '@/config/nav';
 import {
-  Alert,
   Badge,
   Button,
   Denied,
@@ -52,22 +52,20 @@ interface ServerItem {
 
 export default function ManagerSubscriptionsPage() {
   const { phase, me, token } = useAdminSession();
+  const toast = useToast();
   const [subs, setSubs] = useState<Subscription[]>([]);
   const [services, setServices] = useState<Service[]>([]);
   const [servers, setServers] = useState<ServerItem[]>([]);
   const [serverChoice, setServerChoice] = useState<Record<string, string>>({});
-  const [message, setMessage] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
 
   async function load(t: string) {
-    setError(null);
     const [sr, ss, serversRes] = await Promise.all([
       adminListSubscriptions(t),
       adminListServices(t),
       fetch('/api/servers', { headers: { Authorization: `Bearer ${t}` } }).then((r) => r.json()),
     ]);
     if (!sr.ok || !ss.ok) {
-      setError('Impossible de charger les souscriptions / services.');
+      toast.error('Impossible de charger les souscriptions / services.');
       return;
     }
     setSubs((sr.data as Subscription[]) ?? []);
@@ -87,22 +85,17 @@ export default function ManagerSubscriptionsPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [phase, token]);
 
-  function flash(m: string) {
-    setMessage(m);
-    setError(null);
-  }
-
   async function changeSub(id: string, status: string) {
     const r = await adminUpdateSubscription(token, id, status);
-    if (!r.ok) return setError(apiError(r, 'Transition refusée.'));
-    flash(`Souscription → ${SUB_STATUS_LABEL[status] ?? status}`);
+    if (!r.ok) return toast.error(apiError(r, 'Transition refusée.'));
+    toast.ok(`Souscription → ${SUB_STATUS_LABEL[status] ?? status}`);
     void load(token);
   }
 
   async function changeService(id: string, patch: { status?: string; serverId?: string }) {
     const r = await adminUpdateService(token, id, patch);
-    if (!r.ok) return setError(apiError(r, 'Transition refusée.'));
-    flash('Service mis à jour.');
+    if (!r.ok) return toast.error(apiError(r, 'Transition refusée.'));
+    toast.ok('Service mis à jour.');
     void load(token);
   }
 
@@ -130,9 +123,6 @@ export default function ManagerSubscriptionsPage() {
           title="Souscriptions & services"
           sub="Le client garde le contrôle de ses souscriptions/services ; l’admin approuve et affecte une infrastructure (serveur)."
         />
-
-        {message && <Alert tone="ok">{message}</Alert>}
-        {error && <Alert tone="error">{error}</Alert>}
 
         <Panel title="Souscriptions client" sub="Approbation / rejet / suspension par transaction d’état.">
           {subs.length === 0 ? (

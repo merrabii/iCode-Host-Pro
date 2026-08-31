@@ -3,18 +3,18 @@
 import { useEffect, useState } from 'react';
 import { apiError, listUsers, updateUser, UserAdmin } from '@/lib/api';
 import { useAdminSession } from '@/lib/session';
+import { useToast } from '@/components/toast';
 import { AppShell } from '@/components/app-shell';
 import { ADMIN_NAV } from '@/config/nav';
-import { Alert, Badge, Button, Denied, EmptyState, PageIntro, PageLoading } from '@/components/ui';
+import { Badge, Button, Denied, EmptyState, PageIntro, PageLoading } from '@/components/ui';
 
 type BusyId = string | null;
 
 export default function ManagerUsersPage() {
   const { phase, me, token } = useAdminSession();
+  const toast = useToast();
   const [users, setUsers] = useState<UserAdmin[]>([]);
   const [busy, setBusy] = useState<BusyId>(null);
-  const [message, setMessage] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     if (phase === 'ready' && token) void load(token);
@@ -23,18 +23,16 @@ export default function ManagerUsersPage() {
 
   async function load(t: string) {
     const r = await listUsers(t);
-    if (!r.ok) return setError('Impossible de charger les utilisateurs.');
+    if (!r.ok) return toast.error('Impossible de charger les utilisateurs.');
     setUsers((r.data as UserAdmin[]) ?? []);
   }
 
   async function apply(id: string, patch: { role?: string; isActive?: boolean }) {
     setBusy(id);
-    setMessage(null);
-    setError(null);
     const r = await updateUser(token, id, patch);
     setBusy(null);
-    if (!r.ok) return setError(apiError(r, 'Échec de la mise à jour.'));
-    setMessage('Utilisateur mis à jour.');
+    if (!r.ok) return toast.error(apiError(r, 'Échec de la mise à jour.'));
+    toast.ok('Utilisateur mis à jour.');
     void load(token);
   }
 
@@ -62,9 +60,6 @@ export default function ManagerUsersPage() {
           title="Utilisateurs"
           sub="Gestion des comptes de la plateforme — promotion/rétrogradation et activation. Gardes anti-verrouillage actives (un admin ne peut pas être laissé seul)."
         />
-
-        {message && <Alert tone="ok">{message}</Alert>}
-        {error && <Alert tone="error">{error}</Alert>}
 
         {users.length === 0 ? (
           <EmptyState>Aucun compte.</EmptyState>

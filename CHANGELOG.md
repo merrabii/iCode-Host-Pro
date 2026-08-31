@@ -1,6 +1,23 @@
 # CHANGELOG
 
-## Phase 7 — DESIGN SYSTEM DE L'INTERFACE (ADR-023) — IMPLEMENTED 2026-08-31, not yet committed/pushed
+## Phase 7 — POLISH UI (ADR-023 follow-up) — IMPLEMENTED 2026-08-31, commit 31af3e2+ on main
+Owner feedback on Phase 7 design: « tout est correct concernant les couleurs et style, c'est très bien à ne pas changer » — the reference palette stays as-is (dark + light) — with 4 pure-front requests:
+### Added
+- **Sélects déroulants optimisés** (`globals.css` `.select` / `.select-sm`) : flèche OS native supprimée (`appearance:none`) + **chevron SVG du design system** (data-URI, couleur `--text-secondary` par thème), `padding-right: 36px` (texte jamais sous la flèche), `cursor:pointer`. Hauteurs = `.input`/`.btn` → **alignement vertical aligné** avec les boutons adjacents dans les tableaux ; `.select-sm` calqué sur `.btn-sm` (statuts serveur/produit, affectation serveur, filtres journal) ; `<option>` teintés thème.
+- **Contraste des bordures en thème clair** : uniquement `--border` `#e7eaf0 → #d5dce8` et `--border-soft` `#eef0f4 → #e1e6ef` (nuance gris-bleu identique, plus lisible sur blanc). **Dark et toutes les autres teintes inchangés**.
+- **Espacement des messages inline** : `.alert` `margin-bottom: 12px` (plus jamais collé au contenu suivant) ; reset à 0 dans `.stack`/`.panel-body` (espacement par gap).
+- **Toasts pop-up** (`apps/web/src/components/toast.tsx`, neuf) : `ToastProvider`/`useToast()` monté dans `layout.tsx` → disponible sur toutes les pages. Feedback d'action en pop-up **haut-droit** — message + icône de ton + **bouton OK** (ferme immédiatement), **auto-dismiss 5 s** (timers nettoyés au démontage), `role="status"`/`alert` + `aria-live` (polite/assertive), animation slide+fade ~0.18 s, responsive (pleine largeur < 600px). CSS `.toast-host`/`.toast`/`.toast-btn` dans `globals.css` (tokens `--card-bg`/`--border`/`--tint-*`/`--shadow`/`--radius-card`).
+### Changed
+- **8 pages converties** des états `message`/`error`/`testResult` (Alert inline) vers `useToast()` — logic/handlers **inchangés** : `/manager`, `/manager/utilisateurs`, `/manager/journal`, `/manager/invitations`, `/manager/mail` (résultat du mail de test aussi en toast), `/manager/subscriptions`, `/client`, `/auth`. Helpers `flash()` supprimés → `toast.ok()`.
+- **Conservés inline volontairement** (contextes persistants, pas feedbacks d'action) : alerte diagnostic de `/` (santé API) et le panneau « invitation créée » de `/manager/invitations` (jeton + lien à copier).
+- `docs/design/DESIGN_SYSTEM.md` : tokens light ajustés + chevron selects + composant Toast documentés.
+- **Aucun changement API/DB** : pas de migration, suites API inchangées.
+### Verified (2026-08-31)
+- `npx tsc --noEmit` apps/web **PASS** (exit 0) ; `web build` **PASS** (10 routes intactes, après purge `.next` — leçon Phase 2) ; smoke :3000 **200** sur les 9 pages.
+### Pending
+- Validation visuelle propriétaire (toasts, chevrons, bordures light) ; commit + push (sur instruction).
+
+## Phase 7 — DESIGN SYSTEM DE L'INTERFACE (ADR-023) — IMPLEMENTED 2026-08-31, committed `31af3e2`
 Owner GO: « Ne copier que le style et couleurs complet (sidebar + topbar + cartes…) de la page html envoyée et oublier tout le reste. Le système ne doit absolument pas être lié à une brand et tout doit être modifiable. » — copied the reference dashboard's dark/light style EXACTLY, ignored all third-party content, everything stays brand-agnostic + editable via CSS vars.
 ### Added
 - **Design tokens** (`apps/web/src/app/globals.css`, réécrit ~30 → ~1 100 lignes) : palette dark/light complète de la référence (bg/sidebar/header/card/border/text/active…), teintes badges/icônes (green/blue/violet/amber/cyan/pink/gray + **rouge** ajouté pour les erreurs), tokens marque `--brand-primary #00b377`/`--brand-primary-dark`/`--brand-accent`/gradient/glow, fonts, sidebar 280px / topbar 64px, rayons, ombres, breakpoints (<1100/<900/<600). Source : `docs/design/DESIGN_SYSTEM.md`.

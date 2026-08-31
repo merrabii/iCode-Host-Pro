@@ -1,10 +1,10 @@
 # PROJECT_STATUS — iCode Host Pro
 
 ## Overall status
-**PHASE 7 IMPLÉMENTÉE 2026-08-31 — DESIGN SYSTEM DE L'INTERFACE (ADR-023). Réécriture visuelle complète : palette dark/light de la référence copiée à l'identique, brand-agnostic, tout modifiable. Typecheck + build PASS. Pas encore commitée/poussée.**
+**PHASE 7 IMPLÉMENTÉE 2026-08-31 — DESIGN SYSTEM DE L'INTERFACE (ADR-023, commit `31af3e2`) + POLISH UI propriétaire (selects, contraste light, toasts). Purement front, aucun changement API/DB. Typecheck + build PASS. À valider visuellement puis commiter comme « Phase 7 polish ».**
 
 ## Current phase
-**Phase 7 — Design system (ADR-023). Implémenté et vérifié localement (typecheck + build + smoke HTTP). Prochaine étape : commit unique puis proposition de validation propriétaire (et push des Phases 6 + 7 en attente d'instruction).**
+**Phase 7 — Polish UI (ADR-023 follow-up), retour propriétaire 2026-08-31 : « couleurs et style à ne pas changer » + 4 finitions front — (1) sélects déroulants optimisés (chevron SVG + alignement boutons), (2) contraste des bordures light, (3) espacement des messages, (4) messages en pop-up (toast + bouton OK, auto-dismiss 5 s). Implémenté, typecheck + build + smoke PASS. Prochaine étape : validation visuelle propriétaire → commit « Phase 7 polish » → push (Phases 6 + 7 + polish en attente d'instruction).**
 
 ## State (real, as of this update)
 - Monorepo: pnpm workspaces + Turborepo (ADR-001). `apps/web` (Next.js 15), `apps/api` (NestJS 11), `packages/` reserved.
@@ -35,6 +35,12 @@
 - Incidents Brevo maîtrisés pendant la validation (côté compte Brevo, remontés correctement par l'app) : **525 Unauthorized IP** (autoriser l'IP publique dans Brevo — IP ADSL **dynamique**, à réautoriser au changement) ; **sender non validé** → rejet ASYNCHRONE post-250 (l'API montrait `ok:true` ; vu en Brevo Logs→SMTP event `error` « sender not valid ») — fix avec expéditeur validé `contact@codediali.com`.
 - **Rebrand (note owner, différé)** : « iCode Host Pro » → **Code Diali** (`codediali.com`) une fois le projet terminé.
 
+## Verified (Phase 7 polish UI — real checks, 2026-08-31)
+- `npx tsc --noEmit` dans `apps/web` → **PASS (exit 0)**.
+- `web build` → **PASS** (10 routes intactes ; dev web arrêté + purge `.next` avant build — leçon Phase 2), puis `next dev` relancé sur :3000.
+- Smoke HTTP :3000 → **200** sur les 9 pages (`/`, `/auth`, `/client`, `/manager`, `/manager/invitations`, `/manager/journal`, `/manager/mail`, `/manager/subscriptions`, `/manager/utilisateurs`).
+- **Aucun changement API/DB** : pas de migration, suites API inchangées (unit 90/90 + e2e 61/61).
+
 ## Verified (Phase 7 — real checks, 2026-08-31)
 - `npx tsc --noEmit` dans `apps/web` → **PASS (exit 0)**.
 - `corepack pnpm --filter @icode-host-pro/web build` → **PASS** (10 routes, exit 0). Dev web arrêté pendant le build (risque de corruption `.next` — pratique établie Phase 2) ; API :3001 restée up.
@@ -42,15 +48,15 @@
 - **Aucun changement API/DB** : pas de migration, aucun test API touché (unit 90/90 + e2e 61/61 inchangés depuis la Phase 6).
 
 ## Pending
-- **Validation propriétaire Phase 7** (style/couleurs dark/light, sidebar + topbar + cartes) — la logique métier de toutes les pages est inchangée.
-- **Commit unique Phase 7** (prêt) + **push** des Phases 6 (47838c1) et 7 sur instruction.
+- **Validation visuelle propriétaire du polish** : chevrons des selects (statuts serveur/produit dans `/manager`, affectation serveur `/manager/subscriptions`, filtre action `/manager/journal`) alignés avec les boutons ; bordures plus nettes en thème clair ; toasts pop-up (OK ferme immédiatement, disparition ~5 s) ; plus aucun message collé au contenu.
+- **Commit « Phase 7 polish »** (prêt — la branche contient déjà le design 31af3e2) + **push** des Phases 6 (47838c1), 7 (31af3e2) et du polish sur instruction.
 - (Optionnel, Phase 6) test live d'invitation avec email : créer une invite → l'email arrive avec le lien `/auth?invite=…` → accept de bout en bout.
 
 ## Decisions
-- ADR-001..005, 011..014: **APPROVED** (Phase 0). ADR-015+016: **APPROVED** (Phase 1). ADR-017: **APPROVED** (Phase 2). ADR-018: **APPROVED** (Phase 3). ADR-019: **APPROVED** (Phase 4). ADR-020+021: **APPROVED** (Phase 5 GO). **ADR-022 (configuration mail + emails d'invitation) : APPROVED** (Phase 6 GO, 2026-08-31) — valide un périmètre étroit d'ADR-008 (chiffrement applicatif au repos). **ADR-023 (design system de l'interface) : APPROVED** (Phase 7 GO, 2026-08-31 — « copier le style et couleurs complet, brand-agnostic, tout modifiable »). ADR-006 full, 007, 008 complet, 009, 010: **PROPOSED** (untouched). See DECISIONS.md.
+- ADR-001..005, 011..014: **APPROVED** (Phase 0). ADR-015+016: **APPROVED** (Phase 1). ADR-017: **APPROVED** (Phase 2). ADR-018: **APPROVED** (Phase 3). ADR-019: **APPROVED** (Phase 4). ADR-020+021: **APPROVED** (Phase 5 GO). **ADR-022 (configuration mail + emails d'invitation) : APPROVED** (Phase 6 GO, 2026-08-31) — valide un périmètre étroit d'ADR-008 (chiffrement applicatif au repos). **ADR-023 (design system de l'interface) : APPROVED** (Phase 7 GO, 2026-08-31 — « copier le style et couleurs complet, brand-agnostic, tout modifiable ») + **polish UI (selects, contraste light, toasts)** du même ADR. ADR-006 full, 007, 008 complet, 009, 010: **PROPOSED** (untouched). See DECISIONS.md.
 
 ## Next action
-Commit Phase 7 (sur instruction) → validation propriétaire du design (dark + light, toutes les pages) → push Phases 6 + 7 → proposition Phase 8.
+Validation visuelle propriétaire du polish → commit « Phase 7 polish » → push Phases 6 + 7 + polish → proposition Phase 8.
 
 ## Out of scope (do not build yet)
 Déploiement réel chez un provider (ADR-010), jobs/Redis (ADR-007), OAuth / MFA / Turnstile (différés par le propriétaire au profit du « Mail seul »), billing/paiements, `Deployment` (reste différé), asset storage, reverse proxy/SSL, observability, ADR-008 complet (gestion de secrets / config persistée).

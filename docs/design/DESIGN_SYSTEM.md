@@ -71,8 +71,8 @@ storage `rgba(139,92,246,.18)/#a78bfa` · shield `rgba(217,161,6,.18)/#eab308`.
 | `--header-bg` | `#ffffff` |
 | `--card-bg` | `#ffffff` |
 | `--card-bg-2` | `#ffffff` |
-| `--border` | `#e7eaf0` |
-| `--border-soft` | `#eef0f4` |
+| `--border` | `#d5dce8` |
+| `--border-soft` | `#e1e6ef` |
 | `--text-primary` | `#10151f` |
 | `--text-secondary` | `#64748b` |
 | `--text-muted` | `#94a3b8` |
@@ -84,6 +84,11 @@ storage `rgba(139,92,246,.18)/#a78bfa` · shield `rgba(217,161,6,.18)/#eab308`.
 
 Badges/icônes light : déclinaisons pastel (`rgba(…,.1)` / teintes foncées) dérivées des mêmes
 teintes, documentées dans `globals.css`.
+
+> **Ajustement propriétaire 2026-08-31 (polish UI)** : seuls `--border` et `--border-soft` du thème
+> clair ont été renforcés (`#e7eaf0 → #d5dce8`, `#eef0f4 → #e1e6ef`) pour que les bordures restent
+> lisibles sur fond blanc. Le dark et toutes les autres teintes, des deux thèmes, sont **inchangés**
+> (« couleurs et style à ne pas changer »). Nuance gris-bleu identique à la référence.
 
 ### 1.3 Typographie & dimensions
 
@@ -122,8 +127,24 @@ La référence n'a ni formulaires, ni tables, ni états, ni rouge — ajouts ré
 tokens/teintes** pour que l'app soit fonctionnelle :
 - **Boutons** : `.btn-primary` (réf.) + `.btn-secondary` (input-bg + border) + `.btn-danger` (teinte rouge).
 - **Formulaires** : `.input`, `.select`, `.field label`, `.check-row` (case inline), focus ring `--brand-accent`.
+  - **Sélects déroulants** (polish 2026-08-31) : `.select` = `appearance:none` + **chevron SVG** en
+    `background-image` data-URI (couleur `--text-secondary` de chaque thème), `padding-right: 36px`
+    pour que le texte ne passe jamais sous la flèche, `cursor:pointer`. Hauteurs identiques à
+    `.input`/`.btn` → alignement vertical parfait avec les boutons adjacents dans les tableaux ;
+    variante compacte `.select-sm` alignée sur `.btn-sm` (statuts serveur/produit, affectation
+    serveur, filtres journal). `<option>` teintés `--input-bg`/`--text-primary`.
 - **Table** : `.table` (entête uppercase label, lignes séparées `--border-soft`), cellules compactes.
-- **Messages** : `.alert.ok` (vert), `.alert.error` (rouge), `.alert.info` (bleu).
+- **Messages** :
+  - `.alert.ok` (vert), `.alert.error` (rouge), `.alert.info` (bleu). `margin-bottom: 12px`
+    (polish 2026-08-31) — jamais collé au contenu suivant ; resetté à 0 dans `.stack`/`.panel-body`
+    (espacement géré par le `gap` du conteneur). Conservés **inline** pour les contextes persistants
+    (diagnostic santé de `/`, panneau invitation créée avec jeton + lien à copier).
+  - **Toast pop-up** `.toast` (polish 2026-08-31) : feedbacks d'action en pop-up en haut à droite —
+    message + **bouton OK** (referme immédiatement), **auto-dismiss 5 s**, icône de ton
+    (ok/info/warn/error), `role="status"`/`alert` + `aria-live` (polite/assertive), animation
+    d'entrée ~0.18 s. Composant `ToastProvider`/`useToast()` monté dans `layout.tsx` → disponible
+    sur **toutes** les pages. Utilise les tokens `--card-bg`, `--border`, `--tint-*`,
+    `--shadow`, `--radius-card`.
 - **États** : `.empty` (vide), `.spinner` (petit loader marque), `:focus-visible` (ring),
   `:disabled` (50 % + `not-allowed`).
 - **Badges sémantiques** : `.badge` + `.badge-ok` / `.badge-info` / `.badge-warn` / `.badge-danger` / `.badge-neutral` / `.badge-violet`

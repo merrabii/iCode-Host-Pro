@@ -3,9 +3,10 @@
 import { useEffect, useMemo, useState } from 'react';
 import { AuditEntry, AuditPage, listAudit } from '@/lib/api';
 import { useAdminSession } from '@/lib/session';
+import { useToast } from '@/components/toast';
 import { AppShell } from '@/components/app-shell';
 import { ADMIN_NAV } from '@/config/nav';
-import { Alert, Button, Denied, EmptyState, Field, Input, PageIntro, PageLoading, Select } from '@/components/ui';
+import { Button, Denied, EmptyState, Field, Input, PageIntro, PageLoading, Select } from '@/components/ui';
 
 const PER_PAGE = 50;
 
@@ -69,10 +70,10 @@ function resourceLabel(e: AuditEntry): string {
 
 export default function ManagerJournalPage() {
   const { phase, me, token } = useAdminSession();
+  const toast = useToast();
   const [data, setData] = useState<AuditPage | null>(null);
   const [resourceType, setResourceType] = useState('');
   const [action, setAction] = useState('');
-  const [error, setError] = useState<string | null>(null);
 
   const load = (t: string, page: number) =>
     listAudit(t, {
@@ -83,10 +84,9 @@ export default function ManagerJournalPage() {
     });
 
   async function refresh(page: number) {
-    setError(null);
     const r = await load(token, page);
     if (!r.ok) {
-      setError('Impossible de charger le journal.');
+      toast.error('Impossible de charger le journal.');
       return;
     }
     setData(r.data as AuditPage);
@@ -141,8 +141,6 @@ export default function ManagerJournalPage() {
           </Field>
           {data && <span className="muted cell-sub" style={{ paddingBottom: 10 }}>{data.total} entrée(s)</span>}
         </div>
-
-        {error && <Alert tone="error">{error}</Alert>}
 
         {data?.items.length === 0 ? (
           <EmptyState>Aucune entrée.</EmptyState>

@@ -3,10 +3,10 @@
 import { useEffect, useState } from 'react';
 import { apiError, apiJson, getManagerSummary, ManagerSummary } from '@/lib/api';
 import { useAdminSession } from '@/lib/session';
+import { useToast } from '@/components/toast';
 import { AppShell } from '@/components/app-shell';
 import { ADMIN_NAV } from '@/config/nav';
 import {
-  Alert,
   Button,
   Denied,
   EmptyState,
@@ -38,13 +38,12 @@ const SERVER_STATUSES = ['UNKNOWN', 'PROVISIONING', 'ACTIVE', 'PROBLEM', 'REMOVE
 
 export default function ManagerPage() {
   const { phase, me, token } = useAdminSession();
+  const toast = useToast();
   const [summary, setSummary] = useState<ManagerSummary | null>(null);
   const [products, setProducts] = useState<Product[]>([]);
   const [servers, setServers] = useState<ServerItem[]>([]);
   const [drafts, setDrafts] = useState({ productName: '', serverName: '', serverHostname: '' });
   const [hostnameEdits, setHostnameEdits] = useState<Record<string, string>>({});
-  const [message, setMessage] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     if (phase === 'ready' && token) void loadAll(token);
@@ -62,13 +61,8 @@ export default function ManagerPage() {
       const sum = await getManagerSummary(t);
       setSummary((sum.data as ManagerSummary) ?? null);
     } catch {
-      setError('Impossible de charger les données.');
+      toast.error('Impossible de charger les données.');
     }
-  }
-
-  function flash(m: string) {
-    setMessage(m);
-    setError(null);
   }
 
   async function changeProductStatus(id: string, status: string) {
@@ -76,8 +70,8 @@ export default function ManagerPage() {
       method: 'PATCH',
       body: JSON.stringify({ status }),
     });
-    if (!r.ok) return setError(apiError(r, 'Échec de la mise à jour du produit.'));
-    flash('Statut du produit mis à jour.');
+    if (!r.ok) return toast.error(apiError(r, 'Échec de la mise à jour du produit.'));
+    toast.ok('Statut du produit mis à jour.');
     void loadAll(token);
   }
 
@@ -86,8 +80,8 @@ export default function ManagerPage() {
       method: 'PATCH',
       body: JSON.stringify({ status }),
     });
-    if (!r.ok) return setError(apiError(r, 'Échec de la mise à jour du serveur.'));
-    flash('Statut du serveur mis à jour.');
+    if (!r.ok) return toast.error(apiError(r, 'Échec de la mise à jour du serveur.'));
+    toast.ok('Statut du serveur mis à jour.');
     void loadAll(token);
   }
 
@@ -97,8 +91,8 @@ export default function ManagerPage() {
       method: 'PATCH',
       body: JSON.stringify({ hostname: hostname.trim() }),
     });
-    if (!r.ok) return setError(apiError(r, 'Échec de la mise à jour de l’hostname.'));
-    flash('Hostname du serveur mis à jour.');
+    if (!r.ok) return toast.error(apiError(r, 'Échec de la mise à jour de l’hostname.'));
+    toast.ok('Hostname du serveur mis à jour.');
     void loadAll(token);
   }
 
@@ -108,16 +102,16 @@ export default function ManagerPage() {
       method: 'POST',
       body: JSON.stringify({ name: drafts.productName, kind: 'generic' }),
     });
-    if (!r.ok) return setError(apiError(r, 'Échec de la création du produit.'));
+    if (!r.ok) return toast.error(apiError(r, 'Échec de la création du produit.'));
     setDrafts((x) => ({ ...x, productName: '' }));
-    flash('Produit créé.');
+    toast.ok('Produit créé.');
     void loadAll(token);
   }
 
   async function deleteProduct(id: string) {
     const r = await apiJson(`/api/products/${id}`, token, { method: 'DELETE' });
-    if (!r.ok) return setError(apiError(r, 'Échec de la suppression du produit.'));
-    flash('Produit supprimé.');
+    if (!r.ok) return toast.error(apiError(r, 'Échec de la suppression du produit.'));
+    toast.ok('Produit supprimé.');
     void loadAll(token);
   }
 
@@ -127,16 +121,16 @@ export default function ManagerPage() {
       method: 'POST',
       body: JSON.stringify({ name: drafts.serverName, hostname: drafts.serverHostname }),
     });
-    if (!r.ok) return setError(apiError(r, 'Échec de la création du serveur.'));
+    if (!r.ok) return toast.error(apiError(r, 'Échec de la création du serveur.'));
     setDrafts((x) => ({ ...x, serverName: '', serverHostname: '' }));
-    flash('Serveur créé.');
+    toast.ok('Serveur créé.');
     void loadAll(token);
   }
 
   async function deleteServer(id: string) {
     const r = await apiJson(`/api/servers/${id}`, token, { method: 'DELETE' });
-    if (!r.ok) return setError(apiError(r, 'Échec de la suppression du serveur.'));
-    flash('Serveur supprimé.');
+    if (!r.ok) return toast.error(apiError(r, 'Échec de la suppression du serveur.'));
+    toast.ok('Serveur supprimé.');
     void loadAll(token);
   }
 
@@ -204,9 +198,6 @@ export default function ManagerPage() {
             sub={`sur ${summary?.users.total ?? '—'} comptes`}
           />
         </div>
-
-        {message && <Alert tone="ok">{message}</Alert>}
-        {error && <Alert tone="error">{error}</Alert>}
 
         <div className="bottom-grid">
           <Panel

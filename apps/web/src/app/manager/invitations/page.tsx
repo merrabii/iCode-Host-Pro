@@ -10,6 +10,7 @@ import {
   revokeInvitation,
 } from '@/lib/api';
 import { useAdminSession } from '@/lib/session';
+import { useToast } from '@/components/toast';
 import { AppShell } from '@/components/app-shell';
 import { ADMIN_NAV } from '@/config/nav';
 import {
@@ -42,6 +43,7 @@ const STATUS_TONE: Record<string, 'ok' | 'neutral' | 'danger'> = {
 
 export default function ManagerInvitationsPage() {
   const { phase, me, token } = useAdminSession();
+  const toast = useToast();
   const [invites, setInvites] = useState<Invitation[]>([]);
   const [email, setEmail] = useState('');
   const [created, setCreated] = useState<{
@@ -50,14 +52,11 @@ export default function ManagerInvitationsPage() {
     link: string;
     emailSent: boolean;
   } | null>(null);
-  const [message, setMessage] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
 
   async function load(t: string) {
-    setError(null);
     const r = await listInvitations(t);
     if (!r.ok) {
-      setError(apiError(r, 'Impossible de charger les invitations.'));
+      toast.error(apiError(r, 'Impossible de charger les invitations.'));
       return;
     }
     setInvites((r.data as Invitation[]) ?? []);
@@ -70,18 +69,17 @@ export default function ManagerInvitationsPage() {
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
-    setError(null);
     setCreated(null);
     const r = await createInvitation(token, email.trim());
     if (!r.ok) {
-      setError(apiError(r, 'Échec de la création de l’invitation.'));
+      toast.error(apiError(r, 'Échec de la création de l’invitation.'));
       return;
     }
     const inv = r.data as { email: string; token: string; emailSent?: boolean };
     const emailSent = !!inv.emailSent;
     setEmail('');
     setCreated({ email: inv.email, token: inv.token, link: inviteLink(inv.token, inv.email), emailSent });
-    setMessage(
+    toast.ok(
       emailSent
         ? `Invitation créée — l’email d’invitation a été envoyé à ${inv.email}. Le lien reste copiable en secours.`
         : 'Invitation créée. Configuration mail absente ou envoi échoué : lien affiché manuellement.',
@@ -90,24 +88,21 @@ export default function ManagerInvitationsPage() {
   }
 
   async function revoke(id: string) {
-    setError(null);
     const r = await revokeInvitation(token, id);
     if (!r.ok) {
-      setError(apiError(r, 'Échec de la révocation.'));
+      toast.error(apiError(r, 'Échec de la révocation.'));
       return;
     }
-    setMessage('Invitation révoquée.');
+    toast.ok('Invitation révoquée.');
     void load(token);
   }
 
   async function copy(text: string) {
     try {
       await navigator.clipboard.writeText(text);
-      setMessage('Lien copié dans le presse-papiers.');
-      setError(null);
+      toast.ok('Lien copié dans le presse-papiers.');
     } catch {
-      setMessage(null);
-      setError('Impossible de copier automatiquement — sélectionne le texte.');
+      toast.error('Impossible de copier automatiquement — sélectionne le texte.');
     }
   }
 
@@ -135,9 +130,6 @@ export default function ManagerInvitationsPage() {
           title="Invitations"
           sub="L’inscription libre est fermée (ADR-020) : un compte se crée uniquement par invitation à une adresse email."
         />
-
-        {message && <Alert tone="ok">{message}</Alert>}
-        {error && <Alert tone="error">{error}</Alert>}
 
         <Panel title="Créer une invitation" sub="Envoie un email si la configuration mail est active ; sinon le lien est affiché ici.">
           <form className="inline-form" onSubmit={submit}>

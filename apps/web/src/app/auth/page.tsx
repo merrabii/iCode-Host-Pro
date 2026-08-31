@@ -3,7 +3,8 @@
 import { useEffect, useState } from 'react';
 import { acceptInvite, apiError } from '@/lib/api';
 import { AppShell } from '@/components/app-shell';
-import { Alert, Button, Field, Input } from '@/components/ui';
+import { useToast } from '@/components/toast';
+import { Button, Field, Input } from '@/components/ui';
 
 type Mode = 'login' | 'invite';
 
@@ -15,6 +16,7 @@ interface Profile {
 }
 
 export default function AuthPage() {
+  const toast = useToast();
   const [mode, setMode] = useState<Mode>('login');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -22,8 +24,6 @@ export default function AuthPage() {
   const [token, setToken] = useState('');
   const [accessToken, setAccessToken] = useState<string | null>(null);
   const [profile, setProfile] = useState<Profile | null>(null);
-  const [message, setMessage] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
 
   // Pre-fill from an invitation link ?invite=<token>&email=<email> (§ ADR-020).
   useEffect(() => {
@@ -39,8 +39,6 @@ export default function AuthPage() {
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
-    setError(null);
-    setMessage(null);
     setProfile(null);
     setAccessToken(null);
 
@@ -66,7 +64,7 @@ export default function AuthPage() {
     }
 
     setAccessToken(result.accessToken ?? null);
-    setMessage(
+    toast.ok(
       mode === 'login'
         ? 'Connecté. On récupère ton profil protégé…'
         : 'Compte créé via invitation. On récupère ton profil protégé…',
@@ -75,22 +73,19 @@ export default function AuthPage() {
 
   async function fetchMe() {
     if (!accessToken) return;
-    setError(null);
-    setMessage(null);
     try {
       const res = await fetch('/api/users/me', {
         headers: { Authorization: `Bearer ${accessToken}` },
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       setProfile((await res.json()) as Profile);
-      setMessage('Accès au profil protégé OK.');
+      toast.ok('Accès au profil protégé OK.');
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      toast.error(e instanceof Error ? e.message : String(e));
     }
   }
 
   async function logout() {
-    setError(null);
     try {
       await fetch('/api/auth/logout', { method: 'POST', credentials: 'include' });
     } catch {
@@ -98,7 +93,7 @@ export default function AuthPage() {
     }
     setAccessToken(null);
     setProfile(null);
-    setMessage('Déconnecté.');
+    toast.ok('Déconnecté.');
   }
 
   return (
@@ -149,9 +144,6 @@ export default function AuthPage() {
                 : 'J’ai déjà un compte — se connecter'}
             </Button>
           </div>
-
-          {message && <Alert tone="ok" title="✅">{message}</Alert>}
-          {error && <Alert tone="error">{error}</Alert>}
 
           {accessToken && !profile && (
             <div className="mt">

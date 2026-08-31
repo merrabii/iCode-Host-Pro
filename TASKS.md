@@ -359,7 +359,42 @@ Do not log only important work. Record all meaningful actions, including small c
 - Reste en option (non bloquant) : un test live d'**invitation avec email** (créer une invite → l'email arrive avec le lien `/auth?invite=…` → accept de bout en bout).
 - **Rebrand (note owner, différé)** : changer la marque **iCode Host Pro → Code Diali** / `codediali.com` **une fois le projet terminé**.
 
-# PHASE 7 — DESIGN SYSTEM DE L'INTERFACE (ADR-023 — implémenté 2026-08-31, pas encore commité/poussé)
+# PHASE 7 — DESIGN SYSTEM DE L'INTERFACE (ADR-023 — implémenté 2026-08-31, commité `31af3e2`)
+
+# PHASE 7bis — POLISH UI : SELECTS + CONTRASTE LIGHT + TOASTS (ADR-023 follow-up — implémenté 2026-08-31)
+
+## 2026-08-31 — retour propriétaire + périmètre
+- Le propriétaire valide le design existant et précise « ne pas changer les couleurs et le style » — 4 finitions purement front demandées : (1) optimiser l'affichage des boutons à menus déroulants, (2) un peu plus de contraste des bordures en thème clair, (3) bien espacer les messages succès/erreur, (4) messages en pop-up avec un bouton OK et qui disparaissent après 5 s (ou au clic sur OK).
+- Contrainte : **aucun changement backend/DB** (pas de migration, tests API intacts).
+
+## CSS (`apps/web/src/app/globals.css`)
+- **Sélects déroulants** : `.select` = `appearance:none` + chevron SVG data-URI (`background-image`, couleur `--text-secondary` par thème), `padding-right:36px`, `cursor:pointer`, `:hover` border active-text, `:disabled` not-allowed, `<option>` teintés (`--input-bg`/`--text-primary`). Hauteurs = `.input`/`.btn` (mêmes padding verticaux) → alignés avec les boutons ; `.select-sm` compact calqué sur `.btn-sm`. (Flèche native incohérente supprimée.)
+- **Contraste light** : uniquement `--border #e7eaf0 → #d5dce8` et `--border-soft #eef0f4 → #e1e6ef` (nuance gris-bleu identique). Dark + toutes les autres teintes inchangés.
+- **Espacement messages** : `.alert` `margin-bottom:12px` (+ reset `.stack > .alert, .panel-body > .alert { margin-bottom:0 }` pour les conteneurs à gap).
+- **Toasts** : section `/* 15b */` — `.toast-host` (fixed, top sous topbar, right 16, z-index 200, pointer-events none), `.toast` (+ `.ok/.error/.info/.warn` bordure teinte), `.toast-btn` (OK), `@keyframes toast-in` (~0.18 s), responsive pleine largeur <600px.
+
+## Composant toast
+- Created: `apps/web/src/components/toast.tsx` ('use client') — `ToastProvider` (contexte ; état `ToastItem[] {id,tone,message}` ; `push` avec `setTimeout 5000 → dismiss`, timers nettoyés au démontage), `useToast()` → `{ok,error,info,warn}`. Rendu `{children}` + `.toast-host` (icône de ton + message + bouton OK ; `role="status"`/`alert`, `aria-live` polite/assertive). API stable via useMemo.
+- Modifié: `apps/web/src/app/layout.tsx` — `<ToastProvider>` enveloppe `{children}` → disponible sur toutes les pages (y compris `/auth` bare).
+
+## Conversion des pages (états message/error/testResult → toasts ; handlers inchangés)
+- `/manager` : états supprimés, helper `flash()` → `toast.ok()` ; erreurs → `toast.error(apiError(...))`.
+- `/manager/utilisateurs` : « Utilisateur mis à jour. » → toast.ok ; échecs → toast.error.
+- `/manager/journal` : échec de chargement → toast.error.
+- `/manager/invitations` : création/révocation/copie → toasts ; **panneau `created` (jeton + lien) conservé inline** (contexte persistant).
+- `/manager/mail` : validations, enregistrement et **résultat du mail de test** → toasts (rendu inline « ✅ Envoyé / ❌ Échec » supprimé).
+- `/manager/subscriptions` : flash → toast.ok ; transitions refusées → toast.error.
+- `/client` : souscription/annulation/service demandé → toasts ; échec de chargement → toast.error.
+- `/auth` : connexion/invitation acceptée/fetchMe/logout → toasts.
+- **Conservé inline volontairement** : alerte diagnostic de `/` (santé API).
+
+## Vérifications (2026-08-31)
+- `npx tsc --noEmit` dans apps/web → **PASS (exit 0)** (faits sur les 8 pages converties + toast.tsx).
+- `web build` → **PASS** (10 routes intactes ; dev web arrêté + `rm -rf .next` avant build — leçon Phase 2), puis `next dev :3000` relancé.
+- Smoke HTTP :3000 → **200** sur les 9 pages.
+- Aucun changement API/DB ; suites API non relancées (rien de touché).
+
+
 
 ## 2026-08-31 — GO + décision
 - Action: le propriétaire a fourni une page HTML de référence (dashboard d'hébergement, thèmes dark/light) et donné un GO explicite : « Ne copier que le style et couleurs complet (sidebar + topbar + cartes…) et oublier tout le reste. Le système ne doit absolument pas être lié à une brand et tout doit être modifiable. »
@@ -428,4 +463,5 @@ Do not log only important work. Record all meaningful actions, including small c
 - Phase 4: journal d'audit « qui a fait quoi » (ADR-019) — owner-validated 2026-08-31, commitée.
 - Phase 5: espace client + accès sécurisé (ADR-020 invitations 410 + ADR-021 Subscription/Service) — owner-validated 2026-08-31, tests 62/62 + 51/51 verts, builds PASS.
 - Phase 6: configuration mail admin + emails d'invitation (ADR-022) — owner-validated 2026-08-31 (SMTP Brevo réel, domaine codediali.com, événements `delivered`), tests 90/90 unit + 61/61 e2e (8 suites), builds PASS, commitée (47838c1), push en attente d'instruction.
-- Phase 7: design system de l'interface (ADR-023) — réécriture visuelle complète (tokens dark/light de la référence copiés à l'identique, brand-agnostic, thème + anti-FOUC, composants AppShell/ui/icons, 9 pages refactorées logique intacte) — 2026-08-31, typecheck + build PASS, pas encore commitée/poussée.
+- Phase 7: design system de l'interface (ADR-023) — réécriture visuelle complète (tokens dark/light de la référence copiés à l'identique, brand-agnostic, thème + anti-FOUC, composants AppShell/ui/icons, 9 pages refactorées logique intacte) — 2026-08-31, commitée `31af3e2`.
+- Phase 7bis: polish UI (ADR-023 follow-up) — sélects chevron SVG + alignement boutons, contraste bordures light (2 tokens), espacement alerts, toasts pop-up (OK + 5 s) via ToastProvider/useToast convertis sur 8 pages (inline conservés : diagnostic `/`, panneau invitation créée) — 2026-08-31, typecheck + build + smoke PASS, aucun changement API/DB.

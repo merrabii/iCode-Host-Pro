@@ -1,6 +1,7 @@
 import type { Metadata } from 'next';
 import './globals.css';
 import { brand } from '@/config/brand';
+import { ToastProvider } from '@/components/toast';
 
 export const metadata: Metadata = {
   title: brand.name,
@@ -17,7 +18,9 @@ export default function RootLayout({
       <head>
         <script dangerouslySetInnerHTML={{ __html: themeInit }} />
       </head>
-      <body>{children}</body>
+      <body>
+        <ToastProvider>{children}</ToastProvider>
+      </body>
     </html>
   );
 }

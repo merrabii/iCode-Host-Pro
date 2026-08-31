@@ -3,15 +3,17 @@
 import { useEffect, useState } from 'react';
 import { apiError, getMailSettings, MailSettings, sendTestMail, updateMailSettings } from '@/lib/api';
 import { useAdminSession } from '@/lib/session';
+import { useToast } from '@/components/toast';
 import { AppShell } from '@/components/app-shell';
 import { ADMIN_NAV } from '@/config/nav';
-import { Alert, Badge, Button, Denied, Field, Input, PageIntro, PageLoading, Panel } from '@/components/ui';
+import { Badge, Button, Denied, Field, Input, PageIntro, PageLoading, Panel } from '@/components/ui';
 
 // Phase 6 (ADR-022): SMTP configuration administrée. Le mot de passe n'est
 // JAMAIS renvoyé par l'API (hasPassword seulement) — le champ reste vide à
 // l'édition et « inchangé si vide » à l'enregistrement.
 export default function ManagerMailPage() {
   const { phase, me, token } = useAdminSession();
+  const toast = useToast();
   const [settings, setSettings] = useState<MailSettings | null>(null);
   const [form, setForm] = useState({
     enabled: false,
@@ -24,9 +26,6 @@ export default function ManagerMailPage() {
   });
   const [password, setPassword] = useState('');
   const [testTo, setTestTo] = useState('');
-  const [message, setMessage] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [testResult, setTestResult] = useState<{ ok: boolean; text: string } | null>(null);
 
   useEffect(() => {
     if (phase === 'ready' && token) void load(token);
@@ -34,10 +33,9 @@ export default function ManagerMailPage() {
   }, [phase, token]);
 
   async function load(t: string) {
-    setError(null);
     const r = await getMailSettings(t);
     if (!r.ok) {
-      setError(apiError(r, 'Impossible de charger la configuration mail.'));
+      toast.error(apiError(r, 'Impossible de charger la configuration mail.'));
       return;
     }
     const s = (r.data as MailSettings) ?? null;
@@ -52,13 +50,10 @@ export default function ManagerMailPage() {
       fromName: s?.fromName ?? '',
     });
     setPassword('');
-    setTestResult(null);
   }
 
   async function save(e: React.FormEvent) {
     e.preventDefault();
-    setError(null);
-    setMessage(null);
     // PATCH semantics : ''/absent = inchangé sur le serveur. user/fromName vides
     // sont normalisés '' → effacé. Le mot de passe n'est envoyé que s'il est rempli.
     const dto: Record<string, unknown> = {
@@ -73,41 +68,47 @@ export default function ManagerMailPage() {
     if (password.trim()) dto.password = password.trim();
 
     if (form.enabled && (!form.host.trim() || !form.fromEmail.trim())) {
-      setError('Impossible d’activer l’envoi : host et fromEmail sont requis.');
+      toast.error('Impossible d’activer l’envoi : host et fromEmail sont requis.');
       return;
     }
     // Première création : on exige host + fromEmail (sinon l'API refuse un host vide)
     if (!settings?.id && (!form.host.trim() || !form.fromEmail.trim())) {
-      setError('Renseigne au moins host et fromEmail pour enregistrer la configuration.');
+      toast.error('Renseigne au moins host et fromEmail pour enregistrer la configuration.');
       return;
     }
 
     const r = await updateMailSettings(token, dto);
     if (!r.ok) {
-      setError(apiError(r, 'Échec de l’enregistrement de la configuration mail.'));
+      toast.error(apiError(r, 'Échec de l’enregistrement de la configuration mail.'));
       return;
     }
-    setMessage('Configuration mail enregistrée.');
-    void load(token);
+    const s = (r.data as MailSettings) ?? null;
+    setSettings(s);
+    setForm({
+      enabled: s?.enabled ?? false,
+      host: s?.host ?? '',
+      port: s?.port ?? 587,
+      secure: s?.secure ?? false,
+      user: s?.user ?? '',
+      fromEmail: s?.fromEmail ?? '',
+      fromName: s?.fromName ?? '',
+    });
+    setPassword('');
+    toast.ok('Configuration mail enregistrée.');
   }
 
   async function sendTest(e: React.FormEvent) {
     e.preventDefault();
-    setError(null);
-    setTestResult(null);
     if (!testTo.trim()) {
-      setError('Renseigne un destinataire pour le mail de test.');
+      toast.error('Renseigne un destinataire pour le mail de test.');
       return;
     }
     const r = await sendTestMail(token, testTo.trim());
     if (!r.ok) {
-      setTestResult({ ok: false, text: apiError(r, 'Envoi du test échoué.') });
+      toast.error(apiError(r, 'Envoi du test échoué.'));
       return;
     }
-    setTestResult({
-      ok: true,
-      text: (r.data as { message?: string })?.message ?? `Email de test envoyé à ${testTo.trim()}.`,
-    });
+    toast.ok((r.data as { message?: string })?.message ?? `Email de test envoyé à ${testTo.trim()}.`);
   }
 
   if (phase === 'loading') {
@@ -136,9 +137,6 @@ export default function ManagerMailPage() {
           title="Configuration mail"
           sub="Saisie du serveur SMTP + envoi automatique des emails d’invitation (ADR-022). Le mot de passe est chiffré au repos et jamais réaffiché."
         />
-
-        {message && <Alert tone="ok">{message}</Alert>}
-        {error && <Alert tone="error">{error}</Alert>}
 
         <div className="row mb">
           <Badge tone={configured ? 'ok' : 'danger'}>{configured ? '● Configuré' : '● Non configuré'}</Badge>
@@ -224,16 +222,6 @@ export default function ManagerMailPage() {
               </Field>
               <Button type="submit">Envoyer un mail de test</Button>
             </form>
-            {testResult &&
-              (testResult.ok ? (
-                <Alert tone="ok" title="✅ Envoyé">
-                  {testResult.text}
-                </Alert>
-              ) : (
-                <Alert tone="error" title="❌ Échec">
-                  {testResult.text}
-                </Alert>
-              ))}
           </Panel>
         </div>
       </div>

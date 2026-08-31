@@ -17,8 +17,8 @@ import {
 } from '@/lib/api';
 import { AppShell } from '@/components/app-shell';
 import { CLIENT_NAV } from '@/config/nav';
+import { useToast } from '@/components/toast';
 import {
-  Alert,
   Badge,
   Button,
   EmptyState,
@@ -58,6 +58,7 @@ const SERVICE_STATUS_LABEL: Record<string, string> = {
 
 export default function ClientPage() {
   const router = useRouter();
+  const toast = useToast();
   const [phase, setPhase] = useState<Phase>('loading');
   const [me, setMe] = useState<Me | null>(null);
   const [token, setToken] = useState('');
@@ -65,11 +66,8 @@ export default function ClientPage() {
   const [subs, setSubs] = useState<Subscription[]>([]);
   const [services, setServices] = useState<Service[]>([]);
   const [serviceName, setServiceName] = useState<Record<string, string>>({});
-  const [message, setMessage] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
 
   async function load(t: string) {
-    setError(null);
     try {
       const [p, s, svc] = await Promise.all([
         fetch('/api/products', { headers: { Authorization: `Bearer ${t}` } }).then((r) => r.json()),
@@ -80,7 +78,7 @@ export default function ClientPage() {
       setSubs((s.data as Subscription[]) ?? []);
       setServices((svc.data as Service[]) ?? []);
     } catch {
-      setError('Impossible de charger l’espace client.');
+      toast.error('Impossible de charger l’espace client.');
     }
   }
 
@@ -103,22 +101,17 @@ export default function ClientPage() {
     })();
   }, [router]);
 
-  function flash(m: string) {
-    setMessage(m);
-    setError(null);
-  }
-
   async function subscribe(productId: string) {
     const r = await createMySubscription(token, productId);
-    if (!r.ok) return setError(apiError(r, 'Impossible de souscrire.'));
-    flash('Souscription envoyée — en attente d’approbation par l’admin.');
+    if (!r.ok) return toast.error(apiError(r, 'Impossible de souscrire.'));
+    toast.ok('Souscription envoyée — en attente d’approbation par l’admin.');
     void load(token);
   }
 
   async function cancelSub(id: string) {
     const r = await cancelMySubscription(token, id);
-    if (!r.ok) return setError(apiError(r, 'Impossible d’annuler.'));
-    flash('Souscription annulée.');
+    if (!r.ok) return toast.error(apiError(r, 'Impossible d’annuler.'));
+    toast.ok('Souscription annulée.');
     void load(token);
   }
 
@@ -126,9 +119,9 @@ export default function ClientPage() {
     const name = (serviceName[subId] ?? '').trim();
     if (!name) return;
     const r = await createMyService(token, subId, name);
-    if (!r.ok) return setError(apiError(r, 'Impossible de demander un service.'));
+    if (!r.ok) return toast.error(apiError(r, 'Impossible de demander un service.'));
     setServiceName({ ...serviceName, [subId]: '' });
-    flash('Service demandé.');
+    toast.ok('Service demandé.');
     void load(token);
   }
 
@@ -166,9 +159,6 @@ export default function ClientPage() {
           title="Mes services"
           sub="Catalogue, souscriptions et services. L’hébergement (serveur) est géré par l’administrateur : aucune donnée d’infrastructure ne t’est exposée."
         />
-
-        {message && <Alert tone="ok">{message}</Alert>}
-        {error && <Alert tone="error">{error}</Alert>}
 
         <Panel title="Catalogue produits" sub={products.length > 0 ? `${products.filter((p) => p.status === 'ACTIVE' || p.status === 'SUSPENDED').length} offre(s) disponible(s)` : undefined}>
           {products.length === 0 ? (

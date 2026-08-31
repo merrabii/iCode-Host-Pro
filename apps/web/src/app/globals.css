@@ -70,8 +70,10 @@
   --header-bg: #ffffff;
   --card-bg: #ffffff;
   --card-bg-2: #ffffff;
-  --border: #e7eaf0;
-  --border-soft: #eef0f4;
+  /* contraste légèrement renforcé (2026-08-31, polish propriétaire) :
+     bordures plus lisibles sur fond blanc sans changer la nuance */
+  --border: #d5dce8;
+  --border-soft: #e1e6ef;
   --text-primary: #10151f;
   --text-secondary: #64748b;
   --text-muted: #94a3b8;
@@ -1072,12 +1074,47 @@ select:disabled {
   color: var(--text-muted);
 }
 
+/* Sélects à liste déroulante — flèche native supprimée, chevron SVG
+   du design system (couleur = --text-secondary de chaque thème),
+   curseur pointer + marge à droite pour le texte. */
+.select {
+  appearance: none;
+  -webkit-appearance: none;
+  padding-right: 36px;
+  cursor: pointer;
+  background-repeat: no-repeat;
+  background-position: right 12px center;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%2394a3b8' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E");
+}
+
+[data-theme="light"] .select {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%2364748b' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E");
+}
+
+.select:hover {
+  border-color: var(--active-text);
+}
+
+.select:disabled {
+  cursor: not-allowed;
+}
+
+/* options cohérentes avec le thème (dropdown natif) */
+.select option {
+  background: var(--input-bg);
+  color: var(--text-primary);
+}
+
 .input-sm {
   width: 170px;
 }
 
+/* variante compacte alignée sur .btn-sm (tableaux, filtres) */
 .select-sm {
   width: 170px;
+  padding: 6px 34px 6px 11px;
+  font-size: 12px;
+  border-radius: 7px;
 }
 
 .input-mono {
@@ -1117,6 +1154,14 @@ select:disabled {
   color: var(--text-secondary);
   font-size: 13px;
   line-height: 1.5;
+  /* jamais collé au contenu qui suit (polish 2026-08-31) */
+  margin-bottom: 12px;
+}
+
+/* dans les conteneurs espacés par gap, le margging double serait excessif */
+.stack > .alert,
+.panel-body > .alert {
+  margin-bottom: 0;
 }
 
 .alert b,
@@ -1152,6 +1197,88 @@ select:disabled {
   background: var(--tint-amber-bg);
   border-color: transparent;
   color: var(--tint-amber-fg);
+}
+
+/* ---- 15b. Toasts (pop-up : message + OK, auto-dismiss 5 s) ------ */
+.toast-host {
+  position: fixed;
+  top: calc(var(--topbar-h) + 12px);
+  right: 16px;
+  z-index: 200;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 10px;
+  pointer-events: none;
+  max-width: min(360px, calc(100vw - 32px));
+}
+
+.toast {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 11px 12px 11px 14px;
+  border-radius: var(--radius-card);
+  border: 1px solid var(--border-soft);
+  background: var(--card-bg);
+  box-shadow: var(--shadow);
+  color: var(--text-primary);
+  font-size: 13px;
+  line-height: 1.45;
+  pointer-events: auto;
+  animation: toast-in .18s ease;
+}
+
+.toast svg {
+  width: 17px;
+  height: 17px;
+  flex-shrink: 0;
+}
+
+.toast .toast-msg {
+  flex: 1;
+  min-width: 0;
+}
+
+.toast.ok { border-color: rgba(0, 179, 119, .4); }
+.toast.ok svg { color: var(--tint-green-fg); }
+.toast.error { border-color: rgba(239, 68, 68, .45); }
+.toast.error svg { color: var(--tint-red-fg); }
+.toast.info { border-color: rgba(59, 130, 246, .4); }
+.toast.info svg { color: var(--tint-blue-fg); }
+.toast.warn { border-color: rgba(217, 161, 6, .45); }
+.toast.warn svg { color: var(--tint-amber-fg); }
+
+.toast-btn {
+  flex-shrink: 0;
+  padding: 5px 13px;
+  border-radius: 7px;
+  border: 1px solid var(--border);
+  background: var(--input-bg);
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+  transition: var(--transition);
+}
+
+.toast-btn:hover {
+  border-color: var(--active-text);
+  color: var(--active-text);
+  background: var(--active-bg);
+}
+
+@keyframes toast-in {
+  from { opacity: 0; transform: translateY(-8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@media (max-width: 600px) {
+  .toast-host {
+    left: 12px;
+    right: 12px;
+    max-width: none;
+  }
 }
 
 /* ---- 16. Table ------------------------------------------------ */
