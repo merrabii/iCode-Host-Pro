@@ -66,6 +66,7 @@ Direction: fine-grained capability interfaces and provider isolation. Coolify/He
 - ADR-016 Modèle de données Phase 1 (below) — 2026-08-30.
 - ADR-017 Modèle cœur Phase 2 : Product + Server (below) — 2026-08-31.
 - ADR-018 Console d'administration /manager (below) — 2026-08-31.
+- ADR-019 Journal d'audit (below) — 2026-08-31.
 
 ## ADR-011 — Socle config minimal (Phase 0)
 **Status: APPROVED** (2026-08-30, Phase 0 GO)
@@ -126,6 +127,30 @@ table, no migration):
 Registration remains OPEN (deferred from ADR-015) — the owner explicitly kept
 closing registration / an invitation flow OUT of Phase 3 ("plus tard"). Providers
 (ADR-010), jobs/Redis (ADR-007), OAuth and client ownership (ADR-017) unchanged.
+
+## ADR-019 — Journal d'audit (Phase 4)
+**Status: APPROVED** (2026-08-31, Phase 4 GO)
+Decision: introduce an **append-only audit journal** to trace sensitive platform
+actions ("qui a fait quoi"), readable only by ADMIN:
+- New table `AuditLog` (migration `init_audit`): `actorId` (nullable FK → User,
+  `onDelete: SetNull`), `actorEmail` (dénormalisé, survit à la suppression/renommage),
+  `action` (code machine), `resourceType`/`resourceId` (Strings **polymorphes**,
+  pas de FK), `details` (Json optionnel), `createdAt`. Index sur `createdAt`,
+  `resourceType`, `action`.
+- **Append-only** : aucun endpoint de mise à jour/suppression. Pas de scellement
+  cryptographique (hors périmètre).
+- Lecture **ADMIN only** : `GET /api/audit` (pagination offset/limit + filtres
+  `actorId`, `action`, `resourceType`, `from`, `to`). Écriture émise CÔTÉ SERVIVE
+  (jamais par un client), via appels explicites dans la couche service (pas de bus
+  d'événements — choix réversible, zéro nouvelle dépendance).
+- Événements journalisés : mutations sensibles (users promote/demote/
+  activate/deactivate ; products & servers create/update/delete) **+** auth
+  (register, login, refresh, logout).
+- `AuditModule` est `@Global` (expose `AuditService`) pour être injecté sans
+  import par module ; il ré-enregistre localement `JwtModule` + `RolesGuard` pour
+  éviter une dépendance circulaire avec `AuthModule`. La journalisation est
+  best-effort : un échec d'écriture ne casse jamais l'opération métier.
+- ADR-006/007/008/009/010 unchanged ; registration toujours ouverte (différé).
 
 # REJECTED
 None recorded in this clean baseline.

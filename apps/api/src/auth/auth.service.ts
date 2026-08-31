@@ -9,6 +9,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { User } from '@prisma/client';
 import * as bcrypt from 'bcryptjs';
 import { createHash, randomBytes } from 'crypto';
+import { AuditService } from '../audit/audit.service';
 import { RegisterDto } from './dto/register.dto';
 import { LoginDto } from './dto/login.dto';
 import { AuthTokens, JwtPayload } from './types';
@@ -19,6 +20,7 @@ export class AuthService {
     private readonly prisma: PrismaService,
     private readonly jwt: JwtService,
     private readonly config: ConfigService,
+    private readonly audit: AuditService,
   ) {}
 
   async register(dto: RegisterDto): Promise<AuthTokens> {
@@ -37,6 +39,13 @@ export class AuthService {
         name: dto.name,
       },
     });
+    await this.audit.record({
+      actorId: user.id,
+      actorEmail: user.email,
+      action: 'auth.register',
+      resourceType: 'user',
+      resourceId: user.id,
+    });
     return this.issueTokens(user);
   }
 
@@ -50,6 +59,13 @@ export class AuthService {
     if (!user.isActive) {
       throw new UnauthorizedException('Account disabled');
     }
+    await this.audit.record({
+      actorId: user.id,
+      actorEmail: user.email,
+      action: 'auth.login',
+      resourceType: 'user',
+      resourceId: user.id,
+    });
     return this.issueTokens(user);
   }
 
@@ -77,14 +93,35 @@ export class AuthService {
     if (!user) {
       throw new UnauthorizedException('User not found');
     }
+    await this.audit.record({
+      actorId: user.id,
+      actorEmail: user.email,
+      action: 'auth.refresh',
+      resourceType: 'user',
+      resourceId: user.id,
+    });
     return this.issueTokens(user);
   }
 
   async logout(refreshToken: string): Promise<void> {
+    const hash = this.hashToken(refreshToken);
+    const record = await this.prisma.refreshToken.findUnique({
+      where: { tokenHash: hash },
+    });
     await this.prisma.refreshToken.updateMany({
-      where: { tokenHash: this.hashToken(refreshToken), revokedAt: null },
+      where: { tokenHash: hash, revokedAt: null },
       data: { revokedAt: new Date() },
     });
+    if (record?.userId) {
+      const user = await this.prisma.user.findUnique({ where: { id: record.userId } });
+      await this.audit.record({
+        actorId: record.userId,
+        actorEmail: user?.email ?? null,
+        action: 'auth.logout',
+        resourceType: 'user',
+        resourceId: record.userId,
+      });
+    }
   }
 
   private hashToken(token: string): string {

@@ -1,10 +1,10 @@
 # PROJECT_STATUS — iCode Host Pro
 
 ## Overall status
-**PHASE 3 COMPLETE + owner-validated 2026-08-31 — /MANAGER CONSOLE COMPLÈTE (ADMINS + DASHBOARD)**
+**PHASE 4 COMPLETE and owner-validated 2026-08-31 — JOURNAL D'AUDIT « QUI A FAIT QUOI » (commité)**
 
 ## Current phase
-**Phase 3 — Gestion utilisateurs admin + dashboard /manager + catalogue enrichi. COMPLETE + owner-validated 2026-08-31.**
+**Phase 4 — Journal d'audit (ADR-019). COMPLETE + owner-validated 2026-08-31. Awaiting Phase 5 proposal.**
 
 ## State (real, as of this update)
 - Monorepo: pnpm workspaces + Turborepo (ADR-001). `apps/web` (Next.js 15), `apps/api` (NestJS 11), `packages/` reserved.
@@ -16,6 +16,7 @@
 - **Admin bootstrap**: idempotent `db:seed` (prisma/seed.ts) creates/promotes the ADMIN from `ADMIN_EMAIL`/`ADMIN_PASSWORD` in gitignored `apps/api/.env`; placeholders only in `.env.example`; no real secret in Git.
 - Web: login/register at `/auth`; same-origin `/api/*` rewrite (httpOnly cookie works through :3000); **`/manager`** admin console gated to ADMIN, access token minted from the httpOnly refresh cookie (no localStorage token). Homepage links to /auth and /manager.
 - **Admin console (Phase 3, ADR-018)**: `/api/users` list + `/api/users/:id` PATCH (promote/demote, activate/deactivate) — ADMIN only, with **anti-lockout guards** (no self role change, keep ≥1 active ADMIN); `/api/manager/summary` dashboard aggregation — ADMIN only. Web: `/manager` dashboard + catalog (product/server **status transitions**, **editable server hostname**) + **`/manager/utilisateurs`** (promote/demote, activate/deactivate). Data model UNCHANGED — no migration. Registration still OPEN (invitation flow explicitly deferred).
+- **Audit journal (Phase 4, ADR-019)**: append-only trace of sensitive actions. Table `AuditLog` (migration `init_audit`) — `actorId` nullable FK User, `actorEmail` dénormalisé, `action`, `resourceType`/`resourceId` polymorphiques, `details` Json, `createdAt`. `GET /api/audit` (paginated + filterable, ADMIN only). Emission côté service (best-effort) pour users/products/servers/auth (register/login/refresh/logout + promote/demote/activate/deactivate + product/server CRUD). `AuditModule` `@Global`. Web **`/manager/journal`** (tableau + filtres + pagination). No update/delete endpoints.
 - `@nestjs/jwt` pinned to **^11.0.2** (CJS dist) — v12 ships ESM-only dist that breaks our CJS jest/toolchain.
 - Docker Postgres 16 (ADR-012) up and healthy.
 
@@ -38,14 +39,28 @@
 ## Owner validation (2026-08-31)
 - Owner confirmed live: gestion admins (promotion/rétrogradation/activation/désactivation), dashboard `/manager`, catalogue enrichi et transitions de statut. Phase 3 closed.
 
+## Verified (Phase 4 — real checks, 2026-08-31)
+- Unit **28/28** (health 2 + products 5 + servers 4 + users 10 + manager 2 + audit 5).
+- e2e **29/29, 5 suites** (health + auth + core RBAC + admin RBAC + audit RBAC).
+- Builds API + web PASS (web routes `/`, `/auth`, `/manager`, `/manager/utilisateurs`, `/manager/journal`).
+- Live API :3001: `/api/audit` **401 unauth**; admin login → obtient un token → `/api/audit` **200** (16 entrées au fil de l'eau : `auth.login`, `auth.register`, `user.promote/demote`, `server.create/delete`...). Filtres + pagination vérifiés par e2e.
+- Live web: `/manager/journal` **200**, `/manager` 200.
+- Migration `20260831024151_init_audit` appliquée (table `AuditLog`). Prisma client régénéré (arrêt temporaire des dev servers pour libérer la DLL, puis relance API :3001 + web :3000).
+- **Correctif UI (retour propriétaire)** : colonne « Ressource » du journal affichait le payload brut — remplacée par un libellé lisible (nom de l'entité / `.to.name` pour les updates, `hostname` serveur, fallback id court). JSON complet conservé en infobulle `title`. `typecheck apps/web` PASS.
+- **Re-run de clôture (2026-08-31)** : unit **28/28**, e2e **29/29** re-confirmés verts.
+
+## Owner validation (2026-08-31)
+- Owner confirmed live: journal `/manager/journal` (filtres + pagination + navigation) et la colonne « Ressource » lisible (nom + hostname serveur). « validé ». Phase 4 closed. Phase 4 commitée en un seul commit.
+
 ## Pending
-- Proposal for Phase 4 (on owner request).
+- Push of Phase 4 (on owner request).
+- Proposal for Phase 5 (on owner request).
 
 ## Decisions
-- ADR-001..005, 011..014: **APPROVED** (Phase 0). ADR-015 + 016: **APPROVED** (Phase 1). **ADR-017** (core model Product+Server): **APPROVED** (Phase 2 GO, 2026-08-31). **ADR-018** (admin console /manager): **APPROVED** (Phase 3 GO, 2026-08-31). ADR-006 full, 007, 008, 009, 010: **PROPOSED** (untouched). See DECISIONS.md.
+- ADR-001..005, 011..014: **APPROVED** (Phase 0). ADR-015 + 016: **APPROVED** (Phase 1). **ADR-017** (core model Product+Server): **APPROVED** (Phase 2 GO, 2026-08-31). **ADR-018** (admin console /manager): **APPROVED** (Phase 3 GO, 2026-08-31). **ADR-019** (journal d'audit): **APPROVED** (Phase 4 GO, 2026-08-31). ADR-006 full, 007, 008, 009, 010: **PROPOSED** (untouched). See DECISIONS.md.
 
 ## Next action
-Propose Phase 4 on owner request (and/or push the Phase 3 commit).
+Propose Phase 5 on owner request (and/or push the Phase 4 commit on owner request).
 
 ## Out of scope (do not build yet)
 Client-owned resources (Subscription/Service/Deployment), providers (Coolify/Hestia — ADR-010), jobs/Redis (ADR-007), billing, OAuth, licensing. (Product + Server platform reference data now exist; client consumption of them is deferred.)

@@ -193,7 +193,8 @@ export default function ManagerPage() {
       <h1>iCode Host Pro — Manager</h1>
       <p className="muted">
         Console d&apos;administration (Phase 3) — connecté en tant que {me?.email} ·{' '}
-        <Link href="/manager/utilisateurs">Gestion des utilisateurs →</Link>
+        <Link href="/manager/utilisateurs">Gestion des utilisateurs →</Link> ·{' '}
+        <Link href="/manager/journal">Journal d&apos;audit →</Link>
       </p>
 
       {message && <p style={{ color: 'var(--ok, #1a7f37)' }}>{message}</p>}

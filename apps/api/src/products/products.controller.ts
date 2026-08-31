@@ -13,6 +13,8 @@ import { Role } from '@prisma/client';
 import { Roles } from '../auth/decorators/roles.decorator';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
+import { CurrentUser } from '../auth/decorators/current-user.decorator';
+import { JwtPayload } from '../auth/types';
 import { ProductsService } from './products.service';
 import { CreateProductDto } from './dto/create-product.dto';
 import { UpdateProductDto } from './dto/update-product.dto';
@@ -32,8 +34,8 @@ export class ProductsController {
   @UseGuards(RolesGuard)
   @Roles(Role.ADMIN)
   @ApiOperation({ summary: 'Create a product (ADMIN)' })
-  create(@Body() dto: CreateProductDto) {
-    return this.products.create(dto);
+  create(@Body() dto: CreateProductDto, @CurrentUser() actor: JwtPayload) {
+    return this.products.create(dto, actor);
   }
 
   @Get()
@@ -52,15 +54,19 @@ export class ProductsController {
   @UseGuards(RolesGuard)
   @Roles(Role.ADMIN)
   @ApiOperation({ summary: 'Update a product (ADMIN)' })
-  update(@Param('id') id: string, @Body() dto: UpdateProductDto) {
-    return this.products.update(id, dto);
+  update(
+    @Param('id') id: string,
+    @Body() dto: UpdateProductDto,
+    @CurrentUser() actor: JwtPayload,
+  ) {
+    return this.products.update(id, dto, actor);
   }
 
   @Delete(':id')
   @UseGuards(RolesGuard)
   @Roles(Role.ADMIN)
   @ApiOperation({ summary: 'Delete a product (ADMIN)' })
-  remove(@Param('id') id: string) {
-    return this.products.remove(id);
+  remove(@Param('id') id: string, @CurrentUser() actor: JwtPayload) {
+    return this.products.remove(id, actor);
   }
 }

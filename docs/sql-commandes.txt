@@ -323,3 +323,72 @@ REMARKS FOR FUTURE AI:
     → la rétrogradation était refusée à tort. Vérifié par requête:
       SELECT id, email, role, "isActive" FROM "User" WHERE role='ADMIN';
 ================================================================
+PHASE 4 — JOURNAL D'AUDIT (ADR-019) : table AuditLog
+================================================================
+
+DATE: 2026-08-31
+PHASE: 4 — Journal d'audit « qui a fait quoi » (ADR-019)
+OBJECTIVE:
+  Trace the sensitive platform actions (admin mutations + auth events) in an
+  append-only journal readable only by ADMIN. Reuses the existing `User`
+  (actor); adds a single new table `AuditLog`. No changes to Product/Server.
+
+DATABASE ACTIONS:
+  - Created model `AuditLog` in apps/api/prisma/schema.prisma + relation
+    `User.auditLogs`.
+  - Migration applied locally (containers icode-postgres, db icode_host_pro).
+
+MIGRATIONS:
+  - Migration folder: apps/api/prisma/migrations/20260831024151_init_audit/
+  - Name: `init_audit`. Applied via
+    `corepack pnpm --filter @icode-host-pro/api run migrate --name init_audit`.
+  - NOTE: the `prisma generate` inside that run failed with EPERM (query engine
+    DLL locked by the running API dev server). Fixed by stopping the dev node
+    processes, running `corepack pnpm --filter @icode-host-pro/api generate`,
+    then restarting the API (:3001) + web (:3000) dev servers.
+
+IMPORTANT SQL / COMMANDS:
+  - The migration SQL (mirror of Prisma schema):
+
+    CREATE TABLE "AuditLog" (
+        "id"           TEXT NOT NULL,
+        "actorId"      TEXT,
+        "actorEmail"   TEXT,
+        "action"       TEXT NOT NULL,
+        "resourceType" TEXT,
+        "resourceId"   TEXT,
+        "details"      JSONB,
+        "createdAt"    TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        CONSTRAINT "AuditLog_pkey" PRIMARY KEY ("id")
+    );
+    CREATE INDEX "AuditLog_createdAt_idx"   ON "AuditLog"("createdAt");
+    CREATE INDEX "AuditLog_resourceType_idx" ON "AuditLog"("resourceType");
+    CREATE INDEX "AuditLog_action_idx"      ON "AuditLog"("action");
+    ALTER TABLE "AuditLog" ADD CONSTRAINT "AuditLog_actorId_fkey"
+        FOREIGN KEY ("actorId") REFERENCES "users"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+
+  - Endpoint (ADMIN only): GET /api/audit?page&perPage&actorId&action&resourceType&from&to
+
+VALIDATION QUERIES:
+  - `SELECT action, "actorEmail", "resourceType", COUNT(*) FROM "AuditLog" GROUP BY 1,2,3 ORDER BY 3;`
+    -> trace of emitted events (auth.register/login/refresh/logout,
+       user.promote/demote/activate/deactivate, product.*, server.*).
+  - `SELECT COUNT(*) FROM "AuditLog";` -> grows as actions occur; deletion of a
+     user sets actorId NULL (SetNull) but the row (with actorEmail snapshot) stays.
+
+RESULT:
+  - `AuditLog` table created. Live smoke: admin login → 200 on /api/audit with
+    16 entries (register/login + promote/demote + server create/delete from
+    earlier suites). Append-only (no update/delete endpoints). ADMIN-only read.
+
+ROLLBACK NOTES:
+  - No down-migration authored. To drop AuditLog on dev (destructive):
+        docker compose down -v && docker compose up -d postgres
+    then re-run `migrate dev` (re-applies init_auth, init_core, init_audit).
+
+REMARKS FOR FUTURE AI:
+  - AuditLog is APPEND-ONLY and ADMIN-read. Do NOT add update/delete endpoints
+    without owner approval. `details` is polymorphic JSON (before/after snapshots).
+  - `actorId` is a real FK (SetNull); `actorEmail` is the denormalized snapshot
+    that survives user deletion/rename — always log it.
+================================================================

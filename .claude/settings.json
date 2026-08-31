@@ -10,7 +10,15 @@
       "Bash(curl -s -o /dev/null -w \"%{http_code}\\\\n\" http://localhost:3000/api/health)",
       "PowerShell($c = Get-NetTCPConnection -State Listen -LocalPort 3000 -ErrorAction SilentlyContinue; if \\($c\\) { $p = $c.OwningProcess | Select-Object -First 1; Stop-Process -Id $p -Force -Confirm:$false -ErrorAction SilentlyContinue; \"killed 3000 pid=$p\" } else { \"3000 free\" }; if \\(Test-Path \"C:\\\\Users\\\\mourad.errabii\\\\Documents\\\\Projet iCode Host\\\\apps\\\\web\\\\.next\"\\) { Remove-Item -Recurse -Force \"C:\\\\Users\\\\mourad.errabii\\\\Documents\\\\Projet iCode Host\\\\apps\\\\web\\\\.next\"; \".next removed\" })",
       "PowerShell(foreach \\($p in 3000,3001\\) { $c = Get-NetTCPConnection -State Listen -LocalPort $p -ErrorAction SilentlyContinue; if \\($c\\) { \"port $p LISTENING pid=$\\($c.OwningProcess -join ','\\)\" } else { \"port $p free\" } }; $n = \"C:\\\\Users\\\\mourad.errabii\\\\Documents\\\\Projet iCode Host\\\\apps\\\\web\\\\.next\"; if \\(Test-Path $n\\) { Remove-Item -Recurse -Force $n; \".next purged\" } else { \".next already gone\" })",
-      "Bash(node -e \"const d=JSON.parse\\(require\\('fs'\\).readFileSync\\(0,'utf8'\\)\\); for \\(const k of ['/api/products','/api/products/{id}','/api/servers','/api/servers/{id}']\\) { const p=d.paths[k]; console.log\\(k\\); if\\(p\\) for\\(const [m,op] of Object.entries\\(p\\)\\) console.log\\('   ', m.toUpperCase\\(\\), 'tags=', op.tags, 'opId=', op.operationId\\); } \")"
+      "Bash(node -e \"const d=JSON.parse\\(require\\('fs'\\).readFileSync\\(0,'utf8'\\)\\); for \\(const k of ['/api/products','/api/products/{id}','/api/servers','/api/servers/{id}']\\) { const p=d.paths[k]; console.log\\(k\\); if\\(p\\) for\\(const [m,op] of Object.entries\\(p\\)\\) console.log\\('   ', m.toUpperCase\\(\\), 'tags=', op.tags, 'opId=', op.operationId\\); } \")",
+      "PowerShell(docker compose ps 2>$null; \"---- postgres port ----\"; \\(Get-NetTCPConnection -State Listen -LocalPort 5432 -ErrorAction SilentlyContinue | Select-Object -First 1\\).LocalPort)",
+      "PowerShell(corepack pnpm --filter @icode-host-pro/api test 2>&1)",
+      "PowerShell(corepack pnpm --filter @icode-host-pro/api test:e2e 2>&1)",
+      "PowerShell(corepack pnpm --filter @icode-host-pro/api build 2>&1)",
+      "PowerShell(foreach \\($p in 3000,3001\\) { $c = Get-NetTCPConnection -State Listen -LocalPort $p -ErrorAction SilentlyContinue; if \\($c\\) { \"port $p LISTENING pid=$\\($c.OwningProcess -join ','\\)\" } else { \"port $p free\" } })",
+      "PowerShell(docker exec icode-postgres psql -U icode -d icode_host_pro -c \"SELECT email, role, \\\\\"isActive\\\\\" FROM \\\\\"User\\\\\" ORDER BY \\\\\"createdAt\\\\\";\")",
+      "PowerShell(docker exec icode-postgres psql -U icode -d icode_host_pro -tc \"SELECT email, role, \\\\\"isActive\\\\\" FROM \\\\\"User\\\\\" WHERE email='u_1788135183287@example.com';\")",
+      "PowerShell(git push origin main)"
     ]
   }
 }

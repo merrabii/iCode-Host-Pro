@@ -214,6 +214,43 @@ Do not log only important work. Record all meaningful actions, including small c
 - **Commandes** : `test` → **23/23** (5 suites); `test:e2e` → **24/24** (4 suites).
 - **Résultat** : le propriétaire peut désormais rétrograder `u_1788135183287@example.com` via l'UI (fix live sur l'API de dev :3001).
 
+# PHASE 4 — JOURNAL D'AUDIT « QUI A FAIT QUOI » (owner-validated 2026-08-31) ✓
+
+## 2026-08-31 — 4.6 Close & commit
+- Action: owner validated Phase 4 (« validé »), incl. la colonne « Ressource » du journal rendue lisible (nom + hostname serveur, JSON brut conservé en infobulle).
+- Files modified: PROJECT_STATUS.md (Phase 4 ✓), TASKS.md, CHANGELOG.md, HANDOVER.md.
+- Command: unit **28/28** + e2e **29/29** re-confirmés verts (clôture), puis git add + commit unique (Phase 4 baseline). Push offert. `apps/web` typecheck PASS sur le correctif UI.
+
+## 2026-08-31 — 4.0 GO & périmètre
+- Owner chose direction **« D. Audit journal »** (AskUserQuestion). GO donné.
+- Périmètre (comme proposé) : tracer les actions sensibles (mutations admin + événements d'auth). Nouvelle table `AuditLog` ; lecture ADMIN only ; append-only ; émission côté service (pas de bus d'événements — choix réversible noté) ; UI `/manager/journal`. ADR-019 APPROVED au GO.
+- Note : `/auto-mode-setup` invoqué en cours de travail n'est pas un skill disponible dans ma liste => non exécutable.
+
+## 2026-08-31 — 4.1 Modèle + migration (ADR-019)
+- Files modified: `apps/api/prisma/schema.prisma` — modèle `AuditLog` (actorId nullable FK User onDelete SetNull, actorEmail dénormalisé, action, resourceType/resourceId polymorphiques, details Json, createdAt; indexes createdAt/resourceType/action) + relation `User.auditLogs`.
+- Command: `corepack pnpm --filter @icode-host-pro/api run migrate --name init_audit` → migration `20260831024151_init_audit` appliquée. `generate` du client a échoué en EPREM (DLL verrouillée par les dev servers en cours) → arrêt de tous les node sauf web, `generate` OK (client v6.19.3 régénéré), puis relance des dev servers API :3001 + web :3000 en fond.
+
+## 2026-08-31 — 4.2 Backend : AuditService + controller (ADR-019)
+- Files created: `apps/api/src/audit/audit.service.ts` (`record` best-effort + `findAll` paginé/filtré), `audit.controller.ts` (`GET /api/audit` ADMIN only), `audit.module.ts` (`@Global`, exporte AuditService ; ré-enregistre JwtModule + RolesGuard localement pour éviter la dépendance circulaire avec AuthModule), `dto/audit-query.dto.ts` (page/perPage/actorId/action/resourceType/from/to).
+- Files modified: `apps/api/src/app.module.ts` (importa AuditModule).
+
+## 2026-08-31 — 4.3 Branchage de l'émission dans les services
+- `apps/api/src/auth/auth.service.ts` : émission `auth.register`/`auth.login`/`auth.refresh`/`auth.logout` (logout récupère le user du token pour journaliser l'acteur).
+- `apps/api/src/users/users.service.ts` : `update(id, dto, actor: {sub,email})` (au lieu d'un simple sub) ; émission `user.promote`/`user.demote`/`user.activate`/`user.deactivate` avec détails from→to.
+- `apps/api/src/products/products.service.ts` + `servers.service.ts` : signature +`actor` sur create/update/remove ; émission `product.*`/`server.*` (create/update/delete).
+- Contrôleurs users/products/servers : passent l'`@CurrentUser()` (JwtPayload) à la couche service.
+
+## 2026-08-31 — 4.4 Tests + builds + live (all PASS)
+- Files created: `apps/api/src/audit/audit.service.spec.ts` (5 unit : mapping, coercition null, best-effort, page+filtres, clamp perPage), `apps/api/test/audit.e2e-spec.ts` (RBAC : USER 403 ; ADMIN 200 shape + filtre ; register/login produisent des entrées ; une action promote visible+filtrable ; pagination).
+- Files modified: `users/products/servers` specs (injection mockAudit + acteur) — ajout de assertions journalisation.
+- Commands: `test` → **28/28** (6 suites); `test:e2e` → **29/29** (5 suites); builds API + web PASS (routes incl. `/manager/journal`).
+- Live :3001: `/api/audit` 401 unauth; admin login → token → `/api/audit` 200 (16 entrées : auth.register/login, user.promote/demote, server.create/delete...). Web `/manager/journal` 200.
+
+## 2026-08-31 — 4.5 Web /manager/journal
+- Files modified: `apps/web/src/lib/api.ts` (+`AuditEntry`, `AuditPage`, `AuditQuery`, `listAudit`).
+- Files created: `apps/web/src/app/manager/journal/page.tsx` — tableau paginé + filtres (type de ressource, action) + navigation précédent/suivant, gated ADMIN. Correctif TS (garde `data &&` dans les onClick).
+- Files modified: `apps/web/src/app/manager/page.tsx` (lien → Journal d'audit).
+
 # EXECUTION ENTRY TEMPLATE
 ## YYYY-MM-DD — Phase X
 - Action:
@@ -246,3 +283,4 @@ Do not log only important work. Record all meaningful actions, including small c
 - Phase 1: Auth + first tables (User + RefreshToken) — owner-validated, poussée.
 - Phase 2: Modèle cœur Product+Server globaux plateforme + console /manager — owner-validated, poussée.
 - Phase 3: gestion utilisateurs admin + dashboard /manager + catalogue enrichi — owner-validated 2026-08-31.
+- Phase 4: journal d'audit « qui a fait quoi » (ADR-019) — owner-validated 2026-08-31, commitée.

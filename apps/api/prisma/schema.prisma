@@ -28,6 +28,7 @@ model User {
   updatedAt    DateTime       @updatedAt
 
   refreshTokens RefreshToken[]
+  auditLogs     AuditLog[]      // audit entries this user performed (Phase 4)
 
   @@index([email])
 }
@@ -83,4 +84,28 @@ model Server {
   status    ServerStatus @default(UNKNOWN)
   createdAt DateTime     @default(now())
   updatedAt DateTime     @updatedAt
+}
+
+// ── Phase 4 — audit journal (ADR-019) ────────────────────────────────────────
+// Append-only, readable only by ADMIN, emitted explicitly by services. No
+// update/delete endpoints. actorId is a real (nullable) FK to User — null when
+// the actor isn't a valid account (e.g. a failed login). actorEmail is a
+// denormalized snapshot that survives the user being deleted or renamed.
+// resourceType/resourceId are polymorphic strings (the referenced resource
+// varies: user/product/server), so there is deliberately NO relation to them.
+
+model AuditLog {
+  id           String   @id @default(cuid())
+  actorId      String?
+  actor        User?    @relation(fields: [actorId], references: [id], onDelete: SetNull)
+  actorEmail   String?
+  action       String
+  resourceType String?
+  resourceId   String?
+  details      Json?
+  createdAt    DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([resourceType])
+  @@index([action])
 }

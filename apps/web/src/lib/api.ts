@@ -89,3 +89,38 @@ export const listUsers = (t: string) => apiJson('/api/users', t);
 export const updateUser = (t: string, id: string, patch: { role?: string; isActive?: boolean }) =>
   apiJson(`/api/users/${id}`, t, { method: 'PATCH', body: JSON.stringify(patch) });
 export const getManagerSummary = (t: string) => apiJson('/api/manager/summary', t);
+
+// Admin (Phase 4) audit journal helpers.
+export interface AuditEntry {
+  id: string;
+  actorId?: string | null;
+  actorEmail?: string | null;
+  action: string;
+  resourceType?: string | null;
+  resourceId?: string | null;
+  details?: unknown;
+  createdAt: string;
+}
+export interface AuditPage {
+  items: AuditEntry[];
+  total: number;
+  page: number;
+  perPage: number;
+}
+export interface AuditQuery {
+  action?: string;
+  resourceType?: string;
+  actorId?: string;
+  page?: number;
+  perPage?: number;
+}
+export function listAudit(t: string, query: AuditQuery = {}): Promise<ApiResult> {
+  const q = new URLSearchParams();
+  if (query.action) q.set('action', query.action);
+  if (query.resourceType) q.set('resourceType', query.resourceType);
+  if (query.actorId) q.set('actorId', query.actorId);
+  if (query.page) q.set('page', String(query.page));
+  if (query.perPage) q.set('perPage', String(query.perPage));
+  const s = q.toString();
+  return apiJson(`/api/audit${s ? `?${s}` : ''}`, t);
+}

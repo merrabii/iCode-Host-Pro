@@ -7,6 +7,7 @@ import { UsersModule } from './users/users.module';
 import { ProductsModule } from './products/products.module';
 import { ServersModule } from './servers/servers.module';
 import { ManagerModule } from './manager/manager.module';
+import { AuditModule } from './audit/audit.module';
 import { loadAppConfig } from './config/configuration';
 
 @Module({
@@ -22,6 +23,7 @@ import { loadAppConfig } from './config/configuration';
     ProductsModule,
     ServersModule,
     ManagerModule,
+    AuditModule,
   ],
 })
 export class AppModule {}

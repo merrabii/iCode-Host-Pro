@@ -1,13 +1,23 @@
 import { ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { Role, User } from '@prisma/client';
+import { AuditService } from '../audit/audit.service';
 import { UpdateUserDto } from './dto/update-user.dto';
 
 export type PublicUser = Omit<User, 'passwordHash'>;
 
+/** The authenticated actor performing an admin action (JwtPayload shaped). */
+export interface Actor {
+  sub: string;
+  email: string;
+}
+
 @Injectable()
 export class UsersService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly audit: AuditService,
+  ) {}
 
   async getProfile(userId: string): Promise<PublicUser> {
     const user = await this.prisma.user.findUnique({ where: { id: userId } });
@@ -31,8 +41,13 @@ export class UsersService {
    * - You may never change your own role or deactivate your own active account.
    * - The platform must keep at least one active ADMIN: removing the last active
    *   ADMIN is refused (ForbiddenException).
+   * - Every applied change is journaled to the audit log (Phase 4).
    */
-  async update(id: string, dto: UpdateUserDto, actorId: string): Promise<PublicUser> {
+  async update(
+    id: string,
+    dto: UpdateUserDto,
+    actor: Actor,
+  ): Promise<PublicUser> {
     const user = await this.prisma.user.findUnique({ where: { id } });
     if (!user) {
       throw new NotFoundException('User not found');
@@ -48,7 +63,7 @@ export class UsersService {
 
     if (removingActiveAdmin) {
       // Never allow self-demotion / self-deactivation of an active admin.
-      if (user.id === actorId) {
+      if (user.id === actor.sub) {
         throw new ForbiddenException(
           'Vous ne pouvez pas modifier votre propre rôle ou désactiver votre propre compte.',
         );
@@ -68,6 +83,29 @@ export class UsersService {
       where: { id },
       data: { role: nextRole, isActive: nextActive },
     });
+
+    // Journal the applied changes (one entry per logical transition).
+    if (nextRole !== user.role) {
+      await this.audit.record({
+        actorId: actor.sub,
+        actorEmail: actor.email,
+        action: user.role === Role.USER ? 'user.promote' : 'user.demote',
+        resourceType: 'user',
+        resourceId: user.id,
+        details: { fromRole: user.role, toRole: nextRole },
+      });
+    }
+    if (nextActive !== user.isActive) {
+      await this.audit.record({
+        actorId: actor.sub,
+        actorEmail: actor.email,
+        action: user.isActive ? 'user.deactivate' : 'user.activate',
+        resourceType: 'user',
+        resourceId: user.id,
+        details: { fromActive: user.isActive, toActive: nextActive },
+      });
+    }
+
     return this.toPublic(updated);
   }
 

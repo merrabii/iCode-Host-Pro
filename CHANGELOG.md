@@ -1,5 +1,34 @@
 # CHANGELOG
 
+## Phase 4 — COMPLETE and owner-validated (2026-08-31)
+Owner gave GO for direction « Audit journal »; scope includes auth events (register/login/refresh/logout) alongside admin mutations (as proposed).
+### Added
+- **Audit journal (ADR-019)**: new table `AuditLog` (migration `20260831024151_init_audit`) — `actorId` nullable FK User (onDelete SetNull), `actorEmail` (denormalized), `action`, `resourceType`/`resourceId` (polymorphic strings), `details` Json, `createdAt`; indexes on createdAt/resourceType/action.
+- **`GET /api/audit`** (ADMIN only): pagination (offset/limit) + filters `actorId`, `action`, `resourceType`, `from`, `to`. **Append-only** — no update/delete endpoints.
+- **Emission côté service** (best-effort, ne casse jamais l'opération métier): `AuditService` (`@Global`) injecté dans users (promote/demote/activate/deactivate), products & servers (create/update/delete), auth (register/login/refresh/logout).
+- **Web `/manager/journal`**: table admin paginée + filtres (type de ressource, action) + pavés précédent/suivant; lien depuis `/manager`. Helpers `lib/api` (`AuditEntry`, `AuditPage`, `listAudit`).
+- Tests: `audit.service.spec` (5 unit), `audit.e2e-spec` (RBAC 403/USER, lecture+filtres+pagination ADMIN, une action promote produit une entrée visible).
+### Changed
+- DECISIONS.md: ADR-019 APPROVED (Phase 4 GO). Schema Prisma: model `AuditLog` + relation `User.auditLogs`.
+- `AuditModule` est `@Global` et ré-enregistre localement JwtModule + RolesGuard pour éviter une dépendance circulaire avec AuthModule (AuthService injecte l'AuditService global).
+- `UsersService.update` reçoit désormais l'acteur `{ sub, email }` (au lieu d'un simple `sub`) pour journaliser qui agit.
+- PROJECT_STATUS.md, TASKS.md, docs/sql-commandes.txt updated.
+
+### Fixed (2026-08-31, retour du propriétaire)
+- **Colonne « Ressource » du journal** : affichait le payload brut (`JSON.stringify` de `details`) + id tronqué. Rendu remplacé par un **libellé lisible** — le nom de l'entité impactée (`.name` / `.to.name` / `.email`), le `hostname` pour les serveurs, fallback sur l'id court sinon. Le JSON complet est conservé en infobulle `title` (forensique intacte). `typecheck apps/web` PASS.
+
+### Verified (2026-08-31)
+- Unit **28/28** (6 suites, +5 audit); e2e **29/29, 5 suites** (+audit RBAC); builds API + web PASS (routes incl. `/manager/journal`).
+- Live: `/api/audit` 401 unauth; admin login → 200 (16 entrées : auth.register/login, user.promote/demote, server.create/delete…). Web `/manager/journal` 200.
+- Re-run de clôture (2026-08-31, avant commit) : unit **28/28**, e2e **29/29** — confirmés verts.
+
+### Owner validation (2026-08-31)
+- Owner confirmed live: journal `/manager/journal` (filtres, pagination) et la colonne « Ressource » lisible (nom + hostname serveur). « validé ». Phase 4 closed.
+
+### Pending (not yet done)
+- Push of Phase 4 (on owner request).
+- Proposal for Phase 5.
+
 ## Phase 3 — COMPLETE and owner-validated (2026-08-31)
 Owner gave GO for direction « Dashboard /manager + gestion admins »; explicitly kept closing registration / an invitation flow OUT of this phase.
 ### Added

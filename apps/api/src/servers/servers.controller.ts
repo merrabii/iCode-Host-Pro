@@ -13,6 +13,8 @@ import { Role } from '@prisma/client';
 import { Roles } from '../auth/decorators/roles.decorator';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
+import { CurrentUser } from '../auth/decorators/current-user.decorator';
+import { JwtPayload } from '../auth/types';
 import { ServersService } from './servers.service';
 import { CreateServerDto } from './dto/create-server.dto';
 import { UpdateServerDto } from './dto/update-server.dto';
@@ -29,8 +31,8 @@ export class ServersController {
 
   @Post()
   @ApiOperation({ summary: 'Create a server (ADMIN)' })
-  create(@Body() dto: CreateServerDto) {
-    return this.servers.create(dto);
+  create(@Body() dto: CreateServerDto, @CurrentUser() actor: JwtPayload) {
+    return this.servers.create(dto, actor);
   }
 
   @Get()
@@ -47,13 +49,17 @@ export class ServersController {
 
   @Patch(':id')
   @ApiOperation({ summary: 'Update a server (ADMIN)' })
-  update(@Param('id') id: string, @Body() dto: UpdateServerDto) {
-    return this.servers.update(id, dto);
+  update(
+    @Param('id') id: string,
+    @Body() dto: UpdateServerDto,
+    @CurrentUser() actor: JwtPayload,
+  ) {
+    return this.servers.update(id, dto, actor);
   }
 
   @Delete(':id')
   @ApiOperation({ summary: 'Delete a server (ADMIN)' })
-  remove(@Param('id') id: string) {
-    return this.servers.remove(id);
+  remove(@Param('id') id: string, @CurrentUser() actor: JwtPayload) {
+    return this.servers.remove(id, actor);
   }
 }

@@ -41,6 +41,6 @@ export class UsersController {
     @Body() dto: UpdateUserDto,
     @CurrentUser() actor: JwtPayload,
   ) {
-    return this.users.update(id, dto, actor.sub);
+    return this.users.update(id, dto, actor);
   }
 }
