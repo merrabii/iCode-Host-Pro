@@ -659,3 +659,78 @@ REMARKS FOR FUTURE AI:
     (scalars + relations) when you need both (see `SERVICE_SELECT` in
     apps/api/src/subscriptions/subscriptions.service.ts).
 ================================================================
+PHASE 7ter — GESTION ADMIN SERVEURS & PRODUITS + DÉTAILS INFRASTRUCTURE (ADR-024)
+================================================================
+
+DATE: 2026-09-01
+PHASE: 7ter — Server extended with infra details (ADR-024)
+OBJECTIVE:
+  Prepare the `Server` record for real server connections (future ADR-010
+  adapters Coolify/Hestia -> cPanel/DirectAdmin; statuses will be driven by the
+  connection later). All new columns are OPTIONAL so creating a host remains
+  name+hostname only. Backs the new wide ADMIN pages /manager/serveurs
+  (full inline CRUD) and /manager/produits, and the now read-only /manager
+  dashboard. GO via AskUserQuestion (2026-09-01).
+
+DATABASE ACTIONS:
+  - Added enum `ServerPanelProvider` (`NONE`/`HESTIA`/`COOLIFY` — commented for
+    future `cPanel`/`DirectAdmin`).
+  - Extended model `Server` with 7 optional/flagged columns: `ipAddress String?`,
+    `port Int?`, `provider String?`, `region String?`, `quotaMaxAccounts Int?`,
+    `strictTls Boolean @default(true)`, `panelProvider ServerPanelProvider @default(NONE)`.
+  - Migration applied locally (containers icode-postgres, db icode_host_pro).
+
+MIGRATIONS:
+  - Migration folder: apps/api/prisma/migrations/20260901021234_init_server_details/
+  - Name: `init_server_details`. Applied via
+    `corepack pnpm --filter @icode-host-pro/api run migrate --name init_server_details`.
+  - NOTE: dev servers stopped before migrate (EPERM DLL), `prisma generate` OK.
+  - `prisma migrate status` -> up to date, 6 migrations total (init_auth,
+    init_core, init_audit, init_client_access, init_mail, init_server_details).
+
+IMPORTANT SQL / COMMANDS:
+  - Migration SQL (mirror of Prisma schema):
+
+    CREATE TYPE "ServerPanelProvider" AS ENUM ('NONE', 'HESTIA', 'COOLIFY');
+    ALTER TABLE "Server" ADD COLUMN "ipAddress" TEXT;
+    ALTER TABLE "Server" ADD COLUMN "port" INTEGER;
+    ALTER TABLE "Server" ADD COLUMN "provider" TEXT;
+    ALTER TABLE "Server" ADD COLUMN "region" TEXT;
+    ALTER TABLE "Server" ADD COLUMN "quotaMaxAccounts" INTEGER;
+    ALTER TABLE "Server" ADD COLUMN "strictTls" BOOLEAN NOT NULL DEFAULT true;
+    ALTER TABLE "Server" ADD COLUMN "panelProvider" "ServerPanelProvider" NOT NULL DEFAULT 'NONE';
+
+  - API (ADMIN only): POST/PATCH /api/servers accept the 7 new optional fields
+    (validated: port 1-65535, quota >= 0, panelProvider enum). Create still
+    requires only name + hostname.
+
+VALIDATION QUERIES:
+  - `SELECT id, name, hostname, status, "ipAddress", "port", provider, region,
+     "quotaMaxAccounts", "strictTls", "panelProvider" FROM "Server";`
+    -> full infra record as served by GET /api/servers.
+  - e2e: ADMIN POST /api/servers with all ADR-024 fields -> 201 and the body
+    echoes them; PATCH panelProvider=COOLIFY + port=2222 -> 200. Suite
+    `core.e2e-spec` (62/62 total).
+
+RESULT:
+  - `Server` extended, live with 6 migrations in sync. Unit 91/91, e2e 62/62
+    (8 suites) pull on Postgres réel, typecheck PASS, web build PASS (14 routes).
+    Live smoke: dashboard `/manager` + `/manager/serveurs` + `/manager/produits`
+    200 ; owner created a server (momo|10.10.2.36) + a product via the UI
+    between two smoke runs (CRUD writes real rows).
+
+ROLLBACK NOTES:
+  - No down-migration authored. Full dev reset (destructive):
+        docker compose down -v && docker compose up -d postgres
+    then re-run `migrate dev` (re-applies the 6 migrations).
+
+REMARKS FOR FUTURE AI:
+  - All 7 fields stay OPTIONAL by design (ADR-024): the server connection
+    (ADR-010) will drive status/observations later; never make them mandatory at
+    create unless the owner asks.
+  - `panelProvider` is the ADAPTER SEAM: keep adding enum values (cPanel,
+    DirectAdmin…) as their connectors land — schema comment already flags it.
+  - The `/manager` dashboard is READ-ONLY now: mutations live on the dedicated
+    /manager/serveurs + /manager/produits pages. Don't reintroduce inline admin
+    forms into the dashboard.
+================================================================

@@ -1,23 +1,16 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { apiError, apiJson, getManagerSummary, ManagerSummary } from '@/lib/api';
+import { apiJson, getManagerSummary, ManagerSummary } from '@/lib/api';
 import { useAdminSession } from '@/lib/session';
 import { useToast } from '@/components/toast';
 import { AppShell } from '@/components/app-shell';
 import { ADMIN_NAV } from '@/config/nav';
-import {
-  Button,
-  Denied,
-  EmptyState,
-  Field,
-  Input,
-  PageLoading,
-  Panel,
-  Select,
-  StatCard,
-} from '@/components/ui';
-import { IconBox, IconCheck, IconPlus, IconServer, IconUsers, IconX } from '@/components/icons';
+import { Badge, Denied, EmptyState, PageLoading, Panel, StatCard } from '@/components/ui';
+import { IconBox, IconServer, IconUsers } from '@/components/icons';
+
+// Dashboard : VUE DE SYNTHÈSE en lecture seule. Les modifications des serveurs et
+// du catalogue se font sur les pages dédiées (/manager/serveurs, /manager/produits).
 
 interface Product {
   id: string;
@@ -31,10 +24,34 @@ interface ServerItem {
   name: string;
   hostname: string;
   status: string;
+  ipAddress?: string | null;
 }
 
-const PRODUCT_STATUSES = ['DRAFT', 'ACTIVE', 'SUSPENDED', 'DISABLED'];
-const SERVER_STATUSES = ['UNKNOWN', 'PROVISIONING', 'ACTIVE', 'PROBLEM', 'REMOVED'];
+function serverTone(status: string): 'ok' | 'warn' | 'danger' | 'neutral' {
+  switch (status) {
+    case 'ACTIVE':
+      return 'ok';
+    case 'PROVISIONING':
+      return 'warn';
+    case 'PROBLEM':
+      return 'danger';
+    default:
+      return 'neutral';
+  }
+}
+
+function productTone(status: string): 'ok' | 'warn' | 'danger' | 'neutral' {
+  switch (status) {
+    case 'ACTIVE':
+      return 'ok';
+    case 'SUSPENDED':
+      return 'warn';
+    case 'DRAFT':
+      return 'neutral';
+    default:
+      return 'danger';
+  }
+}
 
 export default function ManagerPage() {
   const { phase, me, token } = useAdminSession();
@@ -42,8 +59,6 @@ export default function ManagerPage() {
   const [summary, setSummary] = useState<ManagerSummary | null>(null);
   const [products, setProducts] = useState<Product[]>([]);
   const [servers, setServers] = useState<ServerItem[]>([]);
-  const [drafts, setDrafts] = useState({ productName: '', serverName: '', serverHostname: '' });
-  const [hostnameEdits, setHostnameEdits] = useState<Record<string, string>>({});
 
   useEffect(() => {
     if (phase === 'ready' && token) void loadAll(token);
@@ -63,75 +78,6 @@ export default function ManagerPage() {
     } catch {
       toast.error('Impossible de charger les données.');
     }
-  }
-
-  async function changeProductStatus(id: string, status: string) {
-    const r = await apiJson(`/api/products/${id}`, token, {
-      method: 'PATCH',
-      body: JSON.stringify({ status }),
-    });
-    if (!r.ok) return toast.error(apiError(r, 'Échec de la mise à jour du produit.'));
-    toast.ok('Statut du produit mis à jour.');
-    void loadAll(token);
-  }
-
-  async function changeServerStatus(id: string, status: string) {
-    const r = await apiJson(`/api/servers/${id}`, token, {
-      method: 'PATCH',
-      body: JSON.stringify({ status }),
-    });
-    if (!r.ok) return toast.error(apiError(r, 'Échec de la mise à jour du serveur.'));
-    toast.ok('Statut du serveur mis à jour.');
-    void loadAll(token);
-  }
-
-  async function saveServerHostname(id: string, hostname: string) {
-    if (!hostname.trim()) return;
-    const r = await apiJson(`/api/servers/${id}`, token, {
-      method: 'PATCH',
-      body: JSON.stringify({ hostname: hostname.trim() }),
-    });
-    if (!r.ok) return toast.error(apiError(r, 'Échec de la mise à jour de l’hostname.'));
-    toast.ok('Hostname du serveur mis à jour.');
-    void loadAll(token);
-  }
-
-  async function createProduct(e: React.FormEvent) {
-    e.preventDefault();
-    const r = await apiJson('/api/products', token, {
-      method: 'POST',
-      body: JSON.stringify({ name: drafts.productName, kind: 'generic' }),
-    });
-    if (!r.ok) return toast.error(apiError(r, 'Échec de la création du produit.'));
-    setDrafts((x) => ({ ...x, productName: '' }));
-    toast.ok('Produit créé.');
-    void loadAll(token);
-  }
-
-  async function deleteProduct(id: string) {
-    const r = await apiJson(`/api/products/${id}`, token, { method: 'DELETE' });
-    if (!r.ok) return toast.error(apiError(r, 'Échec de la suppression du produit.'));
-    toast.ok('Produit supprimé.');
-    void loadAll(token);
-  }
-
-  async function createServer(e: React.FormEvent) {
-    e.preventDefault();
-    const r = await apiJson('/api/servers', token, {
-      method: 'POST',
-      body: JSON.stringify({ name: drafts.serverName, hostname: drafts.serverHostname }),
-    });
-    if (!r.ok) return toast.error(apiError(r, 'Échec de la création du serveur.'));
-    setDrafts((x) => ({ ...x, serverName: '', serverHostname: '' }));
-    toast.ok('Serveur créé.');
-    void loadAll(token);
-  }
-
-  async function deleteServer(id: string) {
-    const r = await apiJson(`/api/servers/${id}`, token, { method: 'DELETE' });
-    if (!r.ok) return toast.error(apiError(r, 'Échec de la suppression du serveur.'));
-    toast.ok('Serveur supprimé.');
-    void loadAll(token);
   }
 
   if (phase === 'loading') {
@@ -158,19 +104,19 @@ export default function ManagerPage() {
       <div className="wrap-md">
         <div className="hero">
           <div className="hero-eyebrow">Console d&apos;administration</div>
-          <h1>Infrastructure &amp; catalogue</h1>
+          <h1>Vue d&apos;ensemble</h1>
           <p>
-            Pilotage de la plateforme : produits, serveurs et comptes. Chaque modification est
-            tracée dans le journal d&apos;audit.
+            Synthèse de la plateforme : contenus, infrastructure et comptes. Chaque
+            modification est tracée dans le journal d&apos;audit.
           </p>
           <div className="hero-cta">
-            <a className="btn btn-primary" href="#servers">
+            <a className="btn btn-primary" href="/manager/serveurs">
               <IconServer size={15} />
-              Ajouter un serveur
+              Gérer les serveurs
             </a>
-            <a className="btn btn-secondary" href="#products">
+            <a className="btn btn-secondary" href="/manager/produits">
               <IconBox size={15} />
-              Ajouter un produit
+              Gérer le catalogue
             </a>
           </div>
         </div>
@@ -202,64 +148,27 @@ export default function ManagerPage() {
         <div className="bottom-grid">
           <Panel
             title="Serveurs (infrastructure)"
-            sub="Hôtes gérés par la plateforme — statut et hostname modifiables"
+            sub="Derniers hôtes enregistrés"
+            linkHref="/manager/serveurs"
+            linkLabel="Gérer les serveurs →"
           >
-            <form className="inline-form mb" onSubmit={createServer}>
-              <Field label="Nom">
-                <Input
-                  value={drafts.serverName}
-                  onChange={(e) => setDrafts({ ...drafts, serverName: e.target.value })}
-                  placeholder="prod-01"
-                />
-              </Field>
-              <Field label="Hostname">
-                <Input
-                  value={drafts.serverHostname}
-                  onChange={(e) => setDrafts({ ...drafts, serverHostname: e.target.value })}
-                  placeholder="node1.exemple.com"
-                />
-              </Field>
-              <Button type="submit">
-                <IconPlus size={14} />
-                Ajouter
-              </Button>
-            </form>
-
             {servers.length === 0 ? (
               <EmptyState>Aucun serveur enregistré.</EmptyState>
             ) : (
               <div className="stack">
-                {servers.map((s) => (
+                {servers.slice(0, 6).map((s) => (
                   <div key={s.id} className="status-row">
-                    <span className={`status-icon${s.status === 'PROBLEM' ? ' amber' : s.status === 'ACTIVE' ? '' : ' info'}`}>
+                    <span
+                      className={`status-icon${s.status === 'PROBLEM' ? ' amber' : s.status === 'ACTIVE' ? '' : ' info'}`}
+                    >
                       <IconServer />
                     </span>
                     <div className="status-row-main">
                       <div className="status-row-title">{s.name}</div>
                       <div className="status-row-sub mono">{s.hostname}</div>
                     </div>
-                    <Input
-                      className="input-sm"
-                      value={hostnameEdits[s.id] ?? s.hostname}
-                      onChange={(e) => setHostnameEdits({ ...hostnameEdits, [s.id]: e.target.value })}
-                      aria-label="hostname"
-                    />
-                    <Button size="sm" variant="secondary" onClick={() => saveServerHostname(s.id, hostnameEdits[s.id] ?? s.hostname)} title="Enregistrer l'hostname">
-                      <IconCheck size={14} />
-                    </Button>
-                    <Select
-                      className="select-sm"
-                      value={s.status}
-                      onChange={(e) => changeServerStatus(s.id, e.target.value)}
-                      aria-label="statut"
-                    >
-                      {SERVER_STATUSES.map((st) => (
-                        <option key={st} value={st}>{st}</option>
-                      ))}
-                    </Select>
-                    <Button size="sm" variant="danger" onClick={() => deleteServer(s.id)} title="Supprimer le serveur">
-                      <IconX size={14} />
-                    </Button>
+                    {s.ipAddress && <span className="mono muted cell-sub">{s.ipAddress}</span>}
+                    <Badge tone={serverTone(s.status)}>{s.status}</Badge>
                   </div>
                 ))}
               </div>
@@ -269,51 +178,52 @@ export default function ManagerPage() {
           <Panel
             title="Produits (catalogue)"
             sub="Offres de référence proposées aux clients"
+            linkHref="/manager/produits"
+            linkLabel="Gérer le catalogue →"
           >
-            <form className="inline-form mb" onSubmit={createProduct}>
-              <Field label="Nom du produit">
-                <Input
-                  value={drafts.productName}
-                  onChange={(e) => setDrafts({ ...drafts, productName: e.target.value })}
-                  placeholder="Hébergement web — Starter"
-                />
-              </Field>
-              <Button type="submit">
-                <IconPlus size={14} />
-                Ajouter
-              </Button>
-            </form>
-
             {products.length === 0 ? (
               <EmptyState>Aucun produit enregistré.</EmptyState>
             ) : (
               <div className="stack">
-                {products.map((p) => (
+                {products.slice(0, 6).map((p) => (
                   <div key={p.id} className="status-row">
                     <span className="status-icon violet">
                       <IconBox />
                     </span>
                     <div className="status-row-main">
                       <div className="status-row-title">{p.name}</div>
-                      <div className="status-row-sub">type {p.kind} · statut {p.status}</div>
+                      <div className="status-row-sub">type {p.kind}</div>
                     </div>
-                    <Select
-                      className="select-sm"
-                      value={p.status}
-                      onChange={(e) => changeProductStatus(p.id, e.target.value)}
-                      aria-label="statut"
-                    >
-                      {PRODUCT_STATUSES.map((st) => (
-                        <option key={st} value={st}>{st}</option>
-                      ))}
-                    </Select>
-                    <Button size="sm" variant="danger" onClick={() => deleteProduct(p.id)} title="Supprimer le produit">
-                      <IconX size={14} />
-                    </Button>
+                    <Badge tone={productTone(p.status)}>{p.status}</Badge>
                   </div>
                 ))}
               </div>
             )}
+          </Panel>
+
+          <Panel
+            title="Lien rapide"
+            sub="Accès aux principaux outils d’administration"
+            className="panel-span"
+          >
+            <div className="quick-links">
+              <a className="quick-link" href="/manager/utilisateurs">
+                <IconUsers size={15} />
+                Utilisateurs
+              </a>
+              <a className="quick-link" href="/manager/subscriptions">
+                <IconBox size={15} />
+                Souscriptions &amp; services
+              </a>
+              <a className="quick-link" href="/manager/invitations">
+                <IconBox size={15} />
+                Invitations
+              </a>
+              <a className="quick-link" href="/manager/journal">
+                <IconBox size={15} />
+                Journal d&apos;audit
+              </a>
+            </div>
           </Panel>
         </div>
       </div>

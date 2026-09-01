@@ -1,6 +1,25 @@
 # CHANGELOG
 
-## Phase 7 — POLISH UI (ADR-023 follow-up) — IMPLEMENTED 2026-08-31, commit 31af3e2+ on main
+## Phase 7ter — GESTION ADMIN SERVEURS & PRODUITS + DÉTAILS INFRASTRUCTURE (ADR-024) — IMPLEMENTED 2026-09-01
+Owner asked to fix the `/manager` dashboard overflow (server action buttons behind the products panel) as a real design expert: « ne garde pas les pages centrées et augmente la largeur des pages… créer un menu dans la sidebar pour les serveurs… page sera modifiée au fur et à mesure quand la connexion des serveurs sera établie et avoir beaucoup plus de détails… ». Direction chosen via AskUserQuestion: dedicated **Produits** page too + new Server fields (IP, Port, Fournisseur, Région, Quota Max Comptes, ✓ TLS strict, Module de Panneau HESTIA/COOLIFY d'abord — cPanel/DirectAdmin ensuite).
+### Added
+- **Modèle `Server` étendu** (migration `20260901021234_init_server_details`, +1 → **6 migrations**) : `ipAddress String?`, `port Int?` (1–65535), `provider String?`, `region String?`, `quotaMaxAccounts Int?`, `strictTls Boolean @default(true)`, **`panelProvider` enum `ServerPanelProvider {NONE HESTIA COOLIFY}`** (commenté pour cPanel/DirectAdmin futurs). Tous optionnels — créer un hôte reste obligatoire seulement sur name/hostname ; statut initial UNKNOWN.
+- **API serveurs** : `CreateServerDto` (7 champs optionnels validés — IsInt/IsBoolean/IsEnum/1-65535/quota≥0) + `ServersService.create` whitelist explicite.
+- **Sidebar admin** : items **Serveurs** + **Produits** (`config/nav.ts`, ordre : Tableau de bord, Serveurs, Produits, Utilisateurs, Souscriptions, Invitations, Mail, Journal).
+- **Pages CRUD larges** : `/manager/serveurs` (table — Serveur, IP, Port, Fournisseur, Région, Quota, TLS badge Strict/Off, Panneau badge HESTIA violet/COOLIFY cyan, Statut, Actions ; **édition inline** Modifier/Enregistrer/Annuler ; création formulaire grid ; note « statuts pilotés par la connexion réelle (à venir) ») + `/manager/produits` (Produit, Type badge, Statut select, Supprimer).
+- **Dashboard `/manager` en LECTURE SEULE** : stats + 2 panneaux synthèse (6 premiers serveurs/produits, badges de statut) + panneau « Lien rapide » (CDN vers Utilisateurs/Souscriptions/Invitations/Journal) ; **plus aucun formulaire/édition depuis le dashboard**, CTA hero « Gérer les serveurs » / « Gérer le catalogue ».
+- **Layout élargi** : `wrap-md` 900 → **1320px**, `.table-wide` (min-width 760px + scroll-x), `.grid-form` (auto-fit 210px), `.row-editing` surlignage édition inline, `.panel-span`/`.quick-links` — le débordement « serveurs derrière produits » est structurellement éliminé.
+- Helpers `lib/api.ts` : types `ServerAdmin`/`ServerPatch`/`ProductAdmin`/`PanelProvider` + `list/create/update/deleteServer` + `list/create/update/deleteProduct`.
+### Changed
+- DECISIONS.md : **ADR-024 APPROVED** (2026-09-01). La fiche serveur est volontairement « évolutive » : elle sera enrichie automatiquement (statut, charge, observations panel) quand la connexion réelle sera établie (ADR-010/007 futures, restent PROPOSED) ; le provisionnement reste un stub (ADR-021).
+- `.tools/` + `.claude/settings.json` (allowlist ports/docker) : non inclus dans le diff fonctionnel.
+### Verified (2026-09-01)
+- Unit **91/91** (11 suites, +1 test full-details serveur) ; **e2e 62/62, 8 suites** (+1 test ADR-024 : ADMIN POST serveur avec ip/port/provider/region/quota/strictTls/panelProvider puis PATCH panelProvider/port — verts sur Postgres réel).
+- `npx tsc --noEmit` apps/web **PASS** ; `web build` **PASS** (14 routes dont `/manager/serveurs` 5.28 kB, `/manager/produits` 3.80 kB, `/manager` 3.66 kB ; `.next` purgé avant build — leçon Phase 2).
+- `prisma migrate status` → **6 migrations, in sync**. Smoke live :3000 → **200** sur `/manager`, `/manager/serveurs`, `/manager/produits` + proxy `/api` 401 sans session ; login ADMIN → `/users/me` 200, `/api/servers` (4), `/api/products` (2), `/api/manager/summary` ({2 produits ACTIVE, 4 serveurs, 16/17 users}) — cohérents avec l'API, zéro erreur côté web/API.
+- **Redémarrage environnement (2026-09-01)** : Docker Desktop était éteint → postgres au sol + dev servers arrêtés (le web répondait « pas accessible »). Remonté : docker up (postgres healthy), API :3001, web :3000 — c'était un état d'environnement, pas une régression de code.
+### Pending
+- Validation propriétaire live de la refonte (serveurs/produits/dashboard lecture seule) → commit + push (2 commits ahead + worktree 7ter).
 Owner feedback on Phase 7 design: « tout est correct concernant les couleurs et style, c'est très bien à ne pas changer » — the reference palette stays as-is (dark + light) — with 4 pure-front requests:
 ### Added
 - **Sélects déroulants optimisés** (`globals.css` `.select` / `.select-sm`) : flèche OS native supprimée (`appearance:none`) + **chevron SVG du design system** (data-URI, couleur `--text-secondary` par thème), `padding-right: 36px` (texte jamais sous la flèche), `cursor:pointer`. Hauteurs = `.input`/`.btn` → **alignement vertical aligné** avec les boutons adjacents dans les tableaux ; `.select-sm` calqué sur `.btn-sm` (statuts serveur/produit, affectation serveur, filtres journal) ; `<option>` teintés thème.

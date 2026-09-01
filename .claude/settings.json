@@ -22,7 +22,12 @@
       "PowerShell(corepack pnpm --filter @icode-host-pro/api run migrate --name init_client_access 2>&1)",
       "Bash(sed -e 's/\\\\x1b\\\\[[0-9;]*m//g')",
       "Read(//tmp/**)",
-      "PowerShell(foreach \\($p in 3000,3001\\) { $c = Get-NetTCPConnection -State Listen -LocalPort $p -ErrorAction SilentlyContinue; if \\($c\\) { \"port $p LISTENING pid=$\\($c.OwningProcess -join ','\\)\" } else { \"port $p free\" } }; docker compose ps 2>&1 | Select-Object -First 6)"
+      "PowerShell(foreach \\($p in 3000,3001\\) { $c = Get-NetTCPConnection -State Listen -LocalPort $p -ErrorAction SilentlyContinue; if \\($c\\) { \"port $p LISTENING pid=$\\($c.OwningProcess -join ','\\)\" } else { \"port $p free\" } }; docker compose ps 2>&1 | Select-Object -First 6)",
+      "PowerShell(foreach \\($p in 3000,3001\\) { $c = Get-NetTCPConnection -State Listen -LocalPort $p -ErrorAction SilentlyContinue; if \\($c\\) { \"port $p still LISTENING pid=$\\($c.OwningProcess -join ','\\)\" } else { \"port $p free now\" } })",
+      "PowerShell(foreach \\($p in 3000,3001\\) { $c = Get-NetTCPConnection -State Listen -LocalPort $p -ErrorAction SilentlyContinue; if \\($c\\) { $c.OwningProcess | Sort-Object -Unique | ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue; \"killed pid $_ on port $p\" } } }; Start-Sleep -Milliseconds 800; foreach \\($p in 3000,3001\\) { $c = Get-NetTCPConnection -State Listen -LocalPort $p -ErrorAction SilentlyContinue; if \\($c\\) { \"port $p STILL LISTENING\" } else { \"port $p free\" } })",
+      "Bash(node -e \"const p=require\\('./node_modules/nodemailer/package.json'\\); console.log\\('main:', p.main, '| type:', p.type||'commonjs', '| version:', p.version\\)\")",
+      "PowerShell($conn = Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Where-Object { $_.LocalPort -in 3000,3001 } | Select-Object LocalPort, OwningProcess; if \\($conn\\) { $conn } else { \"ports 3000/3001 free\" })",
+      "Bash(npx tsc *)"
     ]
   }
 }

@@ -143,4 +143,45 @@ describe('Core management RBAC (e2e)', () => {
       .set('Authorization', `Bearer ${adminToken}`)
       .expect(200);
   });
+
+  it('ADMIN can store + patch the infra detail fields (ADR-024)', async () => {
+    const created = await request(app.getHttpServer())
+      .post(`/${GlobalPrefix}/servers`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        name: `srv_dtl_${stamp}`,
+        hostname: `node_${stamp}.exemple.com`,
+        ipAddress: '198.51.100.7',
+        port: 22,
+        provider: 'Hetzner',
+        region: 'fra1',
+        quotaMaxAccounts: 20,
+        strictTls: false,
+        panelProvider: 'HESTIA',
+      })
+      .expect(201);
+    const body = created.body;
+    expect(body).toMatchObject({
+      ipAddress: '198.51.100.7',
+      port: 22,
+      provider: 'Hetzner',
+      region: 'fra1',
+      quotaMaxAccounts: 20,
+      strictTls: false,
+      panelProvider: 'HESTIA',
+    });
+    await request(app.getHttpServer())
+      .patch(`/${GlobalPrefix}/servers/${body.id}`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ panelProvider: 'COOLIFY', port: 2222 })
+      .expect(200)
+      .expect((r) => {
+        expect(r.body.panelProvider).toBe('COOLIFY');
+        expect(r.body.port).toBe(2222);
+      });
+    await request(app.getHttpServer())
+      .delete(`/${GlobalPrefix}/servers/${body.id}`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .expect(200);
+  });
 });

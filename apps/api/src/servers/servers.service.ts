@@ -19,6 +19,13 @@ export class ServersService {
         name: dto.name,
         hostname: dto.hostname,
         status: dto.status,
+        ipAddress: dto.ipAddress,
+        port: dto.port,
+        provider: dto.provider,
+        region: dto.region,
+        quotaMaxAccounts: dto.quotaMaxAccounts,
+        strictTls: dto.strictTls,
+        panelProvider: dto.panelProvider,
       },
     });
     await this.audit.record({

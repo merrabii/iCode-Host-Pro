@@ -71,6 +71,7 @@ Direction: fine-grained capability interfaces and provider isolation. Coolify/He
 - ADR-021 Espace client : Souscription + Service (below) — 2026-08-31.
 - ADR-022 Configuration mail + emails d'invitation (below) — 2026-08-31.
 - ADR-023 Design system de l'interface (below) — 2026-08-31.
+- ADR-024 Détails infrastructure Serveurs + pages CRUD admin larges (below) — 2026-09-01.
 
 ## ADR-011 — Socle config minimal (Phase 0)
 **Status: APPROVED** (2026-08-30, Phase 0 GO)
@@ -275,6 +276,44 @@ iCode Host Pro passe du style inline ad hoc à ce design system.
   référence). Aucune table, aucune migration, aucun changement API.
 - Hors périmètre : redesign du contenu métier de la référence (non copié), tout
   autre changement visuel au-delà des tokens copiés.
+
+## ADR-024 — Détails infrastructure Serveurs + pages CRUD admin larges (Phase 7ter)
+**Status: APPROVED** (2026-09-01, GO du propriétaire posé via AskUserQuestion : « créer un menu
+dans la sidebar pour les serveurs… modifier encore la partie des infos affichées (et modifiables)
+sur l'interface admin » + choix explicites « Page Produits dédiée aussi », champ IP/Port/Fournisseur/
+Région/Quota, case à cocher TLS strict, « Module de Panneau Serveur (HESTIA/COOLIFY d'abord,
+cPanel/DirectAdmin ensuite) »)
+Decision: la fiche d'infrastructure sera pilotée « au fur et à mesure » quand la connexion réelle
+des serveurs sera établie (ADR-010/ADR-007 futures). Pour accueillir ces futurs connecteurs, la
+page admin dédiée de gestion des serveurs est construite dès maintenant avec un **registre de détails
+d'infrastructure** :
+- **Extension du modèle `Server`** (migration `init_server_details`) — tous les nouveaux champs
+  **optionnels** pour ne jamais bloquer la création d'un hôte :
+  - `ipAddress String?` (IPv4/IPv6, sans validation stricte à ce stade — format libre limité 64),
+  - `port Int?` (1–65535, défaut SSH 22 documenté),
+  - `provider String?` (Hetzner, OVH… — libre, pas un enum tant que l'offre n'est pas stable),
+  - `region String?` (région/localisation du datacenter),
+  - `quotaMaxAccounts Int?` (quota maximal de comptes hébergés sur l'hôte),
+  - `strictTls Boolean @default(true)` (vérification stricte des certificats SSL/TLS sur les
+    futures requêtes API du serveur),
+  - `panelProvider ServerPanelProvider @default(NONE)` — **enum d'adaptateur** :
+    `NONE | HESTIA | COOLIFY`, commenté pour l'ajout futur de `cPanel`, `DirectAdmin`, etc.
+- **Pages admin larges dédiées** (sidebar — les pages ne sont plus centrées étroites) :
+  - `/manager/serveurs` : table CRUD **ADMIN-only** large (Serveur, IP, Port, Fournisseur, Région,
+    Quota, TLS, Panneau, Statut, Actions) avec **édition inline** complète ; prête à accueillir les
+    statuts PROVISIONING/ACTIVE/PROBLEM **pilotés par la connexion réelle** (aujourd'hui saisis
+    manuellement, note explicite dans l'UI).
+  - `/manager/produits` : table CRUD ADMIN (Produit, Type, Statut, Actions) — même refonte large.
+  - **Dashboard `/manager` passé en LECTURE SEULE** : synthèse (stats + derniers serveurs/produits)
+    + liens « Gérer → » vers les pages dédiées ; **plus aucune édition depuis le dashboard**.
+- **Conteneur élargi** : `wrap-md` 900 → **1320px** + table horizontale `.table-wide` (le bug
+  « boutons serveurs derrière la case produits » de l'ancien dashboard 2 colonnes étroites est
+  structurellement éliminé).
+- **Évolutivité** : le `panelProvider` prépare l'ADR-010 (adaptateurs Coolify/Hestia, puis
+  cPanel/DirectAdmin) ; le registre de détails alimentera les futures observations de
+  connexion/charge. Le provisionnement reste un **stub** (ADR-021) — pas de déploiement réel,
+  pas de jobs async (ADR-007 inchangés, PROPOSED).
+- Statuts serveur saisis manuellement aujourd'hui (UNKNOWN reste le statut initial d'une création).
 
 # REJECTED
 None recorded in this clean baseline.

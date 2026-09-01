@@ -889,6 +889,7 @@ select:disabled {
   border-radius: var(--radius-card);
   padding: 20px;
   min-width: 0;
+  overflow: hidden; /* aucune ligne (ex. status-row) ne déborde hors de la carte vers le panneau voisin */
 }
 
 .panel-head {
@@ -928,6 +929,7 @@ select:disabled {
 .status-row {
   display: flex;
   align-items: center;
+  flex-wrap: wrap; /* 6 contrôles (nom, hostname, statut, actions) tiennent sur 2 lignes plutôt que de déborder du panneau */
   gap: 10px;
   padding: 10px 12px;
   border-radius: 10px;
@@ -1331,6 +1333,20 @@ select:disabled {
   color: var(--text-primary);
 }
 
+/* variante pleine largeur : conserve des colonnes compactes sans casser */
+.table-wide {
+  min-width: 760px;
+}
+
+/* ligne en cours d'édition inline : fond légèrement teinté pour la repérer */
+.table tbody tr.row-editing {
+  background: var(--active-bg);
+}
+
+.table tbody tr.row-editing:hover {
+  background: var(--active-bg);
+}
+
 /* ---- 17. États ------------------------------------------------- */
 .empty {
   padding: 20px 4px;
@@ -1485,7 +1501,7 @@ select:disabled {
 }
 
 .wrap-md {
-  max-width: 900px;
+  max-width: 1320px;
   margin: 0 auto;
 }
 
@@ -1533,6 +1549,52 @@ select:disabled {
 .flex-1 {
   flex: 1;
   min-width: 0;
+}
+
+/* ---- 21. Formulaires en grille + liens rapides (ADR-024) --------- */
+.grid-form {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 14px 16px;
+  align-items: end;
+}
+
+.grid-form-actions {
+  grid-column: 1 / -1;
+  display: flex;
+  gap: 10px;
+  justify-content: flex-end;
+}
+
+/* panneau qui traverse les deux colonnes du bottom-grid */
+.panel-span {
+  grid-column: 1 / -1;
+}
+
+.quick-links {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 10px;
+}
+
+.quick-link {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 11px 14px;
+  border-radius: 10px;
+  border: 1px solid var(--border-soft);
+  background: var(--card-bg-2);
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 600;
+  transition: var(--transition);
+}
+
+.quick-link:hover {
+  border-color: var(--active-text);
+  color: var(--active-text);
+  background: var(--active-bg);
 }
 
 .ta-right {

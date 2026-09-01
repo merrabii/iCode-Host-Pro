@@ -437,6 +437,41 @@ Do not log only important work. Record all meaningful actions, including small c
 - Smoke HTTP :3000 → 200 sur `/`, `/auth`, `/manager`, `/manager/utilisateurs`, `/manager/journal`, `/manager/invitations`, `/manager/mail`, `/manager/subscriptions`, `/client`. HTML servi : `lang="fr"`, script `ihp-theme` présent ; CSS servi contient les tokens du design system (29 Ko, brand `#00b377`, fonds dark/light).
 - Aucun changement API/DB : pas de migration, pas de test API touché.
 
+# PHASE 7ter — GESTION ADMIN SERVEURS & PRODUITS + DÉTAILS INFRASTRUCTURE (ADR-024)
+
+## 2026-09-01 — 7ter.0 GO & périmètre (retour propriétaire sur le dashboard)
+- Le propriétaire signale un **bug UI** dans `/manager` : les 3 serveurs affichent leurs boutons de suppression **derrière** la case « Produits (catalogue) » (débordement du dashboard 2 colonnes étroites).
+- Consigne : corriger sans capture d'écran ni modèle visuel (lecture code uniquement), « soyez expert designer… ne garde pas les pages centrées et augmente la largeur des pages… créer un menu dans la sidebar pour les serveurs… cette page sera modifiée au fur et à mesure quand la connexion des serveurs sera établie et avoir beaucoup plus de détails… ». Dashboard = **lecture seule** (pas d'édition).
+- **Direction choisie via AskUserQuestion** : « Page Produits dédiée aussi » + nouveaux champs serveur — **Adresse IP, Port, Fournisseur, Région/localisation, Quota Max Comptes Hébergés (Int), case ✓ TLS strict** (« Vérifier les certificats SSL/TLS stricts sur les requêtes API du serveur »), **Module de Panneau Serveur** (adaptateur HESTIA/COOLIFY d'abord — cPanel/DirectAdmin après).
+- Decision: **ADR-024 APPROVED** (DECISIONS.md).
+
+## 2026-09-01 — 7ter.1 Modèle + migration (ADR-024)
+- Files modified: `apps/api/prisma/schema.prisma` — enum `ServerPanelProvider {NONE HESTIA COOLIFY}` (commenté : cPanel/DirectAdmin futurs) + modèle `Server` étendu (`ipAddress String?`, `port Int?`, `provider String?`, `region String?`, `quotaMaxAccounts Int?`, `strictTls Boolean @default(true)`, `panelProvider ServerPanelProvider @default(NONE)`). Tous optionnels.
+- Command: `corepack pnpm --filter @icode-host-pro/api run migrate --name init_server_details` → migration `20260901021234_init_server_details` appliquée. Dev servers arrêtés avant migrate (EPERM DLL), `prisma generate` OK (client v6.19.3). `prisma migrate status` → **6 migrations** in sync.
+
+## 2026-09-01 — 7ter.2 API serveurs étendue (DTO + service + tests)
+- Files modified: `apps/api/src/servers/dto/create-server.dto.ts` (+7 champs optionnels validés : ipAddress IsString MaxLength 64, port IsInt Min1 Max65535, provider/region MaxLength 64, quotaMaxAccounts IsInt Min0, strictTls IsBoolean, panelProvider IsEnum), `apps/api/src/servers/servers.service.ts` (create whitelist explicite 9 champs), `apps/api/src/servers/servers.service.spec.ts` (+1 test full details : ip/port/provider/region/quota/strictTls/panelProvider via objectContaining ; expect strict étendu aux 7 undefined).
+- Files modified: `apps/api/test/core.e2e-spec.ts` (+1 test : ADMIN POST serveur avec tous les champs ADR-024 → 201, PATCH panelProvider COOLIFY + port 2222 → 200).
+- Commands: `corepack pnpm --filter @icode-host-pro/api build` **PASS** ; `corepack pnpm --filter @icode-host-pro/api test` → **91/91** unit PASS.
+
+## 2026-09-01 — 7ter.3 Web : nav + layout + lib/api
+- Files modified: `apps/web/src/config/nav.ts` (+items **Serveurs** (IconServer), **Produits** (IconBox) — ordre Tableau de bord, Serveurs, Produits, Utilisateurs, Souscriptions, Invitations, Mail, Journal).
+- Files modified: `apps/web/src/app/globals.css` — `wrap-md` 900 → **1320px**, `.table-wide` (min-width 760px + overflow-x), `.grid-form` (auto-fit minmax 210px), `.grid-form-actions`, `.panel-span`, `.quick-links`, `.quick-link` (cards), `tr.row-editing` surlignage (active-bg). `.panel overflow:hidden` conservé (filet) ; le flex-wrap temporaire des status-row n'est plus nécessaire (table réelle).
+- Files modified: `apps/web/src/lib/api.ts` — types `PanelProvider`, `ServerAdmin` (7 nouveaux champs), `ProductAdmin`, `ServerPatch` + helpers `listServers`/`createServer`/`updateServer`/`deleteServer`/`listProducts`/`createProduct`/`updateProduct`/`deleteProduct`.
+
+## 2026-09-01 — 7ter.4 Pages dédiées + dashboard lecture seule
+- Files created: `apps/web/src/app/manager/serveurs/page.tsx` (~448 lignes) — CRUD table large ADMIN-only : colonnes Serveur (nom + hostname)/IP/Port/Fournisseur/Région/Quota/**TLS badge Strict|Off**/**Panneau badge HESTIA violet|COOLIFY cyan|—**/Statut (UNKNOWN/PROVISIONING/ACTIVE/PROBLEM/REMOVED)/Actions ; création grid-form (name+hostname obligatoires, strictTls checkbox, note « statuts pilotés par la connexion réelle (à venir) ») ; **édition inline** par ligne (inputs/selects sm + checkbox TLS + IconCheck/IconX) ; `emptyDraft`/`toPatch` (vide → null, nombres validés) ; busy par action.
+- Files created: `apps/web/src/app/manager/produits/page.tsx` — CRUD table : Produit (nom + id court), Type badge violet, Statut select DRAFT/ACTIVE/SUSPENDED/DISABLED, Supprimer (confirm).
+- Files modified: `apps/web/src/app/manager/page.tsx` — **réécrit lecture seule** : hero (CTA « Gérer les serveurs » / « Gérer le catalogue »), 3 StatCards (produits/serveurs/users actifs), 2 panneaux synthèse (slice 6 + badges de statut, `linkHref`/`linkLabel` « Gérer… »), panneau « Lien rapide » (6 pages admin). Tous formulaires/handlers create/delete/status **supprimés** du dashboard.
+- Fix: la page serveurs supprimait le statut à l'édition (Draft sans `status`) → `status` ajouté au Draft + `toPatch` inclut `status` + `saveEdit` utilise le patch complet ; faux import `IconChevronDown` et `statusTone` inutilisé supprimés (noUnusedLocals).
+
+## 2026-09-01 — 7ter.5 Validation (builds + e2e + smoke)
+- Commands: `npx tsc --noEmit` apps/web **PASS** ; `corepack pnpm --filter @icode-host-pro/web build` **PASS** (14 routes statiques — `/manager/serveurs` 5.28 kB, `/manager/produits` 3.80 kB, `/manager` 3.66 kB ; `.next` purgé avant build — leçon Phase 2).
+- Commands: `corepack pnpm --filter @icode-host-pro/api test:e2e` → **62/62, 8 suites PASS** (vert sur Postgres réel ; le nouveau test ADR-024 y compris).
+- **Redémarrage environnement** : Docker Desktop éteint (le web était « pas accessible ») → docker up (postgres healthy), API :3001 + web :3000 relancés en fond. Smoke :3000 → **200** `/`, `/manager`, `/manager/serveurs`, `/manager/produits` ; proxy `/api` 401 sans session ; login ADMIN → `/users/me` 200, `/api/servers` (4), `/api/products` (2), `/api/manager/summary` (`{products:2 ACTIVE, servers:4, users:16/17}`) ; zéro erreur web/API.
+- **Validation live propriétaire (en cours)** : le propriétaire a créé un serveur `momo | mour.ma | UNKNOWN | ip 10.10.2.36` + un produit `Installation Fees` via l'UI entre deux smoke → preuve que le CRUD écrit réellement.
+- Docs: DECISIONS.md (ADR-024 APPROVED), CHANGELOG.md (Phase 7ter Added/Changed/Verified/Pending), PROJECT_STATUS.md (Phase 7ter), docs/sql-commandes.txt (Phase 7ter DB entry — à compléter), TASKS.md (cette section).
+
 # OPEN ITEMS
 - [x] Authentication architecture (ADR-015 APPROVED — Phase 1).
 - [x] Inscription par invitation / fermeture de l'inscription ouverte (ADR-020 APPROVED — Phase 5 : `POST /api/auth/register` → 410, `POST /api/auth/accept-invite` + `Invitation`).
@@ -465,3 +500,4 @@ Do not log only important work. Record all meaningful actions, including small c
 - Phase 6: configuration mail admin + emails d'invitation (ADR-022) — owner-validated 2026-08-31 (SMTP Brevo réel, domaine codediali.com, événements `delivered`), tests 90/90 unit + 61/61 e2e (8 suites), builds PASS, commitée (47838c1), push en attente d'instruction.
 - Phase 7: design system de l'interface (ADR-023) — réécriture visuelle complète (tokens dark/light de la référence copiés à l'identique, brand-agnostic, thème + anti-FOUC, composants AppShell/ui/icons, 9 pages refactorées logique intacte) — 2026-08-31, commitée `31af3e2`.
 - Phase 7bis: polish UI (ADR-023 follow-up) — sélects chevron SVG + alignement boutons, contraste bordures light (2 tokens), espacement alerts, toasts pop-up (OK + 5 s) via ToastProvider/useToast convertis sur 8 pages (inline conservés : diagnostic `/`, panneau invitation créée) — 2026-08-31, typecheck + build + smoke PASS, aucun changement API/DB.
+- Phase 7ter: gestion admin Serveurs & Produits + détails infrastructure (ADR-024) — modèle `Server` étendu (ip/port/provider/region/quota/strictTls/panelProvider HESTIA|COOLIFY, 6 migrations), DTO/service/tests, pages `/manager/serveurs` (table CRUD large + édition inline) et `/manager/produits`, dashboard `/manager` **lecture seule**, sidebar Serveurs/Produits, conteneur 1320px — 2026-09-01, unit 91/91 + e2e 62/62, typecheck + web build (14 routes) + smoke live PASS, commit/push en attente de validation propriétaire.

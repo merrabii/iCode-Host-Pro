@@ -28,11 +28,52 @@ describe('ServersService', () => {
       },
     );
     expect(mockPrisma.server.create).toHaveBeenCalledWith({
-      data: { name: 'vps-eu', hostname: 'vps1.ihp', status: undefined },
+      data: {
+        name: 'vps-eu',
+        hostname: 'vps1.ihp',
+        status: undefined,
+        ipAddress: undefined,
+        port: undefined,
+        provider: undefined,
+        region: undefined,
+        quotaMaxAccounts: undefined,
+        strictTls: undefined,
+        panelProvider: undefined,
+      },
     });
     expect(mockAudit.record).toHaveBeenCalledWith(
       expect.objectContaining({ action: 'server.create', actorId: 'admin', resourceId: '1' }),
     );
+  });
+
+  it('creates a server with full infra details (ADR-024)', async () => {
+    mockPrisma.server.create.mockResolvedValue({ id: '2' });
+    await service.create(
+      {
+        name: 'prod-01',
+        hostname: 'node1.exemple.com',
+        ipAddress: '198.51.100.7',
+        port: 22,
+        provider: 'Hetzner',
+        region: 'fra1',
+        quotaMaxAccounts: 20,
+        strictTls: false,
+        panelProvider: 'HESTIA',
+      },
+      actor,
+    );
+    expect(mockPrisma.server.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        name: 'prod-01',
+        ipAddress: '198.51.100.7',
+        port: 22,
+        provider: 'Hetzner',
+        region: 'fra1',
+        quotaMaxAccounts: 20,
+        strictTls: false,
+        panelProvider: 'HESTIA',
+      }),
+    });
   });
 
   it('throws NotFoundException on findOne for an unknown id', async () => {

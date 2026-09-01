@@ -70,6 +70,15 @@ enum ServerStatus {
   REMOVED
 }
 
+// Module de panneau serveur (adaptateur d'infra). Début = les deux fournisseurs
+// ciblés ; cPanel / DirectAdmin / autres s'ajouteront quand leurs connecteurs
+// seront configurés (ADR-010 providers, ADR-024).
+enum ServerPanelProvider {
+  NONE
+  HESTIA
+  COOLIFY
+}
+
 model Product {
   id        String        @id @default(cuid())
   name      String        @unique
@@ -86,6 +95,17 @@ model Server {
   name      String       @unique
   hostname  String
   status    ServerStatus @default(UNKNOWN)
+
+  // Détails d'infrastructure (ADR-024) — affichés/édités sur /manager/serveurs,
+  // alimentés plus tard par la vraie connexion aux serveurs (ADR-007/010).
+  ipAddress       String?             // adresse IP publique/privée
+  port            Int?                // port de gestion (SSH/API)
+  provider        String?             // fournisseur (Hetzner, OVH, VPS…)
+  region          String?             // région / localisation (ex. fra1, paris)
+  quotaMaxAccounts Int?               // quota max de comptes hébergés
+  strictTls       Boolean             @default(true) // vérifier strictement les certificats TLS des requêtes API
+  panelProvider   ServerPanelProvider @default(NONE) // adaptateur de panneau serveur
+
   createdAt DateTime     @default(now())
   updatedAt DateTime     @updatedAt
 

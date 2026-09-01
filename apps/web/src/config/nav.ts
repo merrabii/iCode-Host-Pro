@@ -1,5 +1,6 @@
 import type { NavSection } from '@/components/app-shell';
 import {
+  IconBox,
   IconBoxes,
   IconFileText,
   IconGlobe,
@@ -15,11 +16,13 @@ export const ADMIN_NAV: NavSection[] = [
     section: 'Administration',
     items: [
       { label: 'Tableau de bord', href: '/manager', icon: IconGrid },
+      { label: 'Serveurs', href: '/manager/serveurs', icon: IconServer },
+      { label: 'Produits', href: '/manager/produits', icon: IconBox },
       { label: 'Utilisateurs', href: '/manager/utilisateurs', icon: IconUsers },
-      { label: "Journal d'audit", href: '/manager/journal', icon: IconFileText },
+      { label: 'Souscriptions & services', href: '/manager/subscriptions', icon: IconBoxes },
       { label: 'Invitations', href: '/manager/invitations', icon: IconMail },
       { label: 'Configuration mail', href: '/manager/mail', icon: IconMail },
-      { label: 'Souscriptions & services', href: '/manager/subscriptions', icon: IconBoxes },
+      { label: "Journal d'audit", href: '/manager/journal', icon: IconFileText },
     ],
   },
   {

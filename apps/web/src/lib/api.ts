@@ -259,6 +259,58 @@ export const updateMailSettings = (t: string, dto: Partial<MailSettings> & { pas
 export const sendTestMail = (t: string, to: string) =>
   apiJson('/api/admin/mail/test', t, { method: 'POST', body: JSON.stringify({ to }) });
 
+// ── Phase 7ter (ADR-024) — gestion admin Serveurs & Produits ─────────────────
+export type PanelProvider = 'NONE' | 'HESTIA' | 'COOLIFY' | string;
+export interface ServerAdmin {
+  id: string;
+  name: string;
+  hostname: string;
+  status: string;
+  ipAddress?: string | null;
+  port?: number | null;
+  provider?: string | null;
+  region?: string | null;
+  quotaMaxAccounts?: number | null;
+  strictTls: boolean;
+  panelProvider: PanelProvider;
+  createdAt: string;
+  updatedAt: string;
+}
+export interface ProductAdmin {
+  id: string;
+  name: string;
+  kind: string;
+  status: string;
+  createdAt: string;
+  updatedAt: string;
+}
+export interface ServerPatch {
+  name?: string;
+  hostname?: string;
+  status?: string;
+  ipAddress?: string | null;
+  port?: number | null;
+  provider?: string | null;
+  region?: string | null;
+  quotaMaxAccounts?: number | null;
+  strictTls?: boolean;
+  panelProvider?: PanelProvider;
+}
+export const listServers = (t: string) => apiJson('/api/servers', t);
+export const createServer = (t: string, dto: ServerPatch & { name: string; hostname: string }) =>
+  apiJson('/api/servers', t, { method: 'POST', body: JSON.stringify(dto) });
+export const updateServer = (t: string, id: string, patch: ServerPatch) =>
+  apiJson(`/api/servers/${id}`, t, { method: 'PATCH', body: JSON.stringify(patch) });
+export const deleteServer = (t: string, id: string) =>
+  apiJson(`/api/servers/${id}`, t, { method: 'DELETE' });
+export const listProducts = (t: string) => apiJson('/api/products', t);
+export const createProduct = (t: string, dto: { name: string; kind?: string; status?: string }) =>
+  apiJson('/api/products', t, { method: 'POST', body: JSON.stringify(dto) });
+export const updateProduct = (t: string, id: string, patch: { name?: string; kind?: string; status?: string }) =>
+  apiJson(`/api/products/${id}`, t, { method: 'PATCH', body: JSON.stringify(patch) });
+export const deleteProduct = (t: string, id: string) =>
+  apiJson(`/api/products/${id}`, t, { method: 'DELETE' });
+
 // Admin-scoped.
 export const adminListSubscriptions = (t: string) => apiJson('/api/admin/subscriptions', t);
 export const adminUpdateSubscription = (t: string, id: string, status: string) =>
