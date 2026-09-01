@@ -472,6 +472,11 @@ Do not log only important work. Record all meaningful actions, including small c
 - **Validation live propriétaire (en cours)** : le propriétaire a créé un serveur `momo | mour.ma | UNKNOWN | ip 10.10.2.36` + un produit `Installation Fees` via l'UI entre deux smoke → preuve que le CRUD écrit réellement.
 - Docs: DECISIONS.md (ADR-024 APPROVED), CHANGELOG.md (Phase 7ter Added/Changed/Verified/Pending), PROJECT_STATUS.md (Phase 7ter), docs/sql-commandes.txt (Phase 7ter DB entry — à compléter), TASKS.md (cette section).
 
+## 2026-09-01 — 7ter.6 Validation propriétaire (✓) + clôture
+- Action: owner a validé la Phase 7ter en live (« validé ») — nouveaux écrans `/manager/serveurs` (création + édition inline avec les nouveaux champs) et `/manager/produits`, dashboard lecture seule, layout large 1320px.
+- Files modified: PROJECT_STATUS.md (Phase 7ter ✓), TASKS.md (cette section), CHANGELOG.md, HANDOVER.md.
+- Command: git add + commit (docs owner validation) puis push — Phase 7ter **closed**.
+
 # OPEN ITEMS
 - [x] Authentication architecture (ADR-015 APPROVED — Phase 1).
 - [x] Inscription par invitation / fermeture de l'inscription ouverte (ADR-020 APPROVED — Phase 5 : `POST /api/auth/register` → 410, `POST /api/auth/accept-invite` + `Invitation`).
@@ -500,4 +505,4 @@ Do not log only important work. Record all meaningful actions, including small c
 - Phase 6: configuration mail admin + emails d'invitation (ADR-022) — owner-validated 2026-08-31 (SMTP Brevo réel, domaine codediali.com, événements `delivered`), tests 90/90 unit + 61/61 e2e (8 suites), builds PASS, commitée (47838c1), push en attente d'instruction.
 - Phase 7: design system de l'interface (ADR-023) — réécriture visuelle complète (tokens dark/light de la référence copiés à l'identique, brand-agnostic, thème + anti-FOUC, composants AppShell/ui/icons, 9 pages refactorées logique intacte) — 2026-08-31, commitée `31af3e2`.
 - Phase 7bis: polish UI (ADR-023 follow-up) — sélects chevron SVG + alignement boutons, contraste bordures light (2 tokens), espacement alerts, toasts pop-up (OK + 5 s) via ToastProvider/useToast convertis sur 8 pages (inline conservés : diagnostic `/`, panneau invitation créée) — 2026-08-31, typecheck + build + smoke PASS, aucun changement API/DB.
-- Phase 7ter: gestion admin Serveurs & Produits + détails infrastructure (ADR-024) — modèle `Server` étendu (ip/port/provider/region/quota/strictTls/panelProvider HESTIA|COOLIFY, 6 migrations), DTO/service/tests, pages `/manager/serveurs` (table CRUD large + édition inline) et `/manager/produits`, dashboard `/manager` **lecture seule**, sidebar Serveurs/Produits, conteneur 1320px — 2026-09-01, unit 91/91 + e2e 62/62, typecheck + web build (14 routes) + smoke live PASS, commit/push en attente de validation propriétaire.
+- Phase 7ter: gestion admin Serveurs & Produits + détails infrastructure (ADR-024) — modèle `Server` étendu (ip/port/provider/region/quota/strictTls/panelProvider HESTIA|COOLIFY, 6 migrations), DTO/service/tests, pages `/manager/serveurs` (table CRUD large + édition inline) et `/manager/produits`, dashboard `/manager` **lecture seule**, sidebar Serveurs/Produits, conteneur 1320px — 2026-09-01, unit 91/91 + e2e 62/62, typecheck + web build (14 routes) + smoke live PASS, **commit `1d7131e` + push + owner-validé ✓**.

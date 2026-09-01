@@ -1,10 +1,10 @@
 # PROJECT_STATUS — iCode Host Pro
 
 ## Overall status
-**PHASE 7ter IMPLÉMENTÉE 2026-09-01 — GESTION ADMIN SERVEURS & PRODUITS + DÉTAILS INFRASTRUCTURE (ADR-024, commit `76fb0db`+ suivis). Model Server étendu (6 migrations), 2 pages CRUD larges (serveurs édition inline + produits), dashboard lecture seule, sidebar Serveurs/Produits, conteneur élargi 1320px. Unit 91/91 + e2e 62/62 verts, typecheck + web build PASS, smoke live validé. À valider par le propriétaire puis commit + push (2 commits ahead + worktree 7ter).**
+**PHASE 7ter TERMINÉE & OWNER-VALIDÉE 2026-09-01 — GESTION ADMIN SERVEURS & PRODUITS + DÉTAILS INFRASTRUCTURE (ADR-024, commit `1d7131e`, poussé sur `origin/main` avec `76fb0db` + `31af3e2`). Model Server étendu (6 migrations), 2 pages CRUD larges (serveurs édition inline + produits), dashboard lecture seule, sidebar Serveurs/Produits, conteneur élargi 1320px. Unit 91/91 + e2e 62/62 verts, typecheck + web build PASS, smoke live + validation propriétaire ✓.**
 
 ## Current phase
-**Phase 7ter — Gestion admin Serveurs & Produits (ADR-024), GO via AskUserQuestion 2026-09-01 : « soyez expert designer… ne garde pas les pages centrées et augmente la largeur des pages… créer un menu dans la sidebar pour les serveurs… cette page sera modifiée au fur et à mesure quand la connexion des serveurs sera établie et avoir beaucoup plus de détails… ». Implémenté : modèle + migration `init_server_details`, DTO/service/tests, pages `/manager/serveurs` + `/manager/produits`, dashboard lecture seule, nav, layout 1320px. Prochaine étape : validation live propriétaire → commit + push (Phases 6 + 7 + 7bis + 7ter en attente d'instruction).**
+**Phase 7ter — Gestion admin Serveurs & Produits (ADR-024), GO via AskUserQuestion 2026-09-01 : « soyez expert designer… ne garde pas les pages centrées et augmente la largeur des pages… créer un menu dans la sidebar pour les serveurs… cette page sera modifiée au fur et à mesure quand la connexion des serveurs sera établie et avoir beaucoup plus de détails… ». Implémenté, commité `1d7131e` + poussé, **validé par le propriétaire (« validé ») — Phase closed**. Prochaine étape : proposition Phase 8.**
 
 ## State (real, as of this update)
 - Monorepo: pnpm workspaces + Turborepo (ADR-001). `apps/web` (Next.js 15), `apps/api` (NestJS 11), `packages/` reserved.
@@ -58,9 +58,8 @@
 - **Aucun changement API/DB** : pas de migration, aucun test API touché (unit 90/90 + e2e 61/61 inchangés depuis la Phase 6).
 
 ## Pending
-- **Validation propriétaire live de la Phase 7ter** : pages `/manager/serveurs` (édition inline + création avec nouveaux champs) et `/manager/produits`, dashboard lecture seule, largeur 1320px.
-- **Commit « Phase 7ter »** (prêt — la branche contient déjà 76fb0db polish + 31af3e2 design + 47838c1 mail) + **push** des Phases 6, 7, 7bis et 7ter sur instruction.
-- (Optionnel, Phase 6) test live d'invitation avec email : créer une invite → l'email arrive avec le lien `/auth?invite=…` → accept de bout en bout.
+- **(Optionnel, Phase 6) test live d'invitation avec email** : créer une invite → l'email arrive avec le lien `/auth?invite=…` → accept de bout en bout.
+- **Proposition Phase 8** (à l'étude) — candidats naturels : connexion réelle des serveurs (ADR-010/007), cPanel/DirectAdmin, observabilité, ADR-008 complet…
 
 ## Decisions
 - ADR-001..005, 011..014: **APPROVED** (Phase 0). ADR-015+016: **APPROVED** (Phase 1). ADR-017: **APPROVED** (Phase 2). ADR-018: **APPROVED** (Phase 3). ADR-019: **APPROVED** (Phase 4). ADR-020+021: **APPROVED** (Phase 5 GO). **ADR-022 (configuration mail + emails d'invitation) : APPROVED** (Phase 6 GO, 2026-08-31) — valide un périmètre étroit d'ADR-008 (chiffrement applicatif au repos). **ADR-023 (design system de l'interface) : APPROVED** (Phase 7 GO, 2026-08-31 — « copier le style et couleurs complet, brand-agnostic, tout modifiable ») + **polish UI (selects, contraste light, toasts)** du même ADR. **ADR-024 (détails infrastructure Serveurs + pages CRUD admin larges, Phase 7ter) : APPROVED** (2026-09-01, GO posé via AskUserQuestion). ADR-006 full, 007, 008 complet, 009, 010: **PROPOSED** (untouched). See DECISIONS.md.

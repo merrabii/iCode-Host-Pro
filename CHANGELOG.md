@@ -18,8 +18,8 @@ Owner asked to fix the `/manager` dashboard overflow (server action buttons behi
 - `npx tsc --noEmit` apps/web **PASS** ; `web build` **PASS** (14 routes dont `/manager/serveurs` 5.28 kB, `/manager/produits` 3.80 kB, `/manager` 3.66 kB ; `.next` purgé avant build — leçon Phase 2).
 - `prisma migrate status` → **6 migrations, in sync**. Smoke live :3000 → **200** sur `/manager`, `/manager/serveurs`, `/manager/produits` + proxy `/api` 401 sans session ; login ADMIN → `/users/me` 200, `/api/servers` (4), `/api/products` (2), `/api/manager/summary` ({2 produits ACTIVE, 4 serveurs, 16/17 users}) — cohérents avec l'API, zéro erreur côté web/API.
 - **Redémarrage environnement (2026-09-01)** : Docker Desktop était éteint → postgres au sol + dev servers arrêtés (le web répondait « pas accessible »). Remonté : docker up (postgres healthy), API :3001, web :3000 — c'était un état d'environnement, pas une régression de code.
-### Pending
-- Validation propriétaire live de la refonte (serveurs/produits/dashboard lecture seule) → commit + push (2 commits ahead + worktree 7ter).
+### Owner validation (2026-09-01)
+- **VALIDÉ par le propriétaire** (« validé ») : pages `/manager/serveurs` (création + édition inline avec les nouveaux champs) et `/manager/produits`, dashboard lecture seule, layout large 1320px. Phase 7ter **closed** — commit `1d7131e` poussé sur `origin/main` (avec `31af3e2` design + `76fb0db` polish).
 Owner feedback on Phase 7 design: « tout est correct concernant les couleurs et style, c'est très bien à ne pas changer » — the reference palette stays as-is (dark + light) — with 4 pure-front requests:
 ### Added
 - **Sélects déroulants optimisés** (`globals.css` `.select` / `.select-sm`) : flèche OS native supprimée (`appearance:none`) + **chevron SVG du design system** (data-URI, couleur `--text-secondary` par thème), `padding-right: 36px` (texte jamais sous la flèche), `cursor:pointer`. Hauteurs = `.input`/`.btn` → **alignement vertical aligné** avec les boutons adjacents dans les tableaux ; `.select-sm` calqué sur `.btn-sm` (statuts serveur/produit, affectation serveur, filtres journal) ; `<option>` teintés thème.
