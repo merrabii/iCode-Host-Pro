@@ -273,8 +273,22 @@ export interface ServerAdmin {
   quotaMaxAccounts?: number | null;
   strictTls: boolean;
   panelProvider: PanelProvider;
+  // Sonde de connectivité réelle (Phase 8, ADR-025).
+  lastCheckedAt?: string | null;
+  lastProbeOk?: boolean | null;
+  lastProbeDetail?: string | null;
   createdAt: string;
   updatedAt: string;
+}
+export interface ServerProbe {
+  ok: boolean;
+  detail: string;
+  latencyMs?: number;
+  httpStatus?: number;
+}
+export interface ServerCheckResult {
+  server: ServerAdmin;
+  probe: ServerProbe;
 }
 export interface ProductAdmin {
   id: string;
@@ -303,6 +317,9 @@ export const updateServer = (t: string, id: string, patch: ServerPatch) =>
   apiJson(`/api/servers/${id}`, t, { method: 'PATCH', body: JSON.stringify(patch) });
 export const deleteServer = (t: string, id: string) =>
   apiJson(`/api/servers/${id}`, t, { method: 'DELETE' });
+// Phase 8 (ADR-025): sonde de connectivité réelle d'un serveur (ADMIN).
+export const checkServer = (t: string, id: string) =>
+  apiJson(`/api/servers/${id}/check`, t, { method: 'POST' });
 export const listProducts = (t: string) => apiJson('/api/products', t);
 export const createProduct = (t: string, dto: { name: string; kind?: string; status?: string }) =>
   apiJson('/api/products', t, { method: 'POST', body: JSON.stringify(dto) });

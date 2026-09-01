@@ -477,6 +477,117 @@ Do not log only important work. Record all meaningful actions, including small c
 - Files modified: PROJECT_STATUS.md (Phase 7ter ✓), TASKS.md (cette section), CHANGELOG.md, HANDOVER.md.
 - Command: git add + commit (docs owner validation) puis push — Phase 7ter **closed**.
 
+# PHASE 8 — CONNEXION RÉELLE DES SERVEURS : SONDE DE CONNECTIVITÉ (ADR-025)
+Direction (AskUserQuestion) : « Implémenter le premier connecteur (ADR-010) : ping/détection
+de l'état réel d'un serveur (Hestia/Coolify), vérification de l'API, statut
+PROVISIONING/ACTIVE/PROBLEM piloté par la connexion, test de connectivité depuis
+/manager/serveurs. » — implémenté 2026-09-01 (en attente validation propriétaire).
+
+## 2026-09-01 — 8.0 GO & périmètre
+- Action: périmètre étroit d'ADR-010 : **sonde de connectivité (TCP + HTTP)** déclenchée par
+  l'admin depuis `/manager/serveurs` — détecte l'état réseau réel et **propose** une bascule
+  de statut. Adaptateurs fournisseurs réels / credentials / auto-provisionnement = HORS
+  périmètre (ADR-010 complet reste PROPOSED).
+- Files modified: DECISIONS.md (ADR-025 APPROVED).
+
+## 2026-09-01 — 8.1 Modèle + migration (ADR-025)
+- Files modified: `apps/api/prisma/schema.prisma` — `Server` +3 champs nullable (écrits
+  uniquement par la sonde, jamais par l'admin) : `lastCheckedAt DateTime?`,
+  `lastProbeOk Boolean?` (null = jamais sondé), `lastProbeDetail String?`.
+- Commands: `corepack pnpm --filter @icode-host-pro/api run migrate --name init_server_check`
+  → migration `20260901082020_init_server_check` appliquée (dev API arrêté d'abord — leçon
+  EPERM DLL) + generate → **7 migrations**, `migrate status` in sync.
+
+## 2026-09-01 — 8.2 ProbeTransportFactory (couture de test)
+- Files created: `apps/api/src/servers/probe-transport.factory.ts` — `ProbeTarget`
+  (`host`,`port`,`strictTls`,`probeMode?`), `ProbeResult` (`ok`,`detail`,`latencyMs?`,
+  `httpStatus?`), `ProbeTransport` abstraite, `NodeProbeTransport` runtime (TCP `net.connect` +
+  HTTP/HTTPS `rejectUnauthorized=strictTls`), `ProbeTransportFactory.create(timeoutMs=5000)`.
+  Protocole dérivé du port (80/443/8443 ⇒ HTTP, sinon TCP) ; `probeMode` force HTTP (tests sur
+  port éphémère). Toute réponse HTTP = joignable (même 5xx). Timeout par défaut 5 000 ms.
+- **Leçon DI Nest** : AUCUN paramètre primitif injecté au constructeur de la factory (un
+  `Number` serait résolu comme un token DI introuvable → AppModule échouait ; vu quand la suite
+  e2e entière sauf `server-check` plantait sur « Cannot read properties of undefined »). Le
+  timeout vit dans `create(timeoutMs)`, surchargeable.
+- Files created: `apps/api/src/servers/probe-transport.factory.spec.ts` — transport RÉEL sur
+  loopback (déterministe, aucun réseau externe) : HTTP 200, TCP ok, connexion refusée, hôte
+  introuvable.
+
+## 2026-09-01 — 8.3 API : endpoint + audit
+- Files modified: `apps/api/src/servers/servers.service.ts` — `check(id, actor)` :
+  `findOne` (404 si inconnu) → cible `hostname`+`port` (défaut 22) via `probeFactory.create()` →
+  persiste les 3 champs → audit `server.check` `{host, port, ok, detail, latencyMs, httpStatus,
+  statusLeft}` → retour `{ server, probe }`. **Le statut n'est JAMAIS forcé** (la sonde
+  propose, l'admin valide via PATCH).
+- Files modified: `apps/api/src/servers/servers.controller.ts` — `POST :id/check` (ADMIN,
+  classe `@Roles(Role.ADMIN)`).
+- Files modified: `apps/api/src/servers/servers.module.ts` — provider `ProbeTransportFactory`.
+- Files modified: `apps/api/src/servers/servers.service.spec.ts` — 3 tests check (succès port
+  22 défaut, échec port explicite, 404 sans sonde).
+- Files created: `apps/api/test/server-check.e2e-spec.ts` — suite e2e (5 tests) avec
+  `overrideProvider(ProbeTransportFactory)` (couture, zéro réseau) : 401/403/404, succès
+  persisté (relecture GET), échec + audit `server.check`.
+- Files modified: `apps/web/src/app/manager/journal/page.tsx` — libellé `server.check`:
+  « Test de connexion serveur ».
+
+## 2026-09-01 — 8.4 Web : colonne Connexion + Tester + bascule statut
+- Files modified: `apps/web/src/lib/api.ts` — type `ServerAdmin` (+3 champs sonde) +
+  `ServerProbe` + `ServerCheckResult` + helper `checkServer(t, id)`.
+- Files modified: `apps/web/src/app/manager/serveurs/page.tsx` — colonne **Connexion**
+  (badge OK/Échec/— persistant via `lastProbe*`, détail `lastProbeDetail`) + bouton
+  **« Tester »** (spin pendant la sonde, `IconRefresh`) + raccourci `→ ACTIVE` (résultat OK) /
+  `→ PROBLEM` (échec) = bascule rapide validée par l'admin (PATCH journalisé `server.update`).
+  État `probeMap` par serveur (résultat restitué sans rechargement).
+
+## 2026-09-01 — 8.5 Validation (builds + tests + smoke)
+- Command: `corepack pnpm --filter @icode-host-pro/api test` → **unit 98/98** (12 suites, +7).
+- Command: `corepack pnpm --filter @icode-host-pro/api test:e2e` → **e2e 67/67, 9 suites** (+
+  `server-check` 5 tests) PASS sur Postgres réel.
+- Command: `npx tsc --noEmit` apps/web → **PASS**. `web build` → **PASS** (14 routes ;
+  `/manager/serveurs` 5.8 kB ; dev web arrêté + `.next` purgé avant build — leçon Phase 2).
+- Smoke live API :3001 — création `probe-smoke-local` (hostname localhost, port 5432) →
+  `POST /api/servers/:id/check` → `{ ok: true, detail: "TCP 5432 : accessible (8 ms)",
+  latencyMs: 8 }`, persisté (`lastProbeOk: true` + GET relu) ; création `probe-smoke-refused`
+  (127.0.0.1:5999) → `{ ok: false, detail: "Connexion refusée" }` persisté ; audit
+  `server.check` avec `{ok, host, port, detail, latencyMs, httpStatus, statusLeft}`. Serveurs
+  de smoke supprimés. Smoke web :3000 → **200** `/`, `/manager/serveurs`, `/manager/journal` ;
+  label « Test de connexion serveur » présent dans le bundle.
+- Docs: DECISIONS.md (ADR-025), CHANGELOG.md (Phase 8), PROJECT_STATUS.md, docs/sql-commandes.txt
+  (Phase 8 DB entry), TASKS.md (cette section), HANDOVER.md.
+- En attente: validation live propriétaire → commit + push (inclut le rework UX — voir 8.6).
+
+## 2026-09-01 — 8.6 Rework UX page serveurs (comm. propriétaire — grille de cartes + drawer)
+- Owner feedback: « dans la page serveur le tableau et la page ne sont pas bien UX optimisé !
+  Prière d'utiliser un style très moderne pour l'affichage des tableaux ou donnée modifiable. »
+- Direction via AskUserQuestion : **Grille de cartes + panneau latéral (drawer)** (style
+  dashboards infra — Coolify/Hetzner/Cloudflare). **Zéro changement API/DB** — pur front,
+  design system ADR-023 respecté (tokens, couleurs, brand), logique métier + sonde Phase 8
+  **conservées** (handlers/validations/toasts identiques).
+- Files modified: `apps/web/src/components/icons.tsx` — +`IconSearch`, `IconPencil`, `IconTrash`.
+- Files modified: `apps/web/src/app/globals.css` — nouvelle section 22 réutilisable :
+  `.srv-toolbar` (recherche loupe + `input`), `.srv-search`, `.srv-chips`/`.srv-chip` (+`.active`,
+  compteur `.n`) ; `.srv-grid`/`.srv-card` (+head/ico teintée/body 2-col/`srv-field`/`srv-field-full`/
+  `srv-conn`/détail/quick/`srv-card-foot`/`srv-actions` révélées au survol) ; `.drawer-overlay`/
+  `.drawer` (animations mount 0.18/0.22 s, `drawer-head`/`body`/`foot`, `.drawer-close`) ;
+  `.badge .dot` ; responsive <600px. Tokens uniquement.
+- Files modified: `apps/web/src/app/manager/serveurs/page.tsx` — réécriture de la VUE :
+  PageIntro + bouton « Nouveau serveur » → drawer ; toolbar recherche + chips statut avec compteurs
+  + compteur affichés/total (filtrage mémoire via `useMemo`) ; grille de cartes (statut ⇒ icône
+  teintée, badge statut, hostname mono, champs, bloc connexion intégré : badge OK/Échec/— + détail
+  « dernière sonde » + « Dernier test » + Tester + bascule rapide ; actions Modifier/Supprimer au
+  survol) ; drawer création/édition (`drawerTitle`, sélect statut en édition seulement, poids
+  Annuler/« Créer le serveur »/« Enregistrer », Échap + clic backdrop ferme si pas busy) ; états
+  vides (liste vide vs recherche sans résultat). Ancien `<Panel>`-form inline et édition inline
+  table supprimés.
+- Command: `corepack pnpm --dir apps/web exec tsc --noEmit` → **PASS (exit 0)**.
+- Command: `web build` → **PASS** (14 routes, `/manager/serveurs` **6.39 kB** ; dev web :3000
+  arrêté + `.next` purgé avant build — leçon Phase 2), puis dev web relancé (PID 876). Marqueurs
+  `srv-grid`/`srv-card`/`drawer-overlay`/`srv-chip`/`IconSearch`/`IconPencil`/`IconTrash` présents
+  dans le chunk client + CSS servi ; smoke `/manager/serveurs` **200**.
+- Docs: CHANGELOG.md (Phase 8 bis), PROJECT_STATUS.md, HANDOVER.md, TASKS.md (cette section).
+  Aucun changement API/DB/test → unit 98/98 + e2e 67/67 toujours valides (non rejoués).
+- En attente: validation live propriétaire (grille + drawer) → commit + push Phase 8 (avec rework).
+
 # OPEN ITEMS
 - [x] Authentication architecture (ADR-015 APPROVED — Phase 1).
 - [x] Inscription par invitation / fermeture de l'inscription ouverte (ADR-020 APPROVED — Phase 5 : `POST /api/auth/register` → 410, `POST /api/auth/accept-invite` + `Invitation`).
@@ -505,4 +616,5 @@ Do not log only important work. Record all meaningful actions, including small c
 - Phase 6: configuration mail admin + emails d'invitation (ADR-022) — owner-validated 2026-08-31 (SMTP Brevo réel, domaine codediali.com, événements `delivered`), tests 90/90 unit + 61/61 e2e (8 suites), builds PASS, commitée (47838c1), push en attente d'instruction.
 - Phase 7: design system de l'interface (ADR-023) — réécriture visuelle complète (tokens dark/light de la référence copiés à l'identique, brand-agnostic, thème + anti-FOUC, composants AppShell/ui/icons, 9 pages refactorées logique intacte) — 2026-08-31, commitée `31af3e2`.
 - Phase 7bis: polish UI (ADR-023 follow-up) — sélects chevron SVG + alignement boutons, contraste bordures light (2 tokens), espacement alerts, toasts pop-up (OK + 5 s) via ToastProvider/useToast convertis sur 8 pages (inline conservés : diagnostic `/`, panneau invitation créée) — 2026-08-31, typecheck + build + smoke PASS, aucun changement API/DB.
+- Phase 8 : sonde de connectivité réelle des serveurs (ADR-025) — modèle `Server` +`lastCheckedAt`/`lastProbeOk`/`lastProbeDetail` (7 migrations), `ProbeTransportFactory` (couture de test type mail, TCP/HTTP/strictTls/timeout 5s, leçon DI Nest sur les primitives), endpoint ADMIN `POST /api/servers/:id/check` + audit `server.check` (3 champs persistés, statut jamais forcé), UI `/manager/serveurs` colonne Connexion (badge OK/Échec/—) + bouton Tester + bascule `→ ACTIVE`/`→ PROBLEM` — 2026-09-01, unit 98/98 + e2e 67/67 (9 suites, override couture zéro réseau), typecheck + web build (14 routes) + smoke live (sonde OK `localhost:5432` 8 ms / refus `127.0.0.1:5999`, audit rempli) PASS.
 - Phase 7ter: gestion admin Serveurs & Produits + détails infrastructure (ADR-024) — modèle `Server` étendu (ip/port/provider/region/quota/strictTls/panelProvider HESTIA|COOLIFY, 6 migrations), DTO/service/tests, pages `/manager/serveurs` (table CRUD large + édition inline) et `/manager/produits`, dashboard `/manager` **lecture seule**, sidebar Serveurs/Produits, conteneur 1320px — 2026-09-01, unit 91/91 + e2e 62/62, typecheck + web build (14 routes) + smoke live PASS, **commit `1d7131e` + push + owner-validé ✓**.

@@ -27,7 +27,10 @@
       "PowerShell(foreach \\($p in 3000,3001\\) { $c = Get-NetTCPConnection -State Listen -LocalPort $p -ErrorAction SilentlyContinue; if \\($c\\) { $c.OwningProcess | Sort-Object -Unique | ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue; \"killed pid $_ on port $p\" } } }; Start-Sleep -Milliseconds 800; foreach \\($p in 3000,3001\\) { $c = Get-NetTCPConnection -State Listen -LocalPort $p -ErrorAction SilentlyContinue; if \\($c\\) { \"port $p STILL LISTENING\" } else { \"port $p free\" } })",
       "Bash(node -e \"const p=require\\('./node_modules/nodemailer/package.json'\\); console.log\\('main:', p.main, '| type:', p.type||'commonjs', '| version:', p.version\\)\")",
       "PowerShell($conn = Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Where-Object { $_.LocalPort -in 3000,3001 } | Select-Object LocalPort, OwningProcess; if \\($conn\\) { $conn } else { \"ports 3000/3001 free\" })",
-      "Bash(npx tsc *)"
+      "Bash(npx tsc *)",
+      "Bash(curl -s -o /dev/null -w \"serveurs %{http_code} \\(%{size_download} octets\\)\\\\n\" http://localhost:3000/manager/serveurs)",
+      "Bash(curl -s http://localhost:3000/manager/serveurs)",
+      "Bash(curl -s http://localhost:3001/api/health)"
     ]
   }
 }

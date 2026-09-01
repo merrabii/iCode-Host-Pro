@@ -62,4 +62,11 @@ export class ServersController {
   remove(@Param('id') id: string, @CurrentUser() actor: JwtPayload) {
     return this.servers.remove(id, actor);
   }
+
+  // Phase 8 (ADR-025): sonde de connectivité réelle. ADMIN-only (classe).
+  @Post(':id/check')
+  @ApiOperation({ summary: 'Probe a server connectivity (ADMIN)' })
+  check(@Param('id') id: string, @CurrentUser() actor: JwtPayload) {
+    return this.servers.check(id, actor);
+  }
 }

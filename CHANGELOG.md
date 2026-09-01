@@ -1,5 +1,38 @@
 # CHANGELOG
 
+## Phase 8 bis — REWORK UX PAGE SERVEURS : GRILLE DE CARTES + PANNEAU LATÉRAL (ADR-023 appliqué) — 2026-09-01
+Owner feedback: « dans la page serveur le tableau et la page ne sont pas bien UX optimisé ! Prière d'utiliser un style très moderne pour l'affichage des tableaux ou donnée modifiable. » Direction choisie via AskUserQuestion : **grille de cartes + panneau latéral (drawer)** (style dashboards infra modernes — Coolify/Hetzner/Cloudflare). **Aucun changement API/DB** — pur front (`apps/web`), design system ADR-023 respecté (tokens, couleurs, brand inchangés), logique métier et sonde Phase 8 **conservées** à l'identique.
+### Added
+- **Grille de cartes** (`globals.css` section 22 + `page.tsx`) en remplacement de la table 11 colonnes : toolbar (recherche libre nom/hostname/IP/fournisseur/région + **chips filtres par statut** avec compteurs + compteur affichés/total, tri mémoire sans appel API), cartes responsives (`repeat(auto-fill, minmax(330px,1fr))`) — en-tête (icône teintée par statut + nom + badge statut + hostname mono), champs en grille 2 colonnes (IP/Port mono, Fournisseur, Région, Quota, TLS badge Strict/Off, Panneau badge Hestia/Coolify), **bloc Connexion Phase 8 intégré** (badge OK/Échec/— avec point + détail + « Dernier test » + bouton **Tester** + bascule rapide `→ ACTIVE`/`→ PROBLEM`), pied d'actions **Modifier**/**Supprimer** (icônes Pencil/Trash, révélées au survol via `:hover`/`:focus-within`).
+- **Panneau latéral (drawer)** création/édition : glisse depuis la droite (animation 0.22 s), overlay blur, mêmes champs que l'ancien formulaire (nom*+, hostname*+, IP, port, fournisseur, région, quota, panneau, strictTls ; sélect statut **uniquement en édition**), pied Annuler/« Créer le serveur »/« Enregistrer ». **Échap** ferme, clic backdrop ferme, désactivé pendant une requête.
+- **Icônes** `icons.tsx` : `IconSearch` (recherche), `IconPencil`, `IconTrash` (actions de liste). État vide liste / recherche sans résultat distincts.
+### Changed
+- `page.tsx` : l'édition inline toutes-cellules remplacée par le drawer — handlers/validations/toasts **inchangés** (`load`, `createServer`, `updateServer`, `deleteServer`, `checkServer`, `applyStatusQuick`, `toPatch`, `emptyDraft`).
+- Le pattern (toolbar + `srv-grid` + `drawer-*`) est générique et réutilisable pour d'autres listes (Produits…) — hors périmètre de ce commit.
+### Verified (2026-09-01)
+- Aucun changement API/DB → unit **98/98** + e2e **67/67** toujours valides (non rejoués — aucun endpoint/garde touché).
+- `npx tsc --noEmit` apps/web **PASS** (exit 0) ; `web build` **PASS** (14 routes, `/manager/serveurs` 6.39 kB — `.next` purgé, dev web arrêté avant build, leçon Phase 2). Marqueurs de la nouvelle structure présents dans le chunk client compilé (`srv-grid`, `srv-card`, `drawer-overlay`, `srv-chip`, `IconSearch/Pencil/Trash`) + CSS servi.
+- Smoke :3000 → `/manager/serveurs` **200** ; dev web relancé en fond (PID 876).
+### Pending
+- Validation live propriétaire (grille + drawer) → commit + push de la Phase 8 (avec ce rework).
+
+## Phase 8 — CONNEXION RÉELLE DES SERVEURS : SONDE DE CONNECTIVITÉ (ADR-025) — IMPLEMENTED 2026-09-01
+Owner's AskUserQuestion choice for Phase 8: « Connexion réelle des serveurs » — « Implémenter le premier connecteur (ADR-010) : ping/détection de l'état réel d'un serveur (Hestia/Coolify), vérification de l'API, statut PROVISIONING/ACTIVE/PROBLEM piloté par la connexion, test de connectivité depuis /manager/serveurs. ». Scoped to a narrow ADR-010 slice: a **connectivity probe (TCP + HTTP)** the admin triggers from `/manager/serveurs`, which detects the real network state and **proposes** a status switch. Real provider adapters / credentials / auto-provisioning stay OUT of scope.
+### Added
+- **Modèle `Server`** (migration `20260901082020_init_server_check`, +1 → **7 migrations**) : 3 champs de résultat, **nullable**, écrits uniquement par la sonde (jamais par l'admin) : `lastCheckedAt DateTime?`, `lastProbeOk Boolean?` (null = jamais sondé), `lastProbeDetail String?`.
+- **`ProbeTransportFactory`** (`apps/api/src/servers/probe-transport.factory.ts`) — la **couture de test** sur le modèle exact de `MailTransportFactory` (Phase 6) : `ServersService` dépend de la factory, l'e2e l'override (`overrideProvider`) → **aucun réseau réel en test** ; l'unit test le vrai transport sur loopback. Runtime = `NodeProbeTransport` : **TCP** (`net.connect`) pour les ports type SSH (défaut 22) + **HTTP/HTTPS** (`rejectUnauthorized = strictTls`) pour 80/443/8443 ; toute réponse HTTP = joignable (même 5xx) ; timeout défaut 5 000 ms ; détail lisible (« TCP 22 : accessible (18 ms) », « HTTP 200 en 45 ms », « Connexion refusée », « Délai dépassé (5 000 ms) », « Erreur TLS : … », « Hôte introuvable »).
+  - **Leçon DI Nest** : pas de paramètre primitif injecté au constructeur de la factory (un `Number` = token DI introuvable → AppModule échouait à l'init, suite e2e entière sauf `server-check` pois activités). Le timeout vit dans `create(timeoutMs)`, surchargeable test par test.
+- **Endpoint** `POST /api/servers/:id/check` (ADMIN) : charge le serveur, cible `hostname` + `port` (défaut 22), sonde, **persiste** les 3 champs, journalise **`server.check`** (`{host, port, ok, detail, latencyMs, httpStatus, statusLeft}`). Réponse `{ server, probe }`. **Le statut n'est JAMAIS forcé** — la sonde propose, l'admin valide.
+- **UI** `/manager/serveurs` : nouvelle colonne **Connexion** — badge persistant (OK / Échec / — = jamais testé), détail `lastProbeDetail`, bouton **« Tester »** (spin pendant la sonde), raccourci `→ ACTIVE` (résultat OK) / `→ PROBLEM` (échec) = bascule rapide validée par l'admin (PATCH + audit `server.update`).
+- Journal (`/manager/journal`) : libellé `server.check` → « Test de connexion serveur ».
+### Verified (2026-09-01)
+- Unit **98/98** (12 suites, +7) ; **e2e 67/67, 9 suites** (+ `server-check` : 401/403/404, succès persisté + relecture GET, échec + audit) — override de la couture, **zéro réseau en test**, verts sur Postgres réel.
+- `npx tsc --noEmit` apps/web **PASS** ; `web build` **PASS** (14 routes, `/manager/serveurs` 5.8 kB ; `.next` purgé avant build). Dev servers API :3001 + web :3000 relancés en fond.
+- Smoke live API :3001 — sonde réelle `localhost:5432` → `{ok: true, detail: "TCP 5432 : accessible (8 ms)", latencyMs: 8}`, persisté + relu ; `127.0.0.1:5999` → `{ok: false, detail: "Connexion refusée"}`, persisté ; audit `server.check` rempli. Smoke web :3000 → **200** `/`, `/manager/serveurs`, `/manager/journal`.
+### Pending
+- Validation live propriétaire → commit + push.
+- Plus tard (hors périmètre ici) : politique automatique des statuts par sonde périodique (ADR-007), adaptateurs fournisseurs réels + credentials (ADR-010 complet), cPanel/DirectAdmin.
+
 ## Phase 7ter — GESTION ADMIN SERVEURS & PRODUITS + DÉTAILS INFRASTRUCTURE (ADR-024) — IMPLEMENTED 2026-09-01
 Owner asked to fix the `/manager` dashboard overflow (server action buttons behind the products panel) as a real design expert: « ne garde pas les pages centrées et augmente la largeur des pages… créer un menu dans la sidebar pour les serveurs… page sera modifiée au fur et à mesure quand la connexion des serveurs sera établie et avoir beaucoup plus de détails… ». Direction chosen via AskUserQuestion: dedicated **Produits** page too + new Server fields (IP, Port, Fournisseur, Région, Quota Max Comptes, ✓ TLS strict, Module de Panneau HESTIA/COOLIFY d'abord — cPanel/DirectAdmin ensuite).
 ### Added

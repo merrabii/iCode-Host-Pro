@@ -72,6 +72,7 @@ Direction: fine-grained capability interfaces and provider isolation. Coolify/He
 - ADR-022 Configuration mail + emails d'invitation (below) — 2026-08-31.
 - ADR-023 Design system de l'interface (below) — 2026-08-31.
 - ADR-024 Détails infrastructure Serveurs + pages CRUD admin larges (below) — 2026-09-01.
+- ADR-025 Sonde de connectivité réelle des serveurs (below) — 2026-09-01.
 
 ## ADR-011 — Socle config minimal (Phase 0)
 **Status: APPROVED** (2026-08-30, Phase 0 GO)
@@ -314,6 +315,58 @@ d'infrastructure** :
   connexion/charge. Le provisionnement reste un **stub** (ADR-021) — pas de déploiement réel,
   pas de jobs async (ADR-007 inchangés, PROPOSED).
 - Statuts serveur saisis manuellement aujourd'hui (UNKNOWN reste le statut initial d'une création).
+
+## ADR-025 — Sonde de connectivité réelle des serveurs (Phase 8)
+**Status: APPROVED** (2026-09-01, GO du propriétaire posé via AskUserQuestion — Phase 8
+« Connexion réelle des serveurs » : « Implémenter le premier connecteur (ADR-010) :
+ping/détection de l'état réel d'un serveur (Hestia/Coolify), vérification de l'API,
+statut PROVISIONING/ACTIVE/PROBLEM piloté par la connexion, test de connectivité depuis
+/manager/serveurs. »)
+Decision: **premier pas réel vers l'ADR-010** — une **sonde de connectivité** (TCP + HTTP)
+déclenchée par l'admin depuis `/manager/serveurs`, qui détecte l'état réseau réel d'un
+serveur et **propose** une bascule de statut. Les **adaptateurs de fournisseurs réels**
+(Coolify/Hestia : appel de leur API, credentials, création de comptes) restent HORS
+périmètre — la sonde est le connecteur minimal de détection d'état.
+- **Modèle `Server`** (migration `init_server_check`, 7e migration) — 3 champs de résultat,
+  **nullable**, jamais saisis par l'admin (écrits uniquement par la sonde) :
+  `lastCheckedAt DateTime?` (dernière sonde), `lastProbeOk Boolean?` (null = jamais sondé),
+  `lastProbeDetail String?` (message lisible : « TCP 22 : accessible (18 ms) », « HTTP 200 en
+  45 ms », « Connexion refusée », « Délai dépassé (5 000 ms) », « Erreur TLS : … », « Hôte
+  introuvable »).
+- **`ProbeTransportFactory`** (`src/servers/probe-transport.factory.ts`) = **couture de test**
+  sur le modèle exact de `MailTransportFactory` (Phase 6) : l'e2e la surcharge
+  (`overrideProvider`) → **aucun réseau réel en test** ; l'unit test le vrai transport sur
+  loopback. `ServersService` dépend de la factory (jamais du réseau).
+  - **Pas de paramètre primitif injecté au constructeur** (leçon Phase 8 : un `Number` injecté
+    serait résolu par Nest comme un token DI introuvable et ferait échouer AppModule en entier —
+    c'est l'objet de la couture qui se fait échouer). Le timeout (défaut 5 000 ms) vit dans
+    `create(timeoutMs)`, surchargeable test par test.
+  - Protocole dérivé du port : `80/443/8443` ⇒ HTTP(S), sinon (SSH/autre) ⇒ TCP connect. Un
+    champ `probeMode` explicite permet de forcer HTTP (sert aux tests sur port éphémère).
+    `strictTls=false` désarme `rejectUnauthorized` (le cas 80/443 d'un panneau interne).
+  - Toute **réponse HTTP = joignable** (même 5xx) : le code est la donnée.
+- **Endpoint** `POST /api/servers/:id/check` (ADMIN) : charge le serveur, cible `hostname` +
+  `port` (défaut **22**), sonde, **persiste** les 3 champs, journalise **`server.check`** dans
+  l'audit (`{host, port, ok, detail, latencyMs, httpStatus, statusLeft}`). Réponse
+  `{ server, probe }`.
+- **Le statut reste piloté (et validé) par l'ADMIN** : la sonde **ne force jamais** le statut
+  (elle écrit `lastProbe*` et propose). Sur `/manager/serveurs`, après un test, l'admin peut
+  cliquer `→ ACTIVE` (résultat OK) ou `→ PROBLEM` (échec) — c'est la « bascule rapide »
+  cohérente avec le résultat, un PATCH classique journalisé `server.update`. PROVISIONING reste
+  saisi manuellement. Le projet vers une **politique automatique** des statuts (pilotage auto
+  par sonde périodique) est mentionné mais **hors périmètre ici**.
+- **UI** `/manager/serveurs` : nouvelle colonne **Connexion** — badge persistant
+  (OK / Échec / — = jamais testé), détail `lastProbeDetail`, bouton **« Tester »** (spin
+  pendant la sonde), et raccourci `→ ACTIVE`/`→ PROBLEM` aligné sur le dernier résultat.
+- **Tests** : unit 98/98 (+ 7 : 3 check du service — succès/échec/404 — + 4 transport réel sur
+  loopback : HTTP 200, TCP ok, refusée, hôte introuvable) ; e2e **67/67 (9 suites)** dont la
+  nouvelle suite `server-check` (5 tests : 401/403/404, succès persisté, échec + audit
+  `server.check`) — tout en surchargeant la couture (zéro réseau en test). Typecheck web + `web
+  build` PASS. Smoke live : sonde réelle `localhost:5432` → « TCP 5432 : accessible (8 ms) »
+  OK persisté ; `127.0.0.1:5999` → « Connexion refusée » persisté ; audit `server.check` rempli.
+- **Hors périmètre (inchangés)** : adaptateurs fournisseurs réels + credentials + auto-
+  provisionnement (ADR-010 complet reste PROPOSED), jobs/sondes périodiques (ADR-007),
+  gestion de secrets (ADR-008 full), cPanel/DirectAdmin.
 
 # REJECTED
 None recorded in this clean baseline.

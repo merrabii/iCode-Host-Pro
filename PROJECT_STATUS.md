@@ -1,10 +1,10 @@
 # PROJECT_STATUS — iCode Host Pro
 
 ## Overall status
-**PHASE 7ter TERMINÉE & OWNER-VALIDÉE 2026-09-01 — GESTION ADMIN SERVEURS & PRODUITS + DÉTAILS INFRASTRUCTURE (ADR-024, commit `1d7131e`, poussé sur `origin/main` avec `76fb0db` + `31af3e2`). Model Server étendu (6 migrations), 2 pages CRUD larges (serveurs édition inline + produits), dashboard lecture seule, sidebar Serveurs/Produits, conteneur élargi 1320px. Unit 91/91 + e2e 62/62 verts, typecheck + web build PASS, smoke live + validation propriétaire ✓.**
+**PHASE 8 IMPLÉMENTÉE 2026-09-01 — CONNEXION RÉELLE DES SERVEURS : SONDE DE CONNECTIVITÉ (ADR-025). Model Server +3 champs de résultat de sonde (7 migrations), `ProbeTransportFactory` (couture de test TCP/HTTP/strictTls/timeout, leçon DI Nest sur les primitives), endpoint ADMIN `POST /api/servers/:id/check` + audit `server.check` (statut jamais forcé — la sonde propose, l'admin valide), UI `/manager/serveurs` colonne Connexion (badge OK/Échec/—) + bouton Tester + bascule `→ ACTIVE`/`→ PROBLEM`. Unit 98/98 + e2e 67/67 (9 suites, override couture zéro réseau) verts, typecheck + web build PASS (14 routes), smoke live (sonde OK `localhost:5432` 8 ms / refus `127.0.0.1:5999`, audit rempli). **PHASE 8 bis (rework UX, commentaire propriétaire) : page serveurs refondue en grille de cartes + panneau latéral (drawer) — toolbar recherche + chips filtres statut, cartes avec bloc Connexion intégré, actions au survol ; zéro changement API/DB, design system ADR-023 respecté, typecheck + web build PASS (14 routes, `/manager/serveurs` 6.39 kB).** En attente validation live propriétaire → commit + push.**
 
 ## Current phase
-**Phase 7ter — Gestion admin Serveurs & Produits (ADR-024), GO via AskUserQuestion 2026-09-01 : « soyez expert designer… ne garde pas les pages centrées et augmente la largeur des pages… créer un menu dans la sidebar pour les serveurs… cette page sera modifiée au fur et à mesure quand la connexion des serveurs sera établie et avoir beaucoup plus de détails… ». Implémenté, commité `1d7131e` + poussé, **validé par le propriétaire (« validé ») — Phase closed**. Prochaine étape : proposition Phase 8.**
+**Phase 8 — Connexion réelle des serveurs (ADR-025), GO via AskUserQuestion 2026-09-01 : « Implémenter le premier connecteur (ADR-010) : ping/détection de l'état réel d'un serveur (Hestia/Coolify), vérification de l'API, statut PROVISIONING/ACTIVE/PROBLEM piloté par la connexion, test de connectivité depuis /manager/serveurs. ». Implémenté (périmètre étroit d'ADR-010), tests + builds + smoke PASS. **En attente de validation live propriétaire puis commit + push.****
 
 ## State (real, as of this update)
 - Monorepo: pnpm workspaces + Turborepo (ADR-001). `apps/web` (Next.js 15), `apps/api` (NestJS 11), `packages/` reserved.
@@ -38,12 +38,27 @@
 - Incidents Brevo maîtrisés pendant la validation (côté compte Brevo, remontés correctement par l'app) : **525 Unauthorized IP** (autoriser l'IP publique dans Brevo — IP ADSL **dynamique**, à réautoriser au changement) ; **sender non validé** → rejet ASYNCHRONE post-250 (l'API montrait `ok:true` ; vu en Brevo Logs→SMTP event `error` « sender not valid ») — fix avec expéditeur validé `contact@codediali.com`.
 - **Rebrand (note owner, différé)** : « iCode Host Pro » → **Code Diali** (`codediali.com`) une fois le projet terminé.
 
+## State — Phase 8 (ADR-025, connexion réelle serveurs)
+- **`Server` +3 champs de résultat** (migration `20260901082020_init_server_check`, **7 migrations**) : `lastCheckedAt DateTime?`, `lastProbeOk Boolean?` (null = jamais sondé), `lastProbeDetail String?` — **nullable, écrits uniquement par la sonde** (jamais par l'admin ; whitelist create/patch inchangée).
+- **`ProbeTransportFactory`** (`src/servers/probe-transport.factory.ts`) — couture de test (modèle `MailTransportFactory`) : `ServersService` dépend de la factory ; e2e override, unit teste le vrai transport sur loopback. Runtime `NodeProbeTransport` : **TCP** (ports type SSH, défaut 22) + **HTTP/HTTPS** (80/443/8443, `rejectUnauthorized = strictTls`) ; toute réponse HTTP = joignable ; timeout défaut 5 000 ms ; détail lisible. **Leçon DI Nest** : aucune primitive au constructeur (le timeout vit dans `create(timeoutMs)`).
+- **Endpoint** `POST /api/servers/:id/check` (ADMIN) : persiste les 3 champs + audit `server.check` ; **le statut n'est JAMAIS forcé** — la sonde `→ ACTIVE`/`→ PROBLEM` n'est qu'un raccourci admin (PATCH + audit `server.update`).
+- **UI** `/manager/serveurs` : colonne **Connexion** (badge OK/Échec/— + détail), bouton **Tester**, bascule rapide.
+- **Rework UX (Phase 8 bis, commentaire propriétaire — grille de cartes + drawer, ADR-023)** : la table 11 colonnes à édition inline est remplacée par une **grille de cartes** moderne — toolbar **recherche** (nom/hostname/IP/fournisseur/région) + **chips filtres par statut** avec compteurs (mémoire, zéro appel API), cartes responsives (en-tête icône teintée par statut + nom + badge statut + hostname mono ; champs IP/Port/Quota mono + Fournisseur/Région + badges TLS/Panneau ; **bloc Connexion Phase 8 intégré** : badge OK/Échec/— + détail + « Dernier test » + bouton Tester + bascule rapide ; pied Modifier/Supprimer, actions révélées au survol). **Édition/création dans un panneau latéral (drawer)** (animation slide + overlay blur, Échap/clic backdrop ferme, sélect statut en édition seulement). Icônes `IconSearch`/`IconPencil`/`IconTrash`. Pattern `srv-*` + `drawer-*` réutilisable (Produits…). **Zéro changement API/DB.**
+
 ## Verified (Phase 7ter — real checks, 2026-09-01)
 - Unit **91/91** (11 suites, +1 full-details serveur) ; **e2e 62/62, 8 suites** (+1 ADR-024 : POST serveur avec ip/port/provider/region/quota/strictTls/panelProvider → 201, PATCH panelProvider+port → 200) — verts sur Postgres réel.
 - `npx tsc --noEmit` apps/web **PASS** ; `web build` **PASS** (14 routes dont `/manager/serveurs` 5.28 kB, `/manager/produits` 3.80 kB ; `.next` purgé avant build). `prisma migrate status` → 6 migrations in sync.
 - Smoke live :3000 → **200** sur `/manager`, `/manager/serveurs`, `/manager/produits` + proxy `/api` 401 sans session. Login ADMIN → `/users/me` 200 ; `/api/servers` (4), `/api/products` (2), `/api/manager/summary` (`{products:2 ACTIVE, servers:4, users:16/17}`) cohérents ; zéro erreur côté web/API.
 - **Redémarrage environnement** : Docker Desktop était éteint (postgres au sol, dev servers arrêtés — le web « pas accessible »). Remonté : docker up (postgres healthy), API :3001, web :3000. État d'environnement, pas une régression de code.
 - Validation live propriétaire en cours (le propriétaire a créé un serveur `momo|10.10.2.36` + un produit `Installation Fees` via l'UI entre deux smoke).
+
+## Verified (Phase 8 — real checks, 2026-09-01)
+- Unit **98/98** (12 suites, +7 : 3 check du service — succès/défaut port 22, échec port explicite, 404 — + 4 transport réel sur loopback : HTTP 200, TCP ok, refusée, hôte introuvable).
+- **e2e 67/67, 9 suites** (+ `server-check` 5 tests, `overrideProvider(ProbeTransportFactory)` → **zéro réseau réel en test**) PASS sur Postgres réel.
+- `npx tsc --noEmit` apps/web **PASS** ; `web build` **PASS** (14 routes, `/manager/serveurs` 5.8 kB ; `.next` purgé avant build). `prisma migrate status` → **7 migrations in sync**.
+- Smoke live :3001 — `POST /api/servers/:id/check` réel : `probe-smoke-local` (localhost:5432) → `{ok:true, detail:"TCP 5432 : accessible (8 ms)", latencyMs:8}`, persisté + relu en GET ; `probe-smoke-refused` (127.0.0.1:5999) → `{ok:false, detail:"Connexion refusée"}`, persisté ; audit `server.check` `{ok, host, port, detail, latencyMs, httpStatus, statusLeft}`. Smoke :3000 → **200** `/`, `/manager/serveurs`, `/manager/journal` ; label « Test de connexion serveur » dans le bundle.
+- Dev servers relancés en fond : API :3001 (`nest watch`) + web :3000 (`next dev`) pour validation propriétaire.
+- **Rework UX (Phase 8 bis)** : `npx tsc --noEmit` apps/web **PASS** (exit 0) ; `web build` **PASS** (14 routes, `/manager/serveurs` 6.39 kB ; `.next` purgé + dev web arrêté avant build) ; marqueurs `srv-grid`/`srv-card`/`drawer-overlay`/`srv-chip`/`IconSearch`/`IconPencil`/`IconTrash` dans le chunk client compilé + CSS servi ; `/manager/serveurs` **200**. Aucun endpoint/garde touché → unit 98/98 + e2e 67/67 toujours valides.
 
 ## Verified (Phase 7 polish UI — real checks, 2026-08-31)
 - `npx tsc --noEmit` dans `apps/web` → **PASS (exit 0)**.
@@ -59,13 +74,14 @@
 
 ## Pending
 - **(Optionnel, Phase 6) test live d'invitation avec email** : créer une invite → l'email arrive avec le lien `/auth?invite=…` → accept de bout en bout.
-- **Proposition Phase 8** (à l'étude) — candidats naturels : connexion réelle des serveurs (ADR-010/007), cPanel/DirectAdmin, observabilité, ADR-008 complet…
+- **Phase 8 implémentée** (sonde de connectivité) — en attente validation live propriétaire → commit + push.
+- Candidats naturels suivants : politique automatique des statuts (sonde périodique, ADR-007/010), adaptateurs fournisseurs réels + credentials (ADR-010 complet), cPanel/DirectAdmin, observabilité, ADR-008 complet…
 
 ## Decisions
-- ADR-001..005, 011..014: **APPROVED** (Phase 0). ADR-015+016: **APPROVED** (Phase 1). ADR-017: **APPROVED** (Phase 2). ADR-018: **APPROVED** (Phase 3). ADR-019: **APPROVED** (Phase 4). ADR-020+021: **APPROVED** (Phase 5 GO). **ADR-022 (configuration mail + emails d'invitation) : APPROVED** (Phase 6 GO, 2026-08-31) — valide un périmètre étroit d'ADR-008 (chiffrement applicatif au repos). **ADR-023 (design system de l'interface) : APPROVED** (Phase 7 GO, 2026-08-31 — « copier le style et couleurs complet, brand-agnostic, tout modifiable ») + **polish UI (selects, contraste light, toasts)** du même ADR. **ADR-024 (détails infrastructure Serveurs + pages CRUD admin larges, Phase 7ter) : APPROVED** (2026-09-01, GO posé via AskUserQuestion). ADR-006 full, 007, 008 complet, 009, 010: **PROPOSED** (untouched). See DECISIONS.md.
+- ADR-001..005, 011..014: **APPROVED** (Phase 0). ADR-015+016: **APPROVED** (Phase 1). ADR-017: **APPROVED** (Phase 2). ADR-018: **APPROVED** (Phase 3). ADR-019: **APPROVED** (Phase 4). ADR-020+021: **APPROVED** (Phase 5 GO). **ADR-022 (configuration mail + emails d'invitation) : APPROVED** (Phase 6 GO, 2026-08-31) — valide un périmètre étroit d'ADR-008 (chiffrement applicatif au repos). **ADR-023 (design system de l'interface) : APPROVED** (Phase 7 GO, 2026-08-31 — « copier le style et couleurs complet, brand-agnostic, tout modifiable ») + **polish UI (selects, contraste light, toasts)** du même ADR. **ADR-024 (détails infrastructure Serveurs + pages CRUD admin larges, Phase 7ter) : APPROVED** (2026-09-01, GO via AskUserQuestion). **ADR-025 (sonde de connectivité réelle des serveurs, Phase 8) : APPROVED** (2026-09-01, GO via AskUserQuestion — premier pas réel vers l'ADR-010, périmètre étroit). ADR-006 full, 007, 008 complet, 009, 010: **PROPOSED** (untouched). See DECISIONS.md.
 
 ## Next action
-Validation live propriétaire des nouveaux écrans → commit + push (Phases 6 + 7 + 7bis + 7ter) → proposition Phase 8.
+Validation live propriétaire de la Phase 8 (sonde `/manager/serveurs`) → commit + push → proposition Phase 9.
 
 ## Out of scope (do not build yet)
 Déploiement réel chez un provider (ADR-010), jobs/Redis (ADR-007), OAuth / MFA / Turnstile (différés par le propriétaire au profit du « Mail seul »), billing/paiements, `Deployment` (reste différé), asset storage, reverse proxy/SSL, observability, ADR-008 complet (gestion de secrets / config persistée).

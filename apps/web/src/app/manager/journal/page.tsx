@@ -26,6 +26,7 @@ const ACTION_LABEL: Record<string, string> = {
   'server.create': 'Création serveur',
   'server.update': 'Modification serveur',
   'server.delete': 'Suppression serveur',
+  'server.check': 'Test de connexion serveur',
   'invite.create': 'Émission invitation',
   'invite.revoke': 'Révocation invitation',
   'invite.accept': 'Acceptation invitation',

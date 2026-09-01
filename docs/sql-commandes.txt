@@ -734,3 +734,57 @@ REMARKS FOR FUTURE AI:
     /manager/serveurs + /manager/produits pages. Don't reintroduce inline admin
     forms into the dashboard.
 ================================================================
+================================================================
+PHASE 8 (ADR-025) — SONDE DE CONNECTIVITÉ RÉELLE DES SERVEURS (2026-09-01)
+================================================================
+CONTEXT:
+  - Direction propriétaire (AskUserQuestion) Phase 8 « Connexion réelle des
+    serveurs » : ping/détection de l'état réel (premier pas vers ADR-010).
+  - La sonde détecte l'état RÉSEAU (TCP/HTTP) d'un serveur, persiste 3 champs
+    de résultat, et PROPOSE une bascule de statut (l'admin valide — le statut
+    n'est jamais forcé).
+
+MIGRATION (7e migration):
+  - `corepack pnpm --filter @icode-host-pro/api run migrate --name init_server_check`
+    -> `20260901082020_init_server_check` appliquée + generate (arrêter le dev
+    API d'abord — leçon EPERM DLL).
+  - SQL généré : 3 ADD COLUMN NULLABLE sur "Server"
+      ALTER TABLE "Server" ADD COLUMN "lastCheckedAt" TIMESTAMP(3);
+      ALTER TABLE "Server" ADD COLUMN "lastProbeOk" BOOLEAN;
+      ALTER TABLE "Server" ADD COLUMN "lastProbeDetail" TEXT;
+    Ces champs sont NULLABLE et écrits UNIQUEMENT par POST /api/servers/:id/check
+    (la whitelist create/patch ne les accepte pas).
+
+API (ADMIN only) — POST /api/servers/:id/check
+  - Cible = hostname + port (défaut 22) ; -> ProbeTransportFactory
+    (couture de test, jamais de réseau en test). Audit `server.check`
+    {host, port, ok, detail, latencyMs, httpStatus, statusLeft}.
+
+VALIDATION QUERIES:
+  - SELECT id, name, hostname, status, port, "lastCheckedAt", "lastProbeOk",
+           "lastProbeDetail" FROM "Server";
+    -> les 3 champs sonde, NULL tant qu'aucun test, remplis sinon.
+  - SELECT action, "resourceType", "resourceId", details, "createdAt"
+    FROM "AuditLog" WHERE action = 'server.check' ORDER BY "createdAt" DESC LIMIT 5;
+    -> chaque test journalisé (ok/host/port/detail/statusLeft).
+  - e2e: suite `test/server-check.e2e-spec.ts` (5 tests, override couture ->
+    zéro réseau). Total e2e 67/67 (9 suites), unit 98/98.
+
+SMOKE LIVE (2026-09-01, API :3001):
+  - POST /api/servers {name: probe-smoke-local, hostname: localhost, port: 5432}
+    -> /check -> {ok:true, detail:"TCP 5432 : accessible (8 ms)", latencyMs:8},
+    persisté + relu (GET). Serveur supprimé après le smoke.
+  - POST /api/servers {hostname: 127.0.0.1, port: 5999} -> /check ->
+    {ok:false, detail:"Connexion refusée"}, persisté. Serveur supprimé.
+
+REMARKS FOR FUTURE AI:
+  - Le STATUT serveur reste piloté manuellement : la sonde écrit `lastProbe*`
+    et propose `→ ACTIVE` / `→ PROBLEM` (purement un PATCH admin + audit
+    `server.update`). Une politique AUTOMATIQUE (sonde périodique -> statut)
+    est hors périmètre (ADR-007/010 restent PROPOSED) — ne pas la forcer.
+  - `strictTls=false` désarme `rejectUnauthorized` sur les requêtes HTTP/S de la
+    sonde (cas d'un panneau interne 80/443 sans cert valide).
+  - Ne PAS réintroduire de paramètre primitif injecté au constructeur d'une
+    classe @Injectable (leçon DI Nest Phase 8) : Nest résoudrait `Number` comme
+    un token DI introuvable et ferait échouer AppModule entier.
+================================================================

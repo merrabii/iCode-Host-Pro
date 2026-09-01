@@ -106,6 +106,13 @@ model Server {
   strictTls       Boolean             @default(true) // vérifier strictement les certificats TLS des requêtes API
   panelProvider   ServerPanelProvider @default(NONE) // adaptateur de panneau serveur
 
+  // Sonde de connectivité réelle (Phase 8, ADR-025) — alimentés par
+  // POST /api/servers/:id/check. null = jamais sondé ; le statut reste piloté
+  // manuellement par l'admin (le résultat de la sonde propose une bascule).
+  lastCheckedAt   DateTime?
+  lastProbeOk     Boolean?
+  lastProbeDetail String?
+
   createdAt DateTime     @default(now())
   updatedAt DateTime     @updatedAt
 

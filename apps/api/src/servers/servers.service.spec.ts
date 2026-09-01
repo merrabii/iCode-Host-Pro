@@ -1,5 +1,6 @@
 import { NotFoundException } from '@nestjs/common';
 import { ServersService } from './servers.service';
+import { ProbeTransportFactory } from './probe-transport.factory';
 
 describe('ServersService', () => {
   let service: ServersService;
@@ -13,10 +14,20 @@ describe('ServersService', () => {
     },
   };
   const mockAudit = { record: jest.fn() };
+  const mockProbeTransport = {
+    probe: jest.fn(),
+  };
+  const mockProbeFactory = {
+    create: jest.fn(() => mockProbeTransport),
+  };
   const actor = { sub: 'admin', email: 'admin@example.com' };
 
   beforeEach(() => {
-    service = new ServersService(mockPrisma as never, mockAudit as never);
+    service = new ServersService(
+      mockPrisma as never,
+      mockAudit as never,
+      mockProbeFactory as never,
+    );
     jest.clearAllMocks();
   });
 
@@ -97,5 +108,91 @@ describe('ServersService', () => {
     expect(mockAudit.record).toHaveBeenCalledWith(
       expect.objectContaining({ action: 'server.delete', actorId: 'admin', resourceId: '1' }),
     );
+  });
+
+  describe('check (Phase 8, ADR-025)', () => {
+    const base = {
+      id: 'srv1',
+      name: 'prod-01',
+      hostname: 'node1.exemple.com',
+      status: 'UNKNOWN',
+      strictTls: true,
+      port: null,
+    };
+
+    it('probes via the factory (hostname, default port 22) and persists a success', async () => {
+      mockPrisma.server.findUnique.mockResolvedValue({ ...base });
+      mockPrisma.server.update.mockResolvedValue({
+        ...base,
+        port: 22,
+        lastCheckedAt: new Date('2026-09-01T10:00:00Z'),
+        lastProbeOk: true,
+        lastProbeDetail: 'TCP 22 : accessible (5 ms)',
+      });
+      mockProbeTransport.probe.mockResolvedValue({
+        ok: true,
+        detail: 'TCP 22 : accessible (5 ms)',
+        latencyMs: 5,
+      });
+
+      const out = await service.check('srv1', actor);
+
+      expect(mockProbeFactory.create).toHaveBeenCalledTimes(1);
+      expect(mockProbeTransport.probe).toHaveBeenCalledWith({
+        host: 'node1.exemple.com',
+        port: 22,
+        strictTls: true,
+      });
+      expect(mockPrisma.server.update).toHaveBeenCalledWith({
+        where: { id: 'srv1' },
+        data: {
+          lastCheckedAt: expect.any(Date),
+          lastProbeOk: true,
+          lastProbeDetail: 'TCP 22 : accessible (5 ms)',
+        },
+      });
+      expect(out.probe.ok).toBe(true);
+      expect(out.server.lastProbeOk).toBe(true);
+      expect(mockAudit.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'server.check',
+          resourceId: 'srv1',
+          details: expect.objectContaining({ ok: true, port: 22, statusLeft: 'UNKNOWN' }),
+        }),
+      );
+    });
+
+    it('respects an explicit port and a failed probe', async () => {
+      mockPrisma.server.findUnique.mockResolvedValue({ ...base, port: 8443 });
+      mockPrisma.server.update.mockResolvedValue({
+        ...base,
+        port: 8443,
+        lastCheckedAt: new Date('2026-09-01T10:00:00Z'),
+        lastProbeOk: false,
+        lastProbeDetail: 'Connexion refusée',
+      });
+      mockProbeTransport.probe.mockResolvedValue({ ok: false, detail: 'Connexion refusée' });
+
+      const out = await service.check('srv1', actor);
+
+      expect(mockProbeTransport.probe).toHaveBeenCalledWith({
+        host: 'node1.exemple.com',
+        port: 8443,
+        strictTls: true,
+      });
+      expect(out.probe.ok).toBe(false);
+      expect(mockAudit.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          details: expect.objectContaining({ ok: false, port: 8443, detail: 'Connexion refusée' }),
+        }),
+      );
+    });
+
+    it('throws NotFoundException on check for an unknown id (no probe)', async () => {
+      mockPrisma.server.findUnique.mockResolvedValue(null);
+      await expect(service.check('nope', actor)).rejects.toBeInstanceOf(NotFoundException);
+      expect(mockProbeTransport.probe).not.toHaveBeenCalled();
+      expect(mockPrisma.server.update).not.toHaveBeenCalled();
+    });
   });
 });
