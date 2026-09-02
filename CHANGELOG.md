@@ -1,5 +1,38 @@
 # CHANGELOG
 
+## Phase 9bis — AUTO-DÉTECTION IP/PORT + ACCÈS DIRECT + MÉTRIQUES SERVEUR (RAM/CPU/DISQUE/BANDE PASSANTE) — DEMANDE PROPRIÉTAIRE 2026-09-02 — IMPLEMENTED 2026-09-02
+### Added
+- **Auto-détection IP (DNS) + port (dérivé de l'API panneau)** à la création/édition : `HostResolverFactory` (couture type Probe/Panel, `dns.promises.lookup`, remplaçable en e2e), helper `derivePortFromUrl` (ex. `http://portal.exemple.com:8000/api/v1` → 8000 ; https→443 / http→80). Une IP saisie manuellement est **préservée** (pas écrasée par le DNS) ; un port posé manuellement **n'est jamais** remplacé (le port n'est déduit que s'il est vide).
+- **Accès direct au serveur** : bouton **« Ouvrir »** sur chaque carte → ouvre l'origine dérivée d'`apiBaseUrl` (adresse réelle du panneau, port compris), sinon `https://{hostname}` (onglet neuf). **Lien cliquable `apiBaseUrl`** sur la carte (champ « API panneau », ouvre l'origine).
+- **Métriques annoncées du serveur** : `Server` +`ramMb?`/`cpuCores?`/`diskGb?`/`bandwidthLimit?` (migration 9 `init_server_metrics`). **Auto-détectées** via le panneau quand possible (Hestia `sysinfo` : parse best-effort de `MemTotal` kB→Mo, `cpu cores`, `Disk` GB) ; **Coolify n'expose pas d'endpoint fiable → null (saisie manuelle)**. Une métrique détectée n'écrase **jamais** une valeur saisie manuellement (fields vides seulement).
+- **UI `/manager/serveurs`** : carte — 4 champs métriques (RAM « X Go/Mo », CPU « N cœurs », Disque « X Go », Bande passante label libre ; « — » si inconnu). Drawer — section « Métriques du serveur » (RAM Mo, CPU cœurs, Disque Go, Limite bande passante) + hint automatisation.
+### Changed
+- `servers.service.ts` : create/update auto-IP/auto-port + 4 métriques ; `verifyPanel` applique `result.metrics` sur champs vides seulement + journalise `metricsDetected`.
+- `create-server.dto.ts` (+ramMb/cpuCores/diskGb/bandwidthLimit) ; `api.ts` (`ServerAdmin` +4, `ServerPatch` +4, `ServerMetrics`, `PanelVerifyResult.metrics`).
+- `PanelTransportFactory` : contrat `PanelVerifyResult.metrics?` — Hestia `sysinfo` parsé, Coolify `metrics: null`.
+### Verified (2026-09-02)
+- Unit **121/121** (13 suites, +7) ; e2e serveurs **15/15** (server-panel + server-check, faux `HostResolverFactory`, zéro DNS réel). Typecheck API + web **PASS** ; `web build` **PASS** (14 routes).
+- **Smoke RÉEL** contre le Coolify du propriétaire (`portal.arumdigital.com:8000`) : serveur `coolify-portal` (ip/port **vides**) → PATCH → **IP auto-résolue `207.180.253.248` + port **8000** déduit** ; re-vérification API réelle → **OK (version 4.1.2)**, `metrics: null` (Coolify, saisie manuelle attendue). Création neuve sans ip/port → IP + port 8000 auto, métriques manuelles persistées.
+- **Correctif test pré-existant** : `probe-transport` « Hôte introuvable » accepte aussi « Délai dépassé » (résolution `.invalid` variée selon la machine/réseau).
+### Pending
+- Validation live propriétaire (page serveurs : « Ouvrir », lien API, métriques) → **commit + push** de la **Phase 8 + 8bis + 9 + 9bis** (gouvernance : commit/push uniquement après validation).
+
+## Phase 9 — ADAPTATEURS FOURNISSEURS RÉELS (COOLIFY / HESTIA) + CREDENTIALS + VÉRIFICATION D'API (ADR-010 COMPLET) — IMPLEMENTED 2026-09-02
+### Added
+- **Adaptateurs fournisseurs réels** via `panelProvider` (HESTIA/COOLIFY), ADR-010 complété : `PanelTransportFactory` (couture de test type ProbeTransport/ADR-025) — **Coolify** `GET {base}/version` Bearer, **Hestia** `?cmd=sysinfo&format=json&returncode=yes` Basic (user `api` défaut). Timeout 8 s, messages réseau/erreurs en français.
+- **Credentials panneau chiffrées au repos** : `Server` +`apiBaseUrl`/`apiTokenEnc`/`apiUser`/`panelVerifiedAt`/`panelOk`/`panelDetail` (migration 8). Jeton AES-256-GCM (`CryptoService`), `ServerView` masque `apiTokenEnc` → **jamais exposé**, seulement `hasApiToken` (leçon applicative).
+- **Vérification d'API** : `POST /api/servers/:id/panel-verify` (ADMIN) — exige provider non-NONE + baseUrl + token (400 sinon), déchiffre, vérifie le panneau réel, persiste `panelVerifiedAt`/`panelOk`/`panelDetail`, audit `server.panel.verify` `{provider, ok, version}`.
+- **UI `/manager/serveurs`** : bloc Panneau sur chaque carte (badge Hestia/Coolify + badge API OK/Échec/— avec point + détail + « Vérifié : <date> »), bouton **« Vérifier l'API »** (spin) ; drawer : URL API, Utilisateur (Hestia), Jeton (chiffré, placeholder « laisser vide pour conserver »), vue momentané. Libellé journal « Vérification API panneau ».
+### Changed
+- `api.ts` : `ServerAdmin` étendu (+6 champs panneau), `ServerPatch` (+`apiBaseUrl`/`apiUser`/`apiToken` avec sémantique absent=''=effacer), `verifyServerPanel(t,id)`, `PanelVerifyResult`/`ServerPanelVerifyResult`.
+- `coolifyVerify` : la version peut être JSON `{version}` **ou texte brut** (`4.1.2` — le vrai panel renvoie du texte).
+### Verified (2026-09-02)
+- **Test RÉEL Coolify fourni par le propriétaire** (`portal.arumdigital.com:8000`) : `verify` → **`ok:true`**, `panelOk` persisté, `detail` « Coolify API : joignable + authentifié (549 ms) », **`version: 4.1.2`** (après correctif texte brut), jeton jamais exposé. Sans auth → 401.
+- Unit **114/114** (13 suites, +16) ; e2e **76/76** (10 suites, + `server-panel` 9 tests, override couture zéro réseau, CryptoService réel). Typecheck web **PASS** ; `web build` **PASS** (14 routes, `/manager/serveurs` 7.23 kB). Smoke web :3000 → 200 (`/`, `/manager/serveurs`) ; API :3001 health 200.
+- **Leçon opérationnelle** : le hang `next dev` (build puis dev sur même `.next`) se résout par **purge totale `.next` + une seule instance dev** → Ready 9.3 s (ne pas empiler des `next dev` résiduels qui tiennent le dossier).
+### Pending
+- Validation live propriétaire (carte Coolify réelle + « Vérifier l'API ») → **commit + push** de la Phase 9.
+
 ## Phase 8 bis — REWORK UX PAGE SERVEURS : GRILLE DE CARTES + PANNEAU LATÉRAL (ADR-023 appliqué) — 2026-09-01
 Owner feedback: « dans la page serveur le tableau et la page ne sont pas bien UX optimisé ! Prière d'utiliser un style très moderne pour l'affichage des tableaux ou donnée modifiable. » Direction choisie via AskUserQuestion : **grille de cartes + panneau latéral (drawer)** (style dashboards infra modernes — Coolify/Hetzner/Cloudflare). **Aucun changement API/DB** — pur front (`apps/web`), design system ADR-023 respecté (tokens, couleurs, brand inchangés), logique métier et sonde Phase 8 **conservées** à l'identique.
 ### Added

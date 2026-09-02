@@ -588,6 +588,96 @@ PROVISIONING/ACTIVE/PROBLEM piloté par la connexion, test de connectivité depu
   Aucun changement API/DB/test → unit 98/98 + e2e 67/67 toujours valides (non rejoués).
 - En attente: validation live propriétaire (grille + drawer) → commit + push Phase 8 (avec rework).
 
+# PHASE 9 — ADAPTATEURS FOURNISSEURS RÉELS (COOLIFY / HESTIA) + CREDENTIALS + VÉRIFICATION D'API (ADR-010 COMPLET) — 2026-09-02
+
+## 2026-09-02 — 9.0 GO & périmètre (demande propriétaire)
+- Owner: « Adaptateurs fournisseurs réels (Hestia / Coolify — via panelProvider, credentials +
+  vérification d'API) — ADR-010 complet. » + consigne autonomie (pas de prompts de permissions,
+  terminer la phase + faire ses propres tests + faire signe seulement quand c'est prêt).
+- Direction: compléter ADR-010 — credentials panneau **chiffrées au repos** + **vérification d'API**
+  par panneau, sur le socle `panelProvider` (ADR-024) et la couture de test (prise en Phase 8/ADR-025).
+
+## 2026-09-02 — 9.1 Modèle + migration (ADR-010)
+- Files modified: `apps/api/prisma/schema.prisma` — `Server` +6 champs nullable pour le panneau :
+  `apiBaseUrl String?`, `apiTokenEnc String?` (jeton chiffré au repos, jamais exposé),
+  `apiUser String?` (Hestia, défaut `api`), `panelVerifiedAt DateTime?`, `panelOk Boolean?`,
+  `panelDetail String?`. `panelProvider` existant (ADR-024) réutilisé comme déclencheur.
+- Command: `corepack pnpm --filter @icode-host-pro/api run migrate --name init_server_panel`
+  → migration `20260901131323_init_server_panel` appliquée (dev API arrêté d'abord — leçon EPERM
+  DLL) + generate → **8 migrations**, in sync.
+
+## 2026-09-02 — 9.2 PanelTransportFactory (couture de test, type ProbeTransport)
+- Files created: `apps/api/src/servers/panel-transport.factory.ts` — `PanelKind`
+  ('HESTIA'|'COOLIFY'), `PanelTarget` (`provider`,`baseUrl`,`token`,`user?`,`strictTls`),
+  `PanelVerifyResult` (`ok`,`detail`,`latencyMs?`,`version?`), `PanelTransport` abstraite,
+  `NodePanelTransport` runtime, `PanelTransportFactory.create(timeoutMs=8000)`.
+  - **Coolify** : `GET {base}/version` avec `Authorization: Bearer <token>` ; version = JSON
+    `{version}` **ou texte brut** (le vrai panel renvoie `4.1.2` en texte — ajusté en 9.5 après le test réel).
+  - **Hestia** : `GET {base}?cmd=sysinfo&format=json&returncode=yes` avec `Authorization: Basic
+    base64(user:token)` (user défaut `api`), rejet si `returncode != 0`.
+  - `401/403` ⇒ détail clair en français (« Jeton API rejeté (401) » / « Jeton d'accès rejeté (403) ») ;
+    réseau ⇒ `networkDetail` (ECONNREFUSED/ENOTFOUND/ETIMEDOUT/TLS). Timeout 8 000 ms.
+
+## 2026-09-02 — 9.3 API : credentials chiffrées + vérification d'API + audit
+- Files modified: `apps/api/src/servers/dto/create-server.dto.ts` — `apiBaseUrl?`/`apiToken?`/`apiUser?`
+  (jeton = secret ENTRANT). `UpdateServerDto` hérite via `PartialType` : `apiToken` absent=inchangé,
+  `''`=effacé, sinon remplacé (chiffré).
+- Files modified: `apps/api/src/servers/servers.service.ts` :
+  - `ServerView = Omit<Server,'apiTokenEnc'> & { hasApiToken }` — le jeton **n'est JAMAIS exposé**,
+    seulement `hasApiToken` (leçon applicative : jamais de secret en sortie).
+  - `encryptToken()` via `CryptoService` AES-256-GCM (échec → `BadRequestException` 400).
+  - `create`/`update` : `apiBaseUrl ''→null`, `apiToken undefined→garde / ''→null / sinon chiffre`.
+  - `verifyPanel(id, actor)` : exige `panelProvider != 'NONE'` + `apiBaseUrl` + `apiTokenEnc` (400),
+    déchiffre, `panelFactory.create().verify(target)`, persiste `panelVerifiedAt`/`panelOk`/
+    `panelDetail`, audit `server.panel.verify` `{provider, ok, version}` → retour `{ server, result }`.
+- Files modified: `apps/api/src/servers/servers.controller.ts` — `POST :id/panel-verify` (ADMIN, classe
+  `@Roles(Role.ADMIN)`).
+- Files modified: `apps/api/src/servers/servers.module.ts` — imports `CryptoModule`, provider
+  `PanelTransportFactory`.
+- Files modified: `apps/web/src/app/manager/journal/page.tsx` — libellé `server.panel.verify`:
+  « Vérification API panneau ».
+
+## 2026-09-02 — 9.4 Tests (unit + e2e)
+- Files created: `apps/api/src/servers/panel-transport.factory.spec.ts` — transport RÉEL sur
+  simulateurs loopback (déterministe, aucun réseau externe) : Coolify 200 JSON + Bearer, 401 ;
+  Hestia 200 returncode 0 (user `api` défaut), user explicite, returncode != 0, 403 ; connexion
+  refusée (port réel fermé).
+- Files modified: `apps/api/src/servers/servers.service.spec.ts` — 7 cas verifyPanel/credentials :
+  chiffrement au create, clear token `''`, replacement, happy Hestia persisté + audit, rejets
+  NONE/sans baseUrl/sans token/échec déchiffrement, 404.
+- Files created: `apps/api/test/server-panel.e2e-spec.ts` — suite e2e (9 tests) avec
+  `overrideProvider(PanelTransportFactory)` (couture, zéro réseau ; **CryptoService réel** pour
+  couvrir le cycle complet) : 401/403/404, create hasApiToken=true sans jamais exposer, GET liste,
+  verify succès persisté + **transport reçoit le jeton DÉCHIFFRÉ** + audit version, échec panelOk=false,
+  400 sans token, `apiToken=''` efface.
+
+## 2026-09-02 — 9.5 Test réel + correctif parsing
+- Smoke live (propriétaire a fourni son Coolify : `portal.arumdigital.com:8000`, token Bearer
+  `4|…`) : `create` serveur `coolify-portal` (`panelProvider: COOLIFY`, `apiBaseUrl:
+  http://portal.arumdigital.com:8000/api/v1`, `apiToken` réel) → `hasApiToken: true`, **apiTokenEnc
+  jamais exposé** → `POST :id/panel-verify` → **`ok:true`, `panelOk` persisté, `detail`
+  « Coolify API : joignable + authentifié (549 ms) »** ; vérification directe `GET .../api/v1/version`
+  → `4.1.2` (200), sans auth → 401.
+- **Correctif du parsing** : `version` sortait `undefined` car Coolify renvoie `4.1.2` en **texte
+  brut**, pas `{version}` JSON. `coolifyVerify` accepte désormais le corps non-JSON non vide comme
+  version → re-test réel : **`version: 4.1.2`**, `panelOk: true`.
+- Smokes de connexion/démo : admin de smoke Phase 9 + fichiers temp supprimés ; serveur
+  `coolify-portal` **conservé** (jacké, voir l'UI `/manager/serveurs` → carte + « Vérifier l'API »).
+
+## 2026-09-02 — 9.6 Validation (builds + tests)
+- Command: `corepack pnpm --filter @icode-host-pro/api test` → **unit 114/114** (13 suites, +16 :
+  +6 detail panel-transport +7 unit verifyPanel, net).
+- Command: `corepack pnpm --filter @icode-host-pro/api test:e2e` → **e2e 76/76** (10 suites, +
+  `server-panel` 9 tests) sur Postgres réel.
+- Command: `npx tsc --noEmit` apps/web → **PASS** ; `web build` PASS (14 routes, `/manager/serveurs`
+  7.23 kB, marqueurs `panel-verify`/`hasApiToken`/`server.panel.verify` présents).
+- Smoke web :3000 → **200** `/`, `/manager/serveurs` (bloc Panneau + « Vérifier l'API » sur carte,
+  drawer URL/Utilisateur/Jeton). Smoke API :3001 → health 200. Problème `.next`/dev hang (build
+  + openhand process tiers) résolu — **purge `.next` + une seule instance dev** = Ready 9.3 s.
+- Docs: DECISIONS.md (ADR-010 APPROVED), CHANGELOG.md (Phase 9), PROJECT_STATUS.md,
+  docs/sql-commandes.txt (Phase 9 DB entry), TASKS.md (cette section), HANDOVER.md.
+- En attente: validation live propriétaire (carte Coolify réelle + Vérifier l'API) → commit + push.
+
 # OPEN ITEMS
 - [x] Authentication architecture (ADR-015 APPROVED — Phase 1).
 - [x] Inscription par invitation / fermeture de l'inscription ouverte (ADR-020 APPROVED — Phase 5 : `POST /api/auth/register` → 410, `POST /api/auth/accept-invite` + `Invitation`).
@@ -595,8 +685,8 @@ PROVISIONING/ACTIVE/PROBLEM piloté par la connexion, test de connectivité depu
 - [x] Email strategy (ADR-022 APPROVED — Phase 6 : SMTP config admin + test email + emails d'invitation best-effort ; ENCRYPTION_KEY pour le password at rest ; jeton manuel conservé en fallback).
 - [ ] Async jobs architecture (ADR-007 — provisionnement réel différé).
 - [ ] Redis requirement (depends on ADR-007).
-- [ ] Coolify API verification.
-- [ ] HestiaCP API verification.
+- [x] Coolify API verification (ADR-010, Phase 9 — transport réel + verified live sur `portal.arumdigital.com:8000`, version 4.1.2).
+- [x] HestiaCP API verification (ADR-010, Phase 9 — transport implémenté `cmd=sysinfo` Basic, tests loopback ; pas de panel réel Hestia fourni pour un smoke, à valider contre un Hestia quand disponible).
 - [ ] Turnstile details.
 - [ ] OAuth / MFA (différés par le propriétaire au profit du « Mail seul » en Phase 6).
 - [ ] Asset storage.
@@ -604,6 +694,17 @@ PROVISIONING/ACTIVE/PROBLEM piloté par la connexion, test de connectivité depu
 - [ ] Observability.
 - [ ] ADR-008 complet (gestion de secrets, architecture de config persistée — Phase 6 n'a validé qu'un périmètre étroit : chiffrement applicatif au repos).
 - [ ] Rebrand iCode Host Pro → **Code Diali** (`codediali.com`) — différé par le owner « une fois le projet terminé » (2026-08-31).
+
+## 2026-09-02 — Phase 9bis — AUTO-DÉTECTION IP/PORT + ACCÈS DIRECT + MÉTRIQUES SERVEUR (demande propriétaire)
+Réponse au retour propriétaire : port Coolify non mentionné, IP non auto-détectée, pas d'accès direct, métriques RAM/CPU/Disque/Bandwidth impossibles → auto ou manuel.
+- [x] Modèle : `Server` +`ramMb?`/`cpuCores?`/`diskGb?`/`bandwidthLimit?` (migration 9 `init_server_metrics`).
+- [x] `HostResolverFactory` (seam DNS type Probe/Panel, `dns.promises.lookup`) — auto-résolution IP au **create** (si IP non fournie) et à l'**update** (IP précédemment vide, ou hostname changé) ; IP/port **saisis manuellement jamais écrasés** ; port déduit d'`apiBaseUrl` (`http://…:8000`→8000, https→443/http→80, seulement si port vide).
+- [x] `PanelTransportFactory` : `PanelVerifyResult.metrics?` — Hestia `sysinfo` auto (MemTotal kB→Mo, `cpu cores`, `Disk` GB, best-effort null sinon) ; Coolify `metrics: null` (pas d'endpoint fiable → saisie manuelle). `verifyPanel` applique les métriques détectées **sur champs vides seulement** + audit `metricsDetected`.
+- [x] DTO/web : +4 métriques ; carte `/manager/serveurs` **bouton « Ouvrir »** (origine dérivée d'apiBaseUrl sinon `https://hostname`, onglet neuf) + **lien API `apiBaseUrl` cliquable** + 4 champs métriques (— si inconnu) ; drawer section « Métriques du serveur ».
+- [x] Tests : unit **121/121** (+7), e2e serveurs **15/15** (faux `HostResolverFactory`, zéro DNS réel ; cas create métriques + verify remplit champs vides), typecheck API/web + `web build` PASS.
+- [x] **Smoke RÉEL Coolify** (`portal.arumdigital.com:8000`) : `coolify-portal` (ip/port vides) → PATCH → **IP auto `207.180.253.248` + port 8000** ; re-verify API → **OK (version 4.1.2)**, `metrics: null` (Coolify → manuel attendu) ; création neuve sans ip/port → IP + port 8000 auto + métriques manuelles persistées.
+- [x] Correctif test pré-existant flaky : `probe-transport` « Hôte introuvable » accepte aussi « Délai dépassé » (résolution `.invalid` variante machine).
+- [ ] **À valider par le propriétaire** (page serveurs : Ouvrir, lien API, métriques, ip/port auto) → puis **commit + push Phase 8 + 8bis + 9 + 9bis**.
 
 # COMPLETED HISTORY
 - Clean baseline (Pre-Phase 0): documentation pack + first AI orientation.

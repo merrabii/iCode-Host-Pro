@@ -69,4 +69,11 @@ export class ServersController {
   check(@Param('id') id: string, @CurrentUser() actor: JwtPayload) {
     return this.servers.check(id, actor);
   }
+
+  // Phase 9 (ADR-010): vérification de l'API du panneau serveur (Hestia/Coolify).
+  @Post(':id/panel-verify')
+  @ApiOperation({ summary: 'Verify a server panel API connectivity (ADMIN)' })
+  verifyPanel(@Param('id') id: string, @CurrentUser() actor: JwtPayload) {
+    return this.servers.verifyPanel(id, actor);
+  }
 }

@@ -60,4 +60,47 @@ export class CreateServerDto {
   @IsOptional()
   @IsEnum(ServerPanelProvider)
   panelProvider?: ServerPanelProvider;
+
+  // Crédentials API panneau (Phase 9, ADR-010) — le token est un secret ENTRANT
+  // uniquement : il n'existe jamais dans le DTO de sortie, le service le chiffre
+  // au repos (apiTokenEnc) et ne renvoie que `hasApiToken`.
+  @IsOptional()
+  @IsString()
+  @MaxLength(255)
+  apiBaseUrl?: string;
+
+  @IsString()
+  @IsOptional()
+  @MaxLength(500)
+  apiToken?: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(64)
+  apiUser?: string;
+
+  // Métriques annoncées (Phase 9bis) — auto-détectées via l'API du panneau quand
+  // c'est possible (Hestia sysinfo), sinon saisies manuellement par l'admin.
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(1048576) // 1 To de RAM max raisonnable
+  ramMb?: number;
+
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(1024)
+  cpuCores?: number;
+
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(1048576)
+  diskGb?: number;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(64)
+  bandwidthLimit?: string; // label libre, ex. "2 To / mois"
 }

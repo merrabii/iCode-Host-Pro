@@ -277,8 +277,27 @@ export interface ServerAdmin {
   lastCheckedAt?: string | null;
   lastProbeOk?: boolean | null;
   lastProbeDetail?: string | null;
+  // Crédentials API panneau (Phase 9, ADR-010) — le jeton n'est JAMAIS exposé.
+  apiBaseUrl?: string | null;
+  apiUser?: string | null;
+  hasApiToken: boolean;
+  panelVerifiedAt?: string | null;
+  panelOk?: boolean | null;
+  panelDetail?: string | null;
+  // Métriques annoncées (Phase 9bis) — auto-détectées via le panneau quand c'est
+  // possible (Hestia sysinfo), sinon saisies manuellement ; null = inconnu.
+  ramMb?: number | null;
+  cpuCores?: number | null;
+  diskGb?: number | null;
+  bandwidthLimit?: string | null;
   createdAt: string;
   updatedAt: string;
+}
+/** Métriques annoncées auto-détectées par le panneau (Phase 9bis). */
+export interface ServerMetrics {
+  ramMb?: number;
+  cpuCores?: number;
+  diskGb?: number;
 }
 export interface ServerProbe {
   ok: boolean;
@@ -289,6 +308,17 @@ export interface ServerProbe {
 export interface ServerCheckResult {
   server: ServerAdmin;
   probe: ServerProbe;
+}
+/** Résultat d'une vérification d'API panneau (Phase 9, ADR-010). */
+export interface PanelVerifyResult {
+  ok: boolean;
+  detail: string;
+  latencyMs?: number;
+  version?: string;
+}
+export interface ServerPanelVerifyResult {
+  server: ServerAdmin;
+  result: PanelVerifyResult;
 }
 export interface ProductAdmin {
   id: string;
@@ -309,6 +339,17 @@ export interface ServerPatch {
   quotaMaxAccounts?: number | null;
   strictTls?: boolean;
   panelProvider?: PanelProvider;
+  // Phase 9 (ADR-010) : config API panneau. `apiToken` est un secret ENTRANT :
+  // absent/undefined = inchangé, '' = effacer, sinon remplacé (chiffré au repos).
+  apiBaseUrl?: string | null;
+  apiUser?: string | null;
+  apiToken?: string;
+  // Métriques (Phase 9bis) : undefined = inchangé, '' = effacer (bandwidthLimit),
+  // null = effacer (champs numériques).
+  ramMb?: number | null;
+  cpuCores?: number | null;
+  diskGb?: number | null;
+  bandwidthLimit?: string | null;
 }
 export const listServers = (t: string) => apiJson('/api/servers', t);
 export const createServer = (t: string, dto: ServerPatch & { name: string; hostname: string }) =>
@@ -320,6 +361,9 @@ export const deleteServer = (t: string, id: string) =>
 // Phase 8 (ADR-025): sonde de connectivité réelle d'un serveur (ADMIN).
 export const checkServer = (t: string, id: string) =>
   apiJson(`/api/servers/${id}/check`, t, { method: 'POST' });
+// Phase 9 (ADR-010): vérification de l'API du panneau serveur (Hestia/Coolify).
+export const verifyServerPanel = (t: string, id: string) =>
+  apiJson(`/api/servers/${id}/panel-verify`, t, { method: 'POST' });
 export const listProducts = (t: string) => apiJson('/api/products', t);
 export const createProduct = (t: string, dto: { name: string; kind?: string; status?: string }) =>
   apiJson('/api/products', t, { method: 'POST', body: JSON.stringify(dto) });

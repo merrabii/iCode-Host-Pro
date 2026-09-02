@@ -113,6 +113,25 @@ model Server {
   lastProbeOk     Boolean?
   lastProbeDetail String?
 
+  // Crédentials API panneau + état de vérification (Phase 9, ADR-010/ADR-008).
+  // alimentés/décryptés uniquement côté API ; `apiTokenEnc` est toujours chiffré
+  // au repos (AES-256-GCM via CryptoService, clé maîtresse ENCRYPTION_KEY) et
+  // JAMAIS renvoyé par l'API (seul `hasApiToken` l'est, dans la vue masquée).
+  apiBaseUrl      String? // URL de base de l'API du panneau (ex. https://panel.exemple.com/api/v1)
+  apiTokenEnc     String? // jeton/clé d'accès API chiffré au repos (jamais déchiffré côté client)
+  apiUser         String? // utilisateur API (Hestia : « api » ; Coolify : inutilisé)
+  panelVerifiedAt DateTime? // dernier POST /api/servers/:id/panel-verify
+  panelOk         Boolean? // résultat du dernier test API (true = panneau joignable + authentifié)
+  panelDetail     String? // détail lisible du dernier test API
+
+  // Métriques annoncées du serveur (Phase 9bis) — auto-détectées via l'API du
+  // panneau quand c'est possible (Hestia `sysinfo`), sinon saisies manuellement
+  // par l'admin (détails impossibles à récupérer => champ libre). null = inconnu.
+  ramMb          Int?    // RAM totale (Mo)
+  cpuCores       Int?    // nombre de cœurs CPU
+  diskGb         Int?    // disque total (Go)
+  bandwidthLimit String? // limite de bande passante (label libre, ex. "2 To / mois")
+
   createdAt DateTime     @default(now())
   updatedAt DateTime     @updatedAt
 

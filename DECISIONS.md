@@ -49,8 +49,16 @@ Note: ADR-008 is **not** partially approved by the Phase 0 GO. The minimal non-s
 Direction: CLI-first, resumable/idempotent phases and persisted state. Any exact dual lock mechanism previously mentioned remains a proposal, not an owner decision.
 
 ## ADR-010 — Provider adapters
-**Status: PROPOSED**
-Direction: fine-grained capability interfaces and provider isolation. Coolify/Hestia capabilities require verification.
+**Status: APPROVED** (2026-09-02, Phase 9 livrée + testée réellement)
+Decision: adaptateurs fournisseurs réels via un `panelProvider` (HESTIA/COOLIFY) avec
+credentials **chiffrées au repos** (AES-256-GCM, jeton jamais exposé) et **vérification d'API**
+déclenchée par l'admin. `PanelTransportFactory` (couture de test type ProbeTransport) :
+Coolify `GET {base}/version` Bearer (version en JSON **ou texte brut** — validé contre le vrai
+panel `portal.arumdigital.com:8000/api/v1`, v4.1.2), Hestia `?cmd=sysinfo&format=json&returncode=yes`
+Basic (user `api` défaut). `POST /api/servers/:id/panel-verify` (ADMIN) persiste
+`panelVerifiedAt`/`panelOk`/`panelDetail` + audit `server.panel.verify`. Utilisateur de panneau
+optionnel (défaut `api`). Était « premier pas réel » via la sonde (ADR-025, Phase 8) ; la Phase 9
+le complète avec les credentials + la vérification d'API.
 
 # APPROVED
 - ADR-001 Monorepo (Turborepo + pnpm workspaces) — 2026-08-30.
@@ -73,6 +81,7 @@ Direction: fine-grained capability interfaces and provider isolation. Coolify/He
 - ADR-023 Design system de l'interface (below) — 2026-08-31.
 - ADR-024 Détails infrastructure Serveurs + pages CRUD admin larges (below) — 2026-09-01.
 - ADR-025 Sonde de connectivité réelle des serveurs (below) — 2026-09-01.
+- ADR-010 Provider adapters (above) — 2026-09-02, Phase 9.
 
 ## ADR-011 — Socle config minimal (Phase 0)
 **Status: APPROVED** (2026-08-30, Phase 0 GO)
@@ -367,6 +376,29 @@ périmètre — la sonde est le connecteur minimal de détection d'état.
 - **Hors périmètre (inchangés)** : adaptateurs fournisseurs réels + credentials + auto-
   provisionnement (ADR-010 complet reste PROPOSED), jobs/sondes périodiques (ADR-007),
   gestion de secrets (ADR-008 full), cPanel/DirectAdmin.
+
+## ADR-026 — Auto-détection IP/port + accès direct + métriques serveur (Phase 9bis)
+**Status: IMPLEMENTED** (2026-09-02, demande du propriétaire) — extension directe d'ADR-024/025 et
+du travail ADR-010 : quand un serveur est ajouté, son **IP** (via DNS) et son **port** (dérivé de
+`apiBaseUrl`) étaient vides ; pas d'accès rapide à l'hôte ; les métriques RAM/CPU/Disque/bande
+passante n'existaient pas.
+Decision:
+- **IP auto-détectée (DNS)** à la création (si non fournie) et à l'édition (si IP précédemment vide
+  ou hostname changé). Une **IP saisie manuellement n'est jamais écrasée**. Couture test dédiée
+  `HostResolverFactory` (`dns.promises.lookup`, remplaçable en e2e — zéro DNS réel en test), même
+  pattern que Probe/Panel.
+- **Port déduit d'`apiBaseUrl`** (`http://h:8000/api/v1` → 8000 ; protocole sans port → 443/https,
+  80/http). Appliqué seulement quand **aucun port n'est posé** (un port manuel reste prioritaire).
+- **Accès direct** : bouton **« Ouvrir »** sur chaque carte → origine dérivée d'`apiBaseUrl` si
+  présent, sinon `https://{hostname}` (onglet neuf). **Lien cliquable `apiBaseUrl`** sur la carte.
+- **Métriques serveur** (`ramMb`/`cpuCores`/`diskGb`/`bandwidthLimit`, migration 9) : **auto-
+  détectées** via `PanelVerifyResult.metrics` quand le panneau les expose (Hestia `sysinfo`,
+  parse best-effort), **null pour Coolify (pas d'endpoint fiable → saisie manuelle par l'admin)**.
+  Une métrique auto-détectée est appliquée **uniquement sur un champ vide** — ne jamais écraser une
+  valeur saisie manuellement. UI : 4 champs sur la carte (— si inconnu) + section « Métriques » du
+  drawer.
+- **Hors périmètre** : récupération de métriques temps-réel/sondes périodiques (ADR-007), détection
+  de charge, adaptateurs cPanel/DirectAdmin.
 
 # REJECTED
 None recorded in this clean baseline.

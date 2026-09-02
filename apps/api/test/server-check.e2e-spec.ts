@@ -8,6 +8,7 @@ import { AppModule } from './../src/app.module';
 import { PrismaService } from './../src/prisma/prisma.service';
 import { GlobalPrefix } from './../src/config/constants';
 import { ProbeTransportFactory, ProbeTransport } from './../src/servers/probe-transport.factory';
+import { HostResolverFactory } from './../src/servers/host-resolver.factory';
 
 // Phase 8 (ADR-025): sonde de connectivité réelle POST /api/servers/:id/check.
 // Comme pour MailTransportFactory, la factory de sonde est overridée en e2e → AUCUN
@@ -32,6 +33,8 @@ describe('ProbeServer check (e2e, Phase 8)', () => {
     const moduleRef = await Test.createTestingModule({ imports: [AppModule] })
       .overrideProvider(ProbeTransportFactory)
       .useValue(fakeFactory)
+      .overrideProvider(HostResolverFactory)
+      .useValue({ create: () => ({ resolveIp: () => Promise.resolve(null) }) })
       .compile();
     app = moduleRef.createNestApplication();
     app.setGlobalPrefix(GlobalPrefix);

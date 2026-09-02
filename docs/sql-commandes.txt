@@ -788,3 +788,67 @@ REMARKS FOR FUTURE AI:
     classe @Injectable (leçon DI Nest Phase 8) : Nest résoudrait `Number` comme
     un token DI introuvable et ferait échouer AppModule entier.
 ================================================================
+
+================================================================
+PHASE 9 (2026-09-02) — ADAPTATEURS FOURNISSEURS + CREDENTIALS + VÉRIF API (ADR-010)
+================================================================
+MIGRATION: 20260901131323_init_server_panel (8e) — Server +6 champs panneau.
+
+COLONNES (Server, champs panneau, NULL tant que non configuré/vérifié):
+  - apiBaseUrl        TEXT?  (ex. http://portal.arumdigital.com:8000/api/v1)
+  - apiTokenEnc       TEXT?  (jeton chiffré AES-256-GCM, JAMAIS exposé par l'API)
+  - apiUser           TEXT?  (Hestia, défaut 'api')
+  - panelVerifiedAt   TIMESTAMP?
+  - panelOk           BOOLEAN?
+  - panelDetail       TEXT?
+  Déclencheur = panelProvider (NONE|HESTIA|COOLIFY, ADR-024).
+
+API:
+  - POST /api/servers/:id/panel-verify (ADMIN) — vérifie le panneau RÉEL :
+    400 si panelProvider=NONE / sans apiBaseUrl / sans token ; déchiffre le
+    jeton, appelle le transport, persiste panelVerifiedAt/panelOk/panelDetail,
+    audit 'server.panel.verify' {provider, ok, version}.
+  - POST/PATCH /api/servers — apiToken ENTRAnt : absent=inchangé, ''=effacé,
+    sinon remplacé (chiffré). hasApiToken=true dans la vue ; apiTokenEnc jamais
+    renvoyé.
+
+TRANSPORT (PanelTransportFactory, couture de test type ProbeTransport):
+  - Coolify: GET {base}/version, Authorization: Bearer <token>. version = JSON
+    {version} OU texte brut ('4.1.2' — vrai panel). 401/403 => "Jeton API rejeté".
+  - Hestia : GET {base}?cmd=sysinfo&format=json&returncode=yes, Basic
+    base64(user:token), user défaut 'api'. returncode != 0 => rejet.
+
+CHECK:
+  - SELECT name, "panelProvider", "apiBaseUrl", "apiUser",
+      "panelVerifiedAt", "panelOk", "panelDetail" FROM "Server"
+    WHERE "panelProvider" <> 'NONE';
+    -> config panneau + dernier état de vérification.
+  - SELECT action, "resourceType", "resourceId", details, "createdAt"
+    FROM "AuditLog" WHERE action = 'server.panel.verify' ORDER BY "createdAt" DESC LIMIT 5;
+    -> chaque vérif journalisée (provider/ok/version).
+
+SMOKE LIVE RÉEL (2026-09-02, Coolify du propriétaire):
+  - POST /api/servers {name: coolify-portal, panelProvider: COOLIFY,
+      apiBaseUrl: http://portal.arumdigital.com:8000/api/v1, apiToken: (réel)}
+    -> hasApiToken:true, apiTokenEnc jamais exposé.
+  - POST /api/servers/:id/panel-verify ->
+    { ok:true, detail:"Coolify API : joignable + authentifié (version 4.1.2)
+      (539 ms)", version:"4.1.2" }, panelOk:true persisté.
+    GET .../api/v1/version direct -> 200 "4.1.2" ; sans auth -> 401.
+  - Serveur coolify-portal CONSERVÉ pour la démo UI (carte + "Vérifier l'API").
+  - e2e: suite test/server-panel.e2e-spec.ts (9 tests, override couture ->
+    zéro réseau, CryptoService réel). Total e2e 76/76 (10 suites), unit 114/114.
+
+REMARKS FOR FUTURE AI:
+  - Le jeton panneau ne doit JAMAIS transiter en clair hors chiffrement : la
+    vue est Omit<Server,'apiTokenEnc'> & {hasApiToken}. Ne pas renvoyer
+    apiTokenEnc / apiToken depuis l'API.
+  - Le parser Coolify accepte la version en JSON ET en texte brut : le vrai
+    panel renvoie '4.1.2' (texte), pas {version:...}. Garder les deux.
+  - Hestia est implémenté + testé en loopback mais AUCUN panel Hestia réel n'a
+    encore été fourni : à re-smoker contre un Hestia réel quand disponible
+    (validation croisée Basic + returncode).
+  - Ne PAS réintroduire de paramètre primitif injecté au constructeur
+    (@Injectable) — leçon DI Nest (Phase 8) répétée sur PanelTransportFactory
+    (timeout dans create(timeoutMs)).
+================================================================

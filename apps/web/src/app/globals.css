@@ -1885,6 +1885,19 @@ select:disabled {
   grid-column: 1 / -1;
 }
 
+/* Lien API panneau (Phase 9bis) — cliquable sur la carte serveur */
+.srv-link {
+  color: var(--brand-600);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  word-break: break-all;
+  transition: color 0.15s ease;
+}
+.srv-link:hover {
+  color: var(--brand-600);
+  filter: brightness(0.92);
+}
+
 /* Connexion (Phase 8) — bloc intégré au corps de la carte */
 .srv-conn {
   grid-column: 1 / -1;
