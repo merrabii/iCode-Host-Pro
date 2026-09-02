@@ -22,6 +22,25 @@ export interface AppConfig {
   /** Phase 6 (ADR-022): public base URL used to build absolute invitation
    *  links in the invitation emails. Optional (default localhost:3000). */
   publicBaseUrl: string;
+  /** Phase 10 (ADR-027): optional security keys — all absent by default, so
+   *  every security feature degrades to "disabled" when unset (non-mandatory).
+   *  Turnstile, OAuth, MFA email/recovery flows read these. */
+  turnstileSecretKey: string;
+  turnstileSiteKey: string;
+  googleClientId: string;
+  googleClientSecret: string;
+  githubClientId: string;
+  githubClientSecret: string;
+  /** Pepper for the HMAC that hashes the 6-digit support codes. */
+  supportCodePepper: string;
+  /** Support code TTL (minutes), default 60, clamped 5..1440 in the service. */
+  supportCodeTtlMinutes: number;
+  /** Email-OTP / MFA challenge TTL in seconds. */
+  mfaOtpTtlSeconds: number;
+  /** Impersonation access-token TTL (seconds or "Ns" JWT format). */
+  impersonationExpiresIn: string;
+  /** OAuth state cookie TTL in seconds. */
+  oauthStateTtlSeconds: number;
 }
 
 export function loadAppConfig(): AppConfig {
@@ -47,5 +66,16 @@ export function loadAppConfig(): AppConfig {
     inviteExpiresInDays: Number(process.env.INVITE_EXPIRES_IN_DAYS ?? 7),
     encryptionKey: process.env.ENCRYPTION_KEY ?? '',
     publicBaseUrl: process.env.PUBLIC_BASE_URL ?? 'http://localhost:3000',
+    turnstileSecretKey: process.env.TURNSTILE_SECRET_KEY ?? '',
+    turnstileSiteKey: process.env.TURNSTILE_SITE_KEY ?? '',
+    googleClientId: process.env.GOOGLE_CLIENT_ID ?? '',
+    googleClientSecret: process.env.GOOGLE_CLIENT_SECRET ?? '',
+    githubClientId: process.env.GITHUB_CLIENT_ID ?? '',
+    githubClientSecret: process.env.GITHUB_CLIENT_SECRET ?? '',
+    supportCodePepper: process.env.SUPPORT_CODE_PEPPER ?? '',
+    supportCodeTtlMinutes: Number(process.env.SUPPORT_CODE_TTL_MINUTES ?? 60),
+    mfaOtpTtlSeconds: Number(process.env.MFA_OTP_TTL_SECONDS ?? 300),
+    impersonationExpiresIn: process.env.IMPERSONATION_EXPIRES_IN ?? '60m',
+    oauthStateTtlSeconds: Number(process.env.OAUTH_STATE_TTL_SECONDS ?? 600),
   };
 }

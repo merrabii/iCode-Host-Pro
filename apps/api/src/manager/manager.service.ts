@@ -30,7 +30,8 @@ export class ManagerService {
       serverRows as { status: ServerStatus; _count: { _all: number } }[],
     );
 
-    const byRole: Record<Role, number> = { [Role.ADMIN]: 0, [Role.USER]: 0 };
+    const byRole = {} as Record<Role, number>;
+    for (const r of Object.values(Role)) byRole[r] = 0;
     for (const r of roleRows as { role: Role; _count: { _all: number } }[]) {
       byRole[r.role] = r._count._all;
     }
@@ -45,7 +46,7 @@ export class ManagerService {
         byStatus: serverByStatus,
       },
       users: {
-        total: byRole[Role.ADMIN] + byRole[Role.USER],
+        total: Object.values(Role).reduce((s, r) => s + byRole[r], 0),
         active: activeUsers,
         byRole,
       },

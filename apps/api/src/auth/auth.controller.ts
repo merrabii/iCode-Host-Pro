@@ -5,18 +5,27 @@ import {
   Req,
   Res,
   UnauthorizedException,
+  UseGuards,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { Request, Response } from 'express';
 import { AuthService } from './auth.service';
+import { CheckoutService } from './checkout.service';
+import { SaRateLimiter, RATE, rateKey } from './rate-limiter';
 import { RegisterDto } from './dto/register.dto';
 import { LoginDto } from './dto/login.dto';
 import { AcceptInviteDto } from './dto/accept-invite.dto';
+import { ChangePasswordDto } from './dto/change-password.dto';
+import { CurrentUser } from './decorators/current-user.decorator';
+import { AllowImpersonationMutation } from './decorators/allow-impersonation.decorator';
+import { JwtAuthGuard } from './guards/jwt-auth.guard';
+import { JwtPayload } from './types';
 
 const DEFAULT_COOKIE = 'ihp_refresh';
+const CHECKOUT_COOKIE = 'ihp_checkout';
 
-type CookieRequest = Request & { cookies?: Record<string, string> };
+type CookieRequest = Request & { cookies?: Record<string, string>; ip?: string };
 
 @ApiTags('auth')
 @Controller('auth')
@@ -25,17 +34,35 @@ export class AuthController {
 
   constructor(
     private readonly auth: AuthService,
+    private readonly checkout: CheckoutService,
     private readonly config: ConfigService,
+    private readonly limiter: SaRateLimiter,
   ) {
     this.cookieName = this.config.get<string>('cookieName') ?? DEFAULT_COOKIE;
   }
 
   @Post('register')
-  @ApiOperation({ summary: 'Closed — returns 410 Gone (invitation required)' })
-  register(): Promise<never> {
-    // Phase 5 (ADR-020): replace throws 410; kept as a route so clients get a
-    // meaningful Gone instead of 404.
-    return this.auth.register(null as unknown as RegisterDto);
+  @ApiOperation({ summary: 'Order-time account creation (requires a checkout intent)' })
+  async register(
+    @Body() dto: RegisterDto,
+    @Req() req: CookieRequest,
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    const rl = this.limiter.consume(
+      rateKey(req.ip, 'register'),
+      RATE.register.limit,
+      RATE.register.windowMs,
+    );
+    if (!rl.allowed) {
+      throw new UnauthorizedException(
+        `Trop de tentatives. Réessayez dans ${Math.ceil(rl.retryAfterMs / 1000)} s.`,
+      );
+    }
+    const productId = await this.checkout.readProductId(req.cookies?.[CHECKOUT_COOKIE]);
+    const tokens = await this.auth.register(dto, productId);
+    res.clearCookie(CHECKOUT_COOKIE, { httpOnly: true, path: '/' });
+    this.setCookie(res, tokens);
+    return { accessToken: tokens.accessToken };
   }
 
   @Post('accept-invite')
@@ -45,16 +72,49 @@ export class AuthController {
     @Res({ passthrough: true }) res: Response,
   ) {
     const tokens = await this.auth.acceptInvite(dto);
-    this.setCookie(res, tokens.refreshToken);
+    this.setCookie(res, tokens);
     return { accessToken: tokens.accessToken };
   }
 
   @Post('login')
-  @ApiOperation({ summary: 'Log in and obtain tokens' })
-  async login(@Body() dto: LoginDto, @Res({ passthrough: true }) res: Response) {
-    const tokens = await this.auth.login(dto);
-    this.setCookie(res, tokens.refreshToken);
-    return { accessToken: tokens.accessToken };
+  @ApiOperation({ summary: 'Log in — may require an MFA step' })
+  async login(
+    @Body() dto: LoginDto,
+    @Req() req: CookieRequest,
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    const result = await this.auth.login(dto, req.ip);
+    if ('mfaRequired' in result) {
+      if (result.mfaRequired) {
+        return {
+          mfaRequired: true,
+          challengeId: result.challengeId,
+          methods: result.methods,
+        };
+      }
+      return { mfaRequired: false, enroll: true, enrollToken: result.enrollToken };
+    }
+    this.setCookie(res, result);
+    return { accessToken: result.accessToken };
+  }
+
+  @Post('impersonate/return')
+  @UseGuards(JwtAuthGuard)
+  @AllowImpersonationMutation()
+  @ApiOperation({ summary: 'End an impersonation session (cleanup + audit)' })
+  async returnFromImpersonation(@CurrentUser() user: JwtPayload) {
+    await this.auth.returnFromImpersonation(user);
+    return { success: true };
+  }
+
+  @Post('change-password')
+  @UseGuards(JwtAuthGuard)
+  @ApiOperation({ summary: 'Self-service password change (re-verifies current password)' })
+  async changePassword(@Body() dto: ChangePasswordDto, @CurrentUser() user: JwtPayload) {
+    if (user.imp) {
+      throw new UnauthorizedException('Changement de mot de passe impossible en session d’impersonation.');
+    }
+    return this.auth.changePassword(user.sub, dto.currentPassword, dto.newPassword);
   }
 
   @Post('refresh')
@@ -65,7 +125,7 @@ export class AuthController {
       throw new UnauthorizedException('Missing refresh token');
     }
     const tokens = await this.auth.refresh(token);
-    this.setCookie(res, tokens.refreshToken);
+    this.setCookie(res, tokens);
     return { accessToken: tokens.accessToken };
   }
 
@@ -97,7 +157,9 @@ export class AuthController {
     };
   }
 
-  private setCookie(res: Response, refreshToken: string): void {
-    res.cookie(this.cookieName, refreshToken, this.cookieOptions());
+  private setCookie(res: Response, tokens: { refreshToken: string }): void {
+    if (tokens.refreshToken) {
+      res.cookie(this.cookieName, tokens.refreshToken, this.cookieOptions());
+    }
   }
 }

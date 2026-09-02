@@ -8,8 +8,10 @@ import { AppModule } from './../src/app.module';
 import { PrismaService } from './../src/prisma/prisma.service';
 import { GlobalPrefix } from './../src/config/constants';
 
-// Phase 5 (ADR-020): public registration is CLOSED — POST /auth/register is 410
-// Gone. New USER accounts arrive only through an ADMIN-issued one-time
+// Phase 5 (ADR-020) + Phase 10 (ADR-027): public registration stays CLOSED —
+// without a valid checkout intent POST /auth/register is 403 Forbidden (it
+// used to be 410 Gone; Phase 10 re-opened the route strictly for order-time
+// account creation). New USER accounts arrive through an ADMIN-issued one-time
 // invitation, accepted via POST /auth/accept-invite.
 describe('Auth (e2e)', () => {
   let app: INestApplication;
@@ -76,11 +78,11 @@ describe('Auth (e2e)', () => {
     await app.close();
   });
 
-  it('POST /api/auth/register is 410 Gone (registration closed)', async () => {
+  it('POST /api/auth/register without a checkout intent is 403 (registration stays closed)', async () => {
     const res = await request(app.getHttpServer())
       .post(`/${GlobalPrefix}/auth/register`)
       .send({ email: `closed_${stamp}@example.com`, password, name: 'X' })
-      .expect(410);
+      .expect(403);
     expect(typeof res.body.message).toBe('string');
   });
 

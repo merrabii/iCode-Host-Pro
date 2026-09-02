@@ -2054,3 +2054,181 @@ select:disabled {
     display: none;
   }
 }
+
+/* ============================================================
+   PHASE 10 (ADR-027) — sécurité, comptes & support
+   ============================================================ */
+
+/* ---- Grille de cartes générique (2 colonnes → 1 sur mobile) */
+.card-grid,
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 16px;
+  align-items: start;
+}
+
+@media (max-width: 720px) {
+  .card-grid,
+  .grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ---- Interrupteur (toggle) d'option de sécurité -------------- */
+.switch {
+  position: relative;
+  display: inline-block;
+  width: 46px;
+  height: 26px;
+  flex-shrink: 0;
+}
+
+.switch input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.switch .slider {
+  position: absolute;
+  cursor: pointer;
+  inset: 0;
+  background: var(--tint-gray-bg);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  transition: var(--transition);
+}
+
+.switch .slider::before {
+  content: "";
+  position: absolute;
+  height: 18px;
+  width: 18px;
+  left: 3px;
+  top: 3px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  transition: var(--transition);
+}
+
+.switch input:checked + .slider {
+  background: var(--tint-green-bg);
+  border-color: var(--active-text);
+}
+
+.switch input:checked + .slider::before {
+  transform: translateX(20px);
+  background: var(--active-text);
+}
+
+.switch input:disabled + .slider {
+  opacity: .55;
+  cursor: not-allowed;
+}
+
+/* ---- Bandeau d'impersonation (lecture seule) ----------------- */
+.imp-banner-wrap {
+  position: sticky;
+  top: calc(var(--topbar-h, 62px));
+  z-index: 60;
+  padding: 0 18px;
+}
+
+.imp-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 12px auto 0;
+  max-width: 1320px;
+  padding: 10px 14px;
+  border-radius: var(--radius-input);
+  background: var(--tint-red-bg);
+  border: 1px solid var(--tint-red-fg);
+  color: var(--tint-red-fg);
+  font-size: 13.5px;
+  line-height: 1.5;
+  flex-wrap: wrap;
+}
+
+.imp-banner b {
+  color: var(--tint-red-fg);
+}
+
+.imp-banner .btn-secondary {
+  margin-left: auto;
+  border-color: var(--tint-red-fg);
+  color: var(--tint-red-fg);
+  background: transparent;
+}
+
+/* ---- Écran d'authentification : boutons OAuth + diviseur ----- */
+.auth-oauth {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-bottom: 4px;
+}
+
+.btn-oauth {
+  width: 100%;
+  justify-content: flex-start;
+  gap: 10px;
+}
+
+.oauth-glyph {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  font-size: 12px;
+  font-weight: 700;
+  color: #ffffff;
+  flex-shrink: 0;
+}
+
+.oauth-g { background: #4285f4; }
+.oauth-gh { background: #24292f; }
+
+.auth-divider {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  color: var(--text-muted);
+  font-size: 12.5px;
+  margin: 14px 0;
+}
+
+.auth-divider::before,
+.auth-divider::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--border-soft);
+}
+
+/* ---- Option list (file de tickets) + message de ticket -------- */
+.panel-active {
+  border-color: var(--active-text);
+  box-shadow: 0 0 0 1px var(--active-text);
+}
+
+.ticket-msg {
+  padding: 10px 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-input);
+  background: var(--card-bg-2);
+}
+
+/* ---- Code d'accès support (affiché une fois) ----------------- */
+.access-code {
+  font-size: 26px;
+  font-weight: 700;
+  letter-spacing: 6px;
+  padding: 6px 12px;
+  border-radius: var(--radius-input);
+  background: var(--tint-green-bg);
+  color: var(--active-text);
+}

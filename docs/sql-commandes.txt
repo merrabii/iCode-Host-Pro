@@ -852,3 +852,113 @@ REMARKS FOR FUTURE AI:
     (@Injectable) — leçon DI Nest (Phase 8) répétée sur PanelTransportFactory
     (timeout dans create(timeoutMs)).
 ================================================================
+
+================================================================
+PHASE 10 (2026-09-02) — SÉCURITÉ, COMPTES & SUPPORT (ADR-027)
+================================================================
+MIGRATION: 20260902063000_init_security_support (10e).
+
+ÉNUM ROLE ÉTENDU (hiérarchie linéaire):
+  ALTER TYPE "Role" ADD VALUE 'SUPPORT_L1';
+  ALTER TYPE "Role" ADD VALUE 'SUPPORT_L2';
+  ALTER TYPE "Role" ADD VALUE 'SUPPORT_L3';
+  (→ USER(0) < SUPPORT_L1(1) < SUPPORT_L2(2) < SUPPORT_L3(3) < ADMIN(99),
+    rang dans src/auth/roles.ts roleRank().)
+
+USER ÉTENDU (colonnes mfa/oauth — NULL tant que non utilisé):
+  ALTER TABLE "User" ADD COLUMN "mfaSecretEnc" TEXT;      -- AES-256-GCM, JAMAIS exposé
+  ALTER TABLE "User" ADD COLUMN "mfaEnabled" BOOLEAN NOT NULL DEFAULT false;
+  ALTER TABLE "User" ADD COLUMN "oauthProvider" TEXT;     -- 'google' | 'github'
+  ALTER TABLE "User" ADD COLUMN "oauthSubject" TEXT;      -- email OAuth vérifié
+  ALTER TABLE "User" ADD COLUMN "githubTokenEnc" TEXT;    -- store Phase 10bis (AES), JAMAIS exposé
+  CREATE UNIQUE INDEX "User_oauthProvider_oauthSubject_key" ON "User"("oauthProvider","oauthSubject");
+
+NOUVELLES TABLES:
+  CREATE TABLE "SecuritySetting" (                    -- singleton, tout défaut false (non obligatoire)
+      "id" TEXT NOT NULL,
+      "turnstileEnabled" BOOLEAN NOT NULL DEFAULT false,
+      "oauthGoogleEnabled" BOOLEAN NOT NULL DEFAULT false,
+      "oauthGithubEnabled" BOOLEAN NOT NULL DEFAULT false,
+      "mfaRequiredForAdmins" BOOLEAN NOT NULL DEFAULT false,
+      "selfRegistrationEnabled" BOOLEAN NOT NULL DEFAULT false,
+      "deployEnabled" BOOLEAN NOT NULL DEFAULT false,
+      CONSTRAINT "SecuritySetting_pkey" PRIMARY KEY ("id")
+  );
+
+  CREATE TABLE "SupportCode" (                        -- code 6 chiffres, codeHash HMAC-SHA256 hex
+      "id" TEXT NOT NULL, "userId" TEXT NOT NULL,
+      "codeHash" TEXT NOT NULL,
+      "expiresAt" TIMESTAMP(3) NOT NULL,
+      "attempts" INTEGER NOT NULL DEFAULT 0,
+      "revokedAt" TIMESTAMP(3),
+      "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      CONSTRAINT "SupportCode_pkey" PRIMARY KEY ("id")
+  );
+  CREATE INDEX "SupportCode_userId_idx" ON "SupportCode"("userId");
+  ALTER TABLE "SupportCode" ADD CONSTRAINT "SupportCode_userId_fkey"
+      FOREIGN KEY ("userId") REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+  CREATE TYPE "TicketStatus" AS ENUM ('OPEN','IN_PROGRESS','WAITING_CLIENT','RESOLVED','CLOSED');
+  CREATE TYPE "TicketPriority" AS ENUM ('LOW','NORMAL','HIGH','URGENT');
+  CREATE TABLE "Ticket" (
+      "id" TEXT NOT NULL, "userId" TEXT NOT NULL,
+      "subject" TEXT NOT NULL,
+      "status" "TicketStatus" NOT NULL DEFAULT 'OPEN',
+      "priority" "TicketPriority" NOT NULL DEFAULT 'NORMAL',
+      "escalatedTo" "Role",                            -- SUPPORT_L2 | SUPPORT_L3
+      "escalatedAt" TIMESTAMP(3),
+      "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      "updatedAt" TIMESTAMP(3) NOT NULL,
+      CONSTRAINT "Ticket_pkey" PRIMARY KEY ("id")
+  );
+  CREATE INDEX "Ticket_userId_idx" ON "Ticket"("userId");
+  ALTER TABLE "Ticket" ADD CONSTRAINT "Ticket_userId_fkey"
+      FOREIGN KEY ("userId") REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+  CREATE TABLE "TicketMessage" (
+      "id" TEXT NOT NULL, "ticketId" TEXT NOT NULL,
+      "authorId" TEXT,                                 -- SetNull si l'user est supprimé
+      "authorEmail" TEXT NOT NULL,                     -- snapshot dénormalisé (audit)
+      "body" TEXT NOT NULL,
+      "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      CONSTRAINT "TicketMessage_pkey" PRIMARY KEY ("id")
+  );
+  CREATE INDEX "TicketMessage_ticketId_idx" ON "TicketMessage"("ticketId");
+  ALTER TABLE "TicketMessage" ADD CONSTRAINT "TicketMessage_ticketId_fkey"
+      FOREIGN KEY ("ticketId") REFERENCES "Ticket"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+  ALTER TABLE "TicketMessage" ADD CONSTRAINT "TicketMessage_authorId_fkey"
+      FOREIGN KEY ("authorId") REFERENCES "User"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+
+CHECK:
+  - SELECT "role", COUNT(*) FROM "User" GROUP BY "role";
+    -> 5 valeurs possibles (ADMIN/USER/SUPPORT_L1/L2/L3).
+  - SELECT id, email, "mfaEnabled", "oauthProvider", "oauthSubject" FROM "User";
+    -> jamais mfaSecretEnc/githubTokenEnc (côté API non plus — toPublic les retire).
+  - SELECT * FROM "SecuritySetting";                     -> 1 ligne singleton.
+  - SELECT id, "userId", "expiresAt", attempts, "revokedAt" FROM "SupportCode";
+    -> 1 seul actif par user (révocation en $transaction) ; codeHash ne doit JAMAIS
+       être un code lisible (HMAC).
+  - SELECT subject, status, "escalatedTo", "escalatedAt" FROM "Ticket";
+  - SELECT action, COUNT(*) FROM "AuditLog" GROUP BY action
+    WHERE action LIKE 'security.%' OR action LIKE 'support.%' OR action LIKE
+    'mfa.%' OR action LIKE 'oauth.%' OR action LIKE 'ticket.%' OR action LIKE
+    'impersonate.%' OR action LIKE 'auth.register';
+    -> toutes les mutations Phase 10 journalisées.
+
+e2e (zéro réseau — OAuth provider + transports mockés, otplib stub):
+  suites test/{support,mfa,tickets,auth-register,oauth,impersonation,
+  security-settings}.e2e-spec.ts -> 52 tests. Total e2e 129/129 (17 suites),
+  unit 212/212 (24 suites).
+
+REMARKS FOR FUTURE AI:
+  - ROUTES RÉELLES impersonation : POST /api/users/:id/impersonate et
+    POST /api/users/:id/mfa-reset (PAS /api/admin/users/...) — divergence
+    assumée du plan, documentée ADR-027 (source de vérité : web lib/api.ts).
+  - Ne JAMAIS renvoyer mfaSecretEnc / githubTokenEnc / passwordEnc par l'API :
+    toPublic() ne garde que mfaEnabled / oauthProvider / hasPassword.
+  - Le code support n'est JAMAIS stocké en clair (codeHash HMAC-SHA256 avec
+    pepper SUPPORT_CODE_PEPPER ?? ENCRYPTION_KEY) ; verrouillage à 5 essais.
+  - redirect_uri OAuth = base publique (PUBLIC_BASE_URL), JAMAIS :3001.
+  - Phase 10bis : githubTokenEnc alimentera l'appel GET /api/client/github/repos
+    + le déploiement Coolify (Deployment + extension PanelTransport).
+================================================================

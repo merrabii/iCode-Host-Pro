@@ -5,12 +5,14 @@ import {
   IconFileText,
   IconGlobe,
   IconGrid,
+  IconKey,
   IconMail,
   IconServer,
+  IconShield,
   IconUsers,
 } from '@/components/icons';
 
-/** Navigation de la console d'administration. */
+/** Navigation de la console d'administration (Phase 10 : + Sécurité + Support). */
 export const ADMIN_NAV: NavSection[] = [
   {
     section: 'Administration',
@@ -26,8 +28,33 @@ export const ADMIN_NAV: NavSection[] = [
     ],
   },
   {
-    section: 'Espace client',
-    items: [{ label: 'Espace client', href: '/client', icon: IconGlobe }],
+    section: 'Sécurité & support',
+    items: [
+      { label: 'Sécurité', href: '/manager/securite', icon: IconShield },
+      { label: 'Support', href: '/manager/support', icon: IconUsers },
+    ],
+  },
+  {
+    section: 'Espaces',
+    items: [
+      { label: 'Espace client', href: '/client', icon: IconGlobe },
+      { label: 'Mon profil', href: '/profil', icon: IconKey },
+    ],
+  },
+];
+
+/** Navigation du support (L1/L2/L3) — file de tickets + espace client en lecture. */
+export const SUPPORT_NAV: NavSection[] = [
+  {
+    section: 'Support',
+    items: [{ label: 'File de tickets', href: '/manager/support', icon: IconUsers }],
+  },
+  {
+    section: 'Espaces',
+    items: [
+      { label: 'Espace client (lecture)', href: '/client', icon: IconGlobe },
+      { label: 'Mon profil', href: '/profil', icon: IconKey },
+    ],
   },
 ];
 
@@ -35,7 +62,10 @@ export const ADMIN_NAV: NavSection[] = [
 export const CLIENT_NAV: NavSection[] = [
   {
     section: 'Espace client',
-    items: [{ label: 'Mes services', href: '/client', icon: IconServer }],
+    items: [
+      { label: 'Mes services', href: '/client', icon: IconServer },
+      { label: 'Mon profil', href: '/profil', icon: IconKey },
+    ],
   },
   {
     section: 'Administration',

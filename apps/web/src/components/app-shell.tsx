@@ -4,6 +4,7 @@ import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
 import type { ComponentType, ReactNode } from 'react';
 import { brand, brandInitials } from '@/config/brand';
+import { roleLabel } from '@/lib/session';
 import { IconChevronDown, IconLogOut, IconRefresh, IconUser } from './icons';
 import { ThemeToggle } from './theme-toggle';
 
@@ -25,8 +26,30 @@ function userInitials(user: NonNullable<ShellUser>): string {
   return user.email.slice(0, 2).toUpperCase();
 }
 
-function roleLabel(role: string): string {
-  return role === 'ADMIN' ? 'Administrateur' : 'Client';
+/** Impersonation banner (admin/support "as client") — red, with a return link. */
+export function ImpersonationBanner({
+  targetEmail,
+  kind,
+  onReturn,
+}: {
+  targetEmail: string;
+  kind: 'admin' | 'support';
+  onReturn?: () => void;
+}) {
+  return (
+    <div className="imp-banner" role="banner">
+      <span className="dot" />
+      <span>
+        Vous consultez l&apos;espace de <b>{targetEmail}</b> (session{' '}
+        {kind === 'admin' ? 'admin' : 'support'} · lecture seule).
+      </span>
+      {onReturn && (
+        <button type="button" className="btn-secondary btn-sm" onClick={onReturn}>
+          Revenir
+        </button>
+      )}
+    </div>
+  );
 }
 
 export function AppShell({
@@ -35,6 +58,7 @@ export function AppShell({
   tenant = { label: 'Espace', name: brand.name },
   footStatus = 'Système opérationnel',
   info = [],
+  banner = null,
   bare = false,
   children,
 }: {
@@ -43,6 +67,8 @@ export function AppShell({
   tenant?: { label: string; name?: string };
   footStatus?: string;
   info?: string[];
+  /** Bandeau d'impersonation (lecture seule) rendu au-dessus du contenu. */
+  banner?: ReactNode;
   /** Mode « bare » : topbar seule, sans sidebar — pour les écrans centrés (auth, …). */
   bare?: boolean;
   children: ReactNode;
@@ -99,7 +125,7 @@ export function AppShell({
         <div className="topbar-right">
           <ThemeToggle />
           {me && (
-            <button type="button" className="user-chip" onClick={() => router.replace(brand.home)}>
+            <button type="button" className="user-chip" onClick={() => router.replace('/profil')}>
               <span className="avatar">{userInitials(me)}</span>
               <span>
                 <div className="user-name">{me.name || me.email}</div>
@@ -114,6 +140,8 @@ export function AppShell({
           )}
         </div>
       </header>
+
+      {banner && <div className="imp-banner-wrap">{banner}</div>}
 
       {bare && <main className="auth-wrap">{children}</main>}
 

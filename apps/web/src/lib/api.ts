@@ -9,6 +9,10 @@ export interface Me {
   email: string;
   name?: string | null;
   role: string;
+  // Phase 10 (ADR-027): public security signals — never the at-rest secrets.
+  mfaEnabled?: boolean;
+  oauthProvider?: string | null;
+  oauthSubject?: string | null;
 }
 
 export interface ManagerSummary {
@@ -382,3 +386,322 @@ export const adminUpdateService = (
   id: string,
   patch: { status?: string; serverId?: string | null },
 ) => apiJson(`/api/admin/services/${id}`, t, { method: 'PATCH', body: JSON.stringify(patch) });
+
+// ═══ Phase 10 (ADR-027) — sécurité, comptes & support ════════════════════════
+
+// ── Impersonation token (sessionStorage ONLY — never localStorage/URL) ──────
+const IMP_TOKEN_KEY = 'ihp_imp_token';
+export function setImpToken(token: string): void {
+  try {
+    sessionStorage.setItem(IMP_TOKEN_KEY, token);
+  } catch {
+    /* storage indisponible */
+  }
+}
+export function getImpToken(): string | null {
+  try {
+    return sessionStorage.getItem(IMP_TOKEN_KEY);
+  } catch {
+    return null;
+  }
+}
+export function clearImpToken(): void {
+  try {
+    sessionStorage.removeItem(IMP_TOKEN_KEY);
+  } catch {
+    /* ok */
+  }
+}
+
+/** Best-effort JWT payload decode (no dependency) — used to read `imp`. */
+export interface ImpClaim {
+  by: string;
+  kind: 'admin' | 'support';
+}
+export interface DecodedToken {
+  sub: string;
+  email: string;
+  role: string;
+  imp?: ImpClaim;
+  exp?: number;
+}
+export function decodeJwt(token: string): DecodedToken | null {
+  try {
+    const part = token.split('.')[1];
+    if (!part) return null;
+    const json = atob(part.replace(/-/g, '+').replace(/_/g, '/'));
+    return JSON.parse(json) as DecodedToken;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Session bootstrap token for a page. An impersonation session has NO refresh
+ * cookie, so its token lives in sessionStorage and must be used directly;
+ * otherwise fall back to the normal refresh-cookie mint.
+ */
+export async function getSessionToken(): Promise<string | null> {
+  const imp = getImpToken();
+  if (imp) return imp;
+  return getAccessToken();
+}
+
+// ── Public auth config (what the /auth page must render) ────────────────────
+export interface PublicAuthConfig {
+  turnstileSiteKey: string;
+  oauthGoogleEnabled: boolean;
+  oauthGithubEnabled: boolean;
+  selfRegistrationEnabled: boolean;
+}
+export async function getPublicAuthConfig(): Promise<PublicAuthConfig | null> {
+  try {
+    const res = await fetch('/api/public/auth-config');
+    if (!res.ok) return null;
+    return (await res.json()) as PublicAuthConfig;
+  } catch {
+    return null;
+  }
+}
+
+// ── Public catalogue (visitor — order-time account creation) ────────────────
+export interface PublicProduct {
+  id: string;
+  name: string;
+  kind: string;
+  status: string;
+}
+/** Public catalogue — unauthenticated GET (visitor browsing before ordering). */
+export async function listPublicProducts(): Promise<ApiResult> {
+  try {
+    const res = await fetch('/api/public/products');
+    let data: unknown = null;
+    try {
+      data = await res.json();
+    } catch {
+      /* non-JSON body */
+    }
+    return { ok: res.ok, status: res.status, data };
+  } catch (e) {
+    return { ok: false, status: 0, data: { message: String(e) } };
+  }
+}
+/** Start an order: sets the signed httpOnly checkout-intent cookie. */
+export async function createCheckoutIntent(productId: string): Promise<ApiResult> {
+  try {
+    const res = await fetch('/api/checkout/intent', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ productId }),
+    });
+    let data: unknown = null;
+    try {
+      data = await res.json();
+    } catch {
+      /* non-JSON body */
+    }
+    return { ok: res.ok, status: res.status, data };
+  } catch (e) {
+    return { ok: false, status: 0, data: { message: String(e) } };
+  }
+}
+
+// ── Login / register with Turnstile + MFA step handling ─────────────────────
+export type LoginResponse =
+  | { accessToken: string }
+  | { mfaRequired: true; challengeId: string; methods: ('totp' | 'email')[] }
+  | { mfaRequired: false; enroll: true; enrollToken: string };
+export async function login(input: {
+  email: string;
+  password: string;
+  turnstileToken?: string;
+}): Promise<ApiResult> {
+  try {
+    const res = await fetch('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify(input),
+    });
+    let data: unknown = null;
+    try {
+      data = await res.json();
+    } catch {
+      /* non-JSON body */
+    }
+    return { ok: res.ok, status: res.status, data };
+  } catch (e) {
+    return { ok: false, status: 0, data: { message: String(e) } };
+  }
+}
+export async function register(input: {
+  email: string;
+  password: string;
+  name?: string;
+}): Promise<ApiResult> {
+  try {
+    const res = await fetch('/api/auth/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify(input),
+    });
+    let data: unknown = null;
+    try {
+      data = await res.json();
+    } catch {
+      /* non-JSON body */
+    }
+    return { ok: res.ok, status: res.status, data };
+  } catch (e) {
+    return { ok: false, status: 0, data: { message: String(e) } };
+  }
+}
+
+// ── MFA (self-service + two-step verification) ──────────────────────────────
+export const mfaSetup = (t: string, password: string) =>
+  apiJson('/api/auth/mfa/setup', t, { method: 'POST', body: JSON.stringify({ password }) });
+export const mfaConfirm = (t: string, code: string) =>
+  apiJson('/api/auth/mfa/confirm', t, { method: 'POST', body: JSON.stringify({ code }) });
+export const mfaDisable = (t: string, password: string, code: string) =>
+  apiJson('/api/auth/mfa/disable', t, {
+    method: 'POST',
+    body: JSON.stringify({ password, code }),
+  });
+export async function mfaVerify(input: {
+  challengeId: string;
+  code: string;
+  method: 'totp' | 'email';
+}): Promise<ApiResult> {
+  try {
+    const res = await fetch('/api/auth/mfa/verify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify(input),
+    });
+    let data: unknown = null;
+    try {
+      data = await res.json();
+    } catch {
+      /* non-JSON body */
+    }
+    return { ok: res.ok, status: res.status, data };
+  } catch (e) {
+    return { ok: false, status: 0, data: { message: String(e) } };
+  }
+}
+export async function mfaEmailSend(challengeId: string): Promise<ApiResult> {
+  try {
+    const res = await fetch('/api/auth/mfa/email/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ challengeId }),
+    });
+    let data: unknown = null;
+    try {
+      data = await res.json();
+    } catch {
+      /* non-JSON body */
+    }
+    return { ok: res.ok, status: res.status, data };
+  } catch (e) {
+    return { ok: false, status: 0, data: { message: String(e) } };
+  }
+}
+
+// ── Support codes (client) ──────────────────────────────────────────────────
+export interface SupportCodeStatus {
+  active: boolean;
+  expiresAt?: string | null;
+}
+export interface GeneratedSupportCode extends SupportCodeStatus {
+  code: string; // shown ONCE
+}
+export const getSupportCodeStatus = (t: string) => apiJson('/api/client/support-code', t);
+export const generateSupportCode = (t: string) =>
+  apiJson('/api/client/support-code', t, { method: 'POST' });
+export const revokeSupportCode = (t: string) =>
+  apiJson('/api/client/support-code', t, { method: 'DELETE' });
+/** Support L2+: redeem a client code → read-only impersonation token. */
+export const supportRedeem = (t: string, code: string, turnstileToken?: string) =>
+  apiJson('/api/support/access', t, {
+    method: 'POST',
+    body: JSON.stringify({ code, ...(turnstileToken ? { turnstileToken } : {}) }),
+  });
+
+// ── Tickets ─────────────────────────────────────────────────────────────────
+export type TicketStatus =
+  | 'OPEN'
+  | 'IN_PROGRESS'
+  | 'WAITING_CLIENT'
+  | 'RESOLVED'
+  | 'CLOSED';
+export interface TicketMessage {
+  id: string;
+  ticketId: string;
+  authorId: string;
+  authorEmail: string;
+  body: string;
+  createdAt: string;
+}
+export interface Ticket {
+  id: string;
+  userId: string;
+  subject: string;
+  status: TicketStatus;
+  priority: string;
+  escalatedTo?: string | null;
+  escalatedAt?: string | null;
+  createdAt: string;
+  updatedAt: string;
+  user?: { id: string; email: string; name?: string | null };
+  messages?: TicketMessage[];
+}
+export const createTicket = (t: string, dto: { subject: string; body: string; priority?: string }) =>
+  apiJson('/api/tickets', t, { method: 'POST', body: JSON.stringify(dto) });
+export const listMyTickets = (t: string) => apiJson('/api/tickets', t);
+/** Support console queue — the whole ticket file (L1+ only). */
+export const listSupportTickets = (t: string) => apiJson('/api/support/tickets', t);
+export const getTicket = (t: string, id: string) => apiJson(`/api/tickets/${id}`, t);
+export const addTicketMessage = (t: string, id: string, body: string) =>
+  apiJson(`/api/tickets/${id}/messages`, t, { method: 'POST', body: JSON.stringify({ body }) });
+export const escalateTicket = (t: string, id: string, to: string) =>
+  apiJson(`/api/tickets/${id}/escalate`, t, { method: 'POST', body: JSON.stringify({ to }) });
+export const updateTicketStatus = (t: string, id: string, status: string) =>
+  apiJson(`/api/tickets/${id}/status`, t, { method: 'PATCH', body: JSON.stringify({ status }) });
+
+// ── Admin security settings ─────────────────────────────────────────────────
+export interface SecuritySettings {
+  id: string | null;
+  turnstileEnabled: boolean;
+  oauthGoogleEnabled: boolean;
+  oauthGithubEnabled: boolean;
+  mfaRequiredForAdmins: boolean;
+  selfRegistrationEnabled: boolean;
+  deployEnabled: boolean;
+  createdAt: string | null;
+  updatedAt: string | null;
+}
+export const getSecuritySettings = (t: string) => apiJson('/api/admin/security', t);
+export const updateSecuritySettings = (t: string, dto: Partial<SecuritySettings>) =>
+  apiJson('/api/admin/security', t, { method: 'PUT', body: JSON.stringify(dto) });
+
+// ── Admin impersonation + recovery ──────────────────────────────────────────
+export const adminImpersonate = (t: string, id: string) =>
+  apiJson(`/api/users/${id}/impersonate`, t, { method: 'POST' });
+export const adminMfaReset = (t: string, id: string) =>
+  apiJson(`/api/users/${id}/mfa-reset`, t, { method: 'POST' });
+export const returnFromImpersonation = (t: string) =>
+  apiJson('/api/auth/impersonate/return', t, { method: 'POST' });
+
+// ── Profile (password change) ───────────────────────────────────────────────
+export const changePassword = (t: string, currentPassword: string, newPassword: string) =>
+  apiJson('/api/auth/change-password', t, {
+    method: 'POST',
+    body: JSON.stringify({ currentPassword, newPassword }),
+  });
+export const oauthUnlink = (t: string, provider: 'google' | 'github') =>
+  apiJson('/api/auth/oauth/unlink', t, { method: 'POST', body: JSON.stringify({ provider }) });

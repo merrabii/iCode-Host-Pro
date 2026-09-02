@@ -94,11 +94,11 @@ describe('Client workspace (e2e)', () => {
     await app.close();
   });
 
-  it('register stays closed (410)', async () => {
+  it('register without a checkout intent stays closed (403)', async () => {
     await request(app.getHttpServer())
       .post(`/${GlobalPrefix}/auth/register`)
       .send({ email: `x${stamp}@example.com`, password })
-      .expect(410);
+      .expect(403);
   });
 
   it('a USER cannot reach the admin overlay (403)', async () => {

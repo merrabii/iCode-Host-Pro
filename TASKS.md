@@ -687,8 +687,9 @@ PROVISIONING/ACTIVE/PROBLEM piloté par la connexion, test de connectivité depu
 - [ ] Redis requirement (depends on ADR-007).
 - [x] Coolify API verification (ADR-010, Phase 9 — transport réel + verified live sur `portal.arumdigital.com:8000`, version 4.1.2).
 - [x] HestiaCP API verification (ADR-010, Phase 9 — transport implémenté `cmd=sysinfo` Basic, tests loopback ; pas de panel réel Hestia fourni pour un smoke, à valider contre un Hestia quand disponible).
-- [ ] Turnstile details.
-- [ ] OAuth / MFA (différés par le propriétaire au profit du « Mail seul » en Phase 6).
+- [x] Turnstile (ADR-027, Phase 10 — `TurnstileService` non-obligatoire, enforce sur login + support/access quand activé).
+- [x] OAuth / MFA (ADR-027, Phase 10 — Google+GitHub login/inscription-commande/liaison ; MFA TOTP + email OTP self-service, `mfaRequiredForAdmins` optionnel).
+- [x] Tickets + support L1/L2/L3 + code 6 chiffres + impersonation admin (ADR-027, Phase 10).
 - [ ] Asset storage.
 - [ ] Reverse proxy/SSL.
 - [ ] Observability.
@@ -705,6 +706,57 @@ Réponse au retour propriétaire : port Coolify non mentionné, IP non auto-dét
 - [x] **Smoke RÉEL Coolify** (`portal.arumdigital.com:8000`) : `coolify-portal` (ip/port vides) → PATCH → **IP auto `207.180.253.248` + port 8000** ; re-verify API → **OK (version 4.1.2)**, `metrics: null` (Coolify → manuel attendu) ; création neuve sans ip/port → IP + port 8000 auto + métriques manuelles persistées.
 - [x] Correctif test pré-existant flaky : `probe-transport` « Hôte introuvable » accepte aussi « Délai dépassé » (résolution `.invalid` variante machine).
 - [ ] **À valider par le propriétaire** (page serveurs : Ouvrir, lien API, métriques, ip/port auto) → puis **commit + push Phase 8 + 8bis + 9 + 9bis**.
+
+# PHASE 10 — SÉCURITÉ, COMPTES & SUPPORT (ADR-027) — implémenté 2026-09-02, tests + builds + typecheck PASS, en attente validation propriétaire
+
+## 2026-09-02 — 10.0 GO & périmètre (plan validé)
+- Action: le plan Phase 10 (sécurité/comptes/support) + Phase 10bis (déploiement GitHub→Coolify) a été présenté et **validé par le propriétaire** (plan `jolly-knitting-meadow.md` APPROVED). Direction consigne : « coder sans arrêter, tester, corriger, livrer à tester/valider ».
+- Périmètre noyau (ADR-027) : flags sécurité admin (singleton `SecuritySetting`, tout OFF par défaut), hiérarchie de rôles L1/L2/L3, impersonation admin lecture seule, code support 6 chiffres, MFA TOTP + email, OAuth Google+GitHub (login / inscription à la commande / liaison), catalogue public + inscription à la commande, tickets, Turnstile, rate limiter.
+- Files modified: DECISIONS.md (ADR-027 APPROVED).
+
+## 2026-09-02 — 10.1 Modèle + migration (ADR-027)
+- Files modified: `apps/api/prisma/schema.prisma` — enum `Role` étendu (+SUPPORT_L1/L2/L3), `User` +`mfaSecretEnc`/`mfaEnabled`/`oauthProvider`/`oauthSubject`/`githubTokenEnc` (+`@@unique([oauthProvider,oauthSubject])`), modèle `SecuritySetting` (singleton, 6 flags `@default(false)`), modèle `SupportCode` (codeHash HMAC, expiresAt, attempts, revokedAt, `@@index([userId])`), enum `TicketStatus`/`TicketPriority`, modèles `Ticket` (+`escalatedTo`/`escalatedAt`) et `TicketMessage` (`authorEmail` dénormalisé).
+- Command: `corepack pnpm --filter @icode-host-pro/api run migrate --name init_security_support` → migration `20260902063000_init_security_support` appliquée → **10 migrations**, in sync. Prisma client régénéré.
+
+## 2026-09-02 — 10.2 Noyau auth : rôles + rate limiter + security settings + checkout + turnstile
+- Files created: `apps/api/src/auth/roles.ts` (`ROLE_RANK` + helper exporté `roleRank`), `auth/rate-limiter.ts` (fenêtre glissante mémoire par IP, 429, presets login/mfa/register/checkout/support) + `rate-limiter.spec.ts` (6 unit), `auth/security/security-settings.service.ts` (singleton flags, enforcement central) + `security-settings.controller.ts` (`GET/PUT /api/admin/security`, ADMIN) + spec, `auth/checkout.service.ts` (intent `ihp_checkout` signé 10 min) + `checkout.controller.ts` (`POST /api/checkout/intent`, public) + spec, `auth/turnstile.service.ts` (fetch natif siteverify, skip si désactivé/sans clé) + spec, `auth/public-config.controller.ts` (`GET /api/public/products` sous `products/public-products.controller.ts`).
+- Files modified: `auth/guards/roles.guard.ts` (rang : `required.some(r => actorRank >= roleRank(r))` — équivalent ADMIN), `auth/types.ts` (JwtPayload +`imp?`), `auth/auth.controller.ts` + `auth.service.ts` (login MFA-aware, register à la commande, rate limit, enrôlement admin), `auth.module.ts`, `auth/auth-cookies.service.ts` (cookies httpOnly ihp_refresh / ihp_checkout / ihp_oauth_state / ihp_mfa), `products/products.service.ts` (catalogue), `manager.service.ts` + spec (byRole 5 clés + total = somme — casse compile enum corrigée), `users.service.ts` + spec (`toPublic` retire aussi `mfaSecretEnc`/`githubTokenEnc`, expose `mfaEnabled`/`oauthProvider`).
+- Tests: `auth.service.spec.ts` (impersonation/link), `checkout.service.spec.ts`.
+
+## 2026-09-02 — 10.3 MFA TOTP + email (self-service + politique admin)
+- Files created: `apps/api/src/auth/mfa/mfa.service.ts` (setup/confirm/disable, `MfaService` — secret AES-256-GCM via CryptoService, verify TOTP otplib + email OTP timing-safe, `mfaRequiredForAdmins` → enrôlement), `mfa-challenge.store.ts` (Map mémoire, ttl 300 s, single-use, lockout 5), `mfa.controller.ts` (`POST /api/auth/mfa/setup|confirm|disable`, `POST /api/auth/mfa/verify`, `POST /api/auth/mfa/email/send`), `totp.ts`, `guards/mfa-enroll-or-session.guard.ts` (jeton d'enrôlement limité à setup/confirm), dto/*, specs unit + `mfa-challenge.store.spec.ts`.
+- Dépendance: `otplib` (+ **stub ESM en Jest** `src/test-utils/otplib.stub.ts`, `moduleNameMapper ^otplib` — verifySync toujours valide → TOTP accepte tout code 6 chiffres en test ; OTP email réel comparé timing-safe).
+
+## 2026-09-02 — 10.4 OAuth Google + GitHub (login / inscription commande / liaison)
+- Files created: `apps/api/src/auth/oauth/oauth-provider.client.ts` (abstraction injectable — tokens `GOOGLE_OAUTH`/`GITHUB_OAUTH` pour override e2e), `google.client.ts`/`github.client.ts` (fetch natif, `isConfigured` = clés présentes), `oauth.service.ts` (resolve par scénario : login / register-intent / link ; email vérifié exigé ; état CSRF signé 10 min cookie httpOnly ; `redirect_uri` = URL PUBLIQUE, jamais :3001 ; `githubTokenEnc` stocké pour 10bis), `oauth.controller.ts` (`GET /api/auth/oauth/:provider` → 302 authorize, `GET .../callback` → 302 web, `GET /api/auth/oauth/link/:provider`, `POST /api/auth/oauth/unlink`), spec.
+- DTO: `oauth-unlink.dto.ts`.
+
+## 2026-09-02 — 10.5 Support : code 6 chiffres + tickets + console L1/L2/L3
+- Files created: `apps/api/src/support/support-codes.service.ts` (génération HMAC-SHA256 pepper, un actif, révocation transactionnelle, TTL 60 clamp 5..1440, redeem timing-safe + lockout 5 + comparaison factice, email best-effort) + `support-codes.controller.ts` (`POST/GET/DELETE /api/client/support-code` USER ; `POST /api/support/access` L2+) + `support.module.ts` + spec.
+- Files created: `apps/api/src/tickets/` (modèles + `tickets.service.ts` + `tickets.controller.ts` — client `POST/GET /api/tickets`, `GET /api/tickets/:id`, `POST :id/messages` — + `SupportTicketsController` `GET /api/support/tickets`, `POST :id/messages`, `POST :id/escalate`, `PATCH :id/status` L1+) + spec. **Bug runtime corrigé** : `SupportTicketsController` non enregistré (404) → ajouté au `controllers` de `tickets.module.ts`.
+
+## 2026-09-02 — 10.6 Impersonation (mécanisme partagé admin/support) + MFA admin reset
+- Files modified: `apps/api/src/auth/auth.service.ts` — `issueTokens(user, opts?)` (expiresIn impersonation ; **`imp` présent → AUCUNE ligne refreshToken + AUCUN cookie**), `impersonate(targetId, actor, kind)` (cible existe + isActive + role ≠ ADMIN + pas soi-même ; jeton `{sub, role: USER, imp}` — rôle USER inscrit à la signature, lecture seule), `returnFromImpersonation`.
+- Files created: `apps/api/src/auth/decorators/allow-impersonation.decorator.ts` (+ `JwtAuthGuard` bloque les verbes mutants sous `imp` sauf marqués).
+- Files modified: `users.controller.ts` — `POST /api/users/:id/impersonate` (ADMIN) + `POST /api/users/:id/mfa-reset` (ADMIN secours anti-verrouillage). **Divergence intentionnelle du plan** : routes réelles sur `/api/users/:id/…` (source de vérité = client web `lib/api.ts`), pas `/api/admin/users/…`.
+
+## 2026-09-02 — 10.7 Web : pages nouvelles + refonte auth/client
+- Files created: `apps/web/src/app/offres/page.tsx` (catalogue public — visiteur consulte avant de commander), `apps/web/src/app/profil/page.tsx` (MFA self-service QR/secret + fournisseurs liés lier/délier + changement de mot de passe), `apps/web/src/app/manager/securite/page.tsx` (toggles admin : Turnstile/OAuth Google/GitHub/MFA admins/inscription commande/Phase 10bis + état des clés env sans les exposer), `apps/web/src/app/manager/support/page.tsx` (file de tickets L1+, zone code 6 chiffres L2+, vues lecture seule L3), `apps/web/src/components/turnstile.tsx` (widget chargé seulement si `NEXT_PUBLIC_TURNSTILE_SITE_KEY`).
+- Files modified: `apps/web/src/app/auth/page.tsx` (boutons Google/GitHub si activés, Turnstile, étape MFA, mode inscription commande avec intent, `?oauth=mfa`), `apps/web/src/app/client/page.tsx` (panneau « Accès support » code 6 chiffres + « Mes tickets » + **bandeau d'impersonation** + Revenir), `apps/web/src/app/manager/utilisateurs/page.tsx` (« Se connecter en tant que » comptes USER), `apps/web/src/lib/session.ts` (`useAdminSession` + `useSupportSession` + `isSupportRole`), `apps/web/src/lib/api.ts` (helpers Phase 10), `apps/web/src/components/app-shell.tsx` (`roleLabel` support + prop `banner`), `apps/web/src/config/nav.ts` (section Support selon rôle).
+
+## 2026-09-02 — 10.8 Tests (7 suites e2e neuves + unit neuves)
+- Files created (unit) : `roles.guard.spec.ts` (rang hiérarchie), `mfa.service.spec.ts` + `mfa-challenge.store.spec.ts`, `oauth.service.spec.ts`, `security-settings.service.spec.ts`, `support-codes.service.spec.ts`, `tickets.service.spec.ts`, `turnstile.service.spec.ts`, `rate-limiter.spec.ts`, `checkout.service.spec.ts`, `auth.service.spec.ts` (impersonation/link).
+- Files created (e2e, `apps/api/test/`) : `support.e2e-spec.ts` (générer/révoquer/lockout/refus USER/read-only), `mfa.e2e-spec.ts` (2 étapes, mauvais code, lockout), `tickets.e2e-spec.ts`, `auth-register.e2e-spec.ts` (intent requis, flag off 403, duplicate 403, catalogue public vs /products 401), `oauth.e2e-spec.ts` (provider Google mocké : redirect_uri public jamais :3001, state mismatch, login, email inconnu SANS intent refusé, inscription commande + souscription PENDING, lien, conflit, délier), `impersonation.e2e-spec.ts` (ADMIN→client jeton USER + pas de refresh cookie, lecture seule 403, admin/support 403, refresh 401, L3→ADMIN 403, self 400 / autre ADMIN 403, return 201), `security-settings.e2e-spec.ts` (tous flags OFF par défaut, toggle OAuth live on/off, toggle inscription live, `mfaRequiredForAdmins` → enrôlement + login 2 étapes + cleanup mfa-reset).
+- **Fixes apportés aux specs** : helper `setCookies` (cast `headers['set-cookie'] as unknown as string[]`) ; routes impersonate/mfa-reset corrigées vers `/api/users/:id/…` (réelles) ; mock OAuth fantôme (exchangeCode résolu pour chaque scénario) ; `limiter.reset()` pour rate-limits déterministes ; stub otplib.
+- Command (spécifiques) : `corepack pnpm exec jest --config ./test/jest-e2e.json --runInBand support mfa tickets auth-register oauth impersonation security-settings` → **7 suites / 52 tests PASS** (88 s).
+
+## 2026-09-02 — 10.9 Validation complète (unit → e2e → tsc → build)
+- Command: `corepack pnpm --filter @icode-host-pro/api test` → **unit 212/212 (24 suites)** PASS.
+- Command: `corepack pnpm exec jest --config ./test/jest-e2e.json --runInBand` → **e2e 129/129 (17 suites)** PASS sur Postgres réel (dont les 10 suites pré-existantes — non-régression `GET /api/products` 401, core/client/audit/invitations/mail/server-check/server-panel vertes).
+- Command: `npx tsc --noEmit` apps/api **PASS** ; `npx tsc --noEmit` apps/web **PASS**.
+- Command: `corepack pnpm --filter @icode-host-pro/web exec next build` → **PASS, 18 routes** (`/` , `/_not-found`, `/auth`, `/client`, `/manager`, `/manager/invitations`, `/manager/journal`, `/manager/mail`, `/manager/produits`, `/manager/securite`, `/manager/serveurs`, `/manager/subscriptions`, `/manager/support`, `/manager/utilisateurs`, `/offres`, `/profil`). Dev web arrêté + `.next` purgé avant build (leçon Phase 2).
+- Docs: DECISIONS.md (ADR-027 APPROVED), CHANGELOG.md (Phase 10), PROJECT_STATUS.md, docs/sql-commandes.txt (Phase 10 DB entry), TASKS.md (cette section), HANDOVER.md.
+- En attente: **validation live propriétaire** (settings sécurité, MFA TOTP+email, OAuth Google/GitHub clés de test, inscription à la commande email+pass/OAuth, liaison de compte, impersonation admin → /client + bandeau + Revenir, code 6 chiffres → L2 lecture seule, tickets L1→L2) → **commit + push Phases 8 + 8bis + 9 + 9bis + 10**.
 
 # COMPLETED HISTORY
 - Clean baseline (Pre-Phase 0): documentation pack + first AI orientation.

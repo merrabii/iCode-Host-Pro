@@ -1,6 +1,6 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
-import { Product } from '@prisma/client';
+import { Product, ProductStatus } from '@prisma/client';
 import { AuditService } from '../audit/audit.service';
 import { CreateProductDto } from './dto/create-product.dto';
 import { UpdateProductDto } from './dto/update-product.dto';
@@ -34,6 +34,14 @@ export class ProductsService {
 
   async findAll(): Promise<Product[]> {
     return this.prisma.product.findMany({ orderBy: { createdAt: 'desc' } });
+  }
+
+  /** Public catalogue (no auth) — only orderable products (Phase 10, ADR-027). */
+  async findPublicCatalog(): Promise<Product[]> {
+    return this.prisma.product.findMany({
+      where: { status: { notIn: [ProductStatus.DRAFT, ProductStatus.DISABLED] } },
+      orderBy: { createdAt: 'desc' },
+    });
   }
 
   async findOne(id: string): Promise<Product> {

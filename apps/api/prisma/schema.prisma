@@ -12,9 +12,15 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+// Phase 10 (ADR-027): support ladder — USER < SUPPORT_L1 < SUPPORT_L2 <
+// SUPPORT_L3 < ADMIN. Rank semantics are enforced in auth/roles.ts
+// (ROLE_RANK) and shared by RolesGuard, tickets, console support, web.
 enum Role {
   ADMIN
   USER
+  SUPPORT_L1
+  SUPPORT_L2
+  SUPPORT_L3
 }
 
 model User {
@@ -32,7 +38,107 @@ model User {
   subscriptions Subscription[]  // client-owned subscriptions (Phase 5)
   issuedInvites Invitation[]    // invitations this admin issued (Phase 5)
 
+  // ── Phase 10 (ADR-027): MFA + OAuth linking ───────────────────────────────
+  // mfaSecretEnc: TOTP secret, AES-256-GCM at rest (CryptoService) — NEVER
+  // returned by the API (only mfaEnabled is). oauthProvider/oauthSubject:
+  // linked Google/GitHub identity (one provider + its subject); the pair is
+  // unique so one social identity can never be attached to two accounts.
+  // githubTokenEnc: GitHub OAuth access token, AES-256-GCM at rest, used by
+  // Phase 10bis (repo auto-detection + Coolify deploy) — also never returned.
+  mfaSecretEnc    String?
+  mfaEnabled      Boolean  @default(false)
+  oauthProvider   String?
+  oauthSubject    String?
+  githubTokenEnc  String?
+
+  supportCodes   SupportCode[]
+  tickets        Ticket[]
+  ticketMessages TicketMessage[]
+
+  @@unique([oauthProvider, oauthSubject])
   @@index([email])
+}
+
+// Phase 10 (ADR-027): SINGLETON security feature-flags (one row, same pattern
+// as MailSetting). EVERY security option stays NON-mandatory: the admin turns
+// each on/off to strengthen or relax security. Defaults are all OFF.
+model SecuritySetting {
+  id                   String   @id @default(cuid())
+  turnstileEnabled     Boolean  @default(false)
+  oauthGoogleEnabled   Boolean  @default(false)
+  oauthGithubEnabled   Boolean  @default(false)
+  mfaRequiredForAdmins Boolean  @default(false)
+  selfRegistrationEnabled Boolean @default(false) // création de compte à la commande
+  deployEnabled        Boolean  @default(false) // Phase 10bis GitHub → Coolify
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+}
+
+// Phase 10 (ADR-027): client-generated 6-digit support access code. The raw
+// code is shown ONCE and never stored: only HMAC-SHA256(pepper, code) is kept
+// (`codeHash`). One active code per client (generation revokes the previous in
+// a $transaction). 5 wrong attempts auto-lock (revokedAt).
+model SupportCode {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  codeHash  String
+  expiresAt DateTime
+  attempts  Int      @default(0)
+  revokedAt DateTime?
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+}
+
+// Phase 10 (ADR-027): minimal support tickets. `escalatedTo` reuses the Role
+// enum (only SUPPORT_L2 / SUPPORT_L3 are valid escalation targets, enforced in
+// the service). `authorEmail` on messages is a denormalized snapshot that
+// survives the author being deleted.
+enum TicketStatus {
+  OPEN
+  IN_PROGRESS
+  WAITING_CLIENT
+  RESOLVED
+  CLOSED
+}
+
+enum TicketPriority {
+  LOW
+  NORMAL
+  HIGH
+  URGENT
+}
+
+model Ticket {
+  id          String         @id @default(cuid())
+  userId      String
+  user        User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  subject     String
+  status      TicketStatus   @default(OPEN)
+  priority    TicketPriority @default(NORMAL)
+  escalatedTo Role?
+  escalatedAt DateTime?
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+
+  messages TicketMessage[]
+
+  @@index([userId])
+  @@index([status])
+}
+
+model TicketMessage {
+  id          String   @id @default(cuid())
+  ticketId    String
+  ticket      Ticket   @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  authorId    String?
+  author      User?    @relation(fields: [authorId], references: [id], onDelete: SetNull)
+  authorEmail String // dénormalisé (survit à la suppression de l'auteur)
+  body        String
+  createdAt   DateTime @default(now())
+
+  @@index([ticketId])
 }
 
 model RefreshToken {

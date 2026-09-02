@@ -4,7 +4,9 @@ import { Role, User } from '@prisma/client';
 import { AuditService } from '../audit/audit.service';
 import { UpdateUserDto } from './dto/update-user.dto';
 
-export type PublicUser = Omit<User, 'passwordHash'>;
+// Public shape NEVER carries passwordHash nor the at-rest secrets (MFA TOTP
+// secret, GitHub token). mfaEnabled/oauthProvider are the safe public signals.
+export type PublicUser = Omit<User, 'passwordHash' | 'mfaSecretEnc' | 'githubTokenEnc'>;
 
 /** The authenticated actor performing an admin action (JwtPayload shaped). */
 export interface Actor {
@@ -110,7 +112,12 @@ export class UsersService {
   }
 
   private toPublic(user: User): PublicUser {
-    const { passwordHash: _passwordHash, ...rest } = user;
+    const {
+      passwordHash: _passwordHash,
+      mfaSecretEnc: _mfaSecretEnc,
+      githubTokenEnc: _githubTokenEnc,
+      ...rest
+    } = user;
     return rest;
   }
 }

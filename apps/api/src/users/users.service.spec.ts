@@ -22,6 +22,10 @@ describe('UsersService', () => {
     role: Role.ADMIN,
     isActive: true,
     passwordHash: 'secret',
+    mfaSecretEnc: 'enc-secret',
+    githubTokenEnc: 'enc-token',
+    mfaEnabled: true,
+    oauthProvider: 'google',
   };
   const user = {
     id: 'u1',
@@ -30,6 +34,10 @@ describe('UsersService', () => {
     role: Role.USER,
     isActive: true,
     passwordHash: 'secret',
+    mfaSecretEnc: 'enc-secret',
+    githubTokenEnc: 'enc-token',
+    mfaEnabled: false,
+    oauthProvider: null,
   };
 
   const actorSelf = { sub: 'a1', email: 'admin@example.com' };
@@ -40,18 +48,26 @@ describe('UsersService', () => {
     jest.clearAllMocks();
   });
 
-  it('getProfile strips passwordHash', async () => {
+  it('getProfile strips passwordHash + at-rest secrets, keeps mfaEnabled/oauthProvider', async () => {
     mockPrisma.user.findUnique.mockResolvedValue(admin);
     const result = await service.getProfile('a1');
     expect(result).not.toHaveProperty('passwordHash');
+    expect(result).not.toHaveProperty('mfaSecretEnc');
+    expect(result).not.toHaveProperty('githubTokenEnc');
     expect(result.role).toBe(Role.ADMIN);
+    expect(result.mfaEnabled).toBe(true);
+    expect(result.oauthProvider).toBe('google');
   });
 
-  it('findAll returns only public users (no passwordHash)', async () => {
+  it('findAll returns only public users (no passwordHash nor at-rest secrets)', async () => {
     mockPrisma.user.findMany.mockResolvedValue([admin, user]);
     const result = await service.findAll();
     expect(result).toHaveLength(2);
-    for (const u of result) expect(u).not.toHaveProperty('passwordHash');
+    for (const u of result) {
+      expect(u).not.toHaveProperty('passwordHash');
+      expect(u).not.toHaveProperty('mfaSecretEnc');
+      expect(u).not.toHaveProperty('githubTokenEnc');
+    }
   });
 
   it('update throws NotFoundException for an unknown user', async () => {

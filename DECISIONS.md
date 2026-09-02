@@ -82,6 +82,8 @@ le complète avec les credentials + la vérification d'API.
 - ADR-024 Détails infrastructure Serveurs + pages CRUD admin larges (below) — 2026-09-01.
 - ADR-025 Sonde de connectivité réelle des serveurs (below) — 2026-09-01.
 - ADR-010 Provider adapters (above) — 2026-09-02, Phase 9.
+- ADR-026 Auto-détection IP/port + accès direct + métriques serveur (above) — 2026-09-02, Phase 9bis.
+- ADR-027 Sécurité, comptes & support (below) — 2026-09-02, Phase 10.
 
 ## ADR-011 — Socle config minimal (Phase 0)
 **Status: APPROVED** (2026-08-30, Phase 0 GO)
@@ -399,6 +401,81 @@ Decision:
   drawer.
 - **Hors périmètre** : récupération de métriques temps-réel/sondes périodiques (ADR-007), détection
   de charge, adaptateurs cPanel/DirectAdmin.
+
+## ADR-027 — Sécurité, comptes & support (Phase 10)
+**Status: APPROVED** (2026-09-02, plan Phase 10 validé par le propriétaire) — refonte
+« security-first » de l'authentification + support client structuré, **toute option de
+sécurité NON obligatoire** (l'admin renforce ou relâche via des flags singleton) + tickets.
+Decision:
+- **Feature-flags admin (singleton `SecuritySetting`, migration `init_security_support`,
+  10e migration)** — pattern exact de `MailSetting` : `turnstileEnabled`,
+  `oauthGoogleEnabled`, `oauthGithubEnabled`, `mfaRequiredForAdmins`,
+  `selfRegistrationEnabled` (création de compte À LA COMMANDE uniquement),
+  `deployEnabled` (Phase 10bis GitHub→Coolify). **Tous `@default(false)`** — rien n'est
+  obligatoire. `GET/PUT /api/admin/security` (ADMIN, audit `security.settings.update`),
+  enforcement central dans `SecuritySettingsService` (Turnstile seulement si activé ET
+  clé présente ; fournisseur OAuth refusé (403) s'il n'est pas activé ; inscription à la
+  commande fermée (403) si flag off ; MFA admin forcée au login si flag on).
+- **Hiérarchie des rôles** : enum `Role` étendu `ADMIN USER SUPPORT_L1 SUPPORT_L2 SUPPORT_L3` ;
+  rang linéaire `USER(0) < L1(1) < L2(2) < L3(3) < ADMIN(99)` via `auth/roles.ts`
+  `ROLE_RANK` + helper exporté `roleRank` (source unique partagée par RolesGuard, tickets,
+  console support). Le guard passe si `actorRank >= roleRank(requis)` — **équivalent pour
+  ADMIN** (tous les `@Roles(Role.ADMIN)` rang 99 → aucune route existante ne change).
+- **Impersonation « Se connecter en tant que client »** : jeton signé `role: USER` **inscrit
+  à la signature** (un jeton stale reste USER même si la cible est promue) + marqueur
+  `imp:{by, kind: admin|support}` qui force la **lecture seule** (verbes mutants 403) et
+  **n'émet AUCUNE ligne refreshToken ni cookie** — la session meurt à son TTL (60 min,
+  cap 24 h) et `POST /api/auth/refresh` ne peut jamais la prolonger. Routes : `POST
+  /api/users/:id/impersonate` (ADMIN) + `POST /api/users/:id/mfa-reset` (ADMIN, secours
+  anti-verrouillage) — **divergence intentionnelle du plan** : routes réelles sur
+  `/api/users/:id/…` (source de vérité = client web), PAS `/admin/users/…` ; `POST
+  /api/auth/impersonate/return` (200), `POST /api/support/access` (L2+, code 6 chiffres).
+  Web : jeton en **sessionStorage**, bandeau rouge sur `/client`, Revenir = cleanup.
+- **Code support 6 chiffres** (`SupportCode`) : généré par le CLIENT (`POST
+  /api/client/support-code`, un seul actif, révocation du précédent en `$transaction`) ;
+  **jamais stocké en clair** — `codeHash = HMAC-SHA256(SUPPORT_CODE_PEPPER ?? ENCRYPTION_KEY,
+  code)` ; TTL 60 min (clamp 5..1440) ; montré une seule fois (canal = téléphone) ; email
+  best-effort. Rédemption par L2+ (`POST /api/support/access`) : `timingSafeEqual` sur
+  digests hex sans short-circuit, **verrouillage à 5 essais** (auto-révocation + audit
+  `support.code.locked`), code inexistant → comparaison factice + throttle IP. Statut /
+  révocation par le client (`GET/DELETE /api/client/support-code`, jamais le code).
+- **MFA deux méthodes** : TOTP (otplib, `step:30 window:[1,0] digits:6`) + repli **email
+  OTP** (dispo quand le mail est activé). Self-service (setup/confirm/disable via mot de
+  passe + code) ; login en **deux étapes** (challenge mono-usage 300 s, lockout 5 essais,
+  throttle IP, anti-replay : le challenge est détruit au succès) ; `mfaRequiredForAdmins`
+  force les admins (jeton d'enrôlement limité à setup/confirm au login). Secret TOTP
+  chiffré AES-256-GCM (`CryptoService`) — **jamais renvoyé** (seulement `mfaEnabled`).
+- **OAuth Google + GitHub** (fetch natif, abstraction `OAuthProviderClient` injectable —
+  e2e-mockable) : état CSRF signé en cookie httpOnly (`ihp_oauth_state`, 10 min, comparé
+  timing-safe), **`redirect_uri` = URL PUBLIQUE** (`${PUBLIC_BASE_URL}/api/auth/oauth/:provider/callback`,
+  jamais `:3001`), email **vérifié** exigé. Scénarios : **login** (email existant → MFA →
+  jetons), **inscription À LA COMMANDE** (email inconnu + **checkout intent** valide
+  `ihp_checkout` → création + souscription PENDING ; **jamais d'auto-création hors
+  commande** — email inconnu sans intent = 403/redirect erreur), **liaison** (mode `link`,
+  attache `oauthProvider/oauthSubject` au compte connecté ; conflit = déjà lié ailleurs →
+  409). **Liaison de compte** (profil) : un compte email+pass peut lier Google et/ou GitHub
+  et délier ; `githubTokenEnc` (AES-256-GCM) alimente la Phase 10bis.
+- **Catalogue public + inscription à la commande** : `GET /api/public/products` (public —
+  le visiteur consulte avant de commander) ; `GET /api/products` **reste authentifié**
+  (non-régression `core.e2e-spec`). `POST /api/checkout/intent {productId}` (public) pose un
+  jeton signé 10 min en cookie `ihp_checkout` ; `POST /api/auth/register` (ex-410) réouvert
+  **UNIQUEMENT** avec intent valide + flag on → compte + souscription PENDING en
+  `$transaction`. OAuth fait de même via le callback.
+- **Tickets minimal** : modèles `Ticket` (+`TicketStatus`/`TicketPriority`, `escalatedTo`
+  L2/L3 seulement) et `TicketMessage` (`authorEmail` dénormalisé, survit à la suppression
+  de l'auteur). Client : ouvrir/lister/voir les siens + messages ; support ≥ L1 :
+  répondre, escalader, changer le statut (via `roleRank`). Tout est audité (`ticket.*`).
+- **Turnstile** : `TurnstileService` (fetch natif, skip si désactivé/sans clé), enforce sur
+  `POST /api/auth/login` + `POST /api/support/access` quand activé ; widget web chargé
+  seulement si `NEXT_PUBLIC_TURNSTILE_SITE_KEY` présente.
+- **Rate limiter maison** (`auth/rate-limiter.ts`, fenêtre glissante en mémoire par IP, 429)
+  sur login / mfa verify / mfa email send / support access / register / checkout intent.
+- **Sécurité des invariants** : `mfaSecretEnc`/`githubTokenEnc`/`apiTokenEnc` JAMAIS
+  renvoyés par l'API (seulement `mfaEnabled`/`hasApiToken`) ; code support jamais en clair ;
+  impersonation = rôle USER forcé + lecture seule + sans refresh ; inscription à la commande
+  = seul chemin de création de compte (avec OAuth via intent). Dépendance ajoutée : `otplib`
+  (stub ESM en Jest via `moduleNameMapper` → TOTP accepte tout code 6 chiffres en test ;
+  l'OTP email réel reste comparé timing-safe).
 
 # REJECTED
 None recorded in this clean baseline.

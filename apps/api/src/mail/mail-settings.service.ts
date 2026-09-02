@@ -79,6 +79,13 @@ export class MailSettingsService {
     return row?.enabled ?? false;
   }
 
+  /** Whether a usable SMTP config exists (host + fromEmail present) —
+   *  gates features that email a code (MFA email OTP, support codes). */
+  async canSend(): Promise<boolean> {
+    const row = await this.prisma.mailSetting.findFirst();
+    return !!row && !!row.host && !!row.fromEmail;
+  }
+
   /**
    * PATCH-semantics upsert (all fields optional, undefined = leave unchanged).
    * - enabled=true requires host+fromEmail (400 otherwise).
@@ -269,5 +276,24 @@ export class MailSettingsService {
   }): Promise<void> {
     const cfg = await this.getMailConfig();
     await this.mail.sendMail(cfg, this.mail.buildInviteMessage(input));
+  }
+
+  /**
+   * Generic best-effort send through the currently saved config, driven by a
+   * pre-built MailMessage (Phase 10: MFA email OTP, support-code emails).
+   * Throws MailException on failure — callers decide whether to surface it.
+   */
+  async sendPlain(
+    msg: { to: string; subject: string; text: string },
+  ): Promise<void> {
+    const cfg = await this.getMailConfig();
+    await this.mail.sendMail(cfg, msg);
+  }
+
+  /** Send a 6-digit code email (kind 'mfa' or 'support') through the saved
+   *  config. Throws MailException on failure — callers best-effort it. */
+  async sendOtpMail(to: string, code: string, kind: 'mfa' | 'support'): Promise<void> {
+    const cfg = await this.getMailConfig();
+    await this.mail.sendMail(cfg, this.mail.buildOtpMessage(to, code, kind));
   }
 }

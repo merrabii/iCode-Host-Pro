@@ -68,6 +68,38 @@ export class MailService {
     };
   }
 
+  /** 6-digit code body for a security email (Phase 10, ADR-027). `kind` picks
+   *  the subject line: 'mfa' (two-step login / activate TOTP) or 'support'
+   *  (client-generated support access code shared with a support agent). */
+  buildOtpMessage(
+    to: string,
+    code: string,
+    kind: 'mfa' | 'support',
+  ): MailMessage {
+    const subject =
+      kind === 'mfa'
+        ? 'Votre code de connexion — iCode Host Pro'
+        : 'Votre code d’accès support — iCode Host Pro';
+    const intro =
+      kind === 'mfa'
+        ? 'Voici votre code de vérification à usage unique.'
+        : 'Voici votre code d’accès à 6 chiffres à communiquer à un membre du support. Il expire rapidement.';
+    return {
+      to,
+      subject,
+      text: [
+        'Bonjour,',
+        '',
+        intro,
+        '',
+        `Code : ${code}`,
+        '',
+        'Ne partagez ce code avec personne d’autre que votre interlocuteur de confiance.',
+        '— iCode Host Pro',
+      ].join('\n'),
+    };
+  }
+
   private errMessage(err: unknown): string {
     return err instanceof Error && err.message ? err.message : String(err);
   }

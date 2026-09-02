@@ -52,7 +52,7 @@ describe('ManagerService', () => {
     expect(summary.users).toEqual({
       total: 5,
       active: 5,
-      byRole: { ADMIN: 1, USER: 4 },
+      byRole: { ADMIN: 1, USER: 4, SUPPORT_L1: 0, SUPPORT_L2: 0, SUPPORT_L3: 0 },
     });
   });
 
@@ -66,6 +66,12 @@ describe('ManagerService', () => {
     expect(summary.products.total).toBe(0);
     expect(summary.servers.total).toBe(0);
     expect(summary.users.total).toBe(0);
-    expect(summary.users.byRole).toEqual({ ADMIN: 0, USER: 0 });
+    expect(summary.users.byRole).toEqual({
+      ADMIN: 0,
+      USER: 0,
+      SUPPORT_L1: 0,
+      SUPPORT_L2: 0,
+      SUPPORT_L3: 0,
+    });
   });
 });
