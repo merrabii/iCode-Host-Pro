@@ -1,4 +1,4 @@
-﻿-- Phase 11 — base de connaissance (admin + client)
+-- Phase 11 — base de connaissance (admin + client)
 CREATE TYPE "KnowledgeAudience" AS ENUM ('ADMIN', 'CLIENT');
 CREATE TYPE "KnowledgeType" AS ENUM ('INFORMATIVE', 'TECHNICAL', 'HOWTO');
 CREATE TYPE "KnowledgeStatus" AS ENUM ('DRAFT', 'PUBLISHED', 'ARCHIVED');

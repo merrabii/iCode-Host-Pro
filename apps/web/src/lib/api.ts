@@ -453,6 +453,8 @@ export interface PublicAuthConfig {
   oauthGoogleEnabled: boolean;
   oauthGithubEnabled: boolean;
   selfRegistrationEnabled: boolean;
+  /** Phase 10bis : drapeau NON sensible — affiche/cache le panneau Déploiements. */
+  deployEnabled: boolean;
 }
 export async function getPublicAuthConfig(): Promise<PublicAuthConfig | null> {
   try {
@@ -806,3 +808,80 @@ export const changePassword = (t: string, currentPassword: string, newPassword: 
   });
 export const oauthUnlink = (t: string, provider: 'google' | 'github') =>
   apiJson('/api/auth/oauth/unlink', t, { method: 'POST', body: JSON.stringify({ provider }) });
+
+// ═══ Phase 10bis — Déploiement GitHub → Coolify ══════════════════════════════
+export interface GithubRepo {
+  fullName: string; // "owner/repo"
+  defaultBranch: string;
+  private: boolean;
+  language: string | null;
+}
+export interface GithubLinkStatus {
+  linked: boolean;
+  login: string | null;
+}
+export type DeploymentStatus =
+  | 'PENDING'
+  | 'DEPLOYING'
+  | 'ACTIVE'
+  | 'FAILED';
+/** Build packs Coolify proposés dans l'UI (mode URL collée, Phase 10bis.5). */
+export const BUILD_PACKS = ['nixpacks', 'dockerfile', 'dockercompose', 'static'] as const;
+export type BuildPack = (typeof BUILD_PACKS)[number];
+export interface Deployment {
+  id: string;
+  userId: string;
+  serviceId: string;
+  serverId?: string | null;
+  repoFullName: string;
+  /** URL git collée (mode URL) — null en mode GitHub lié. */
+  repoUrl?: string | null;
+  /** Build pack envoyé à Coolify (affichage liste). */
+  buildPack?: string | null;
+  /** Nom de l'application côté Coolify (mode URL, modifiable par le client). */
+  appName?: string | null;
+  branch: string;
+  status: DeploymentStatus;
+  detail?: string | null;
+  createdAt: string;
+  updatedAt: string;
+  /** Références masquées — jamais l'UUID Coolify ni l'adresse du serveur. */
+  service?: { id: string; name: string } | null;
+  server?: { id: string; name: string } | null;
+}
+/** Résultat de la détection automatique d'une URL (Phase 10bis.5). */
+export interface DetectResult {
+  valid: boolean;
+  repoUrl: string; // URL assainie
+  repoFullName: string | null;
+  defaultBranch: string;
+  language: string | null;
+  suggestedBuildPack: string;
+  detail?: string;
+}
+/** Repos GitHub du client, autodétectés via le compte lié (Phase 10bis, M). */
+export const listGithubRepos = (t: string) => apiJson('/api/client/github/repos', t);
+/** État de la liaison GitHub — jamais le token. */
+export const githubLinkStatus = (t: string) =>
+  apiJson('/api/client/github/link-status', t, { method: 'POST' });
+/** Détection auto d'une URL de dépôt collée (aucune liaison GitHub requise). */
+export const detectDeployment = (t: string, url: string) =>
+  apiJson('/api/client/deployments/detect', t, {
+    method: 'POST',
+    body: JSON.stringify({ url }),
+  });
+export const listMyDeployments = (t: string) => apiJson('/api/client/deployments', t);
+export const getMyDeployment = (t: string, id: string) =>
+  apiJson(`/api/client/deployments/${id}`, t);
+/** Déploiement : mode GitHub lié (repoFullName) OU mode URL (repoUrl) — exactement un. */
+export const createDeployment = (
+  t: string,
+  dto: {
+    serviceId: string;
+    repoFullName?: string;
+    repoUrl?: string;
+    branch?: string;
+    buildPack?: BuildPack;
+    appName?: string;
+  },
+) => apiJson('/api/client/deployments', t, { method: 'POST', body: JSON.stringify(dto) });

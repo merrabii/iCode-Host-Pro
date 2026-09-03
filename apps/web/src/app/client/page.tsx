@@ -5,22 +5,35 @@ import { useRouter } from 'next/navigation';
 import {
   addTicketMessage,
   apiError,
+  BUILD_PACKS,
   cancelMySubscription,
   clearImpToken,
+  createDeployment,
+  detectDeployment,
   createMyService,
   createMySubscription,
   createTicket,
   decodeJwt,
   fetchMe,
   generateSupportCode,
+  getMyDeployment,
+  getPublicAuthConfig,
   getSessionToken,
   getSupportCodeStatus,
+  githubLinkStatus,
+  listGithubRepos,
+  listMyDeployments,
   listMyServices,
   listMySubscriptions,
   listMyTickets,
   listPublicProducts,
   returnFromImpersonation,
   revokeSupportCode,
+  type BuildPack,
+  type Deployment,
+  type DetectResult,
+  type GithubLinkStatus,
+  type GithubRepo,
   type Me,
   type Service,
   type Subscription,
@@ -38,6 +51,7 @@ import {
   PageIntro,
   PageLoading,
   Panel,
+  Select,
   statusTone,
 } from '@/components/ui';
 import { IconBox } from '@/components/icons';
@@ -73,6 +87,12 @@ const TICKET_STATUS_LABEL: Record<string, string> = {
   RESOLVED: 'Résolu',
   CLOSED: 'Fermé',
 };
+const DEP_STATUS_LABEL: Record<string, string> = {
+  PENDING: 'En file',
+  DEPLOYING: 'Déploiement en cours',
+  ACTIVE: 'Déployé',
+  FAILED: 'Échec',
+};
 
 export default function ClientPage() {
   const router = useRouter();
@@ -100,6 +120,22 @@ export default function ClientPage() {
   const [ticketReply, setTicketReply] = useState<Record<string, string>>({});
   const [tSubject, setTSubject] = useState('');
   const [tBody, setTBody] = useState('');
+
+  // Déploiements GitHub → Coolify (Phase 10bis) — panneau masqué si désactivé.
+  const [deployEnabled, setDeployEnabled] = useState(false);
+  const [github, setGithub] = useState<GithubLinkStatus | null>(null);
+  const [repos, setRepos] = useState<GithubRepo[]>([]);
+  const [deployments, setDeployments] = useState<Deployment[]>([]);
+  const [depRepo, setDepRepo] = useState('');
+  const [depBranch, setDepBranch] = useState('');
+  const [depServiceId, setDepServiceId] = useState('');
+  // Mode URL collée (Phase 10bis.5) — détection auto, champs éditables.
+  const [depTab, setDepTab] = useState<'github' | 'url'>('github');
+  const [depUrl, setDepUrl] = useState('');
+  const [detecting, setDetecting] = useState(false);
+  const [detected, setDetected] = useState<DetectResult | null>(null);
+  const [depAppName, setDepAppName] = useState('');
+  const [depBuildPack, setDepBuildPack] = useState<BuildPack>('nixpacks');
 
   const load = useCallback(
     async (t: string) => {
@@ -136,6 +172,30 @@ export default function ClientPage() {
     if (r.ok) setTickets((r.data as Ticket[]) ?? []);
   }, []);
 
+  // GitHub (Phase 10bis) : état de la liaison + repos autodétectés.
+  const loadGithub = useCallback(async (t: string) => {
+    const [ls, r] = await Promise.all([githubLinkStatus(t), listGithubRepos(t)]);
+    if (ls.ok) setGithub((ls.data as GithubLinkStatus) ?? null);
+    if (r.ok) setRepos((r.data as GithubRepo[]) ?? []);
+  }, []);
+
+  // Déploiements + rafraîchissement live des statuts en cours.
+  const loadDeployments = useCallback(async (t: string) => {
+    const r = await listMyDeployments(t);
+    if (!r.ok) return;
+    let list = (r.data as Deployment[]) ?? [];
+    const live = await Promise.all(
+      list.filter((d) => d.status === 'DEPLOYING').map((d) => getMyDeployment(t, d.id)),
+    );
+    const byId = new Map<string, Deployment>();
+    for (const item of live) {
+      const d = item.data as Deployment | null;
+      if (item.ok && d) byId.set(d.id, d);
+    }
+    list = list.map((d) => byId.get(d.id) ?? d);
+    setDeployments(list);
+  }, []);
+
   useEffect(() => {
     (async () => {
       const t = await getSessionToken();
@@ -158,8 +218,23 @@ export default function ClientPage() {
       void load(t);
       void loadCodeStatus(t);
       void loadTickets(t);
+      const cfg = await getPublicAuthConfig();
+      if (cfg?.deployEnabled) {
+        setDeployEnabled(true);
+        void loadGithub(t);
+        void loadDeployments(t);
+      }
     })();
-  }, [router, load, loadCodeStatus, loadTickets]);
+  }, [router, load, loadCodeStatus, loadTickets, loadGithub, loadDeployments]);
+
+  // Auto-poll : tant qu'un déploiement est en cours, re-sonde toutes les 8 s.
+  useEffect(() => {
+    if (!deployEnabled || !token) return;
+    const hasDeploying = deployments.some((d) => d.status === 'DEPLOYING');
+    if (!hasDeploying) return;
+    const id = setInterval(() => void loadDeployments(token), 8000);
+    return () => clearInterval(id);
+  }, [deployEnabled, token, deployments, loadDeployments]);
 
   async function subscribe(productId: string) {
     const r = await createMySubscription(token, productId);
@@ -229,6 +304,69 @@ export default function ClientPage() {
     setTicketReply({ ...ticketReply, [id]: '' });
     toast.ok('Message ajouté.');
     void loadTickets(token);
+  }
+
+  // Déploiements (Phase 10bis).
+  function onRepoChange(fullName: string) {
+    setDepRepo(fullName);
+    const repo = repos.find((x) => x.fullName === fullName);
+    setDepBranch(repo?.defaultBranch ?? '');
+  }
+
+  async function deploy() {
+    if (!depRepo || !depServiceId) return;
+    const branch = depBranch.trim() || 'main';
+    const r = await createDeployment(token, {
+      serviceId: depServiceId,
+      repoFullName: depRepo,
+      branch,
+    });
+    if (!r.ok) return toast.error(apiError(r, 'Déploiement impossible.'));
+    toast.ok('Déploiement déclenché — statut en direct ci-dessous.');
+    void loadDeployments(token);
+  }
+
+  // Mode URL collée (Phase 10bis.5) : Détecter → préremplit la branche + le
+  // build pack suggéré ; le client peut corriger Nom de l'app et Build pack.
+  async function onDetect() {
+    const url = depUrl.trim();
+    if (!url) return;
+    setDetecting(true);
+    const r = await detectDeployment(token, url);
+    setDetecting(false);
+    if (!r.ok) return toast.error(apiError(r, 'Détection impossible.'));
+    const d = r.data as DetectResult | null;
+    if (!d) return toast.error('Détection impossible.');
+    setDetected(d);
+    setDepAppName(d.repoFullName?.split('/').pop() ?? '');
+    setDepBuildPack(
+      (BUILD_PACKS as readonly string[]).includes(d.suggestedBuildPack)
+        ? (d.suggestedBuildPack as BuildPack)
+        : 'nixpacks',
+    );
+    toast.ok(d.detail ? `Détecté — ${d.detail}` : 'Dépôt détecté — vérifiez puis déployez.');
+  }
+
+  function onUrlServiceChange(id: string) {
+    setDepServiceId(id);
+    if (!depAppName.trim()) {
+      const svc = services.find((s) => s.id === id);
+      if (svc) setDepAppName(svc.name);
+    }
+  }
+
+  async function deployUrl() {
+    if (!detected?.repoUrl || !depServiceId) return;
+    const r = await createDeployment(token, {
+      serviceId: depServiceId,
+      repoUrl: detected.repoUrl,
+      branch: detected.defaultBranch, // branche auto (non éditée dans l'UI)
+      buildPack: depBuildPack,
+      appName: depAppName.trim() || undefined,
+    });
+    if (!r.ok) return toast.error(apiError(r, 'Déploiement impossible.'));
+    toast.ok('Déploiement déclenché — statut en direct ci-dessous.');
+    void loadDeployments(token);
   }
 
   async function onReturn() {
@@ -396,6 +534,226 @@ export default function ClientPage() {
           </Panel>
         </div>
 
+        {deployEnabled && (
+          <div className="mt">
+            <Panel
+              title="Déploiements"
+              sub="Deux façons de déployer sur votre service d’hébergement (serveur Coolify géré par l’admin) : coller l’URL d’un dépôt git (détection automatique), ou choisir un dépôt de votre compte GitHub lié."
+            >
+              {!github ? (
+                <EmptyState>Chargement…</EmptyState>
+              ) : (
+                <div className="stack">
+                  <div className="row" style={{ gap: 8, flexWrap: 'wrap' }}>
+                    {github.linked && (
+                      <Button
+                        variant={depTab === 'github' ? 'primary' : 'secondary'}
+                        size="sm"
+                        disabled={isImp}
+                        onClick={() => setDepTab('github')}
+                      >
+                        Dépôt GitHub lié
+                      </Button>
+                    )}
+                    <Button
+                      variant={depTab === 'url' ? 'primary' : 'secondary'}
+                      size="sm"
+                      disabled={isImp}
+                      onClick={() => setDepTab('url')}
+                    >
+                      URL d&apos;un dépôt
+                    </Button>
+                  </div>
+
+                  {depTab === 'github' && github.linked ? (
+                    <div className="inline-form">
+                      <Field label="Dépôt GitHub">
+                        <Select
+                          value={depRepo}
+                          disabled={isImp}
+                          onChange={(e) => onRepoChange(e.target.value)}
+                        >
+                          <option value="">Choisir un dépôt…</option>
+                          {repos.map((r) => (
+                            <option key={r.fullName} value={r.fullName}>
+                              {r.fullName}
+                              {r.private ? ' 🔒' : ''}
+                            </option>
+                          ))}
+                        </Select>
+                      </Field>
+                      <Field label="Branche">
+                        <Input
+                          className="input-sm"
+                          placeholder="main"
+                          value={depBranch}
+                          disabled={isImp}
+                          onChange={(e) => setDepBranch(e.target.value)}
+                        />
+                      </Field>
+                      <Field label="Service cible">
+                        <Select
+                          value={depServiceId}
+                          disabled={isImp}
+                          onChange={(e) => setDepServiceId(e.target.value)}
+                        >
+                          <option value="">Choisir un service actif…</option>
+                          {services
+                            .filter((s) => s.status === 'ACTIVE')
+                            .map((s) => (
+                              <option key={s.id} value={s.id}>
+                                {s.name}
+                              </option>
+                            ))}
+                        </Select>
+                      </Field>
+                      <Button disabled={isImp || !depRepo || !depServiceId} onClick={deploy}>
+                        Déployer
+                      </Button>
+                    </div>
+                  ) : (
+                    <div className="stack">
+                      {!github.linked && (
+                        <p className="muted" style={{ fontSize: 13 }}>
+                          La liaison GitHub est optionnelle — collez simplement l&apos;URL de votre
+                          dépôt. (Vous pouvez aussi <a href="/profil">lier votre compte GitHub</a> pour
+                          choisir un dépôt.)
+                        </p>
+                      )}
+                      <div className="inline-form">
+                        <Field label="URL du dépôt git">
+                          <Input
+                            className="flex-1"
+                            placeholder="https://github.com/vous/mon-projet.git"
+                            value={depUrl}
+                            disabled={isImp || detecting}
+                            onChange={(e) => setDepUrl(e.target.value)}
+                          />
+                        </Field>
+                        <Button
+                          variant="secondary"
+                          disabled={isImp || detecting || !depUrl.trim()}
+                          onClick={onDetect}
+                        >
+                          {detecting ? 'Détection…' : 'Détecter'}
+                        </Button>
+                      </div>
+
+                      {detected ? (
+                        <div className="stack" style={{ padding: '12px', border: '1px solid var(--border)', borderRadius: 8 }}>
+                          <div className="row" style={{ gap: 12, flexWrap: 'wrap' }}>
+                            <div className="muted" style={{ fontSize: 13 }}>
+                              Repo : <b style={{ color: 'var(--text)' }}>{detected.repoFullName ?? detected.repoUrl}</b>
+                              {detected.language ? ` · ${detected.language}` : ''}
+                            </div>
+                            <div className="muted" style={{ fontSize: 13 }}>
+                              Branche : <b style={{ color: 'var(--text)' }}>{detected.defaultBranch}</b>{' '}
+                              (auto)
+                            </div>
+                          </div>
+                          {detected.detail && (
+                            <div className="muted" style={{ fontSize: 12.5 }}>{detected.detail}</div>
+                          )}
+                          <div className="inline-form">
+                            <Field label="Nom de l’app" hint="Nom de l’application côté Coolify.">
+                              <Input
+                                className="input-sm"
+                                value={depAppName}
+                                disabled={isImp}
+                                onChange={(e) => setDepAppName(e.target.value)}
+                              />
+                            </Field>
+                            <Field label="Build pack" hint="Suggéré par la détection, modifiable.">
+                              <Select
+                                value={depBuildPack}
+                                disabled={isImp}
+                                onChange={(e) => setDepBuildPack(e.target.value as BuildPack)}
+                              >
+                                {BUILD_PACKS.map((b) => (
+                                  <option key={b} value={b}>
+                                    {b}
+                                  </option>
+                                ))}
+                              </Select>
+                            </Field>
+                            <Field label="Service cible">
+                              <Select
+                                value={depServiceId}
+                                disabled={isImp}
+                                onChange={(e) => onUrlServiceChange(e.target.value)}
+                              >
+                                <option value="">Choisir un service actif…</option>
+                                {services
+                                  .filter((s) => s.status === 'ACTIVE')
+                                  .map((s) => (
+                                    <option key={s.id} value={s.id}>
+                                      {s.name}
+                                    </option>
+                                  ))}
+                              </Select>
+                            </Field>
+                            <Button
+                              disabled={isImp || !detected.repoUrl || !depServiceId}
+                              onClick={deployUrl}
+                            >
+                              Déployer
+                            </Button>
+                          </div>
+                        </div>
+                      ) : (
+                        !detecting && (
+                          <EmptyState>
+                            Collez l&apos;URL du dépôt puis « Détecter » pour préremplir la branche
+                            et le build pack.
+                          </EmptyState>
+                        )
+                      )}
+                    </div>
+                  )}
+
+                  <div className="row" style={{ justifyContent: 'space-between' }}>
+                    <span className="muted" style={{ fontSize: 13 }}>
+                      {deployments.length} déploiement(s) sur votre compte
+                    </span>
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      disabled={isImp}
+                      onClick={() => loadDeployments(token)}
+                    >
+                      Actualiser
+                    </Button>
+                  </div>
+
+                  {deployments.length === 0 ? (
+                    <EmptyState>Aucun déploiement pour l&apos;instant.</EmptyState>
+                  ) : (
+                    <div className="stack">
+                      {deployments.map((d) => (
+                        <div key={d.id} className="status-row">
+                          <div className="status-row-main">
+                            <div className="status-row-title">{d.repoFullName}</div>
+                            <div className="status-row-sub">
+                              branche {d.branch} · service {d.service?.name ?? '—'}
+                              {d.buildPack ? ` · build ${d.buildPack}` : ''}
+                              {d.appName ? ` · app « ${d.appName} »` : ''}
+                              {d.status === 'FAILED' && d.detail ? ` · ${d.detail}` : ''} ·{' '}
+                              {new Date(d.updatedAt).toLocaleString()}
+                            </div>
+                          </div>
+                          <Badge tone={statusTone(DEP_TONE(d.status))}>
+                            {DEP_STATUS_LABEL[d.status] ?? d.status}
+                          </Badge>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+            </Panel>
+          </div>
+        )}
+
         <div className="mt">
           <Panel
             title="Accès support"
@@ -530,5 +888,14 @@ function TICKET_TONE(status: string): string {
   if (status === 'CLOSED') return 'CANCELLED';
   if (status === 'WAITING_CLIENT') return 'PENDING';
   if (status === 'IN_PROGRESS') return 'REQUESTED';
+  return status;
+}
+
+/** Map a deployment status to a statusTone-compatible value for the badge. */
+function DEP_TONE(status: string): string {
+  if (status === 'ACTIVE') return 'ACTIVE';
+  if (status === 'FAILED') return 'CANCELLED';
+  if (status === 'DEPLOYING') return 'PENDING';
+  if (status === 'PENDING') return 'REQUESTED';
   return status;
 }

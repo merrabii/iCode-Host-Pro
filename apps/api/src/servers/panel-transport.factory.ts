@@ -47,27 +47,66 @@ export interface PanelMetrics {
   diskGb?: number; // disque total (Go)
 }
 
+// ── Phase 10bis (GitHub → Coolify) — opérations de déploiement ───────────────
+
+/** Entrée de création d'une application Coolify depuis un dépôt Git (public).
+ *  Phase 10bis.5 : `buildPack` et `appName` sont optionnels — en mode URL collée
+ *  le client peut corriger le build pack suggéré (détection) et le nom de l'app ;
+ *  en mode GitHub lié les défauts s'appliquent (nixpacks + nom du Service). */
+export interface CoolifyGitAppInput {
+  repoUrl: string; // ex. https://github.com/owner/repo.git
+  branch: string;
+  serviceName: string; // nom lisible de l'application (le Service du client)
+  buildPack?: string; // nixpacks | dockerfile | dockercompose | static — défaut nixpacks
+  appName?: string; // nom de l'application côté Coolify — défaut serviceName
+}
+
+export interface CoolifyGitAppResult {
+  uuid: string; // UUID de l'application côté Coolify
+}
+
+/** Statut brut renvoyé par Coolify (le mapping → DeploymentStatus vit dans
+ *  DeploymentsService, testable isolément). `detail` = message d'échec réseau
+ *  quand Coolify est injoignable (best-effort, jamais bloquant). */
+export interface CoolifyDeploymentStatusResult {
+  rawStatus: string;
+  detail?: string;
+}
+
 export abstract class PanelTransport {
   abstract verify(target: PanelTarget): Promise<PanelVerifyResult>;
+
+  // Phase 10bis — déploiement (COOLIFY uniquement ; Hestia lève une erreur).
+  abstract createGitApp(
+    target: PanelTarget,
+    input: CoolifyGitAppInput,
+  ): Promise<CoolifyGitAppResult>;
+  abstract deployApp(target: PanelTarget, uuid: string): Promise<void>;
+  abstract deploymentStatus(
+    target: PanelTarget,
+    uuid: string,
+  ): Promise<CoolifyDeploymentStatusResult>;
 }
 
 // ── Runtime ───────────────────────────────────────────────────────────
 export const PANEL_TIMEOUT_MS = 8_000;
 
-// Requête GET unique avec timeout ; on collecte le corps (JSON pour la version).
-function httpGet(
+// Requête HTTP unique avec timeout ; on collecte le corps texte. Méthode + corps
+// JSON optionnels (Phase 10bis : POST des opérations de déploiement Coolify).
+function httpRequest(
+  method: string,
   href: string,
   headers: http.OutgoingHttpHeaders,
   strictTls: boolean,
   timeoutMs: number,
+  body?: string,
 ): Promise<{ status: number; body: string }> {
-  const started = Date.now();
   return new Promise((resolve, reject) => {
     const urlObj = new URL(href);
     const isHttps = urlObj.protocol === 'https:';
     const reqLib = (isHttps ? https : http) as typeof http;
     const opts: https.RequestOptions = {
-      method: 'GET',
+      method,
       hostname: urlObj.hostname,
       port: Number(urlObj.port) || (isHttps ? 443 : 80),
       path: `${urlObj.pathname}${urlObj.search}`,
@@ -86,8 +125,6 @@ function httpGet(
       res.on('data', (c: Buffer) => chunks.push(c));
       res.on('end', () => {
         const status = res.statusCode ?? 0;
-        const ms = Date.now() - started;
-        void ms;
         settleOk(status, Buffer.concat(chunks).toString('utf8'));
       });
     });
@@ -108,8 +145,31 @@ function httpGet(
       settled = true;
       reject(err);
     });
+    if (body) req.write(body);
     req.end();
   });
+}
+
+// Requête GET unique avec timeout ; on collecte le corps (JSON pour la version).
+function httpGet(
+  href: string,
+  headers: http.OutgoingHttpHeaders,
+  strictTls: boolean,
+  timeoutMs: number,
+): Promise<{ status: number; body: string }> {
+  return httpRequest('GET', href, headers, strictTls, timeoutMs);
+}
+
+// Requête avec corps JSON (POST des opérations de déploiement Coolify).
+function httpJson(
+  method: string,
+  href: string,
+  headers: http.OutgoingHttpHeaders,
+  strictTls: boolean,
+  timeoutMs: number,
+  body?: string,
+): Promise<{ status: number; body: string }> {
+  return httpRequest(method, href, { 'Content-Type': 'application/json', ...headers }, strictTls, timeoutMs, body);
 }
 
 // Messages d'échec réseau dans la même veine que la sonde (Phase 8).
@@ -245,6 +305,117 @@ class NodePanelTransport extends PanelTransport {
       return coolifyVerify(target, this.timeoutMs);
     }
     return hestiaVerify(target, this.timeoutMs);
+  }
+
+  // ── Phase 10bis — déploiement GitHub → Coolify ───────────────────────────
+
+  /** Les opérations de déploiement n'existent que pour Coolify (ADR-010). */
+  private assertCoolify(target: PanelTarget): void {
+    if (target.provider !== 'COOLIFY') {
+      throw new Error(
+        'Opération de déploiement non disponible pour ce fournisseur de panneau (Coolify uniquement).',
+      );
+    }
+  }
+
+  /**
+   * Crée l'application Coolify depuis un dépôt Git public. Endpoint CONFIRMÉ
+   * contre le serveur réel (vérification live Phase 10bis, Coolify 4.1.2) :
+   * `POST /applications/public` — `/applications/git` n'existe pas sur cette
+   * version (404). Body : projet/serveur par défaut (« 0 »), environnement
+   * production, build pack nixpacks. NB : Coolify exige un jeton API ROOT pour
+   * créer une application — un jeton lecture seule répond 403 « not allowed ».
+   */
+  async createGitApp(
+    target: PanelTarget,
+    input: CoolifyGitAppInput,
+  ): Promise<CoolifyGitAppResult> {
+    this.assertCoolify(target);
+    const base = target.baseUrl.replace(/\/+$/, '');
+    const { status, body } = await httpJson(
+      'POST',
+      `${base}/applications/public`,
+      { Authorization: `Bearer ${target.token}` },
+      target.strictTls,
+      this.timeoutMs,
+      JSON.stringify({
+        project_uuid: '0', // projet par défaut Coolify
+        server_uuid: '0', // serveur géré par défaut (localhost) Coolify
+        environment_name: 'production',
+        git_repository: input.repoUrl,
+        git_branch: input.branch,
+        name: input.appName ?? input.serviceName,
+        build_pack: input.buildPack ?? 'nixpacks',
+      }),
+    );
+    if (status !== 200 && status !== 201) {
+      throw new Error(
+        `Coolify API : création de l'application refusée (HTTP ${status})${body ? ` — ${body.slice(0, 200)}` : ''}`,
+      );
+    }
+    let parsed: { uuid?: unknown } = {};
+    try {
+      parsed = JSON.parse(body) as { uuid?: unknown };
+    } catch {
+      /* corps non JSON */
+    }
+    if (typeof parsed.uuid !== 'string' || !parsed.uuid) {
+      throw new Error('Coolify API : réponse sans uuid d’application.');
+    }
+    return { uuid: parsed.uuid };
+  }
+
+  /** Déclenche un déploiement de l'application Coolify (POST /applications/:uuid/deploy). */
+  async deployApp(target: PanelTarget, uuid: string): Promise<void> {
+    this.assertCoolify(target);
+    const base = target.baseUrl.replace(/\/+$/, '');
+    const { status, body } = await httpJson(
+      'POST',
+      `${base}/applications/${encodeURIComponent(uuid)}/deploy`,
+      { Authorization: `Bearer ${target.token}` },
+      target.strictTls,
+      this.timeoutMs,
+    );
+    if (status !== 200 && status !== 201) {
+      throw new Error(
+        `Coolify API : déclenchement du déploiement refusé (HTTP ${status})${body ? ` — ${body.slice(0, 200)}` : ''}`,
+      );
+    }
+  }
+
+  /**
+   * État du déploiement (best-effort) : lit le statut de l'APPLICATION Coolify
+   * (GET /applications/:uuid → `status`). Le mapping vers notre DeploymentStatus
+   * (PENDING/DEPLOYING/ACTIVE/FAILED) est fait dans DeploymentsService. Une
+   * erreur réseau ne REJETTE pas : on renvoie un statut « unknown » + détail, le
+   * service garde alors l'état courant.
+   */
+  async deploymentStatus(
+    target: PanelTarget,
+    uuid: string,
+  ): Promise<CoolifyDeploymentStatusResult> {
+    this.assertCoolify(target);
+    const base = target.baseUrl.replace(/\/+$/, '');
+    const { status, body } = await httpGet(
+      `${base}/applications/${encodeURIComponent(uuid)}`,
+      { Authorization: `Bearer ${target.token}` },
+      target.strictTls,
+      this.timeoutMs,
+    );
+    if (status !== 200) {
+      return { rawStatus: 'unknown', detail: `Coolify API : HTTP ${status}` };
+    }
+    let parsed: { status?: unknown } = {};
+    try {
+      parsed = JSON.parse(body) as { status?: unknown };
+    } catch {
+      /* corps non JSON */
+    }
+    const raw = typeof parsed.status === 'string' && parsed.status ? parsed.status : 'unknown';
+    return {
+      rawStatus: raw,
+      detail: raw === 'unknown' ? 'Statut Coolify illisible' : undefined,
+    };
   }
 }
 

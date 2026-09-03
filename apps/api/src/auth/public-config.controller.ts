@@ -14,6 +14,9 @@ export interface PublicAuthConfig {
   oauthGoogleEnabled: boolean;
   oauthGithubEnabled: boolean;
   selfRegistrationEnabled: boolean;
+  /** Phase 10bis : drapeau NON sensible (même veine que selfRegistrationEnabled)
+   *  — le web l'utilise pour afficher/cacher le panneau Déploiements du /client. */
+  deployEnabled: boolean;
 }
 
 @ApiTags('public/auth-config')
@@ -44,6 +47,7 @@ export class PublicAuthConfigController {
       oauthGoogleEnabled: (await this.settings.isOAuthGoogleEnabled()) && googleKeys,
       oauthGithubEnabled: (await this.settings.isOAuthGithubEnabled()) && githubKeys,
       selfRegistrationEnabled: await this.settings.isSelfRegistrationEnabled(),
+      deployEnabled: await this.settings.isDeployEnabled(),
     };
   }
 }

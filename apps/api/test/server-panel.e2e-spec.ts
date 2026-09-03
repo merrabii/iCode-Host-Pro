@@ -30,10 +30,15 @@ describe('Server panel verify (e2e, Phase 9)', () => {
   let userToken = '';
 
   // Couture : transport factice dont `verify` est reconfiguré test par test.
+  // Phase 10bis : les 3 opérations de déploiement sont fournies (jamais appelées
+  // par cette suite — seules verify l'est), l'objet reste conforme au contrat.
   const fakeVerify = jest.fn().mockResolvedValue({ ok: true, detail: 'FAKE PANEL OK' });
   const fakeFactory: PanelTransportFactory = {
     create: (): PanelTransport => ({
       verify: fakeVerify as unknown as PanelTransport['verify'],
+      createGitApp: jest.fn(),
+      deployApp: jest.fn(),
+      deploymentStatus: jest.fn(),
     }),
   } as unknown as PanelTransportFactory;
 

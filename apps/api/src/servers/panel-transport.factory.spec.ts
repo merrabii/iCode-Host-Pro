@@ -205,4 +205,199 @@ describe('PanelTransportFactory / NodePanelTransport', () => {
     expect(out.ok).toBe(false);
     expect(out.detail).toBe('Coolify API : Connexion refusée');
   });
+
+  describe('Phase 10bis — Coolify deploy ops (POST/GET, Bearer, loopback)', () => {
+    const target = {
+      provider: 'COOLIFY' as const,
+      baseUrl: '', // rempli par test (URL du mini-serveur)
+      token: 'tok-deploy',
+      strictTls: true,
+    };
+    const base = (url: string) => ({ ...target, baseUrl: `${url}/api/v1` });
+
+    it('createGitApp POSTs /applications/public (route réelle Coolify 4.1.x, vérifiée live) with the git repo + branch + build pack and returns the app uuid', async () => {
+      let method = '';
+      let path = '';
+      let authHeader: string | undefined;
+      let body = '';
+      const srv = await serve((req, res) => {
+        method = req.method ?? '';
+        path = req.url ?? '';
+        authHeader = req.headers.authorization;
+        req.on('data', (c: Buffer) => (body += c.toString()));
+        req.on('end', () => {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ uuid: 'app-123', name: 'my-app' }));
+        });
+      });
+      try {
+        const out = await factory.create(timeoutMs).createGitApp(base(srv.url), {
+          repoUrl: 'https://github.com/owner/repo.git',
+          branch: 'main',
+          serviceName: 'Mon service',
+        });
+        expect(out.uuid).toBe('app-123');
+        expect(method).toBe('POST');
+        expect(path).toBe('/api/v1/applications/public');
+        expect(authHeader).toBe('Bearer tok-deploy');
+        const parsed = JSON.parse(body) as Record<string, string>;
+        expect(parsed.git_repository).toBe('https://github.com/owner/repo.git');
+        expect(parsed.git_branch).toBe('main');
+        expect(parsed.name).toBe('Mon service');
+        expect(parsed.build_pack).toBe('nixpacks');
+        expect(parsed.project_uuid).toBe('0');
+        expect(parsed.environment_name).toBe('production');
+      } finally {
+        await srv.close();
+      }
+    });
+
+    it('createGitApp forwards an explicit buildPack + appName (Phase 10bis.5 URL mode)', async () => {
+      let body = '';
+      const srv = await serve((req, res) => {
+        req.on('data', (c: Buffer) => (body += c.toString()));
+        req.on('end', () => {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ uuid: 'app-url-1' }));
+        });
+      });
+      try {
+        const out = await factory.create(timeoutMs).createGitApp(base(srv.url), {
+          repoUrl: 'https://gitlab.com/foo/bar.git',
+          branch: 'develop',
+          serviceName: 'Mon service',
+          buildPack: 'dockerfile',
+          appName: 'mon-app-personnalisee',
+        });
+        expect(out.uuid).toBe('app-url-1');
+        const parsed = JSON.parse(body) as Record<string, string>;
+        expect(parsed.build_pack).toBe('dockerfile');
+        expect(parsed.name).toBe('mon-app-personnalisee');
+        expect(parsed.git_repository).toBe('https://gitlab.com/foo/bar.git');
+        expect(parsed.git_branch).toBe('develop');
+      } finally {
+        await srv.close();
+      }
+    });
+
+    it('createGitApp rejects with a readable message when Coolify returns no uuid', async () => {
+      const srv = await serve((_req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+      });
+      try {
+        await expect(
+          factory.create(timeoutMs).createGitApp(base(srv.url), {
+            repoUrl: 'https://github.com/o/r.git',
+            branch: 'main',
+            serviceName: 'x',
+          }),
+        ).rejects.toThrow(/uuid/);
+      } finally {
+        await srv.close();
+      }
+    });
+
+    it('createGitApp rejects with the HTTP status on 401 (bad token)', async () => {
+      const srv = await serve((_req, res) => {
+        res.writeHead(401);
+        res.end('unauthorized');
+      });
+      try {
+        await expect(
+          factory.create(timeoutMs).createGitApp(base(srv.url), {
+            repoUrl: 'https://github.com/o/r.git',
+            branch: 'main',
+            serviceName: 'x',
+          }),
+        ).rejects.toThrow(/401/);
+      } finally {
+        await srv.close();
+      }
+    });
+
+    it('deployApp POSTs /applications/{uuid}/deploy and resolves on 200', async () => {
+      let method = '';
+      let path = '';
+      let authHeader: string | undefined;
+      const srv = await serve((req, res) => {
+        method = req.method ?? '';
+        path = req.url ?? '';
+        authHeader = req.headers.authorization;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ deployment_uuid: 'dep-1' }));
+      });
+      try {
+        await expect(
+          factory.create(timeoutMs).deployApp(base(srv.url), 'app-123'),
+        ).resolves.toBeUndefined();
+        expect(method).toBe('POST');
+        expect(path).toBe('/api/v1/applications/app-123/deploy');
+        expect(authHeader).toBe('Bearer tok-deploy');
+      } finally {
+        await srv.close();
+      }
+    });
+
+    it('deployApp rejects on a non-2xx response', async () => {
+      const srv = await serve((_req, res) => {
+        res.writeHead(500);
+        res.end('boom');
+      });
+      try {
+        await expect(
+          factory.create(timeoutMs).deployApp(base(srv.url), 'app-123'),
+        ).rejects.toThrow(/500/);
+      } finally {
+        await srv.close();
+      }
+    });
+
+    it('deploymentStatus GETs the application and returns its raw status', async () => {
+      let path = '';
+      let authHeader: string | undefined;
+      const srv = await serve((req, res) => {
+        path = req.url ?? '';
+        authHeader = req.headers.authorization;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ uuid: 'app-123', status: 'in_progress' }));
+      });
+      try {
+        const out = await factory.create(timeoutMs).deploymentStatus(base(srv.url), 'app-123');
+        expect(out.rawStatus).toBe('in_progress');
+        expect(out.detail).toBeUndefined();
+        expect(path).toBe('/api/v1/applications/app-123');
+        expect(authHeader).toBe('Bearer tok-deploy');
+      } finally {
+        await srv.close();
+      }
+    });
+
+    it('deploymentStatus degrades to unknown (never rejects) on a non-200', async () => {
+      const srv = await serve((_req, res) => {
+        res.writeHead(503);
+        res.end('unavailable');
+      });
+      try {
+        const out = await factory.create(timeoutMs).deploymentStatus(base(srv.url), 'app-123');
+        expect(out.rawStatus).toBe('unknown');
+        expect(out.detail).toContain('503');
+      } finally {
+        await srv.close();
+      }
+    });
+
+    it('refuses deploy ops on a non-Coolify provider (Hestia)', async () => {
+      const hestiaTarget = { ...target, provider: 'HESTIA' as const, baseUrl: 'http://127.0.0.1:1/api/' };
+      await expect(
+        factory.create(timeoutMs).createGitApp(hestiaTarget, {
+          repoUrl: 'https://github.com/o/r.git',
+          branch: 'main',
+          serviceName: 'x',
+        }),
+      ).rejects.toThrow(/Coolify uniquement/);
+      await expect(factory.create(timeoutMs).deployApp(hestiaTarget, 'x')).rejects.toThrow(/Coolify uniquement/);
+      await expect(factory.create(timeoutMs).deploymentStatus(hestiaTarget, 'x')).rejects.toThrow(/Coolify uniquement/);
+    });
+  });
 });

@@ -14,6 +14,7 @@ import { MailModule } from './mail/mail.module';
 import { SupportModule } from './support/support.module';
 import { TicketsModule } from './tickets/tickets.module';
 import { KnowledgeModule } from './knowledge/knowledge.module';
+import { DeploymentsModule } from './deployments/deployments.module';
 import { loadAppConfig } from './config/configuration';
 
 @Module({
@@ -36,6 +37,7 @@ import { loadAppConfig } from './config/configuration';
     SupportModule,
     TicketsModule,
     KnowledgeModule,
+    DeploymentsModule,
   ],
 })
 export class AppModule {}

@@ -55,6 +55,7 @@ model User {
   tickets           Ticket[]
   ticketMessages    TicketMessage[]
   knowledgeArticles KnowledgeArticle[] // articles de base de connaissance (Phase 11)
+  deployments       Deployment[] // déploiements GitHub → Coolify (Phase 10bis)
 
   @@unique([oauthProvider, oauthSubject])
   @@index([email])
@@ -248,6 +249,7 @@ model Server {
   updatedAt DateTime @updatedAt
 
   services Service[] // services this host is assigned to (Phase 5)
+  deployments Deployment[] // déploiements GitHub → Coolify sur ce serveur (Phase 10bis)
 }
 
 // ── Phase 4 — audit journal (ADR-019) ────────────────────────────────────────
@@ -349,7 +351,50 @@ model Service {
   createdAt      DateTime      @default(now())
   updatedAt      DateTime      @updatedAt
 
+  deployments Deployment[] // déploiements GitHub → Coolify de ce service (Phase 10bis)
+
   @@index([subscriptionId])
+}
+
+// ── Phase 10bis — déploiement GitHub → Coolify (Deployment) ──────────────────
+// Ressource PROPRIÉTÉ du client (même pattern que Subscription/Service, ADR-021) :
+// un dépôt GitHub du client est déployé par la plateforme sur le serveur Coolify
+// « actuellement connecté » — celui que l'admin a affecté au Service ACTIVE du
+// client (panelProvider=COOLIFY + panelOk=true). L'ownership est vérifiée dans le
+// service (where userId — un autre client voit 404). `coolifyUuid` est l'UUID de
+// l'application côté Coolify : stocké côté serveur UNIQUEMENT, jamais renvoyé au
+// client (pas d'exposition d'infrastructure, ADR-021). Le statut est pollé par le
+// client (GET /api/client/deployments/:id rafraîchit l'état via l'API Coolify).
+
+enum DeploymentStatus {
+  PENDING
+  DEPLOYING
+  ACTIVE // déploiement terminé avec succès
+  FAILED
+}
+
+model Deployment {
+  id           String           @id @default(cuid())
+  userId       String
+  user         User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  serviceId    String
+  service      Service          @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+  serverId     String?
+  server       Server?          @relation(fields: [serverId], references: [id], onDelete: SetNull)
+  repoFullName String           // "owner/repo" tel que détecté sur GitHub (mode GH lié) ou dérivé de l'URL (mode URL)
+  repoUrl      String? // URL git collée par le client (mode URL 10bis.5) — null en mode GitHub lié
+  buildPack    String? // build pack envoyé à Coolify (nixpacks/dockerfile/…) — jamais exposé en infrastructure
+  appName      String? // nom de l'application côté Coolify (mode URL : modifiable par le client)
+  branch       String           @default("main")
+  coolifyUuid  String? // UUID de l'application Coolify (jamais exposé au client)
+  status       DeploymentStatus @default(PENDING)
+  detail       String?
+  createdAt    DateTime         @default(now())
+  updatedAt    DateTime         @updatedAt
+
+  @@index([userId])
+  @@index([serviceId])
+  @@index([status])
 }
 
 // ── Phase 6 — mail/SMTP configuration (ADR-022) ─────────────────────────────

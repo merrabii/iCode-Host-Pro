@@ -85,6 +85,7 @@ le complète avec les credentials + la vérification d'API.
 - ADR-026 Auto-détection IP/port + accès direct + métriques serveur (above) — 2026-09-02, Phase 9bis.
 - ADR-027 Sécurité, comptes & support (below) — 2026-09-02, Phase 10.
 - ADR-028 Base de connaissance + clés Turnstile admin (below) — 2026-09-02, Phase 11.
+- ADR-030 Déploiement GitHub → Coolify (below) — 2026-09-03, Phase 10bis.
 
 ## ADR-011 — Socle config minimal (Phase 0)
 **Status: APPROVED** (2026-08-30, Phase 0 GO)
@@ -536,6 +537,67 @@ Decision (recommandée, non implémentée) :
   suspension) ne viendra qu'avec des quotas appliqués et sera auditée.
 - **Périmètre NON retenu maintenant** : paiement/facturation, quotas appliqués, jobs
   périodiques, Redis. Aucun code introduit par cet ADR (documentaire).
+
+## ADR-030 — Déploiement GitHub → Coolify (Phase 10bis)
+**Status: IMPLEMENTED** (2026-09-03, plan validé par le propriétaire « go » — consigné, en
+attente de validation live propriétaire avant commit + push).
+Decision:
+- **Auto-détection des repos GitHub** : store `githubTokenEnc` (AES-256-GCM, posé par la
+  Phase 10/ADR-027) → `GET /api/client/github/repos` (Bearer + `X-GitHub-Api-Version:
+  2022-11-28`, `GET /user/repos?per_page=100&sort=updated`) → liste `{fullName, defaultBranch,
+  private, language}`. `POST /api/client/github/link-status` → `{linked, login}`.
+- **Cible de déploiement** : le serveur **Coolify connecté** que l'admin a configuré
+  (`panelProvider=COOLIFY` + `panelOk=true`) et affecté au `Service` ACTIVE du client — « le
+  compte d'hébergement » du client. `POST /api/client/deployments {serviceId, repoFullName,
+  branch}` vérifie `deployEnabled` (SecuritySetting, OFF par défaut) + propriété du repo +
+  service ACTIVE sur serveur Coolify.
+- **Transport** : extension `PanelTransport` (factory, e2e-mockable) — `createGitApp` (`POST
+  /applications/public`, **endpoint CONFIRMÉ contre Coolify 4.1.2 réel** : `/applications/git`
+  n'existe pas sur cette version, 404), `deployApp` (`POST /applications/{uuid}/deploy`),
+  `deploymentStatus` (`GET /applications/{uuid}`, best-effort, ne rejette jamais).
+- **Modèle** `Deployment` (PENDING/DEPLOYING/ACTIVE/FAILED, `detail?`, `coolifyUuid` **jamais
+  exposé** à l'API — cohérent ADR-021). Audit `deploy.create` / `deploy.failed` /
+  `deploy.status`. Rafraîchissement live au `GET /api/client/deployments/:id` quand DEPLOYING.
+- **Exigence opérationnelle documentée** : Coolify exige un **jeton API ROOT / write-scope**
+  pour créer une application (un jeton lecture seule répond 403 « Missing required
+  permissions: write ») — comportement attendu de Coolify, pas un bug du code.
+- **Repos PRIVÉS = follow-up** (déploiement initial : repos publics) via GitHub App Coolify,
+  documenté hors de l'implémentation actuelle.
+- **Périmètre NON retenu maintenant** : GitHub App/private repos, webhooks de statut en
+  temps réel (le polling client reste le canal), rollback automatique.
+
+### ADR-030 ADDENDUM — Mode « URL collée » + détection auto (Phase 10bis.5) — 2026-09-03
+**Status: IMPLEMENTED + verified (unit 280, e2e 149, tsc api+web, web build 19 routes).**
+Décision du propriétaire (demande : « copier-coller le lien de son repo, la détection de
+l'app se fait automatiquement avec possibilité de modifier des choses, déploiement simple ;
+lier GitHub reste une option mais pas la seule ») — réponses AskUserQuestion : détection
+**intelligente**, réglages éditables = **Build pack + Nom de l'app**.
+- **Modèle** : `Deployment` + `repoUrl?`, `buildPack?`, `appName?` (migration 14
+  `init_deployment_url`). `repoFullName` reste l'identité d'affichage (owner/repo en mode GH,
+  segments dérivés de l'URL sinon).
+- **Détection (`GithubService.detectRepo`)** : **ne lève JAMAIS** (best-effort). `sanitizeGitUrl`
+  (http(s) uniquement, trim, fragment/query retirés, **refus hosts privés/réservés — SSRF léger** :
+  localhost, IP littérales, RFC1918/169.254) ; github.com → GET **public SANS token**
+  `/repos/{owner}/{repo}` (default_branch + language) + best-effort `/contents/Dockerfile` →
+  suggestion `dockerfile` ; sinon `suggestBuildPack(language)` (nixpacks par défaut) ; 404/réseau →
+  fallback `main`/nixpacks + `detail`. Quota GitHub unauth (60/h par IP) borné par client
+  (JwtAuthGuard) — non anonyme.
+- **API** : `POST /api/client/deployments/detect {url}` (JwtAuthGuard, `deployEnabled` requis,
+  aucun token GitHub) ; `POST /api/client/deployments` accepte **exactement un** de
+  `repoFullName` (mode GH lié, flow inchangé) ou `repoUrl` (mode URL : branch =
+  `dto.branch ?? détectée ?? 'main'`, buildPack = `dto.buildPack ?? suggéré ?? 'nixpacks'`,
+  appName = `dto.appName ?? service.name` ; skip token/propriété). Les deux → 400.
+- **Transport** : `createGitApp` body `name: appName ?? serviceName`, `build_pack: buildPack ??
+  'nixpacks'`.
+- **Web** : panneau « Déploiements » à 2 onglets — « Dépôt GitHub lié » (si `github.linked`) +
+  « URL d'un dépôt » (toujours dispo) : URL → Détecter → prefill branche/langage/build pack →
+  champs éditables Nom de l'app + Build pack (nixpacks/dockerfile/dockercompose/static) + select
+  Service ACTIVE → Déployer.
+- **Causes racines du « rien ne se passe sur l'espace client »** (relevées en live, à corriger
+  côté configuration par le propriétaire, PAS un bug du code) : `deployEnabled` OFF (aucune ligne
+  `SecuritySetting`) ; aucun `Service` ACTIVE ; jeton API Coolify stocké refusé (403 « You are not
+  allowed to access the API » — token périmé/read-only ⇒ mettre un jeton ROOT/write et re-vérifier
+  le panneau sur `/manager/serveurs`).
 
 # REJECTED
 None recorded in this clean baseline.
