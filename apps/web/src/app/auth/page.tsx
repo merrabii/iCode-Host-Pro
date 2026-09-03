@@ -6,6 +6,8 @@ import { AppShell } from '@/components/app-shell';
 import { useToast } from '@/components/toast';
 import { Button, Field, Input } from '@/components/ui';
 import { Turnstile } from '@/components/turnstile';
+import { brand } from '@/config/brand';
+import { IconCheck, IconServer, IconShield, IconUsers } from '@/components/icons';
 import { roleRank, ROLE_RANK } from '@/lib/session';
 import {
   acceptInvite,
@@ -489,10 +491,47 @@ export default function AuthPage() {
   );
 }
 
+const AUTH_POINTS = [
+  { icon: IconServer, text: 'Déployez depuis GitHub vers votre serveur en un clic' },
+  { icon: IconShield, text: 'Sécurité configurable : Turnstile, OAuth, double authentification' },
+  { icon: IconUsers, text: 'Support escaladable et centre d’aide à jour' },
+];
+
 function Shell({ children }: { children: React.ReactNode }) {
   return (
     <AppShell me={null} nav={[]} bare>
-      <div className="wrap-sm">{children}</div>
+      <div className="auth-split">
+        <aside className="auth-aside">
+          <span className="landing-chip">
+            <span className="landing-chip-dot" />
+            Console d’hébergement
+          </span>
+          <h2 className="auth-aside-title">
+            Tout votre hébergement, <span className="landing-gradient">un seul compte.</span>
+          </h2>
+          <p className="auth-aside-sub">
+            Commandez un service, déployez vos applications et suivez vos serveurs —
+            connectez-vous ou créez votre compte en quelques secondes.
+          </p>
+          <ul className="auth-aside-points">
+            {AUTH_POINTS.map((p) => (
+              <li key={p.text}>
+                <span className="offres-perk-check"><p.icon size={13} /></span>
+                {p.text}
+              </li>
+            ))}
+          </ul>
+          <div className="auth-aside-foot">
+            <span className="pill-tag"><span className="dot" /> {brand.tag}</span>
+            <span className="muted" style={{ fontSize: 12.5 }}>
+              Plateforme sécurisée · données chiffrées au repos
+            </span>
+          </div>
+        </aside>
+        <div className="auth-stage">
+          <div className="auth-card">{children}</div>
+        </div>
+      </div>
     </AppShell>
   );
 }

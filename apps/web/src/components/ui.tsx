@@ -4,21 +4,39 @@ import type { ButtonHTMLAttributes, InputHTMLAttributes, ReactNode, SelectHTMLAt
 import { IconServer, IconShield } from './icons';
 
 /* ---- Bouton ------------------------------------------------------ */
-type BtnVariant = 'primary' | 'secondary' | 'danger';
+type BtnVariant = 'primary' | 'secondary' | 'danger' | 'ghost';
 export function Button({
   variant = 'primary',
   size,
+  busy,
   className,
+  disabled,
+  children,
   ...rest
-}: ButtonHTMLAttributes<HTMLButtonElement> & { variant?: BtnVariant; size?: 'sm' }) {
+}: ButtonHTMLAttributes<HTMLButtonElement> & {
+  variant?: BtnVariant;
+  size?: 'sm';
+  busy?: boolean;
+}) {
   const cls = [
-    variant === 'primary' ? 'btn-primary' : variant === 'danger' ? 'btn-danger' : 'btn-secondary',
+    variant === 'primary'
+      ? 'btn-primary'
+      : variant === 'danger'
+        ? 'btn-danger'
+        : variant === 'ghost'
+          ? 'btn-ghost'
+          : 'btn-secondary',
     size === 'sm' ? 'btn-sm' : '',
     className ?? '',
   ]
     .filter(Boolean)
     .join(' ');
-  return <button type="button" className={cls} {...rest} />;
+  return (
+    <button type="button" className={cls} disabled={disabled || busy} {...rest}>
+      {busy ? <span className="spinner spinner-btn" aria-hidden="true" /> : null}
+      {children}
+    </button>
+  );
 }
 
 /* ---- Badge --------------------------------------------------------- */

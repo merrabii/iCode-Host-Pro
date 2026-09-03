@@ -2,7 +2,7 @@
 
 import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
-import type { ComponentType, ReactNode } from 'react';
+import { useEffect, useState, type ComponentType, type ReactNode } from 'react';
 import { brand, brandInitials } from '@/config/brand';
 import { roleLabel } from '@/lib/session';
 import { IconChevronDown, IconLogOut, IconRefresh, IconUser } from './icons';
@@ -76,6 +76,20 @@ export function AppShell({
   const pathname = usePathname();
   const router = useRouter();
 
+  // Tiroir de navigation mobile (repliée < 900px).
+  const [navOpen, setNavOpen] = useState(false);
+
+  // Verrouille le défilement de la page quand le tiroir est ouvert.
+  useEffect(() => {
+    document.body.classList.toggle('mobile-nav-open', navOpen);
+    return () => document.body.classList.remove('mobile-nav-open');
+  }, [navOpen]);
+
+  // Navigation entrée → referme le tiroir.
+  useEffect(() => {
+    setNavOpen(false);
+  }, [pathname]);
+
   function isActive(href: string): boolean {
     if (href === '/') return pathname === '/';
     return pathname === href || pathname.startsWith(href + '/');
@@ -90,10 +104,42 @@ export function AppShell({
     router.replace('/auth');
   }
 
+  const navTree = (
+    <>
+      {nav.map((s, i) => (
+        <nav key={s.section ?? i} className="nav" aria-label={s.section ?? 'Navigation'}>
+          {s.section && <div className="nav-section-label">{s.section}</div>}
+          {s.items.map((item) => (
+            <Link key={item.href} href={item.href} className={`nav-item${isActive(item.href) ? ' active' : ''}`}>
+              <span className="nav-item-left">
+                <item.icon />
+                <span className="nav-item-label">{item.label}</span>
+              </span>
+              {item.badge && (
+                <span className={`nav-badge${item.badge.tone ? ` ${item.badge.tone}` : ''}`}>{item.badge.text}</span>
+              )}
+            </Link>
+          ))}
+        </nav>
+      ))}
+    </>
+  );
+
   return (
     <>
       <header className="topbar">
         <div className="topbar-left">
+          {!bare && (
+            <button
+              type="button"
+              className={`hamburger${navOpen ? ' open' : ''}`}
+              onClick={() => setNavOpen((o) => !o)}
+              aria-label={navOpen ? 'Fermer la navigation' : 'Ouvrir la navigation'}
+              aria-expanded={navOpen}
+            >
+              <span />
+            </button>
+          )}
           <Link href={brand.home} className="logo-badge" aria-label={brand.name}>
             {brandInitials()}
           </Link>
@@ -159,22 +205,7 @@ export function AppShell({
             <IconChevronDown className="chevron" />
           </div>
 
-          {nav.map((s, i) => (
-            <nav key={s.section ?? i} className="nav" aria-label={s.section ?? 'Navigation'}>
-              {s.section && <div className="nav-section-label">{s.section}</div>}
-              {s.items.map((item) => (
-                <Link key={item.href} href={item.href} className={`nav-item${isActive(item.href) ? ' active' : ''}`}>
-                  <span className="nav-item-left">
-                    <item.icon />
-                    <span className="nav-item-label">{item.label}</span>
-                  </span>
-                  {item.badge && (
-                    <span className={`nav-badge${item.badge.tone ? ` ${item.badge.tone}` : ''}`}>{item.badge.text}</span>
-                  )}
-                </Link>
-              ))}
-            </nav>
-          ))}
+          {navTree}
 
           <button type="button" className="refresh-btn" onClick={() => window.location.reload()}>
             <IconRefresh />
@@ -198,6 +229,44 @@ export function AppShell({
 
         <main className="main">{children}</main>
       </div>}
+
+      {/* ── Tiroir de navigation mobile (repliée < 900px) ─────────────── */}
+      {!bare && (
+        <>
+          <div
+            className={`mobile-nav-overlay${navOpen ? ' open' : ''}`}
+            onClick={() => setNavOpen(false)}
+            aria-hidden
+          />
+          <aside className={`mobile-nav${navOpen ? ' open' : ''}`} aria-label="Navigation mobile">
+            <div className="mobile-nav-head">
+              <span className="logo-badge" aria-hidden>{brandInitials()}</span>
+              <div className="brand-col flex-1">
+                <span className="brand-title">{brand.name}</span>
+                <span className="brand-sub">{brand.sub}</span>
+              </div>
+            </div>
+            {navTree}
+            <button type="button" className="refresh-btn" onClick={() => window.location.reload()}>
+              <IconRefresh />
+              Actualiser
+            </button>
+            <div className="sidebar-foot">
+              <div className="foot-status">
+                <span className="dot" />
+                {footStatus}
+              </div>
+              <div className="foot-user">
+                <IconUser />
+                <div className="flex-1">
+                  <div className="foot-user-name">{me ? me.name || me.email : 'Non connecté'}</div>
+                  {me && <div className="foot-user-mail">{roleLabel(me.role)} — {me.email}</div>}
+                </div>
+              </div>
+            </div>
+          </aside>
+        </>
+      )}
     </>
   );
 }

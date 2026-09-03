@@ -33,8 +33,14 @@ export class PublicAuthConfigController {
     const githubKeys =
       !!this.config.get<string>('githubClientId') &&
       !!this.config.get<string>('githubClientSecret');
+    // Phase 11: la clé SITE gérée par l'admin (SecuritySetting) prime ; le env
+    // reste le fallback pour les déploiements configurés par variable.
+    const siteKey =
+      (await this.settings.getTurnstileSiteKey()) ??
+      this.config.get<string>('turnstileSiteKey') ??
+      '';
     return {
-      turnstileSiteKey: this.config.get<string>('turnstileSiteKey') ?? '',
+      turnstileSiteKey: siteKey,
       oauthGoogleEnabled: (await this.settings.isOAuthGoogleEnabled()) && googleKeys,
       oauthGithubEnabled: (await this.settings.isOAuthGithubEnabled()) && githubKeys,
       selfRegistrationEnabled: await this.settings.isSelfRegistrationEnabled(),

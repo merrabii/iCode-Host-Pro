@@ -1,4 +1,8 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import {
+  ConflictException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { Product, ProductStatus } from '@prisma/client';
 import { AuditService } from '../audit/audit.service';
@@ -68,6 +72,17 @@ export class ProductsService {
 
   async remove(id: string, actor: Actor): Promise<Product> {
     const before = await this.findOne(id);
+    // Un produit référencé par une souscription ne peut pas être supprimé
+    // physiquement (violation de FK → 500 Prisma P2003) : l'admin doit passer
+    // par le statut DISABLED pour le masquer du catalogue.
+    const refs = await this.prisma.subscription.count({
+      where: { productId: id },
+    });
+    if (refs > 0) {
+      throw new ConflictException(
+        'Ce produit est référencé par des souscriptions — passez-le en statut DISABLED pour le retirer du catalogue.',
+      );
+    }
     const product = await this.prisma.product.delete({ where: { id } });
     await this.audit.record({
       actorId: actor.sub,

@@ -2,31 +2,45 @@ import { TurnstileService } from './turnstile.service';
 
 describe('TurnstileService (Cloudflare anti-bot, ADR-027)', () => {
   const mockConfig = { get: jest.fn() };
+  const mockSettings = { getTurnstileSecretKey: jest.fn() };
+  const makeSvc = () => new TurnstileService(mockConfig as never, mockSettings as never);
 
   beforeEach(() => {
     mockConfig.get.mockReset();
     mockConfig.get.mockReturnValue(undefined);
+    mockSettings.getTurnstileSecretKey.mockReset();
+    mockSettings.getTurnstileSecretKey.mockResolvedValue(null);
     global.fetch = jest.fn();
   });
 
   it('degrades safe: without a secret key the check is skipped (verify → true)', async () => {
-    const svc = new TurnstileService(mockConfig as never);
+    const svc = makeSvc();
     expect(svc.isConfigured()).toBe(false);
     await expect(svc.verify('tok', '1.2.3.4')).resolves.toBe(true);
     expect(global.fetch).not.toHaveBeenCalled();
   });
 
-  it('isConfigured true when a secret key is present', () => {
+  it('isConfigured true when a secret key is present (env fallback)', () => {
     mockConfig.get.mockReturnValue('s3cret');
-    const svc = new TurnstileService(mockConfig as never);
+    const svc = makeSvc();
     expect(svc.isConfigured()).toBe(true);
   });
 
-  it('returns true when Cloudflare reports success, forwarding secret/response/remoteip', async () => {
+  it('the DB-stored secret (admin-managed) takes precedence over env', async () => {
+    mockSettings.getTurnstileSecretKey.mockResolvedValue('db-secret');
     mockConfig.get.mockImplementation((k: string) =>
-      k === 'turnstileSecretKey' ? 's3cret' : undefined,
+      k === 'turnstileSecretKey' ? 'env-secret' : undefined,
     );
-    const svc = new TurnstileService(mockConfig as never);
+    const svc = makeSvc();
+    global.fetch = jest.fn().mockResolvedValue({ json: async () => ({ success: true }) });
+    await expect(svc.verify('tok')).resolves.toBe(true);
+    const body = (global.fetch as jest.Mock).mock.calls[0][1].body as URLSearchParams;
+    expect(body.get('secret')).toBe('db-secret');
+  });
+
+  it('returns true when Cloudflare reports success, forwarding secret/response/remoteip', async () => {
+    mockSettings.getTurnstileSecretKey.mockResolvedValue('s3cret');
+    const svc = makeSvc();
     global.fetch = jest.fn().mockResolvedValue({ json: async () => ({ success: true }) });
     await expect(svc.verify('tok', '1.2.3.4')).resolves.toBe(true);
     const body = (global.fetch as jest.Mock).mock.calls[0][1].body as URLSearchParams;
@@ -36,10 +50,8 @@ describe('TurnstileService (Cloudflare anti-bot, ADR-027)', () => {
   });
 
   it('returns false on a failed verification or on any network error', async () => {
-    mockConfig.get.mockImplementation((k: string) =>
-      k === 'turnstileSecretKey' ? 's3cret' : undefined,
-    );
-    const svc = new TurnstileService(mockConfig as never);
+    mockSettings.getTurnstileSecretKey.mockResolvedValue('s3cret');
+    const svc = makeSvc();
     global.fetch = jest.fn().mockResolvedValue({ json: async () => ({ success: false }) });
     await expect(svc.verify('tok')).resolves.toBe(false);
     global.fetch = jest.fn().mockRejectedValue(new Error('network down'));

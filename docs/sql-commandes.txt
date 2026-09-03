@@ -962,3 +962,66 @@ REMARKS FOR FUTURE AI:
   - Phase 10bis : githubTokenEnc alimentera l'appel GET /api/client/github/repos
     + le déploiement Coolify (Deployment + extension PanelTransport).
 ================================================================
+PHASE 11 (2026-09-02) — CLÉS TURNSTILE ADMIN + BASE DE CONNAISSANCE (ADR-028)
+================================================================
+MIGRATIONS: 20260902070000_add_turnstile_keys (11e) + 20260902080000_init_knowledge (12e).
+
+MIGRATION 11 — add_turnstile_keys (SecuritySetting + 2 colonnes):
+  ALTER TABLE "SecuritySetting" ADD COLUMN "turnstileSiteKey" TEXT;
+  ALTER TABLE "SecuritySetting" ADD COLUMN "turnstileSecretEnc" TEXT;
+  -- turnstileSiteKey  = clé PUBLIQUE (servie par GET /api/public/auth-config, widget).
+  -- turnstileSecretEnc= AES-256-GCM (CryptoService) — JAMAIS renvoyé par l'API,
+  --                     seulement turnstileHasSecretKey (booléen). '' = efface les
+  --                     deux -> retour au fallback env. Priorité DB -> env.
+
+MIGRATION 12 — init_knowledge (KnowledgeArticle + 3 enums):
+  CREATE TYPE "KnowledgeAudience" AS ENUM ('ADMIN', 'CLIENT');
+  CREATE TYPE "KnowledgeType"    AS ENUM ('INFORMATIVE', 'TECHNICAL', 'HOWTO');
+  CREATE TYPE "KnowledgeStatus"  AS ENUM ('DRAFT', 'PUBLISHED', 'ARCHIVED');
+
+  CREATE TABLE "KnowledgeArticle" (
+      "id" TEXT NOT NULL,
+      "audience" "KnowledgeAudience" NOT NULL,
+      "type" "KnowledgeType" NOT NULL,
+      "status" "KnowledgeStatus" NOT NULL DEFAULT 'DRAFT',
+      "title" TEXT NOT NULL,
+      "slug" TEXT NOT NULL,               -- unique PAR AUDIENCE
+      "summary" TEXT NOT NULL,
+      "body" TEXT NOT NULL,               -- HTML admin ; sanitizé côté client avant render
+      "category" TEXT NOT NULL,
+      "phase" TEXT,                       -- ex. "10bis", "11" — lien aux phases
+      "tags" TEXT[],
+      "authorId" TEXT,                    -- auteur admin (SetNull)
+      "authorEmail" TEXT NOT NULL,        -- snapshot dénormalisé (audit)
+      "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      "updatedAt" TIMESTAMP(3) NOT NULL,
+      CONSTRAINT "KnowledgeArticle_pkey" PRIMARY KEY ("id")
+  );
+  CREATE UNIQUE INDEX "KnowledgeArticle_audience_slug_key" ON "KnowledgeArticle"("audience", "slug");
+  ALTER TABLE "KnowledgeArticle" ADD CONSTRAINT "KnowledgeArticle_authorId_fkey"
+      FOREIGN KEY ("authorId") REFERENCES "User"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+
+CHECK:
+  - SELECT "audience", "status", COUNT(*) FROM "KnowledgeArticle" GROUP BY "audience", "status";
+    -> le client ne lit QUE audience=CLIENT ET status=PUBLISHED (liste sans body) ;
+       jamais un brouillon ni un article admin.
+  - SELECT "turnstileSiteKey" IS NOT NULL AS site_ok, "turnstileSecretEnc" IS NOT NULL AS secret_ok
+    FROM "SecuritySetting";
+    -> le secret N'EST PAS lisible (chiffré AES) ; l'API ne renvoie que
+       turnstileSiteKey + turnstileHasSecretKey.
+  - SELECT action, COUNT(*) FROM "AuditLog" WHERE action LIKE 'knowledge.%'
+    -> toutes les mutations admin connaissance journalisées.
+
+e2e (zéro réseau) : suites test/{knowledge,e2e + security-settings.e2e-spec (+1 test clés)}
+  -> +4 tests. Total e2e 132/132 (18 suites), unit 223/223 (25 suites).
+
+REMARKS FOR FUTURE AI:
+  - Le SECRET Turnstile (turnstileSecretEnc) n'est JAMAIS renvoyé par l'API ;
+    'GET /api/public/auth-config' ne sert QUE turnstileSiteKey (clé publique du widget).
+  - Priorité de config Turnstile : DB (saisie admin) -> env (fallback).
+  - Un article KnowledgeArticle CLIENT non PUBLISHED, ou un article ADMIN, n'est
+    JAMAIS exposé via /api/client/knowledge (filtre audience+status + 404 sur
+    idOrSlug non publiable). Le HTML est sanitizé côté client (script/iframe/on*/javascript:).
+  - Phase 10bis : githubTokenEnc alimentera l'appel GET /api/client/github/repos
+    + le déploiement Coolify (Deployment + extension PanelTransport).
+================================================================

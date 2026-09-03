@@ -18,7 +18,7 @@ import {
   listMyServices,
   listMySubscriptions,
   listMyTickets,
-  listProducts,
+  listPublicProducts,
   returnFromImpersonation,
   revokeSupportCode,
   type Me,
@@ -105,7 +105,7 @@ export default function ClientPage() {
     async (t: string) => {
       try {
         const [p, s, svc] = await Promise.all([
-          listProducts(t),
+          listPublicProducts(),
           listMySubscriptions(t),
           listMyServices(t),
         ]);

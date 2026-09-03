@@ -758,6 +758,79 @@ Réponse au retour propriétaire : port Coolify non mentionné, IP non auto-dét
 - Docs: DECISIONS.md (ADR-027 APPROVED), CHANGELOG.md (Phase 10), PROJECT_STATUS.md, docs/sql-commandes.txt (Phase 10 DB entry), TASKS.md (cette section), HANDOVER.md.
 - En attente: **validation live propriétaire** (settings sécurité, MFA TOTP+email, OAuth Google/GitHub clés de test, inscription à la commande email+pass/OAuth, liaison de compte, impersonation admin → /client + bandeau + Revenir, code 6 chiffres → L2 lecture seule, tickets L1→L2) → **commit + push Phases 8 + 8bis + 9 + 9bis + 10**.
 
+## 2026-09-02 — 11.0 Turnstile : clés admin saisie/modif (store chiffré + API + UI)
+- Files modified: `apps/api/prisma/schema.prisma` — `SecuritySetting` + `turnstileSiteKey String?` (texte public) + `turnstileSecretEnc String?` (AES-256-GCM). Migration `20260902070000_add_turnstile_keys` → **11 migrations**, in sync.
+- Files modified: `apps/api/src/auth/security/security-settings.service.ts` — `FLAG_KEYS`/`CREATE_DATA` split (les clés Turnstile ne sont pas des flags) ; `getTurnstileSiteKey()`/`getTurnstileSecretKey()` ; `updateSecuritySettings` sauvegarde `turnstileSiteKey` + `turnstileSecretEnc` (chiffré), `''` efface les deux (retour au fallback env) ; `toPublic()` ne renvoie **jamais** le secret (`turnstileHasSecretKey` booléen seulement). DTO `update-security-settings.dto.ts` + `turnstileSecretKey` (write-only, nullable).
+- Files modified: `apps/api/src/auth/turnstile.service.ts` + spec — `isConfiguredAsync()` **DB prioritaire sur env** (priorité demandée par l'admin) ; `turnstile.service.spec.ts` +tests isConfiguredAsync.
+- Files modified: `apps/api/src/auth/public-config.controller.ts` — `GET /api/public/auth-config` sert `turnstileSiteKey` (la clé **publique** pour le widget) — jamais le secret.
+- Files modified: `apps/api/test/security-settings.e2e-spec.ts` — +1 test : clés Turnstile sauvegardées chiffrées, GET ne renvoie jamais le secret, effacement `''`.
+- Files modified: `apps/web/src/app/manager/securite/page.tsx` — panneau « Clés Turnstile » : saisie site key + secret (« laisser vide = inchangé »), bouton Effacer, badges état configuré (DB ou env), note priorité DB. `apps/web/src/lib/api.ts` — `SecuritySettings` + `turnstileSiteKey`/`turnstileHasSecretKey`, `updateSecuritySettings` + `turnstileSecretKey`.
+
+## 2026-09-02 — 11.1 Base de connaissance : modèle + migration + API admin/client
+- Files created: `apps/api/prisma/migrations/20260902080000_init_knowledge/` — modèle `KnowledgeArticle` (`audience ADMIN|CLIENT`, `type INFORMATIVE|TECHNICAL|HOWTO`, `status DRAFT|PUBLISHED|ARCHIVED`, `slug` unique par audience, `summary`, `body` HTML, `category`, `phase`, `tags` String[], `authorEmail`) + enums `KnowledgeAudience`/`KnowledgeType`/`KnowledgeStatus` → **12 migrations**, in sync.
+- Files created: `apps/api/src/knowledge/` — `knowledge.module.ts`, `knowledge.service.ts` (slug auto si vide + collisions `-2`/`-3`, scoping audience), `knowledge.controller.ts` **admin** `GET/POST/PUT/DELETE /api/knowledge` (`@Roles(ADMIN)`, audit `knowledge.*`), `knowledge-client.controller.ts` **client** `GET /api/client/knowledge` (uniquement `CLIENT + PUBLISHED`, liste **sans** `body`), `GET .../categories`, `GET .../:idOrSlug` (brouillon client ou article admin → **jamais exposé**), dto/*, `knowledge.service.spec.ts` (8 unit).
+- Files created: `apps/api/test/knowledge.e2e-spec.ts` — admin CRUD complet, audit, slug auto/collision, client ne voit que PUBLISHED CLIENT, brouillon refusé, 403 non-admin.
+
+## 2026-09-02 — 11.2 Web : /manager/connaissance (admin) + /aide (client)
+- Files created: `apps/web/src/app/manager/connaissance/page.tsx` — onglets Admin/Client, recherche + filtre statut, badges Publié/Brouillon/Archivé, Publier/Dépublier/Supprimer, éditeur drawer (audience/type/statut/slug/catégorie-phase/résumé/HTML/étiquettes).
+- Files created: `apps/web/src/app/aide/page.tsx` — centre d'aide client : héro + recherche + chips catégories, cartes groupées par catégorie, lecteur drawer avec **sanitisation défensive** du HTML (script/iframe/on*/javascript: supprimés avant `dangerouslySetInnerHTML`).
+- Files modified: `apps/web/src/lib/api.ts` — types + helpers knowledge admin (`listKnowledge/getKnowledge/createKnowledge/updateKnowledge/deleteKnowledge`) + client (`listClientKnowledge/getClientKnowledge`).
+
+## 2026-09-02 — 11.3 Refonte design system + pages (conversion, mobile responsive, style app.arumdigital)
+- Files modified: `apps/web/src/app/page.tsx` — landing de conversion (héro « Votre hébergement, piloté depuis un seul endroit » + chip + trust + vitrine produit `landing-showcase` avec fenêtre navigateur + spark bars + 6 cartes fonctionnalités + bandeau stats + CTA final).
+- Files modified: `apps/web/src/app/offres/page.tsx` — catalogue pricing moderne (groupes par type deployment/domain/infrastructure, cartes avec badge Disponible/Indisponible + prix + bouton Commander, bande réassurance 4 items).
+- Files modified: `apps/web/src/app/auth/page.tsx` — mise en page split `.auth-split` (aside valeur de marque : chip, titre gradient, 3 points, foot marque — carte auth à droite, repli < 880 px) ; logique auth intacte.
+- Files modified: `apps/web/src/app/globals.css` — tokens étendus (`--bg-glow-1/2`, `--shadow-soft`/`--shadow-lift`, `--header-blur`/`--header-bg` glass, `--sidebar-bg`, `--ease-spring`, `--radius-hero` 18 px), fond ambiant `background-attachment: fixed`, topbar glass backdrop-filter, `.btn-primary` gradient + glow + press spring, hover lift panneaux/stat-cards, `.main` animation page-in, `.landing*` + `.offres*` + `.auth-split` complets, tiroir mobile (hamburger + `.mobile-nav` drawer + overlay + verrouillage scroll, visible < 900 px), `.stat-icon.cyan`.
+- Files modified: `apps/web/src/components/app-shell.tsx` — `navTree` partagé sidebar/drawer, bouton hamburger animé (aria-expanded), drawer mobile + overlay + fermeture sur navigation, prop `banner` conservée. `apps/web/src/config/brand.ts` — `home` → `/` (logo → landing). `apps/web/src/components/icons.tsx`/`ui.tsx` — retouches mineures compat redesign.
+- **Règles respectées** : tokens `--brand-*` + `config/brand.ts` seuls points de marque (pas de rebrand), design system ADR-023 intouchable, pages converties sans perte de logique.
+
+## 2026-09-02 — 11.4 Validation complète (unit → e2e → tsc → build) + gouvernance
+- Command: `corepack pnpm --filter @icode-host-pro/api test` → **unit 223/223 (25 suites)** PASS (+10 : knowledge 8, security-settings 8 réécrit, turnstile isConfiguredAsync).
+- Command: `corepack pnpm exec jest --config ./test/jest-e2e.json --runInBand` → **e2e 132/132 (18 suites)** PASS sur Postgres réel (+2 : `knowledge` 3 tests, `security-settings` +1 clés Turnstile — non-régression intégrale des 16 suites pré-existantes, dont `GET /api/products` 401, core/client/audit/invitations/mail/server-check/server-panel/Phase 10).
+- Command: `npx tsc --noEmit` apps/api **PASS** ; `npx tsc --noEmit` apps/web **PASS**.
+- Command: `corepack pnpm --filter @icode-host-pro/web build` → **PASS, 18 routes** (dev web arrêté + `.next` purgé avant build — leçon Phase 2).
+- Dev servers relancés : API `:3001` health `/api/health` → `{"status":"ok","database":"ok"}` ; web `:3000` Ready.
+- Docs: CHANGELOG.md (Phase 11), PROJECT_STATUS.md, TASKS.md (cette section), docs/sql-commandes.txt (migrations 11 + 12), HANDOVER.md, DECISIONS.md (ADR-028 si applicable).
+- En attente: **validation live propriétaire** → **commit + push Phase 11** → **Phase 10bis (GitHub → déploiement Coolify)**.
+
+# PHASE 11 (SUITE) — AUDIT RÉEL & CORRECTIONS TECHNIQUES + BASE DE CONNAISSANCE SEEDÉE + DOCS (2026-09-03, directive propriétaire : audit → corrections techniques uniquement → matrice permissions → trafic/quotas + ADR → DESIGN_HANDOVER → tests → rapport final, **NE PAS commiter / NE PAS pousser / NE PAS faire 10bis, attendre validation explicite**)
+
+## 2026-09-03 — 11.5 Audit réel complet (lecture code, zéro invention)
+- Action: audit de bout en bout de la Phase 11 — architecture, modèles (dont `KnowledgeArticle`), routes + guards, `SecuritySettingsService`, rate limiting, checkout intent, produits/souscriptions admin, les 10 pages `/manager` + `/aide` + `/offres` + `/auth`.
+- Verdict: implémentation conforme au plan Phase 11 ; 3 écarts techniques réels corrigés (11.6) ; pas d'écart sécurité sur l'exposition des secrets (`mfaSecretEnc`/`githubTokenEnc`/`apiTokenEnc`/`passwordEnc` jamais renvoyés).
+
+## 2026-09-03 — 11.6 Corrections techniques uniquement (3)
+1. **Delete produit référencé → 409** (`products.service.ts`) : avant suppression physique, `subscription.count({ where: { productId } })` ; si > 0 → `ConflictException` « Ce produit est référencé par des souscriptions — passez-le en statut DISABLED pour le retirer du catalogue. » + spec unit `refuses (409) to delete a product referenced by subscriptions` (mock `subscription.count` ajouté en haut du mock — le fix TS2339 initial passait un objet non typé).
+2. **Espace client sans DRAFT/DISABLED** (`client/page.tsx`) : le catalogue client utilise `listPublicProducts()` au lieu de `listProducts()` (DRAFT/DISABLED filtrés côté API publique ; `GET /api/products` reste authentifié, test core.e2e intact).
+3. **Texte éditeur base de connaissance** (`manager/connaissance/page.tsx`) : alerte alignée sur la réalité — « Publié, visible par tous sur le centre d'aide public (/aide). »
+
+## 2026-09-03 — 11.7 Base de connaissance : seed initial réel (double-audience)
+- Files created: `apps/api/prisma/seed-knowledge.ts` — idempotent (create-if-missing par `[audience, slug]`, ne modifie JAMAIS les articles édités par l'admin), auteur = plus ancien ADMIN ou `seed@icode-host.local` en repli, tout PUBLISHED. Contenu : **23 articles ADMIN** (12 INFORMATIVE récap Phase 1→11 issus de CHANGELOG/DECISIONS réels ; 4 TECHNICAL : architecture-monorepo, permissions-roles, securite-applicative, transport-panels ; 7 HOWTO : configurer-serveur, approuver-souscription, configurer-mail, options-securite, base-connaissance, impersonation, tickets) + **11 articles CLIENT** (catégories Premiers pas / Compte & sécurité / Support).
+- Files modified: `apps/api/package.json` — script `db:seed:knowledge` = `ts-node prisma/seed-knowledge.ts`.
+- Command: `corepack pnpm --filter @icode-host-pro/api db:seed:knowledge` → **34 créé(s), 0 existant(s)** ; re-run → **0 créé(s), 34 existant(s) (non modifiés)** — idempotence prouvée sur la DB réelle `icode-postgres` (12 migrations in sync).
+
+## 2026-09-03 — 11.8 Docs : matrice permissions + trafic/quotas (ADR-029 PROPOSED) + parcours commande + DESIGN_HANDOVER
+- Files created: `docs/permissions-matrix.md` (matrice route→accès réelle : public / any-auth / ADMIN / SUPPORT_L1+/L2+, séparation stricte base de connaissance CLIENT+PUBLISHED sans body, règles transversales impersonation anti-escalade / secrets jamais renvoyés) ; `docs/traffic-quotas.md` (analyse 4 couches mesure/quota/limitation/suspension — `Server.quotaMaxAccounts` existe mais NON enforce, suspension manuelle via `User.isActive` ; recommandation = **ADR-029 PROPOSED**, rien d'implémenté) ; `docs/parcours-commande-publique.md` (audit bout en bout du parcours commander-sans-compte, pièces réelles + écarts documentés sans invention : pas de prix/ordre, intent réutilisable, SUSPENDED visible non commandable, pas d'email de confirmation) ; `docs/design/DESIGN_HANDOVER.md` (point d'entrée du futur agent design — 8 règles impératives, carte fichiers fonctionnel vs présentation, comportements à préserver, périmètre hors-design : pas de page paiement, 10bis, rebrand Code Diali différé).
+- Files modified: `DECISIONS.md` — **ADR-029 — Trafic, quotas & suspension : architecture en 4 couches, Status: PROPOSED** (2026-09-03), volontairement PAS ajouté à la liste APPROVED (en attente de validation propriétaire).
+
+## 2026-09-03 — 11.9 Tests réels (vert sur DB réelle) + correctif isolation e2e
+- Command: `corepack pnpm --filter @icode-host-pro/api test` → **unit 224/224 (25 suites)** PASS (+1 : spec products 409).
+- Command: `corepack pnpm --filter @icode-host-pro/api test:e2e` → **9 échecs pré-existants dans `security-settings` (2) + `oauth` (7)** : suite isolées avec `--runInBand` → PASS (5/5 et 9/9). **Cause racine : clobbering inter-suites** — Postgres partagé + ligne singleton `SecuritySetting` + workers jest parallèles (oauth seed le singleton à `oauthGoogleEnabled:true` pendant que security-settings le reset à false). **Correctif : `apps/api/test/jest-e2e.json` → `"maxWorkers": 1`.** Ré-exécution complète → **e2e 132/132 (18 suites) PASS** sur Postgres réel.
+- Command: `npx tsc --noEmit` apps/api → **PASS** ; apps/web → **PASS**.
+- Command: `corepack pnpm --filter @icode-host-pro/web build` → **PASS (18 routes**, dev arrêté + `.next` purgé avant build — leçon Phase 2).
+- Command: seed knowledge validé sur DB réelle (11.7).
+
+## 2026-09-03 — 11.10 Gouvernance + rapport final
+- Files modified: TASKS.md (cette section), PROJECT_STATUS.md, CHANGELOG.md (Phase 11 — audit & corrections), HANDOVER.md, DECISIONS.md (ADR-029 déjà).
+- **Rapport final structuré présenté au propriétaire (audit, 3 corrections, seed 34 articles, 4 docs, tests verts, ADR-029 PROPOSED, conformité : rien commité / rien poussé / 10bis non touchée).**
+
+## 2026-09-03 — 11.11 Validation propriétaire (✓) + clôture
+- Action: **le propriétaire valide la Phase 11** (« Je valide la Phase 11. Conserve ADR-029 en PROPOSED, ne l'implémente pas maintenant. Tu peux préparer la transition vers la prochaine phase conformément au roadmap, mais ne commence aucune nouvelle phase tant que je ne l'ai pas explicitement validée. »).
+- Décisions du propriétaire : **ADR-029 reste PROPOSED** (non implémenté) ; **transition vers la prochaine phase à préparer mais AUCUNE nouvelle phase commencée sans validation explicite**.
+- Files modified: PROJECT_STATUS.md (Phase 11 ✓), TASKS.md (cette section), CHANGELOG.md, HANDOVER.md.
+- Command: git add + commit (Phase 11 + audit + corrections) → push.
+- **Prochaine étape (roadmap) : Phase 10bis — déploiement GitHub → Coolify — en attente de validation explicite du plan par le propriétaire.**
+
 # COMPLETED HISTORY
 - Clean baseline (Pre-Phase 0): documentation pack + first AI orientation.
 - Phase 0: source tree and config files authored; runtime execution (install, generate, migrate, tests) pending toolchain availability.

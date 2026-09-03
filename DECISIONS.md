@@ -84,6 +84,7 @@ le complète avec les credentials + la vérification d'API.
 - ADR-010 Provider adapters (above) — 2026-09-02, Phase 9.
 - ADR-026 Auto-détection IP/port + accès direct + métriques serveur (above) — 2026-09-02, Phase 9bis.
 - ADR-027 Sécurité, comptes & support (below) — 2026-09-02, Phase 10.
+- ADR-028 Base de connaissance + clés Turnstile admin (below) — 2026-09-02, Phase 11.
 
 ## ADR-011 — Socle config minimal (Phase 0)
 **Status: APPROVED** (2026-08-30, Phase 0 GO)
@@ -476,6 +477,65 @@ Decision:
   = seul chemin de création de compte (avec OAuth via intent). Dépendance ajoutée : `otplib`
   (stub ESM en Jest via `moduleNameMapper` → TOTP accepte tout code 6 chiffres en test ;
   l'OTP email réel reste comparé timing-safe).
+
+## ADR-028 — Base de connaissance + clés Turnstile admin (Phase 11)
+**Status: IMPLEMENTED** (2026-09-02, demande propriétaire) — la base de connaissance
+double-audience et le pilotage **des clés** (pas seulement des toggles) sont consignés ici ;
+la refonte design/UX conversion & mobile relève de l'extension du même ADR-023 (APPROVED).
+Decision:
+- **Clés Turnstile saisies/modifiées par l'admin** (pas de simples boutons) : `SecuritySetting`
+  + `turnstileSiteKey String?` (texte, publique — servie par `GET /api/public/auth-config`)
+  + `turnstileSecretEnc String?` (AES-256-GCM, **write-only** — GET ne renvoie que
+  `turnstileHasSecretKey`). Saisie « laisser vide = inchangé », `''` efface les deux → retour
+  au fallback env. **Priorité DB → env** (`TurnstileService.isConfiguredAsync()`) : ce que
+  l'admin a configuré gagne sur l'environnement. UI `/manager/securite` (panneau Clés +
+  badges état). Invariant : le secret n'est JAMAIS renvoyé par l'API.
+- **Base de connaissance « admin-only »** : `KnowledgeArticle` (audience `ADMIN`,
+  types `INFORMATIVE` — récapitulatifs de phase — `TECHNICAL` — détails techniques — `HOWTO`
+  — guides « comment faire », statut `DRAFT|PUBLISHED|ARCHIVED`, `slug` unique par audience,
+  `summary`, `body` HTML, `category`, `phase`, `tags`, `authorEmail`). CRUD `@Roles(ADMIN)`
+  audit `knowledge.*`, slug auto + collisions `-2`/`-3`. Web `/manager/connaissance`.
+- **Base de connaissance client** (même modèle, audience `CLIENT`) : lectures publiques
+  `GET /api/client/knowledge` — **uniquement** `CLIENT + PUBLISHED`, liste **sans** `body`,
+  `.../categories`, `.../:idOrSlug` (brouillon client ou article admin → jamais exposé) ;
+  l'admin gère entièrement le contenu (créer/publier/archiver pour les clients). Web `/aide`
+  (centre d'aide : héro, recherche, chips catégories, cartes groupées, lecteur drawer avec
+  **sanitisation défensive** du HTML — `script`/`iframe`/`on*`/`javascript:` supprimés avant
+  `dangerouslySetInnerHTML`).
+- **Refonte design/UX conversion & mobile (extension ADR-023, cible app.arumdigital)** :
+  landing `/` vitrine (héro + showcase + 6 cartes + bandeau stats + CTA), `/offres` catalogue
+  pricing, `/auth` split, **tiroir de navigation mobile** (hamburger → drawer + overlay +
+  verrouillage scroll, < 900 px), topbar glass `backdrop-filter`, boutons primary gradient +
+  glow + press spring, hover-lift panneaux, fonds ambiants `--bg-glow-*` + `background-attachment:
+  fixed`, `--radius-hero` 18 px, animation d'entrée `.main`. Marque toujours UNIQUEMENT dans
+  `config/brand.ts` + tokens `--brand-*` (rebrand Code Diali différé). **Logique métier des
+  pages converties inchangée** ; aucune route/DB touchée par la refonte.
+- **Invariants** : le secret Turnstile (`turnstileSecretEnc`) n'est jamais renvoyé ; un
+  article client non PUBLISHED ou un article admin n'est jamais exposé au client ; la
+  sanisation HTML côté client reste **défensive** (le HTML est de l'admin déjà approuvé) ;
+  zéro changement de marque. Migrations 11 (`20260902070000_add_turnstile_keys`) + 12
+  (`20260902080000_init_knowledge`) → 12 migrations in sync.
+
+## ADR-029 — Trafic, quotas & suspension : architecture en 4 couches
+**Status: PROPOSED** (2026-09-03, analyse `docs/traffic-quotas.md` — à valider par le
+propriétaire avant toute implémentation). Distingue **mesure / quota / limitation /
+suspension** et constate l'existant :
+Decision (recommandée, non implémentée) :
+- **Mesure** : aucune mesure de trafic persistée aujourd'hui (seul le journal d'audit
+  enregistre les mutations). Si besoin réel constaté → compteurs par route/IP (inline ou
+  job périodique, dépend d'ADR-007).
+- **Quota** : `Server.quota` existe (ADR-024) mais **n'est pas appliqué** — décider
+  explicitement s'il devient un plafond vérifié (souscriptions/services actifs, volume),
+  ou le retirer du champ d'intention. Aucun quota par utilisateur aujourd'hui.
+- **Limitation** : le rate limiter maison (ADR-027, fenêtre glissante mémoire, par IP) sur
+  login/register/MFA/checkout/support suffit en **mono-instance** ; un store partagé
+  (Redis/table) ne se justifie qu'en multi-réplicas. Budgets actuels documentés dans
+  `docs/traffic-quotas.md`.
+- **Suspension** : reste **manuelle** (`User.isActive`, ADR-018, gardes anti-lockout) tant
+  qu'il n'y a ni facturation ni abus constaté ; l'automatisation (dépassement de quota →
+  suspension) ne viendra qu'avec des quotas appliqués et sera auditée.
+- **Périmètre NON retenu maintenant** : paiement/facturation, quotas appliqués, jobs
+  périodiques, Redis. Aucun code introduit par cet ADR (documentaire).
 
 # REJECTED
 None recorded in this clean baseline.

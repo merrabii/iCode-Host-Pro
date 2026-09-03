@@ -1,5 +1,46 @@
 # CHANGELOG
 
+## Phase 11 (suite) — AUDIT RÉEL & CORRECTIONS TECHNIQUES + BASE DE CONNAISSANCE SEEDÉE + DOCS — 2026-09-03 (directive propriétaire : audit → corrections techniques uniquement → matrice → trafic/quotas + ADR → DESIGN_HANDOVER → tests → rapport final ; **NE PAS commiter / NE PAS pousser / NE PAS faire 10bis, attendre validation explicite**)
+### Fixed
+- **Delete produit référencé → 409** (`products.service.ts` + spec) : `remove` compte les `Subscription` avant suppression physique ; référencé → `ConflictException` « Ce produit est référencé par des souscriptions — passez-le en statut DISABLED pour le retirer du catalogue. » (l'admin garde la solution : DISABLED retire du catalogue sans casser l'historique).
+- **Espace client sans DRAFT/DISABLED** (`client/page.tsx`) : le catalogue client lit `listPublicProducts()` (catalogue public) — cohérence avec `/offres`, `GET /api/products` reste authentifié (non-régression core.e2e).
+- **Isolation e2e (cause racine, 9 échecs pré-existants `security-settings` 2 + `oauth` 7)** : clobbering inter-suites du singleton `SecuritySetting` sur Postgres partagé avec workers jest parallèles (chaque suite passe seule en `--runInBand`). Fix : `"maxWorkers": 1` dans `apps/api/test/jest-e2e.json` → **132/132 (18 suites) verts**.
+### Added
+- **Seed base de connaissance double-audience** : `apps/api/prisma/seed-knowledge.ts` (idempotent create-if-missing par `[audience, slug]`, ne modifie jamais les edits admin, auteur = plus ancien ADMIN, tout PUBLISHED) + script `db:seed:knowledge`. **34 articles** — 23 ADMIN (12 INFORMATIVE récap Phase 1→11, 4 TECHNICAL, 7 HOWTO) + 11 CLIENT (Premiers pas / Compte & sécurité / Support). Validé DB réelle : 34 créés puis 0 au re-run (idempotence).
+- **`docs/permissions-matrix.md`** — matrice route→accès réelle (public / any-auth / ADMIN / SUPPORT_L1+ / L2+), séparation stricte base de connaissance (CLIENT+PUBLISHED, liste sans `body`), règles transversales (impersonation anti-escalade, pas de refresh, secrets jamais renvoyés).
+- **`docs/traffic-quotas.md`** — analyse 4 couches **mesure / quota / limitation / suspension** : `Server.quotaMaxAccounts` existe mais **NON enforce** (les nouvelles souscriptions/services ne sont pas bloquées), suspension manuelle uniquement (`User.isActive`). Recommandation = **ADR-029 PROPOSED**, rien d'implémenté.
+- **`docs/parcours-commande-publique.md`** — audit bout en bout du parcours « commander sans compte » (offres → checkout/intent → inscription email+pass/OAuth → souscription PENDING), pièces réelles + écarts documentés sans invention (pas de prix/ordre, intent réutilisable dans son TTL, SUSPENDED visible non commandable, pas d'email de confirmation de commande).
+- **`docs/design/DESIGN_HANDOVER.md`** — point d'entrée du futur agent design (ex. Gemini) : 8 règles impératives (jamais le fonctionnel, charte ADR-023 intouchable, brand-agnostic, CSS natif, thème double-mode, a11y/responsive, tsc+build obligatoires, pas de réécriture des pages métier), carte des fichiers fonctionnel vs présentation, composants & conventions, comportements à préserver, périmètre hors-design (pas de page paiement, 10bis, rebrand Code Diali différé).
+### Changed
+- `DECISIONS.md` : **ADR-029 — Trafic, quotas & suspension : architecture en 4 couches — PROPOSED 2026-09-03** (volontairement pas dans la liste APPROVED, en attente validation).
+- `manager/connaissance/page.tsx` : alerte éditeur alignée sur la réalité (« Publié, visible par tous sur le centre d'aide public (/aide). »).
+- `apps/api/package.json` : script `db:seed:knowledge`.
+### Verified (2026-09-03)
+- Unit **224/224 (25 suites)** (+1 spec products 409) ; **e2e 132/132 (18 suites)** après `maxWorkers: 1` — verts sur Postgres réel.
+- Typecheck API **PASS** + web **PASS** ; `web build` **PASS** (18 routes ; `.next` purgé + dev arrêté avant build).
+- Seed connaissance exécuté sur la DB réelle : 34 créés puis 0 au re-run (idempotence prouvée).
+### Pending
+- **Phase 11 ✓ VALIDÉE par le propriétaire 2026-09-03** (« Je valide la Phase 11. Conserve ADR-029 en PROPOSED… ne commence aucune nouvelle phase tant que je ne l'ai pas explicitement validée ») → commit + push faits. **Prochaine : Phase 10bis (GitHub → déploiement Coolify)** — plan à présenter, non commencée sans validation explicite. · ADR-029 conservé PROPOSED (si validé plus tard : enforcement des quotas + politique de suspension).
+
+## Phase 11 — CLÉS TURNSTILE ADMIN + BASE DE CONNAISSANCE + REFONTE DESIGN/UX (CONVERSION & MOBILE) — IMPLEMENTED 2026-09-02
+### Added
+- **Turnstile piloté par l'admin (saisie/modif des clés)** : `SecuritySetting` + `turnstileSiteKey` (texte, public) + `turnstileSecretEnc` (AES-256-GCM, write-only). `PUT /api/admin/security` sauvegarde les deux clés, `GET` ne renvoie **jamais** le secret (`turnstileHasSecretKey` seulement), `''` efface les deux (retour au fallback env). `GET /api/public/auth-config` sert la **site key** au widget, jamais le secret. `TurnstileService.isConfiguredAsync()` priorité **DB → env**. Page `/manager/securite` : panneau « Clés Turnstile » (site key + secret « laisser vide = inchangé / Effacer ») + badges état configuré + note priorité DB.
+- **Base de connaissance double-audience** : modèle `KnowledgeArticle` (`audience ADMIN|CLIENT`, `type INFORMATIVE|TECHNICAL|HOWTO`, `status DRAFT|PUBLISHED|ARCHIVED`, `slug` unique par audience, `summary`, `body` HTML, `category`, `phase`, `tags`, `authorEmail` dénormalisé). **Admin only** (`@Roles(ADMIN)` `GET/POST/PUT/DELETE /api/knowledge`, audit `knowledge.*`, slug auto si vide, collisions `-2`/`-3`) — **client public** (`GET /api/client/knowledge` : **uniquement** `CLIENT + PUBLISHED`, liste SANS `body` ; `GET .../categories` ; `GET .../:idOrSlug` — un brouillon client ou un article admin → **jamais exposé**).
+- **Pages web** : `/manager/connaissance` (admin : onglets Admin/Client, recherche, filtre statut, badges Publié/Brouillon/Archivé, Publier/Dépublier, éditeur drawer audience/type/statut/slug/catégorie-phase/résumé/HTML/étiquettes) · **`/aide`** (centre d'aide client : héro + recherche + chips catégories, cartes groupées, lecteur drawer avec **sanitisation défensive** du HTML — script/iframe/on*/javascript: supprimés avant `dangerouslySetInnerHTML`).
+- **Refonte design system & conversion (ADR-023 étendu)** : landing **`/`** (héro « Votre hébergement, piloté depuis un seul endroit » + vitrine produit + 6 cartes fonctionnalités + bandeau stats + CTA) · **`/offres`** réécrit en catalogue pricing (cartes par type, badge Disponible, bouton Commander plein largeur, bande de réassurance) · **`/auth`** mise en page split (valeur de marque à gauche, carte à droite, repli mobile) · **shell mobile** : tiroir de navigation (hamburger → drawer + overlay, verrouillage scroll, fermeture sur navigation) sous 900 px, sidebar masquée · **topbar glass** (`backdrop-filter` blur + saturate), boutons primary gradient + glow + press spring, panneaux/stat-cards avec `--shadow-soft`/`--shadow-lift` + hover lift, fonds ambiants `--bg-glow-1/2`, `--radius-hero` 18 px, animation d'entrée `.main`.
+### Changed
+- `schema.prisma` : `SecuritySetting` + `turnstileSiteKey String?`/`turnstileSecretEnc String?` (migration 11 `add_turnstile_keys`) ; nouveau modèle `KnowledgeArticle` + enums `KnowledgeAudience`/`KnowledgeType`/`KnowledgeStatus` (migration 12 `init_knowledge`).
+- `brand.ts` : `home` → `/` (la landing de conversion remplace la page diagnostic).
+- `globals.css` : tokens étendus (glass, ombres, glows, rayons), landing + offres + auth-split + drawer mobile + `.stat-icon.cyan`.
+- `app-shell.tsx` : `navTree` partagé sidebar/drawer mobile, hamburger, overlay, prop `banner` conservée.
+- `lib/api.ts` : `SecuritySettings` + `turnstileSiteKey`/`turnstileHasSecretKey`, `updateSecuritySettings` + `turnstileSecretKey` ; types + helpers knowledge (admin + client).
+### Verified (2026-09-02)
+- Unit **223/223 (25 suites)** (+10 : knowledge.service 8, security-settings 8 réécrit, turnstile isConfiguredAsync) ; **e2e 132/132 (18 suites)** (+2 : `knowledge` 3, `security-settings` +1 test clés) — verts sur Postgres réel.
+- Typecheck API **PASS** + web **PASS** ; `web build` **PASS** (18 routes ; `.next` purgé + dev arrêté avant build).
+- Dev servers relancés : API `:3001` health ok + web `:3000` Ready.
+### Pending
+- **VALIDÉE par le propriétaire 2026-09-03 ✓** — commit + push faits. Enchaînement : **Phase 10bis (GitHub → déploiement Coolify)**, plan à présenter, non commencée sans validation explicite.
+
 ## Phase 10 — SÉCURITÉ, COMPTES & SUPPORT (ADR-027) — IMPLEMENTED 2026-09-02
 ### Added
 - **Feature-flags sécurité admin (tout NON obligatoire, défaut OFF)** : singleton `SecuritySetting` (migration 10 `init_security_support`) — `turnstileEnabled`, `oauthGoogleEnabled`, `oauthGithubEnabled`, `mfaRequiredForAdmins`, `selfRegistrationEnabled`, `deployEnabled`. `GET/PUT /api/admin/security` (ADMIN only, audit `security.settings.update`), page web **`/manager/securite`** (toggles + état des clés env sans les exposer). Enforcement live : Turnstile si flag+clé, OAuth refusé par le backend si désactivé, MFA admin forcée au login si `mfaRequiredForAdmins`, inscription à la commande fermée (403) si `selfRegistrationEnabled` faux.

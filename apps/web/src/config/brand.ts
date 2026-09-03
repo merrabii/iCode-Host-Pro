@@ -10,8 +10,8 @@ export const brand = {
   sub: 'Self-hosted hosting control plane',
   /** Tag de pilule (ex. 'CLOUD'). null = aucun. Frappé de la marque librement. */
   tag: 'CLOUD' as string | null,
-  /** Lien de la "home" (logo clickable). */
-  home: '/auth',
+  /** Lien de la "home" (logo clickable) — la landing page de conversion est sur /. */
+  home: '/',
 };
 
 /** Initiales affichées dans le logo (tile) : 1re lettre des 2 premiers mots. */

@@ -673,10 +673,14 @@ export const escalateTicket = (t: string, id: string, to: string) =>
 export const updateTicketStatus = (t: string, id: string, status: string) =>
   apiJson(`/api/tickets/${id}/status`, t, { method: 'PATCH', body: JSON.stringify({ status }) });
 
-// ── Admin security settings ─────────────────────────────────────────────────
+// ── Admin security settings (Phase 11: Turnstile keys admin-managed, secret never returned) ─
 export interface SecuritySettings {
   id: string | null;
   turnstileEnabled: boolean;
+  /** Clé SITE publique Turnstile ; null = non configurée. */
+  turnstileSiteKey: string | null;
+  /** Seul l'état de la SECRET est renvoyé (write-only, AES-256-GCM). */
+  turnstileHasSecretKey: boolean;
   oauthGoogleEnabled: boolean;
   oauthGithubEnabled: boolean;
   mfaRequiredForAdmins: boolean;
@@ -686,8 +690,105 @@ export interface SecuritySettings {
   updatedAt: string | null;
 }
 export const getSecuritySettings = (t: string) => apiJson('/api/admin/security', t);
-export const updateSecuritySettings = (t: string, dto: Partial<SecuritySettings>) =>
-  apiJson('/api/admin/security', t, { method: 'PUT', body: JSON.stringify(dto) });
+export const updateSecuritySettings = (
+  t: string,
+  dto: Partial<SecuritySettings> & { turnstileSiteKey?: string; turnstileSecretKey?: string },
+) => apiJson('/api/admin/security', t, { method: 'PUT', body: JSON.stringify(dto) });
+
+// ── Base de connaissance (Phase 11) ────────────────────────────────────────
+export type KnowledgeAudience = 'ADMIN' | 'CLIENT';
+export type KnowledgeType = 'INFORMATIVE' | 'TECHNICAL' | 'HOWTO';
+export type KnowledgeStatus = 'DRAFT' | 'PUBLISHED' | 'ARCHIVED';
+
+export interface KnowledgeArticle {
+  id: string;
+  audience: KnowledgeAudience;
+  type: KnowledgeType;
+  status: KnowledgeStatus;
+  title: string;
+  slug: string;
+  summary?: string | null;
+  body: string;
+  category?: string | null;
+  phase?: string | null;
+  tags: string[];
+  authorEmail: string;
+  author?: { id: string; email: string; name?: string | null } | null;
+  createdAt: string;
+  updatedAt: string;
+  publishedAt?: string | null;
+}
+
+export interface KnowledgeArticleSummary {
+  id: string;
+  type: KnowledgeType;
+  title: string;
+  slug: string;
+  summary?: string | null;
+  category?: string | null;
+  tags: string[];
+  publishedAt?: string | null;
+}
+
+export type KnowledgeArticleInput = {
+  audience?: KnowledgeAudience;
+  type?: KnowledgeType;
+  status?: KnowledgeStatus;
+  title?: string;
+  slug?: string;
+  summary?: string;
+  body?: string;
+  category?: string;
+  phase?: string;
+  tags?: string[];
+};
+
+// Admin (CRUD complet, les deux audiences)
+export const listKnowledgeArticles = (t: string, qs = '') =>
+  apiJson(`/api/knowledge${qs}`, t);
+export const getKnowledgeArticle = (t: string, id: string) =>
+  apiJson(`/api/knowledge/${id}`, t);
+export const createKnowledgeArticle = (t: string, dto: KnowledgeArticleInput) =>
+  apiJson('/api/knowledge', t, { method: 'POST', body: JSON.stringify(dto) });
+export const updateKnowledgeArticle = (t: string, id: string, dto: KnowledgeArticleInput) =>
+  apiJson(`/api/knowledge/${id}`, t, { method: 'PUT', body: JSON.stringify(dto) });
+export const deleteKnowledgeArticle = (t: string, id: string) =>
+  apiJson(`/api/knowledge/${id}`, t, { method: 'DELETE' });
+
+// Client (public — PUBLISHED uniquement)
+export async function listClientKnowledge(category?: string, q?: string): Promise<ApiResult> {
+  const qs = new URLSearchParams();
+  if (category) qs.set('category', category);
+  if (q) qs.set('q', q);
+  const url = `/api/client/knowledge${qs.size ? `?${qs}` : ''}`;
+  try {
+    const res = await fetch(url);
+    let data: unknown = null;
+    try { data = await res.json(); } catch { /* non-JSON */ }
+    return { ok: res.ok, status: res.status, data };
+  } catch (e) {
+    return { ok: false, status: 0, data: { message: String(e) } };
+  }
+}
+export async function getClientKnowledge(idOrSlug: string): Promise<ApiResult> {
+  try {
+    const res = await fetch(`/api/client/knowledge/${encodeURIComponent(idOrSlug)}`);
+    let data: unknown = null;
+    try { data = await res.json(); } catch { /* non-JSON */ }
+    return { ok: res.ok, status: res.status, data };
+  } catch (e) {
+    return { ok: false, status: 0, data: { message: String(e) } };
+  }
+}
+export async function listClientKnowledgeCategories(): Promise<string[]> {
+  try {
+    const res = await fetch('/api/client/knowledge/categories');
+    if (!res.ok) return [];
+    return (await res.json()) as string[];
+  } catch {
+    return [];
+  }
+}
 
 // ── Admin impersonation + recovery ──────────────────────────────────────────
 export const adminImpersonate = (t: string, id: string) =>

@@ -13,6 +13,7 @@ import { SubscriptionsModule } from './subscriptions/subscriptions.module';
 import { MailModule } from './mail/mail.module';
 import { SupportModule } from './support/support.module';
 import { TicketsModule } from './tickets/tickets.module';
+import { KnowledgeModule } from './knowledge/knowledge.module';
 import { loadAppConfig } from './config/configuration';
 
 @Module({
@@ -34,6 +35,7 @@ import { loadAppConfig } from './config/configuration';
     MailModule,
     SupportModule,
     TicketsModule,
+    KnowledgeModule,
   ],
 })
 export class AppModule {}

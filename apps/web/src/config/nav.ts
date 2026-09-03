@@ -1,11 +1,13 @@
 import type { NavSection } from '@/components/app-shell';
 import {
+  IconBook,
   IconBox,
   IconBoxes,
   IconFileText,
   IconGlobe,
   IconGrid,
   IconKey,
+  IconLifeBuoy,
   IconMail,
   IconServer,
   IconShield,
@@ -32,6 +34,7 @@ export const ADMIN_NAV: NavSection[] = [
     items: [
       { label: 'Sécurité', href: '/manager/securite', icon: IconShield },
       { label: 'Support', href: '/manager/support', icon: IconUsers },
+      { label: 'Base de connaissance', href: '/manager/connaissance', icon: IconBook },
     ],
   },
   {
@@ -65,6 +68,7 @@ export const CLIENT_NAV: NavSection[] = [
     items: [
       { label: 'Mes services', href: '/client', icon: IconServer },
       { label: 'Mon profil', href: '/profil', icon: IconKey },
+      { label: 'Centre d’aide', href: '/aide', icon: IconLifeBuoy },
     ],
   },
   {

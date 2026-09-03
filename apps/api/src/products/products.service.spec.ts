@@ -1,4 +1,4 @@
-import { NotFoundException } from '@nestjs/common';
+import { ConflictException, NotFoundException } from '@nestjs/common';
 import { ProductsService } from './products.service';
 
 describe('ProductsService', () => {
@@ -11,6 +11,7 @@ describe('ProductsService', () => {
       update: jest.fn(),
       delete: jest.fn(),
     },
+    subscription: { count: jest.fn() },
   };
   const mockAudit = { record: jest.fn() };
   const actor = { sub: 'admin', email: 'admin@example.com' };
@@ -54,11 +55,20 @@ describe('ProductsService', () => {
 
   it('deletes an existing product and journals the delete', async () => {
     mockPrisma.product.findUnique.mockResolvedValue({ id: '1' });
+    mockPrisma.subscription.count.mockResolvedValue(0);
     mockPrisma.product.delete.mockResolvedValue({ id: '1' });
     await expect(service.remove('1', actor)).resolves.toEqual({ id: '1' });
     expect(mockPrisma.product.delete).toHaveBeenCalledWith({ where: { id: '1' } });
     expect(mockAudit.record).toHaveBeenCalledWith(
       expect.objectContaining({ action: 'product.delete', actorId: 'admin', resourceId: '1' }),
     );
+  });
+
+  it('refuses (409) to delete a product referenced by subscriptions', async () => {
+    mockPrisma.product.findUnique.mockResolvedValue({ id: '1' });
+    mockPrisma.subscription.count.mockResolvedValue(2);
+    await expect(service.remove('1', actor)).rejects.toBeInstanceOf(ConflictException);
+    expect(mockPrisma.product.delete).not.toHaveBeenCalled();
+    expect(mockAudit.record).not.toHaveBeenCalled();
   });
 });

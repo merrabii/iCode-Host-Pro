@@ -24,19 +24,19 @@ enum Role {
 }
 
 model User {
-  id           String         @id @default(cuid())
-  email        String         @unique
+  id           String   @id @default(cuid())
+  email        String   @unique
   passwordHash String
   name         String?
-  role         Role           @default(USER)
-  isActive     Boolean        @default(true)
-  createdAt    DateTime       @default(now())
-  updatedAt    DateTime       @updatedAt
+  role         Role     @default(USER)
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
 
   refreshTokens RefreshToken[]
-  auditLogs     AuditLog[]      // audit entries this user performed (Phase 4)
-  subscriptions Subscription[]  // client-owned subscriptions (Phase 5)
-  issuedInvites Invitation[]    // invitations this admin issued (Phase 5)
+  auditLogs     AuditLog[] // audit entries this user performed (Phase 4)
+  subscriptions Subscription[] // client-owned subscriptions (Phase 5)
+  issuedInvites Invitation[] // invitations this admin issued (Phase 5)
 
   // ── Phase 10 (ADR-027): MFA + OAuth linking ───────────────────────────────
   // mfaSecretEnc: TOTP secret, AES-256-GCM at rest (CryptoService) — NEVER
@@ -45,15 +45,16 @@ model User {
   // unique so one social identity can never be attached to two accounts.
   // githubTokenEnc: GitHub OAuth access token, AES-256-GCM at rest, used by
   // Phase 10bis (repo auto-detection + Coolify deploy) — also never returned.
-  mfaSecretEnc    String?
-  mfaEnabled      Boolean  @default(false)
-  oauthProvider   String?
-  oauthSubject    String?
-  githubTokenEnc  String?
+  mfaSecretEnc   String?
+  mfaEnabled     Boolean @default(false)
+  oauthProvider  String?
+  oauthSubject   String?
+  githubTokenEnc String?
 
-  supportCodes   SupportCode[]
-  tickets        Ticket[]
-  ticketMessages TicketMessage[]
+  supportCodes      SupportCode[]
+  tickets           Ticket[]
+  ticketMessages    TicketMessage[]
+  knowledgeArticles KnowledgeArticle[] // articles de base de connaissance (Phase 11)
 
   @@unique([oauthProvider, oauthSubject])
   @@index([email])
@@ -63,15 +64,20 @@ model User {
 // as MailSetting). EVERY security option stays NON-mandatory: the admin turns
 // each on/off to strengthen or relax security. Defaults are all OFF.
 model SecuritySetting {
-  id                   String   @id @default(cuid())
-  turnstileEnabled     Boolean  @default(false)
-  oauthGoogleEnabled   Boolean  @default(false)
-  oauthGithubEnabled   Boolean  @default(false)
-  mfaRequiredForAdmins Boolean  @default(false)
-  selfRegistrationEnabled Boolean @default(false) // création de compte à la commande
-  deployEnabled        Boolean  @default(false) // Phase 10bis GitHub → Coolify
-  createdAt            DateTime @default(now())
-  updatedAt            DateTime @updatedAt
+  id                      String   @id @default(cuid())
+  turnstileEnabled        Boolean  @default(false)
+  // Phase 11 (demande propriétaire) : l'admin saisit/modifie les clés Turnstile
+  // dans l'UI (/manager/securite) — la clé site est PUBLIQUE (côté widget), la
+  // clé secret est chiffrée AES-256-GCM au repos (jamais exposée, hasSecretKey).
+  turnstileSiteKey        String? // site key publique (widget client)
+  turnstileSecretEnc      String? // secret key chiffrée (siteverify serveur)
+  oauthGoogleEnabled      Boolean  @default(false)
+  oauthGithubEnabled      Boolean  @default(false)
+  mfaRequiredForAdmins    Boolean  @default(false)
+  selfRegistrationEnabled Boolean  @default(false) // création de compte à la commande
+  deployEnabled           Boolean  @default(false) // Phase 10bis GitHub → Coolify
+  createdAt               DateTime @default(now())
+  updatedAt               DateTime @updatedAt
 }
 
 // Phase 10 (ADR-027): client-generated 6-digit support access code. The raw
@@ -79,14 +85,14 @@ model SecuritySetting {
 // (`codeHash`). One active code per client (generation revokes the previous in
 // a $transaction). 5 wrong attempts auto-lock (revokedAt).
 model SupportCode {
-  id        String   @id @default(cuid())
+  id        String    @id @default(cuid())
   userId    String
-  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
   codeHash  String
   expiresAt DateTime
-  attempts  Int      @default(0)
+  attempts  Int       @default(0)
   revokedAt DateTime?
-  createdAt DateTime @default(now())
+  createdAt DateTime  @default(now())
 
   @@index([userId])
 }
@@ -197,20 +203,20 @@ model Product {
 }
 
 model Server {
-  id        String       @id @default(cuid())
-  name      String       @unique
-  hostname  String
-  status    ServerStatus @default(UNKNOWN)
+  id       String       @id @default(cuid())
+  name     String       @unique
+  hostname String
+  status   ServerStatus @default(UNKNOWN)
 
   // Détails d'infrastructure (ADR-024) — affichés/édités sur /manager/serveurs,
   // alimentés plus tard par la vraie connexion aux serveurs (ADR-007/010).
-  ipAddress       String?             // adresse IP publique/privée
-  port            Int?                // port de gestion (SSH/API)
-  provider        String?             // fournisseur (Hetzner, OVH, VPS…)
-  region          String?             // région / localisation (ex. fra1, paris)
-  quotaMaxAccounts Int?               // quota max de comptes hébergés
-  strictTls       Boolean             @default(true) // vérifier strictement les certificats TLS des requêtes API
-  panelProvider   ServerPanelProvider @default(NONE) // adaptateur de panneau serveur
+  ipAddress        String? // adresse IP publique/privée
+  port             Int? // port de gestion (SSH/API)
+  provider         String? // fournisseur (Hetzner, OVH, VPS…)
+  region           String? // région / localisation (ex. fra1, paris)
+  quotaMaxAccounts Int? // quota max de comptes hébergés
+  strictTls        Boolean             @default(true) // vérifier strictement les certificats TLS des requêtes API
+  panelProvider    ServerPanelProvider @default(NONE) // adaptateur de panneau serveur
 
   // Sonde de connectivité réelle (Phase 8, ADR-025) — alimentés par
   // POST /api/servers/:id/check. null = jamais sondé ; le statut reste piloté
@@ -233,13 +239,13 @@ model Server {
   // Métriques annoncées du serveur (Phase 9bis) — auto-détectées via l'API du
   // panneau quand c'est possible (Hestia `sysinfo`), sinon saisies manuellement
   // par l'admin (détails impossibles à récupérer => champ libre). null = inconnu.
-  ramMb          Int?    // RAM totale (Mo)
-  cpuCores       Int?    // nombre de cœurs CPU
-  diskGb         Int?    // disque total (Go)
+  ramMb          Int? // RAM totale (Mo)
+  cpuCores       Int? // nombre de cœurs CPU
+  diskGb         Int? // disque total (Go)
   bandwidthLimit String? // limite de bande passante (label libre, ex. "2 To / mois")
 
-  createdAt DateTime     @default(now())
-  updatedAt DateTime     @updatedAt
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   services Service[] // services this host is assigned to (Phase 5)
 }
@@ -276,15 +282,15 @@ model AuditLog {
 // admin's pending invites survive.
 
 model Invitation {
-  id        String   @id @default(cuid())
+  id        String    @id @default(cuid())
   email     String
-  tokenHash String   @unique // sha256 of the raw one-time token
+  tokenHash String    @unique // sha256 of the raw one-time token
   issuerId  String?
-  issuer    User?    @relation(fields: [issuerId], references: [id], onDelete: SetNull)
+  issuer    User?     @relation(fields: [issuerId], references: [id], onDelete: SetNull)
   expiresAt DateTime
   usedAt    DateTime?
   revokedAt DateTime?
-  createdAt DateTime @default(now())
+  createdAt DateTime  @default(now())
 
   @@index([email])
 }
@@ -356,15 +362,68 @@ model Service {
 // ENCRYPTION_KEY) — it is NEVER returned by the API (only `hasPassword`).
 
 model MailSetting {
-  id           String   @id @default(cuid())
-  enabled      Boolean  @default(false)
-  host         String
-  port         Int      @default(587)
-  secure       Boolean  @default(false) // true = implicit TLS (465), false = STARTTLS (587)
-  user         String?
-  passwordEnc  String?
-  fromEmail    String
-  fromName     String?
-  createdAt    DateTime @default(now())
-  updatedAt    DateTime @updatedAt
+  id          String   @id @default(cuid())
+  enabled     Boolean  @default(false)
+  host        String
+  port        Int      @default(587)
+  secure      Boolean  @default(false) // true = implicit TLS (465), false = STARTTLS (587)
+  user        String?
+  passwordEnc String?
+  fromEmail   String
+  fromName    String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+// ── Phase 11 — base de connaissance (KnowledgeArticle) ──────────────────────
+// UNE table pour les DEUX bases demandées par le propriétaire :
+//  - `audience = ADMIN` : base "Admin only" — articles INFORMATIF (récap des
+//    phases effectuées, champ `phase` lié), TECHNIQUE (détails d'implémentation)
+//    et HOWTO (comment utiliser les options du système) — jamais servis au client.
+//  - `audience = CLIENT` : base accessible au client (/aide) — articles de
+//    support / explication des options, le tout géré et publié par l'admin
+//    (statut DRAFT → PUBLISHED → ARCHIVED ; seul PUBLISHED est servi).
+// `body` est du HTML (sanitisé à l'affichage), `summary` un extrait en clair.
+// `slug` est unique par audience. L'API n'expose jamais un article non-PUBLISHED
+// côté client ; côté admin, tout est visible.
+
+enum KnowledgeAudience {
+  ADMIN // base interne admin : informative / technique / howto
+  CLIENT // base publique /aide : support + explication des options
+}
+
+enum KnowledgeType {
+  INFORMATIVE // récap des phases effectuées (ADMIN)
+  TECHNICAL // détails techniques du projet (ADMIN)
+  HOWTO // guide "comment faire" (ADMIN) — et support (CLIENT)
+}
+
+enum KnowledgeStatus {
+  DRAFT
+  PUBLISHED
+  ARCHIVED
+}
+
+model KnowledgeArticle {
+  id          String            @id @default(cuid())
+  audience    KnowledgeAudience
+  type        KnowledgeType
+  status      KnowledgeStatus   @default(DRAFT)
+  title       String
+  slug        String
+  summary     String?
+  body        String // HTML
+  category    String? // catégorie client (ex. "Prise en main", "Facturation") — ADMIN: phase ou domaine
+  phase       String? // ex. "Phase 10" — lié à un article INFORMATIF
+  tags        String[]          @default([]) // étiquettes libres (recherche)
+  authorId    String?
+  author      User?             @relation(fields: [authorId], references: [id], onDelete: SetNull)
+  authorEmail String // dénormalisé (survit à la suppression de l'auteur)
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+  publishedAt DateTime?
+
+  @@unique([audience, slug])
+  @@index([audience, status])
+  @@index([audience, category])
 }

@@ -116,6 +116,12 @@ export const IconChevronDown = ({ size = 16, className }: IconProps) => (
   </svg>
 );
 
+export const IconChevronRight = ({ size = 16, className }: IconProps) => (
+  <svg {...base(size)} className={className} data-icon="chevron-right">
+    <path d="m9 6 6 6-6 6" />
+  </svg>
+);
+
 export const IconSun = ({ size = 16, className }: IconProps) => (
   <svg {...base(size)} className={className} data-icon="sun">
     <circle cx="12" cy="12" r="4" />
@@ -222,5 +228,30 @@ export const IconTrash = ({ size = 16, className }: IconProps) => (
     <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
     <path d="M10 11v6" />
     <path d="M14 11v6" />
+  </svg>
+);
+
+export const IconBook = ({ size = 16, className }: IconProps) => (
+  <svg {...base(size)} className={className} data-icon="book">
+    <path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1 0-5H20" />
+  </svg>
+);
+
+export const IconLifeBuoy = ({ size = 16, className }: IconProps) => (
+  <svg {...base(size)} className={className} data-icon="life-buoy">
+    <circle cx="12" cy="12" r="10" />
+    <circle cx="12" cy="12" r="4" />
+    <path d="m4.93 4.93 4.24 4.24" />
+    <path d="m14.83 14.83 4.24 4.24" />
+    <path d="m19.07 4.93-4.24 4.24" />
+    <path d="m9.17 14.83-4.24 4.24" />
+  </svg>
+);
+
+export const IconLayers = ({ size = 16, className }: IconProps) => (
+  <svg {...base(size)} className={className} data-icon="layers">
+    <path d="m12.83 2.18a2 2 0 0 0-1.66 0L2.6 6.08a1 1 0 0 0 0 1.83l8.58 3.91a2 2 0 0 0 1.66 0l8.58-3.9a1 1 0 0 0 0-1.83Z" />
+    <path d="m22 17.65-9.17 4.16a2 2 0 0 1-1.66 0L2 17.65" />
+    <path d="m22 12.65-9.17 4.16a2 2 0 0 1-1.66 0L2 12.65" />
   </svg>
 );
