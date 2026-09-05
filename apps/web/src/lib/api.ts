@@ -187,6 +187,7 @@ export interface ProductRef {
   name: string;
   kind?: string;
   status?: string;
+  pack?: PackMin | null;
 }
 export interface Subscription {
   id: string;
@@ -288,6 +289,9 @@ export interface ServerAdmin {
   panelVerifiedAt?: string | null;
   panelOk?: boolean | null;
   panelDetail?: string | null;
+  // Cibles Coolify (Phase 12) : projet + serveur de déploiement (uuid).
+  coolifyProjectUuid?: string | null;
+  coolifyServerUuid?: string | null;
   // Métriques annoncées (Phase 9bis) — auto-détectées via le panneau quand c'est
   // possible (Hestia sysinfo), sinon saisies manuellement ; null = inconnu.
   ramMb?: number | null;
@@ -331,7 +335,63 @@ export interface ProductAdmin {
   status: string;
   createdAt: string;
   updatedAt: string;
+  // Phase 12 (Catalog) — classification + ressources.
+  categoryId?: string | null;
+  packId?: string | null;
+  category?: { id: string; name: string } | null;
+  pack?: PackMin | null;
 }
+/** Référence pack (limites présentées à l'admin + client). */
+export interface PackMin {
+  id: string;
+  name: string;
+  ramMb: number;
+  cpuCores: number;
+  diskGb: number | null;
+  bandwidth: string | null;
+  status?: string;
+}
+/** Vue admin d'un pack d'hébergement. */
+export interface PackAdmin {
+  id: string;
+  name: string;
+  description?: string | null;
+  ramMb: number;
+  cpuCores: number;
+  diskGb: number | null;
+  bandwidth: string | null;
+  status: string;
+  createdAt: string;
+  updatedAt: string;
+  _count?: { products: number; categories: number };
+}
+/** Vue admin d'une catégorie de produits. */
+export interface ProductCategory {
+  id: string;
+  name: string;
+  description?: string | null;
+  displayOrder: number;
+  recommendedPack?: PackMin | null;
+  recommendedPackId?: string | null;
+  createdAt: string;
+  updatedAt: string;
+  _count?: { products: number };
+}
+export type PackInput = {
+  name?: string;
+  description?: string;
+  ramMb?: number;
+  cpuCores?: number;
+  diskGb?: number | null;
+  bandwidth?: string;
+  status?: string;
+};
+export type CategoryInput = {
+  name?: string;
+  description?: string;
+  displayOrder?: number;
+  recommendedPackId?: string;
+};
 export interface ServerPatch {
   name?: string;
   hostname?: string;
@@ -348,6 +408,10 @@ export interface ServerPatch {
   apiBaseUrl?: string | null;
   apiUser?: string | null;
   apiToken?: string;
+  // Cibles Coolify (Phase 12) : projet + serveur dans lesquels déployer
+  // (uuid). undefined = inchangé, '' = effacer → projet/serveur par défaut.
+  coolifyProjectUuid?: string | null;
+  coolifyServerUuid?: string | null;
   // Métriques (Phase 9bis) : undefined = inchangé, '' = effacer (bandwidthLimit),
   // null = effacer (champs numériques).
   ramMb?: number | null;
@@ -369,12 +433,34 @@ export const checkServer = (t: string, id: string) =>
 export const verifyServerPanel = (t: string, id: string) =>
   apiJson(`/api/servers/${id}/panel-verify`, t, { method: 'POST' });
 export const listProducts = (t: string) => apiJson('/api/products', t);
-export const createProduct = (t: string, dto: { name: string; kind?: string; status?: string }) =>
-  apiJson('/api/products', t, { method: 'POST', body: JSON.stringify(dto) });
-export const updateProduct = (t: string, id: string, patch: { name?: string; kind?: string; status?: string }) =>
-  apiJson(`/api/products/${id}`, t, { method: 'PATCH', body: JSON.stringify(patch) });
+export const createProduct = (
+  t: string,
+  dto: { name: string; kind?: string; status?: string; categoryId?: string; packId?: string },
+) => apiJson('/api/products', t, { method: 'POST', body: JSON.stringify(dto) });
+export const updateProduct = (
+  t: string,
+  id: string,
+  patch: { name?: string; kind?: string; status?: string; categoryId?: string | null; packId?: string | null },
+) => apiJson(`/api/products/${id}`, t, { method: 'PATCH', body: JSON.stringify(patch) });
 export const deleteProduct = (t: string, id: string) =>
   apiJson(`/api/products/${id}`, t, { method: 'DELETE' });
+
+// ── Phase 12 (Catalog) — catégories & packs d'hébergement ───────────────────
+export const listCategories = (t: string) => apiJson('/api/categories', t);
+export const createCategory = (t: string, dto: CategoryInput) =>
+  apiJson('/api/categories', t, { method: 'POST', body: JSON.stringify(dto) });
+export const updateCategory = (t: string, id: string, dto: CategoryInput) =>
+  apiJson(`/api/categories/${id}`, t, { method: 'PATCH', body: JSON.stringify(dto) });
+export const deleteCategory = (t: string, id: string) =>
+  apiJson(`/api/categories/${id}`, t, { method: 'DELETE' });
+
+export const listPacks = (t: string) => apiJson('/api/packs', t);
+export const createPack = (t: string, dto: PackInput) =>
+  apiJson('/api/packs', t, { method: 'POST', body: JSON.stringify(dto) });
+export const updatePack = (t: string, id: string, dto: PackInput) =>
+  apiJson(`/api/packs/${id}`, t, { method: 'PATCH', body: JSON.stringify(dto) });
+export const deletePack = (t: string, id: string) =>
+  apiJson(`/api/packs/${id}`, t, { method: 'DELETE' });
 
 // Admin-scoped.
 export const adminListSubscriptions = (t: string) => apiJson('/api/admin/subscriptions', t);
@@ -472,6 +558,9 @@ export interface PublicProduct {
   name: string;
   kind: string;
   status: string;
+  // Phase 12 (Catalog) — limites du pack + catégorie exposées au visiteur.
+  category?: { id: string; name: string } | null;
+  pack?: PackMin | null;
 }
 /** Public catalogue — unauthenticated GET (visitor browsing before ordering). */
 export async function listPublicProducts(): Promise<ApiResult> {

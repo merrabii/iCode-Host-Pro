@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   ConflictException,
   Injectable,
   NotFoundException,
@@ -10,6 +11,37 @@ import { CreateProductDto } from './dto/create-product.dto';
 import { UpdateProductDto } from './dto/update-product.dto';
 import { Actor } from '../users/users.service';
 
+/** Références embarquées dans la vue produit : catégorie + pack (limites). */
+const PRODUCT_INCLUDE = {
+  category: { select: { id: true, name: true } },
+  pack: {
+    select: {
+      id: true,
+      name: true,
+      ramMb: true,
+      cpuCores: true,
+      diskGb: true,
+      bandwidth: true,
+      status: true,
+    },
+  },
+};
+
+/** Vue publique (catalogue) : pack sans le statut interne. */
+const PUBLIC_INCLUDE = {
+  category: { select: { id: true, name: true } },
+  pack: {
+    select: {
+      id: true,
+      name: true,
+      ramMb: true,
+      cpuCores: true,
+      diskGb: true,
+      bandwidth: true,
+    },
+  },
+};
+
 @Injectable()
 export class ProductsService {
   constructor(
@@ -17,13 +49,29 @@ export class ProductsService {
     private readonly audit: AuditService,
   ) {}
 
+  /** Vérifie qu'une catégorie/pack référencé existe (best-effort clair). */
+  private async assertRefs(categoryId?: string, packId?: string): Promise<void> {
+    if (categoryId) {
+      const cat = await this.prisma.productCategory.findUnique({ where: { id: categoryId } });
+      if (!cat) throw new BadRequestException('Catégorie introuvable.');
+    }
+    if (packId) {
+      const pack = await this.prisma.hostingPack.findUnique({ where: { id: packId } });
+      if (!pack) throw new BadRequestException('Pack introuvable.');
+    }
+  }
+
   async create(dto: CreateProductDto, actor: Actor): Promise<Product> {
+    await this.assertRefs(dto.categoryId, dto.packId);
     const product = await this.prisma.product.create({
       data: {
         name: dto.name,
         kind: dto.kind ?? 'generic',
         status: dto.status,
+        categoryId: dto.categoryId ?? null,
+        packId: dto.packId ?? null,
       },
+      include: PRODUCT_INCLUDE,
     });
     await this.audit.record({
       actorId: actor.sub,
@@ -31,13 +79,22 @@ export class ProductsService {
       action: 'product.create',
       resourceType: 'product',
       resourceId: product.id,
-      details: { name: product.name, kind: product.kind, status: product.status },
+      details: {
+        name: product.name,
+        kind: product.kind,
+        status: product.status,
+        categoryId: product.categoryId,
+        packId: product.packId,
+      },
     });
     return product;
   }
 
   async findAll(): Promise<Product[]> {
-    return this.prisma.product.findMany({ orderBy: { createdAt: 'desc' } });
+    return this.prisma.product.findMany({
+      orderBy: { createdAt: 'desc' },
+      include: PRODUCT_INCLUDE,
+    });
   }
 
   /** Public catalogue (no auth) — only orderable products (Phase 10, ADR-027). */
@@ -45,11 +102,15 @@ export class ProductsService {
     return this.prisma.product.findMany({
       where: { status: { notIn: [ProductStatus.DRAFT, ProductStatus.DISABLED] } },
       orderBy: { createdAt: 'desc' },
+      include: PUBLIC_INCLUDE,
     });
   }
 
   async findOne(id: string): Promise<Product> {
-    const product = await this.prisma.product.findUnique({ where: { id } });
+    const product = await this.prisma.product.findUnique({
+      where: { id },
+      include: PRODUCT_INCLUDE,
+    });
     if (!product) {
       throw new NotFoundException('Product not found');
     }
@@ -58,7 +119,24 @@ export class ProductsService {
 
   async update(id: string, dto: UpdateProductDto, actor: Actor): Promise<Product> {
     const before = await this.findOne(id);
-    const product = await this.prisma.product.update({ where: { id }, data: dto });
+    await this.assertRefs(dto.categoryId, dto.packId);
+    const data: {
+      name?: string;
+      kind?: string;
+      status?: ProductStatus;
+      categoryId?: string | null;
+      packId?: string | null;
+    } = {};
+    if (dto.name !== undefined) data.name = dto.name;
+    if (dto.kind !== undefined) data.kind = dto.kind;
+    if (dto.status !== undefined) data.status = dto.status;
+    if (dto.categoryId !== undefined) data.categoryId = dto.categoryId === '' ? null : dto.categoryId;
+    if (dto.packId !== undefined) data.packId = dto.packId === '' ? null : dto.packId;
+    const product = await this.prisma.product.update({
+      where: { id },
+      data,
+      include: PRODUCT_INCLUDE,
+    });
     await this.audit.record({
       actorId: actor.sub,
       actorEmail: actor.email,

@@ -216,7 +216,16 @@ export class SubscriptionsService {
         createdAt: true,
         updatedAt: true,
         subscription: {
-          select: { id: true, product: { select: { id: true, name: true } } },
+          select: {
+            id: true,
+            product: {
+              select: {
+                id: true,
+                name: true,
+                pack: { select: { id: true, name: true, ramMb: true, cpuCores: true, diskGb: true, bandwidth: true } },
+              },
+            },
+          },
         },
       },
       orderBy: { createdAt: 'desc' },

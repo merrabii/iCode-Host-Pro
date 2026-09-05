@@ -49,6 +49,7 @@ describe('Deployments GitHub → Coolify (e2e, Phase 10bis)', () => {
       verify: fakeVerify as unknown as PanelTransport['verify'],
       createGitApp: fakeCreateGitApp,
       deployApp: fakeDeployApp,
+      applyAppLimits: jest.fn().mockResolvedValue(undefined),
       deploymentStatus: fakeDeploymentStatus,
     }),
   } as unknown as PanelTransportFactory;

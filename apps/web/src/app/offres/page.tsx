@@ -112,6 +112,17 @@ export default function OffresPage() {
                       )}
                     </div>
                     <p className="offres-card-desc">{meta.desc || 'Service disponible dans le catalogue.'}</p>
+                    {p.pack && (
+                      <div className="offres-resources">
+                        {p.pack.ramMb ? <span>{p.pack.ramMb} Mo RAM</span> : null}
+                        {p.pack.cpuCores ? <span>{p.pack.cpuCores} CPU</span> : null}
+                        {p.pack.diskGb ? <span>{p.pack.diskGb} Go</span> : null}
+                        {p.pack.bandwidth ? <span>{p.pack.bandwidth}</span> : null}
+                      </div>
+                    )}
+                    {p.category && (
+                      <span className="offres-cat muted">{p.category.name}</span>
+                    )}
                     <div className="offres-price">
                       <span className="offres-price-num">Abonnement</span>
                       <span className="offres-price-sub">mensuel</span>

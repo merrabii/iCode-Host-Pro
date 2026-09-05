@@ -316,24 +316,29 @@ describe('PanelTransportFactory / NodePanelTransport', () => {
       }
     });
 
-    it('deployApp POSTs /applications/{uuid}/deploy and resolves on 200', async () => {
+    it('deployApp POSTs /deploy (route réelle Coolify 4.1.x, vérifiée live) with uuid+force and resolves on 200', async () => {
       let method = '';
       let path = '';
       let authHeader: string | undefined;
+      let body = '';
       const srv = await serve((req, res) => {
         method = req.method ?? '';
         path = req.url ?? '';
         authHeader = req.headers.authorization;
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ deployment_uuid: 'dep-1' }));
+        req.on('data', (c: Buffer) => (body += c.toString()));
+        req.on('end', () => {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ deployments: [{ resource_uuid: 'app-123' }] }));
+        });
       });
       try {
         await expect(
           factory.create(timeoutMs).deployApp(base(srv.url), 'app-123'),
         ).resolves.toBeUndefined();
         expect(method).toBe('POST');
-        expect(path).toBe('/api/v1/applications/app-123/deploy');
+        expect(path).toBe('/api/v1/deploy');
         expect(authHeader).toBe('Bearer tok-deploy');
+        expect(JSON.parse(body)).toEqual({ uuid: 'app-123', force: true });
       } finally {
         await srv.close();
       }
@@ -387,6 +392,67 @@ describe('PanelTransportFactory / NodePanelTransport', () => {
       }
     });
 
+    it('applyAppLimits PATCHes limits_cpus + limits_memory on /applications/{uuid}', async () => {
+      let method = '';
+      let path = '';
+      let authHeader: string | undefined;
+      let body = '';
+      const srv = await serve((req, res) => {
+        method = req.method ?? '';
+        path = req.url ?? '';
+        authHeader = req.headers.authorization;
+        req.on('data', (c: Buffer) => (body += c.toString()));
+        req.on('end', () => {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true }));
+        });
+      });
+      try {
+        await expect(
+          factory.create(timeoutMs).applyAppLimits(base(srv.url), 'app-123', {
+            cpus: '1',
+            memory: '1g',
+          }),
+        ).resolves.toBeUndefined();
+        expect(method).toBe('PATCH');
+        expect(path).toBe('/api/v1/applications/app-123');
+        expect(authHeader).toBe('Bearer tok-deploy');
+        const parsed = JSON.parse(body) as Record<string, string>;
+        expect(parsed.limits_cpus).toBe('1');
+        expect(parsed.limits_memory).toBe('1g');
+      } finally {
+        await srv.close();
+      }
+    });
+
+    it('applyAppLimits sends nothing and resolves when no limit is provided', async () => {
+      const srv = await serve((_req, res) => {
+        res.writeHead(200);
+        res.end();
+      });
+      try {
+        await expect(
+          factory.create(timeoutMs).applyAppLimits(base(srv.url), 'app-123', {}),
+        ).resolves.toBeUndefined();
+      } finally {
+        await srv.close();
+      }
+    });
+
+    it('applyAppLimits rejects on a non-2xx response', async () => {
+      const srv = await serve((_req, res) => {
+        res.writeHead(400);
+        res.end('bad request');
+      });
+      try {
+        await expect(
+          factory.create(timeoutMs).applyAppLimits(base(srv.url), 'app-123', { memory: '512m' }),
+        ).rejects.toThrow(/400/);
+      } finally {
+        await srv.close();
+      }
+    });
+
     it('refuses deploy ops on a non-Coolify provider (Hestia)', async () => {
       const hestiaTarget = { ...target, provider: 'HESTIA' as const, baseUrl: 'http://127.0.0.1:1/api/' };
       await expect(
@@ -398,6 +464,9 @@ describe('PanelTransportFactory / NodePanelTransport', () => {
       ).rejects.toThrow(/Coolify uniquement/);
       await expect(factory.create(timeoutMs).deployApp(hestiaTarget, 'x')).rejects.toThrow(/Coolify uniquement/);
       await expect(factory.create(timeoutMs).deploymentStatus(hestiaTarget, 'x')).rejects.toThrow(/Coolify uniquement/);
+      await expect(
+        factory.create(timeoutMs).applyAppLimits(hestiaTarget, 'x', { memory: '512m' }),
+      ).rejects.toThrow(/Coolify uniquement/);
     });
   });
 });

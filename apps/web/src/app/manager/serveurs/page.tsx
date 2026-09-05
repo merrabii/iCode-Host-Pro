@@ -136,6 +136,9 @@ function emptyDraft() {
     apiUser: '',
     apiToken: '',
     hasApiToken: false,
+    // Cibles Coolify (Phase 12) : projet + serveur de déploiement (uuid).
+    coolifyProjectUuid: '',
+    coolifyServerUuid: '',
     // Métriques (Phase 9bis) — auto-détectées via le panneau (Hestia sysinfo),
     // sinon saisies manuellement ici.
     ramMb: '',
@@ -226,6 +229,9 @@ export default function ManagerServeursPage() {
       apiBaseUrl: d.apiBaseUrl === '' ? null : d.apiBaseUrl,
       apiUser: d.apiUser === '' ? null : d.apiUser,
       apiToken: d.apiToken === '' ? undefined : d.apiToken,
+      // Cibles Coolify (Phase 12) : '' → effacé (→ cible Coolify par défaut).
+      coolifyProjectUuid: d.coolifyProjectUuid === '' ? null : d.coolifyProjectUuid,
+      coolifyServerUuid: d.coolifyServerUuid === '' ? null : d.coolifyServerUuid,
       // Métriques (Phase 9bis) : '' → null ; bande passante = label libre.
       ramMb: metric(d.ramMb),
       cpuCores: metric(d.cpuCores),
@@ -255,6 +261,8 @@ export default function ManagerServeursPage() {
       apiUser: s.apiUser ?? '',
       apiToken: '', // jamais réaffiché — vide = conserve le jeton actuel
       hasApiToken: s.hasApiToken,
+      coolifyProjectUuid: s.coolifyProjectUuid ?? '',
+      coolifyServerUuid: s.coolifyServerUuid ?? '',
       ramMb: s.ramMb?.toString() ?? '',
       cpuCores: s.cpuCores?.toString() ?? '',
       diskGb: s.diskGb?.toString() ?? '',
@@ -832,6 +840,30 @@ export default function ManagerServeursPage() {
                             conserver ; une nouvelle saisie le remplace.
                           </span>
                         </div>
+                      )}
+                      {draft.panelProvider === 'COOLIFY' && (
+                        <>
+                          <Field label="Projet Coolify cible (uuid)">
+                            <Input
+                              value={draft.coolifyProjectUuid}
+                              onChange={(e) => set('coolifyProjectUuid', e.target.value)}
+                              placeholder="dnke41uj6jfu8qvnj7oq1g1a — vide = projet par défaut"
+                            />
+                          </Field>
+                          <Field label="Serveur Coolify cible (uuid)">
+                            <Input
+                              value={draft.coolifyServerUuid}
+                              onChange={(e) => set('coolifyServerUuid', e.target.value)}
+                              placeholder="gcpn2wk4cqwtecqmbo0ey6ej — vide = serveur par défaut"
+                            />
+                          </Field>
+                          <div className="srv-field-full">
+                            <span className="muted cell-sub" style={{ lineHeight: 1.6 }}>
+                              Applications déployées en <b>partage</b> sur ce projet/serveur Coolify, plafonnées
+                              par le pack du client. UUID vides ⇒ cibles Coolify par défaut.
+                            </span>
+                          </div>
+                        </>
                       )}
                     </>
                   )}

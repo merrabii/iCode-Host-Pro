@@ -524,7 +524,12 @@ export default function ClientPage() {
                           <span className="muted cell-sub"> · {svc.subscription.product.name}</span>
                         )}
                       </div>
-                      <div className="status-row-sub">Service</div>
+                      <div className="status-row-sub">
+                        Service
+                        {svc.subscription?.product?.pack && (
+                          <span className="muted"> · pack {svc.subscription.product.pack.name} ({svc.subscription.product.pack.ramMb} Mo · {svc.subscription.product.pack.cpuCores} CPU{svc.subscription.product.pack.diskGb ? ` · ${svc.subscription.product.pack.diskGb} Go` : ''})</span>
+                        )}
+                      </div>
                     </div>
                     <Badge tone={statusTone(svc.status)}>{SERVICE_STATUS_LABEL[svc.status] ?? svc.status}</Badge>
                   </div>

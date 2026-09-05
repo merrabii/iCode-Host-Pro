@@ -5,6 +5,8 @@ import { HealthModule } from './health/health.module';
 import { AuthModule } from './auth/auth.module';
 import { UsersModule } from './users/users.module';
 import { ProductsModule } from './products/products.module';
+import { CategoriesModule } from './categories/categories.module';
+import { PacksModule } from './packs/packs.module';
 import { ServersModule } from './servers/servers.module';
 import { ManagerModule } from './manager/manager.module';
 import { AuditModule } from './audit/audit.module';
@@ -28,6 +30,8 @@ import { loadAppConfig } from './config/configuration';
     AuthModule,
     UsersModule,
     ProductsModule,
+    CategoriesModule,
+    PacksModule,
     ServersModule,
     ManagerModule,
     AuditModule,

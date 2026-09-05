@@ -16,6 +16,21 @@ describe('ProductsService', () => {
   const mockAudit = { record: jest.fn() };
   const actor = { sub: 'admin', email: 'admin@example.com' };
 
+  // Phase 12 — include utilisé par read/create/update côté service.
+  const PRODUCT_INCLUDE = {
+    category: { select: { id: true, name: true } },
+    pack: {
+      select: {
+        id: true,
+        name: true,
+        ramMb: true,
+        cpuCores: true,
+        diskGb: true,
+        bandwidth: true,
+        status: true,
+      },
+    },
+  };
   beforeEach(() => {
     service = new ProductsService(mockPrisma as never, mockAudit as never);
     jest.clearAllMocks();
@@ -25,7 +40,8 @@ describe('ProductsService', () => {
     mockPrisma.product.create.mockResolvedValue({ id: '1', name: 'WP', kind: 'generic', status: 'ACTIVE' });
     await expect(service.create({ name: 'WP' }, actor)).resolves.toMatchObject({ kind: 'generic' });
     expect(mockPrisma.product.create).toHaveBeenCalledWith({
-      data: { name: 'WP', kind: 'generic', status: undefined },
+      data: { name: 'WP', kind: 'generic', status: undefined, categoryId: null, packId: null },
+      include: PRODUCT_INCLUDE,
     });
     expect(mockAudit.record).toHaveBeenCalledWith(
       expect.objectContaining({ action: 'product.create', actorId: 'admin', resourceId: '1' }),
@@ -36,7 +52,8 @@ describe('ProductsService', () => {
     mockPrisma.product.create.mockResolvedValue({});
     await service.create({ name: 'DNS', kind: 'dns', status: 'DRAFT' }, actor);
     expect(mockPrisma.product.create).toHaveBeenCalledWith({
-      data: { name: 'DNS', kind: 'dns', status: 'DRAFT' },
+      data: { name: 'DNS', kind: 'dns', status: 'DRAFT', categoryId: null, packId: null },
+      include: PRODUCT_INCLUDE,
     });
   });
 

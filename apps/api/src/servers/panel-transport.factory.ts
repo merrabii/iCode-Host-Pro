@@ -59,10 +59,33 @@ export interface CoolifyGitAppInput {
   serviceName: string; // nom lisible de l'application (le Service du client)
   buildPack?: string; // nixpacks | dockerfile | dockercompose | static — défaut nixpacks
   appName?: string; // nom de l'application côté Coolify — défaut serviceName
+  projectUuid?: string; // projet Coolify cible (uuid) — défaut "0" (projet par défaut)
+  serverUuid?: string; // serveur Coolify cible (uuid) — défaut "0" (serveur par défaut)
 }
 
 export interface CoolifyGitAppResult {
   uuid: string; // UUID de l'application côté Coolify
+}
+
+/** Limites Docker d'une application Coolify (Phase 12) — champs opt. :
+ *  `cpus` = limits_cpus (ex "0.5", "1"), `memory` = limits_memory (ex "512m",
+ *  "1g"). Appliquées via PATCH /applications/:uuid. */
+export interface CoolifyAppLimits {
+  cpus?: string;
+  memory?: string;
+}
+
+/** Formate les cœurs CPU du pack en string Docker Coolify (décimal simple). */
+export function cpusFromCores(cpuCores: number): string {
+  const n = Math.round(cpuCores * 100) / 100;
+  return Number.isInteger(n) ? String(n) : n.toFixed(2).replace(/0+$/, '').replace(/\.$/, '');
+}
+
+/** Formate la RAM (Mo) du pack en string Coolify : "XYm" < 1024, sinon "X.Yg". */
+export function memoryFromMb(ramMb: number): string {
+  if (ramMb < 1024) return `${Math.round(ramMb)}m`;
+  const n = ramMb / 1024;
+  return `${Number.isInteger(n) ? n : Math.round(n * 100) / 100}g`;
 }
 
 /** Statut brut renvoyé par Coolify (le mapping → DeploymentStatus vit dans
@@ -82,6 +105,12 @@ export abstract class PanelTransport {
     input: CoolifyGitAppInput,
   ): Promise<CoolifyGitAppResult>;
   abstract deployApp(target: PanelTarget, uuid: string): Promise<void>;
+  /** Applique les limites ressources (RAM/CPU) à une application (COOLIFY). */
+  abstract applyAppLimits(
+    target: PanelTarget,
+    uuid: string,
+    limits: CoolifyAppLimits,
+  ): Promise<void>;
   abstract deploymentStatus(
     target: PanelTarget,
     uuid: string,
@@ -339,8 +368,8 @@ class NodePanelTransport extends PanelTransport {
       target.strictTls,
       this.timeoutMs,
       JSON.stringify({
-        project_uuid: '0', // projet par défaut Coolify
-        server_uuid: '0', // serveur géré par défaut (localhost) Coolify
+        project_uuid: input.projectUuid ?? '0', // projet par défaut Coolify sauf si configuré sur le serveur
+        server_uuid: input.serverUuid ?? '0', // serveur géré par défaut (localhost) sauf si configuré
         environment_name: 'production',
         git_repository: input.repoUrl,
         git_branch: input.branch,
@@ -365,16 +394,50 @@ class NodePanelTransport extends PanelTransport {
     return { uuid: parsed.uuid };
   }
 
-  /** Déclenche un déploiement de l'application Coolify (POST /applications/:uuid/deploy). */
+  /**
+   * Applique les limites Docker (RAM/CPU) à une app Coolify (Phase 12) via
+   * `PATCH /applications/:uuid` (verbe update Coolify v4) avec `limits_cpus` /
+   * `limits_memory`. Seuls les champs fournis sont envoyés. NB : best-effort
+   * côté service — l'échec ne doit pas bloquer le déploiement de l'app.
+   */
+  async applyAppLimits(
+    target: PanelTarget,
+    uuid: string,
+    limits: CoolifyAppLimits,
+  ): Promise<void> {
+    this.assertCoolify(target);
+    const body: Record<string, string> = {};
+    if (limits.cpus !== undefined) body.limits_cpus = limits.cpus;
+    if (limits.memory !== undefined) body.limits_memory = limits.memory;
+    if (Object.keys(body).length === 0) return;
+    const base = target.baseUrl.replace(/\/+$/, '');
+    const { status, body: resp } = await httpJson(
+      'PATCH',
+      `${base}/applications/${encodeURIComponent(uuid)}`,
+      { Authorization: `Bearer ${target.token}` },
+      target.strictTls,
+      this.timeoutMs,
+      JSON.stringify(body),
+    );
+    if (status !== 200 && status !== 204) {
+      throw new Error(
+        `Coolify API : application des limites refusée (HTTP ${status})${resp ? ` — ${resp.slice(0, 200)}` : ''}`,
+      );
+    }
+  }
+
+  /** Déclenche un déploiement de l'application Coolify (POST /deploy, vérifié live
+   *  4.1.2 — /applications/:uuid/deploy renvoie 404 sur cette version). */
   async deployApp(target: PanelTarget, uuid: string): Promise<void> {
     this.assertCoolify(target);
     const base = target.baseUrl.replace(/\/+$/, '');
     const { status, body } = await httpJson(
       'POST',
-      `${base}/applications/${encodeURIComponent(uuid)}/deploy`,
+      `${base}/deploy`,
       { Authorization: `Bearer ${target.token}` },
       target.strictTls,
       this.timeoutMs,
+      JSON.stringify({ uuid, force: true }),
     );
     if (status !== 200 && status !== 201) {
       throw new Error(

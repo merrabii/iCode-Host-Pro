@@ -175,6 +175,18 @@ enum ProductStatus {
   DISABLED
 }
 
+// Pack d'hébergement (Catalog) : gabarit réutilisable de ressources proposé à
+// un Produit. Les limites RAM/CPU appliquées à l'app Coolify au déploiement
+// (limits_cpus/limits_memory) ; disque + bande passante = informatifs (Coolify
+// ne les enforce pas au niveau application). Suppression protégée par le FK
+// Restrict de Product.pack (passer status=DISABLED pour dissocier).
+enum PackStatus {
+  DRAFT
+  ACTIVE
+  SUSPENDED
+  DISABLED
+}
+
 enum ServerStatus {
   UNKNOWN
   PROVISIONING
@@ -201,6 +213,45 @@ model Product {
   updatedAt DateTime      @updatedAt
 
   subscriptions Subscription[] // clients subscribing to this offering (Phase 5)
+
+  // ── Catalog (Phase 12) — classification + ressources ──────────────────────
+  // Product → ProductCategory (classification, optionnelle, SetNull) et
+  // Product → HostingPack (ressources, Restrict — passer DISABLED pour
+  // dissocier). Le pack pilote les limites appliquées à l'app Coolify au
+  // déploiement (service → subscription → product → pack).
+  categoryId String?
+  category   ProductCategory? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  packId     String?
+  pack       HostingPack?     @relation(fields: [packId], references: [id], onDelete: Restrict)
+}
+
+model HostingPack {
+  id          String     @id @default(cuid())
+  name        String     @unique
+  description String?
+  ramMb       Int // RAM (Mo)
+  cpuCores    Float      @default(1) // cœurs (fraction autorisée, ex 0.5)
+  diskGb      Int? // disque (Go)
+  bandwidth   String? // bande passante, label libre ex « 1 To / mois »
+  status      PackStatus @default(ACTIVE)
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+
+  products   Product[] // packs référencés par des produits (Restrict)
+  categories ProductCategory[] // catégories dont ce pack est le recommandé
+}
+
+model ProductCategory {
+  id                String       @id @default(cuid())
+  name              String       @unique
+  description       String?
+  displayOrder      Int          @default(0)
+  recommendedPackId String? // pack suggéré lors de la création d'un produit de cette catégorie
+  recommendedPack   HostingPack? @relation(fields: [recommendedPackId], references: [id], onDelete: SetNull)
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @updatedAt
+
+  products Product[] // produits de cette catégorie (SetNull)
 }
 
 model Server {
@@ -233,6 +284,8 @@ model Server {
   apiBaseUrl      String? // URL de base de l'API du panneau (ex. https://panel.exemple.com/api/v1)
   apiTokenEnc     String? // jeton/clé d'accès API chiffré au repos (jamais déchiffré côté client)
   apiUser         String? // utilisateur API (Hestia : « api » ; Coolify : inutilisé)
+  coolifyProjectUuid String? // projet Coolify cible pour les déploiements (uuid) ; défaut "0" si absent
+  coolifyServerUuid String? // serveur Coolify cible (uuid) ; défaut "0" si absent
   panelVerifiedAt DateTime? // dernier POST /api/servers/:id/panel-verify
   panelOk         Boolean? // résultat du dernier test API (true = panneau joignable + authentifié)
   panelDetail     String? // détail lisible du dernier test API
@@ -248,7 +301,7 @@ model Server {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  services Service[] // services this host is assigned to (Phase 5)
+  services    Service[] // services this host is assigned to (Phase 5)
   deployments Deployment[] // déploiements GitHub → Coolify sur ce serveur (Phase 10bis)
 }
 
@@ -381,7 +434,7 @@ model Deployment {
   service      Service          @relation(fields: [serviceId], references: [id], onDelete: Cascade)
   serverId     String?
   server       Server?          @relation(fields: [serverId], references: [id], onDelete: SetNull)
-  repoFullName String           // "owner/repo" tel que détecté sur GitHub (mode GH lié) ou dérivé de l'URL (mode URL)
+  repoFullName String // "owner/repo" tel que détecté sur GitHub (mode GH lié) ou dérivé de l'URL (mode URL)
   repoUrl      String? // URL git collée par le client (mode URL 10bis.5) — null en mode GitHub lié
   buildPack    String? // build pack envoyé à Coolify (nixpacks/dockerfile/…) — jamais exposé en infrastructure
   appName      String? // nom de l'application côté Coolify (mode URL : modifiable par le client)

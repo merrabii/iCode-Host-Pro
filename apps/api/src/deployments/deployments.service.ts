@@ -8,6 +8,8 @@ import {
 import {
   Deployment,
   DeploymentStatus,
+  HostingPack,
+  PackStatus,
   Server,
   ServerPanelProvider,
   Service,
@@ -19,6 +21,9 @@ import { CryptoService } from '../crypto/crypto.service';
 import { SecuritySettingsService } from '../auth/security/security-settings.service';
 import { Actor } from '../users/users.service';
 import {
+  CoolifyAppLimits,
+  cpusFromCores,
+  memoryFromMb,
   PanelKind,
   PanelTarget,
   PanelTransportFactory,
@@ -161,7 +166,7 @@ export class DeploymentsService {
       repoUrl = `https://github.com/${repoFullName}.git`;
     }
 
-    const { service, server } = await this.resolveCoolifyTarget(dto.serviceId, actor.sub);
+    const { service, server, pack } = await this.resolveCoolifyTarget(dto.serviceId, actor.sub);
     const branch = dto.branch?.trim() ? dto.branch.trim() : (detectedBranch ?? 'main');
     const buildPack = dto.buildPack ?? suggestedBuildPack ?? 'nixpacks';
     const appName = dto.appName?.trim() ? dto.appName.trim() : service.name;
@@ -189,14 +194,45 @@ export class DeploymentsService {
         serviceName: service.name,
         buildPack,
         appName,
+        projectUuid: server.coolifyProjectUuid ?? undefined,
+        serverUuid: server.coolifyServerUuid ?? undefined,
       });
+      // Phase 12 — applique les limites RAM/CPU du pack du produit AVANT de
+      // lancer le déploiement. Best-effort : un échec n'interrompt pas l'app.
+      const limits = this.packLimits(pack);
+      let deployDetail = 'Déploiement déclenché sur Coolify.';
+      if (limits) {
+        try {
+          await transport.applyAppLimits(target, app.uuid, limits);
+          deployDetail = `Déploiement déclenché — limites appliquées (${limits.memory ?? ''} RAM${limits.cpus ? `, ${limits.cpus} CPU` : ''}).`;
+          await this.audit.record({
+            actorId: actor.sub,
+            actorEmail: actor.email,
+            action: 'deploy.limits',
+            resourceType: 'deployment',
+            resourceId: row.id,
+            details: { coolifyUuid: app.uuid, ...limits, packName: pack?.name },
+          });
+        } catch (err) {
+          const m = err instanceof Error ? err.message : String(err);
+          deployDetail = `App créée — limites non appliquées (${m}). Déploiement lancé.`;
+          await this.audit.record({
+            actorId: actor.sub,
+            actorEmail: actor.email,
+            action: 'deploy.limits.warn',
+            resourceType: 'deployment',
+            resourceId: row.id,
+            details: { coolifyUuid: app.uuid, ...limits, packName: pack?.name, message: m },
+          });
+        }
+      }
       await transport.deployApp(target, app.uuid);
       const updated = await this.prisma.deployment.update({
         where: { id: row.id },
         data: {
           coolifyUuid: app.uuid,
           status: DeploymentStatus.DEPLOYING,
-          detail: 'Déploiement déclenché sur Coolify.',
+          detail: deployDetail,
         },
         include: {
           service: { select: { id: true, name: true } },
@@ -285,10 +321,15 @@ export class DeploymentsService {
   private async resolveCoolifyTarget(
     serviceId: string,
     userId: string,
-  ): Promise<{ service: Service; server: Server }> {
+  ): Promise<{ service: Service; server: Server; pack: HostingPack | null }> {
     const service = await this.prisma.service.findFirst({
       where: { id: serviceId, subscription: { userId } },
-      include: { server: true },
+      include: {
+        server: true,
+        subscription: {
+          include: { product: { include: { pack: true } } },
+        },
+      },
     });
     if (!service) {
       throw new NotFoundException('Service introuvable.');
@@ -307,7 +348,19 @@ export class DeploymentsService {
         'Le serveur Coolify de ce service n’est pas connecté (vérification API en échec).',
       );
     }
-    return { service, server };
+    // Pack du produit auquel le client est abonné — nul si le produit n'a pas de
+    // pack (ou de relation abonnement→produit résolue).
+    const pack = service.subscription?.product?.pack ?? null;
+    return { service, server, pack };
+  }
+
+  /** Limites Coolify dérivées d'un pack ACTIVE (RAM/CPU). null = rien à appliquer. */
+  private packLimits(pack: HostingPack | null): CoolifyAppLimits | null {
+    if (!pack || pack.status !== PackStatus.ACTIVE) return null;
+    const limits: CoolifyAppLimits = {};
+    if (pack.cpuCores && pack.cpuCores > 0) limits.cpus = cpusFromCores(pack.cpuCores);
+    if (pack.ramMb && pack.ramMb > 0) limits.memory = memoryFromMb(pack.ramMb);
+    return limits.cpus || limits.memory ? limits : null;
   }
 
   /** Construit la cible du transport : jeton API panneau déchiffré à la volée. */

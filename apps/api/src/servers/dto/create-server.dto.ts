@@ -79,6 +79,20 @@ export class CreateServerDto {
   @MaxLength(64)
   apiUser?: string;
 
+  // Projet Coolify cible pour les déploiements (uuid du projet). Absent ⇒ la
+  // plateforme utilise le projet par défaut Coolify ("0").
+  @IsOptional()
+  @IsString()
+  @MaxLength(64)
+  coolifyProjectUuid?: string;
+
+  // Serveur Coolify cible (uuid) pour les déploiements. Absent ⇒ la plateforme
+  // utilise le serveur par défaut Coolify ("0").
+  @IsOptional()
+  @IsString()
+  @MaxLength(64)
+  coolifyServerUuid?: string;
+
   // Métriques annoncées (Phase 9bis) — auto-détectées via l'API du panneau quand
   // c'est possible (Hestia sysinfo), sinon saisies manuellement par l'admin.
   @IsOptional()

@@ -5,8 +5,12 @@ import {
   apiError,
   createProduct,
   deleteProduct,
+  listCategories,
+  listPacks,
   listProducts,
+  PackAdmin,
   ProductAdmin,
+  ProductCategory,
   updateProduct,
 } from '@/lib/api';
 import { useAdminSession } from '@/lib/session';
@@ -25,7 +29,7 @@ import {
   Panel,
   Select,
 } from '@/components/ui';
-import { IconBox, IconPlus, IconX } from '@/components/icons';
+import { IconBox, IconPlus, IconTrash, IconX } from '@/components/icons';
 
 const PRODUCT_STATUSES = ['DRAFT', 'ACTIVE', 'SUSPENDED', 'DISABLED'];
 
@@ -33,10 +37,14 @@ export default function ManagerProduitsPage() {
   const { phase, me, token } = useAdminSession();
   const toast = useToast();
   const [products, setProducts] = useState<ProductAdmin[]>([]);
+  const [categories, setCategories] = useState<ProductCategory[]>([]);
+  const [packs, setPacks] = useState<PackAdmin[]>([]);
   const [showCreate, setShowCreate] = useState(false);
   const [name, setName] = useState('');
   const [kind, setKind] = useState('generic');
   const [status, setStatus] = useState('DRAFT');
+  const [catId, setCatId] = useState('');
+  const [packId, setPackId] = useState('');
   const [busy, setBusy] = useState<string | null>(null); // 'create' | product id
 
   useEffect(() => {
@@ -45,23 +53,44 @@ export default function ManagerProduitsPage() {
   }, [phase, token]);
 
   async function load(t: string) {
-    const r = await listProducts(t);
-    if (!r.ok) return toast.error(apiError(r, 'Impossible de charger le catalogue.'));
-    setProducts((r.data as ProductAdmin[]) ?? []);
+    const [p, c, k] = await Promise.all([listProducts(t), listCategories(t), listPacks(t)]);
+    if (p.ok) setProducts((p.data as ProductAdmin[]) ?? []);
+    else toast.error(apiError(p, 'Impossible de charger le catalogue.'));
+    if (c.ok) setCategories((c.data as ProductCategory[]) ?? []);
+    if (k.ok) setPacks((k.data as PackAdmin[]) ?? []);
   }
 
   async function handleCreate() {
     if (!name.trim()) return toast.error('Le nom du produit est obligatoire.');
     setBusy('create');
-    const r = await createProduct(token, { name: name.trim(), kind, status });
+    const r = await createProduct(token, {
+      name: name.trim(),
+      kind,
+      status,
+      categoryId: catId || undefined,
+      packId: packId || undefined,
+    });
     setBusy(null);
     if (!r.ok) return toast.error(apiError(r, 'Échec de la création du produit.'));
     toast.ok('Produit créé.');
     setName('');
     setKind('generic');
     setStatus('DRAFT');
+    setCatId('');
+    setPackId('');
     setShowCreate(false);
     void load(token);
+  }
+
+  // « Intelligent » : choisir une catégorie préremplit son pack recommandé
+  // (si aucun pack explicitement choisi encore).
+  function onCategoryChange(id: string) {
+    setCatId(id);
+    const cat = categories.find((c) => c.id === id);
+    if (cat?.recommendedPack && packId === '') {
+      setPackId(cat.recommendedPack.id);
+      toast.ok(`Pack recommandé « ${cat.recommendedPack.name} » présélectionné.`);
+    }
   }
 
   async function handleDelete(p: ProductAdmin) {
@@ -105,7 +134,7 @@ export default function ManagerProduitsPage() {
         <PageIntro
           eyebrow="Administration"
           title="Produits (catalogue)"
-          sub="Offres de référence proposées aux clients. Le statut contrôle leur visibilité dans l’espace client."
+          sub="Offres de référence proposées aux clients. Chaque produit peut être classé (catégorie) et porter un pack de ressources (RAM/CPU/disque/bande passante)."
         >
           <Button onClick={() => setShowCreate((v) => !v)}>
             <IconPlus size={14} />
@@ -132,6 +161,24 @@ export default function ManagerProduitsPage() {
                 <Select value={status} onChange={(e) => setStatus(e.target.value)}>
                   {PRODUCT_STATUSES.map((st) => (
                     <option key={st} value={st}>{st}</option>
+                  ))}
+                </Select>
+              </Field>
+              <Field label="Catégorie">
+                <Select value={catId} onChange={(e) => onCategoryChange(e.target.value)}>
+                  <option value="">Aucune</option>
+                  {categories.map((c) => (
+                    <option key={c.id} value={c.id}>{c.name}</option>
+                  ))}
+                </Select>
+              </Field>
+              <Field label="Pack">
+                <Select value={packId} onChange={(e) => setPackId(e.target.value)}>
+                  <option value="">Aucun</option>
+                  {packs.map((pk) => (
+                    <option key={pk.id} value={pk.id}>
+                      {pk.name} — {pk.ramMb} Mo · {pk.cpuCores} CPU
+                    </option>
                   ))}
                 </Select>
               </Field>
@@ -163,6 +210,8 @@ export default function ManagerProduitsPage() {
                 <tr>
                   <th>Produit</th>
                   <th>Type</th>
+                  <th>Catégorie</th>
+                  <th>Pack</th>
                   <th>Statut</th>
                   <th className="ta-right">Actions</th>
                 </tr>
@@ -176,6 +225,18 @@ export default function ManagerProduitsPage() {
                     </td>
                     <td>
                       <Badge tone="violet">{p.kind || 'generic'}</Badge>
+                    </td>
+                    <td>
+                      {p.category ? <Badge tone="blue">{p.category.name}</Badge> : <span className="muted">—</span>}
+                    </td>
+                    <td>
+                      {p.pack ? (
+                        <div className="cell-sub">
+                          <Badge tone="green">{p.pack.name}</Badge>
+                        </div>
+                      ) : (
+                        <span className="muted">—</span>
+                      )}
                     </td>
                     <td>
                       <Select
@@ -194,7 +255,7 @@ export default function ManagerProduitsPage() {
                     <td>
                       <div className="row ta-right">
                         <Button size="sm" variant="danger" disabled={busy === p.id} onClick={() => handleDelete(p)} title="Supprimer le produit">
-                          <IconX size={14} />
+                          <IconTrash size={14} />
                         </Button>
                       </div>
                     </td>

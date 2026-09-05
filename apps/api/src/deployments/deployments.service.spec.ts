@@ -27,6 +27,7 @@ describe('DeploymentsService', () => {
   };
   const mockTransport = {
     createGitApp: jest.fn(),
+    applyAppLimits: jest.fn(),
     deployApp: jest.fn(),
     deploymentStatus: jest.fn(),
   };
@@ -238,6 +239,95 @@ describe('DeploymentsService', () => {
         expect.anything(),
         expect.objectContaining({ branch: 'develop' }),
       );
+    });
+
+    it('Phase 12 — pack ACTIVE du produit : limites appliquées AVANT deployApp', async () => {
+      // Service dont le produit est abonné à un pack ACTIVE (RAM 1 Go, 1 CPU).
+      const packRow = {
+        id: 'pack1',
+        name: 'Starter 1 Go',
+        status: 'ACTIVE',
+        ramMb: 1024,
+        cpuCores: 1,
+        diskGb: 20,
+        bandwidth: null,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+      const serviceRowWithPack = serviceRow({
+        subscription: { product: { id: 'prod1', pack: packRow } },
+      });
+      mockPrisma.service.findFirst.mockResolvedValue(serviceRowWithPack);
+      mockPrisma.deployment.create.mockResolvedValue(deploymentRow({ status: 'PENDING', coolifyUuid: null }));
+      mockTransport.createGitApp.mockResolvedValue({ uuid: 'app-1' });
+      mockTransport.applyAppLimits.mockResolvedValue(undefined);
+      mockTransport.deployApp.mockResolvedValue(undefined);
+      mockPrisma.deployment.update.mockResolvedValue(deploymentRow());
+
+      const out = await service.create({ serviceId: 'svc1', repoFullName: 'owner/repo' }, actor);
+
+      // Ordre : createGitApp → applyAppLimits → deployApp.
+      expect(mockTransport.createGitApp).toHaveBeenCalledTimes(1);
+      expect(mockTransport.applyAppLimits).toHaveBeenCalledWith(
+        expect.objectContaining({ provider: 'COOLIFY', token: 'coolify-token' }),
+        'app-1',
+        { cpus: '1', memory: '1g' },
+      );
+      expect(mockTransport.deployApp).toHaveBeenCalledWith(
+        expect.objectContaining({ provider: 'COOLIFY' }),
+        'app-1',
+      );
+      const createOrder = mockTransport.createGitApp.mock.invocationCallOrder[0];
+      const limitsOrder = mockTransport.applyAppLimits.mock.invocationCallOrder[0];
+      const deployOrder = mockTransport.deployApp.mock.invocationCallOrder[0];
+      expect(createOrder).toBeLessThan(limitsOrder);
+      expect(limitsOrder).toBeLessThan(deployOrder);
+      expect(mockAudit.record).toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'deploy.limits', details: expect.objectContaining({ memory: '1g', cpus: '1', packName: 'Starter 1 Go' }) }),
+      );
+      expect(out.status).toBe('DEPLOYING');
+    });
+
+    it('Phase 12 — best-effort : limites refusées ⇒ ligne DEPLOYING + audit deploy.limits.warn', async () => {
+      const packRow = {
+        id: 'pack1',
+        name: 'Starter 1 Go',
+        status: 'ACTIVE',
+        ramMb: 1024,
+        cpuCores: 1,
+        diskGb: 20,
+        bandwidth: null,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+      mockPrisma.service.findFirst.mockResolvedValue(
+        serviceRow({ subscription: { product: { id: 'prod1', pack: packRow } } }),
+      );
+      mockPrisma.deployment.create.mockResolvedValue(deploymentRow({ status: 'PENDING', coolifyUuid: null }));
+      mockTransport.createGitApp.mockResolvedValue({ uuid: 'app-1' });
+      mockTransport.applyAppLimits.mockRejectedValue(new Error('Coolify API : application des limites refusée (HTTP 400)'));
+      mockTransport.deployApp.mockResolvedValue(undefined);
+      mockPrisma.deployment.update.mockResolvedValue(deploymentRow());
+
+      const out = await service.create({ serviceId: 'svc1', repoFullName: 'owner/repo' }, actor);
+
+      expect(out.status).toBe('DEPLOYING');
+      expect(mockTransport.deployApp).toHaveBeenCalled(); // jamais bloqué par l'échec des limites
+      expect(mockAudit.record).toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'deploy.limits.warn' }),
+      );
+      const created = mockTransport.createGitApp.mock.invocationCallOrder[0];
+      const deployOrder = mockTransport.deployApp.mock.invocationCallOrder[0];
+      expect(created).toBeLessThan(deployOrder);
+    });
+
+    it('Phase 12 — aucun pack ⇒ applyAppLimits jamais appelé', async () => {
+      mockPrisma.deployment.create.mockResolvedValue(deploymentRow({ status: 'PENDING', coolifyUuid: null }));
+      mockTransport.createGitApp.mockResolvedValue({ uuid: 'app-1' });
+      mockTransport.deployApp.mockResolvedValue(undefined);
+      mockPrisma.deployment.update.mockResolvedValue(deploymentRow());
+      await service.create({ serviceId: 'svc1', repoFullName: 'owner/repo' }, actor);
+      expect(mockTransport.applyAppLimits).not.toHaveBeenCalled();
     });
 
     it('échec Coolify : ligne FAILED + audit deploy.failed + 502', async () => {

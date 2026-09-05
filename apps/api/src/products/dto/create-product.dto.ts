@@ -15,4 +15,16 @@ export class CreateProductDto {
   @IsOptional()
   @IsEnum(ProductStatus)
   status?: ProductStatus;
+
+  // Phase 12 (Catalog) — classification + ressources. Optionnels (rétro-compatible
+  // avec les produits sans catégorie/pack ; existence vérifiée au service).
+  @IsOptional()
+  @IsString()
+  @MaxLength(60)
+  categoryId?: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(60)
+  packId?: string;
 }

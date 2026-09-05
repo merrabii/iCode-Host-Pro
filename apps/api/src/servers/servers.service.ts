@@ -175,6 +175,12 @@ export class ServersService {
       ...(dto.panelProvider !== undefined ? { panelProvider: dto.panelProvider } : {}),
       ...(dto.apiBaseUrl !== undefined ? { apiBaseUrl: dto.apiBaseUrl === '' ? null : dto.apiBaseUrl } : {}),
       ...(dto.apiUser !== undefined ? { apiUser: dto.apiUser === '' ? null : dto.apiUser } : {}),
+      ...(dto.coolifyProjectUuid !== undefined
+        ? { coolifyProjectUuid: dto.coolifyProjectUuid === '' ? null : dto.coolifyProjectUuid }
+        : {}),
+      ...(dto.coolifyServerUuid !== undefined
+        ? { coolifyServerUuid: dto.coolifyServerUuid === '' ? null : dto.coolifyServerUuid }
+        : {}),
       // Métriques (Phase 9bis) : remplacées seulement quand l'admin les fournit.
       ...(dto.ramMb !== undefined ? { ramMb: dto.ramMb } : {}),
       ...(dto.cpuCores !== undefined ? { cpuCores: dto.cpuCores } : {}),
