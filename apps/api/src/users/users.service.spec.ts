@@ -12,8 +12,18 @@ describe('UsersService', () => {
       count: jest.fn(),
       update: jest.fn(),
     },
+    subscription: {
+      findFirst: jest.fn(),
+    },
+    clientProject: {
+      findUnique: jest.fn(),
+      create: jest.fn(),
+    },
   };
   const mockAudit = { record: jest.fn() };
+  const mockDeployments = {
+    getOrCreateClientProject: jest.fn(),
+  };
 
   const admin = {
     id: 'a1',
@@ -44,7 +54,7 @@ describe('UsersService', () => {
   const actorOther = { sub: 'o1', email: 'other@example.com' };
 
   beforeEach(() => {
-    service = new UsersService(mockPrisma as never, mockAudit as never);
+    service = new UsersService(mockPrisma as never, mockAudit as never, mockDeployments as never);
     jest.clearAllMocks();
   });
 
@@ -146,5 +156,113 @@ describe('UsersService', () => {
       service.update('a1', { isActive: false }, actorOther),
     ).resolves.toMatchObject({ isActive: false });
     expect(mockPrisma.user.count).not.toHaveBeenCalled();
+  });
+
+  describe('findAll with clientProjects (Phase 13)', () => {
+    it('includes clientProject for Module B users', async () => {
+      const moduleB = {
+        id: 'modB',
+        kind: 'PER_CLIENT_PROJECT',
+        name: 'Module B',
+        code: 'B',
+      };
+      mockPrisma.user.findMany.mockResolvedValue([
+        { ...user, clientProjects: [{ id: 'cp1', name: 'client-u1', projectUuid: 'uuid-1', module: moduleB }] },
+        { ...admin, clientProjects: [] },
+      ]);
+      const result = await service.findAll();
+      expect(result).toHaveLength(2);
+      expect(result[0].clientProject).toEqual({
+        id: 'cp1',
+        name: 'client-u1',
+        projectUuid: 'uuid-1',
+      });
+      expect(result[1].clientProject).toBeNull();
+    });
+
+    it('excludes non-Module B clientProjects', async () => {
+      const moduleA = {
+        id: 'modA',
+        kind: 'SHARED_PROJECT',
+        name: 'Module A',
+        code: 'A',
+      };
+      mockPrisma.user.findMany.mockResolvedValue([
+        { ...user, clientProjects: [{ id: 'cp1', name: 'client-u1', projectUuid: 'uuid-1', module: moduleA }] },
+      ]);
+      const result = await service.findAll();
+      expect(result[0].clientProject).toBeNull();
+    });
+  });
+
+  describe('createClientProject (Phase 13)', () => {
+    const pack = {
+      id: 'pack1',
+      ramMb: 1024,
+      cpuCores: 1,
+      storageLimit: 10,
+      status: 'ACTIVE',
+      deploymentModule: {
+        id: 'modB',
+        kind: 'PER_CLIENT_PROJECT',
+        name: 'Module B',
+        code: 'B',
+        perClientPrefix: 'client',
+        server: { id: 'srv1', coolifyServerUuid: 'coolify-srv-1' },
+      },
+    };
+
+    it('throws NotFoundException if user has no active subscription with pack/module', async () => {
+      mockPrisma.user.findUnique.mockResolvedValue(user);
+      mockPrisma.subscription.findFirst.mockResolvedValue(null);
+      await expect(service.createClientProject('u1', actorOther)).rejects.toBeInstanceOf(NotFoundException);
+    });
+
+    it('throws ForbiddenException if pack module is not PER_CLIENT_PROJECT', async () => {
+      mockPrisma.user.findUnique.mockResolvedValue(user);
+      mockPrisma.subscription.findFirst.mockResolvedValue({
+        product: { pack: { ...pack, deploymentModule: { ...pack.deploymentModule, kind: 'SHARED_PROJECT' } } },
+      });
+      await expect(service.createClientProject('u1', actorOther)).rejects.toBeInstanceOf(ForbiddenException);
+    });
+
+    it('throws NotFoundException if module has no server', async () => {
+      mockPrisma.user.findUnique.mockResolvedValue(user);
+      mockPrisma.subscription.findFirst.mockResolvedValue({
+        product: { pack: { ...pack, deploymentModule: { ...pack.deploymentModule, server: null } } },
+      });
+      await expect(service.createClientProject('u1', actorOther)).rejects.toBeInstanceOf(NotFoundException);
+    });
+
+    it('calls deployments.getOrCreateClientProject and returns result + audit', async () => {
+      mockPrisma.user.findUnique.mockResolvedValue(user);
+      mockPrisma.subscription.findFirst.mockResolvedValue({
+        product: { pack },
+      });
+      mockDeployments.getOrCreateClientProject.mockResolvedValue({
+        id: 'cp-new',
+        projectUuid: 'coolify-project-uuid',
+      });
+
+      const result = await service.createClientProject('u1', actorOther);
+
+      expect(result).toEqual({
+        id: 'cp-new',
+        name: 'client-u1',
+        projectUuid: 'coolify-project-uuid',
+      });
+      expect(mockDeployments.getOrCreateClientProject).toHaveBeenCalledWith(
+        'u1',
+        expect.objectContaining({ id: 'srv1' }),
+        expect.objectContaining({ id: 'modB' }),
+      );
+      expect(mockAudit.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'clientProject.create',
+          actorId: 'o1',
+          resourceId: 'cp-new',
+        }),
+      );
+    });
   });
 });

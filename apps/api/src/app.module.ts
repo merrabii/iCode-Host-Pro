@@ -18,6 +18,7 @@ import { TicketsModule } from './tickets/tickets.module';
 import { KnowledgeModule } from './knowledge/knowledge.module';
 import { DeploymentsModule } from './deployments/deployments.module';
 import { CloudflareModule } from './cloudflare/cloudflare.module';
+import { MonitoringModule } from './monitoring/monitoring.module';
 import { loadAppConfig } from './config/configuration';
 
 @Module({
@@ -44,6 +45,7 @@ import { loadAppConfig } from './config/configuration';
     KnowledgeModule,
     DeploymentsModule,
     CloudflareModule,
+    MonitoringModule,
   ],
 })
 export class AppModule {}

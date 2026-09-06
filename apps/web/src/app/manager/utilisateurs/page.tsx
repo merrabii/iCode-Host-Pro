@@ -6,6 +6,7 @@ import {
   adminImpersonate,
   adminMfaReset,
   apiError,
+  createClientProject,
   listUsers,
   setImpToken,
   updateUser,
@@ -89,6 +90,18 @@ export default function ManagerUsersPage() {
     toast.ok(`MFA désactivée pour ${u.email} — elle pourra se reconnecter.`);
   }
 
+  async function createProject(u: UserAdmin) {
+    if (!window.confirm(`Créer le projet Coolify dédié pour « ${u.email} » (Module B) ?`)) {
+      return;
+    }
+    setBusy(u.id);
+    const r = await createClientProject(token, u.id);
+    setBusy(null);
+    if (!r.ok) return toast.error(apiError(r, 'Impossible de créer le projet.'));
+    toast.ok('Projet Coolify client créé.');
+    void load(token);
+  }
+
   if (phase === 'loading') {
     return (
       <AppShell me={null} nav={ADMIN_NAV}>
@@ -122,6 +135,7 @@ export default function ManagerUsersPage() {
               <thead>
                 <tr>
                   <th>Compte</th>
+                  <th>Projet Coolify (Module B)</th>
                   <th>Rôle</th>
                   <th>Statut</th>
                   <th className="ta-right">Actions</th>
@@ -136,6 +150,18 @@ export default function ManagerUsersPage() {
                         {u.name ?? '—'}
                         {u.id === me?.id && <span> · vous</span>}
                       </div>
+                    </td>
+                    <td>
+                      {u.clientProject ? (
+                        <div>
+                          <div className="cell-title font-mono text-sm">{u.clientProject.name}</div>
+                          <div className="muted cell-sub font-mono text-xs">
+                            {u.clientProject.projectUuid}
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="muted">—</div>
+                      )}
                     </td>
                     <td>
                       {u.id === me?.id ? (
@@ -168,6 +194,16 @@ export default function ManagerUsersPage() {
                             onClick={() => impersonate(u)}
                           >
                             Se connecter en tant que
+                          </Button>
+                        )}
+                        {u.clientProject === null && u.role === 'USER' && u.isActive && (
+                          <Button
+                            size="sm"
+                            variant="primary"
+                            disabled={busy === u.id}
+                            onClick={() => createProject(u)}
+                          >
+                            Créer le projet maintenant
                           </Button>
                         )}
                         <Button

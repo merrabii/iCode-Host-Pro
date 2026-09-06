@@ -70,4 +70,14 @@ export class UsersController {
   mfaReset(@Param('id') id: string, @CurrentUser() actor: JwtPayload) {
     return this.mfa.adminReset(id, { sub: actor.sub, email: actor.email });
   }
+
+  // Phase 13 (ADR-031): create the client's dedicated Coolify project (Module B)
+  // — idempotent (POST /projects on Coolify + @@unique on ClientProject).
+  @Post(':id/project')
+  @UseGuards(RolesGuard)
+  @Roles(Role.ADMIN)
+  @ApiOperation({ summary: 'Create client Coolify project for Module B (ADMIN)' })
+  createClientProject(@Param('id') id: string, @CurrentUser() actor: JwtPayload) {
+    return this.users.createClientProject(id, actor);
+  }
 }

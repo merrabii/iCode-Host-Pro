@@ -27,6 +27,8 @@ export interface UserAdmin {
   name?: string | null;
   role: string;
   isActive: boolean;
+  // Phase 13 — projet Coolify dédié (Module B)
+  clientProject?: { id: string; name: string; projectUuid: string } | null;
 }
 
 export interface ApiResult<T = unknown> {
@@ -92,6 +94,8 @@ export function apiError(res: ApiResult, fallback: string): string {
 export const listUsers = (t: string) => apiJson('/api/users', t);
 export const updateUser = (t: string, id: string, patch: { role?: string; isActive?: boolean }) =>
   apiJson(`/api/users/${id}`, t, { method: 'PATCH', body: JSON.stringify(patch) });
+export const createClientProject = (t: string, id: string) =>
+  apiJson(`/api/users/${id}/project`, t, { method: 'POST' });
 export const getManagerSummary = (t: string) => apiJson('/api/manager/summary', t);
 
 // Admin (Phase 4) audit journal helpers.
@@ -1136,3 +1140,24 @@ export const deleteDeploymentModule = (t: string, id: string) =>
 /** Liste LIVE des projets Coolify du serveur du module (choix du projet partagé A). */
 export const listDeploymentModuleProjects = (t: string, id: string) =>
   apiJson(`/api/admin/deployment-modules/${id}/projects`, t);
+
+// ═══ Phase 13 — Monitoring projets ══════════════════════════════════════════════
+export interface ProjectConsumption {
+  projectUuid: string;
+  clientName: string | null;
+  clientEmail: string;
+  moduleKind: DeploymentModuleKind | null;
+  appsCount: number;
+  totalRamMb: number;
+  totalCpuCores: number;
+  totalStorageGb: number;
+  packRamMb: number | null;
+  packCpuCores: number | null;
+  packStorageGb: number | null;
+  overRam: boolean;
+  overCpu: boolean;
+  overDisk: boolean;
+  totalConsumption: number;
+}
+export const listProjectsConsumption = (t: string) =>
+  apiJson('/api/admin/monitoring/projects', t);

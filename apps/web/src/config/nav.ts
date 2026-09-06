@@ -3,6 +3,7 @@ import {
   IconBook,
   IconBox,
   IconBoxes,
+  IconChartBar,
   IconDatabase,
   IconFileText,
   IconGlobe,
@@ -32,6 +33,7 @@ export const ADMIN_NAV: NavSection[] = [
       { label: 'Configuration mail', href: '/manager/mail', icon: IconMail },
       { label: 'DNS & Cloudflare', href: '/manager/dns', icon: IconGlobe },
       { label: "Journal d'audit", href: '/manager/journal', icon: IconFileText },
+      { label: 'Monitoring projets', href: '/manager/monitoring', icon: IconChartBar },
     ],
   },
   {

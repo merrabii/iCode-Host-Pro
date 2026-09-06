@@ -560,8 +560,9 @@ export class DeploymentsService {
    * Projet Coolify dédié du client (Module B) : existe → renvoyé ; sinon créé
    * paresseusement sur Coolify (`POST /projects`, idempotent via @@unique) puis
    * persisté. Nom = `<perClientPrefix>-<id client>` — retrouvable par le support.
+   * Exposed for admin create-client-project endpoint (UsersService).
    */
-  private async getOrCreateClientProject(
+  async getOrCreateClientProject(
     userId: string,
     server: Server,
     module: DeploymentModule,
