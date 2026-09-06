@@ -176,8 +176,8 @@ export default function AidePage() {
 
       {/* ── Lecteur d'article ───────────────────────────────────────────── */}
       {open && (
-        <div className="drawer-overlay" onClick={() => setOpen(null)}>
-          <div className="drawer" onClick={(e) => e.stopPropagation()} style={{ width: 'min(720px, 100vw)' }}>
+        <div className="drawer-overlay">
+          <div className="drawer" style={{ width: 'min(720px, 100%)' }}>
             <div className="drawer-head">
               <div className="flex-1">
                 <div className="drawer-title">{open.title}</div>

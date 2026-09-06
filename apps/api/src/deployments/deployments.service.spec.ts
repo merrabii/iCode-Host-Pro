@@ -12,10 +12,14 @@ describe('DeploymentsService', () => {
     service: { findFirst: jest.fn() },
     server: { findUnique: jest.fn() },
     deployment: { create: jest.fn(), findMany: jest.fn(), findFirst: jest.fn(), update: jest.fn() },
+    cloudflareSetting: { findFirst: jest.fn(), create: jest.fn(), update: jest.fn(), updateMany: jest.fn() },
+    domain: { findFirst: jest.fn(), findUnique: jest.fn() },
+    clientSubdomain: { findFirst: jest.fn(), create: jest.fn() },
   };
   const mockAudit = { record: jest.fn() };
   const mockSettings = { isDeployEnabled: jest.fn() };
   const mockCrypto = { encrypt: jest.fn(), decrypt: jest.fn() };
+  const mockCloudflare = { findActiveRootDomain: jest.fn(), allocateClientSubdomain: jest.fn() };
   const mockGithub = {
     decryptToken: jest.fn(),
     listRepos: jest.fn(),
@@ -101,8 +105,11 @@ describe('DeploymentsService', () => {
       mockCrypto as never,
       mockGithub as never,
       mockPanelFactory as never,
+      mockCloudflare as never,
     );
     jest.clearAllMocks();
+    // Aucun domaine racine configuré par défaut → flux inchangé (Phase 3 best-effort).
+    mockCloudflare.findActiveRootDomain.mockResolvedValue(null);
     mockSettings.isDeployEnabled.mockResolvedValue(true);
     // Compte GitHub lié par défaut (token chiffré présent).
     mockPrisma.user.findUnique.mockResolvedValue({ id: 'u1', githubTokenEnc: 'enc:gh' });
@@ -249,7 +256,7 @@ describe('DeploymentsService', () => {
         status: 'ACTIVE',
         ramMb: 1024,
         cpuCores: 1,
-        diskGb: 20,
+        storageLimit: 20,
         bandwidth: null,
         createdAt: new Date(),
         updatedAt: new Date(),
@@ -295,7 +302,7 @@ describe('DeploymentsService', () => {
         status: 'ACTIVE',
         ramMb: 1024,
         cpuCores: 1,
-        diskGb: 20,
+        storageLimit: 20,
         bandwidth: null,
         createdAt: new Date(),
         updatedAt: new Date(),
@@ -319,6 +326,78 @@ describe('DeploymentsService', () => {
       const created = mockTransport.createGitApp.mock.invocationCallOrder[0];
       const deployOrder = mockTransport.deployApp.mock.invocationCallOrder[0];
       expect(created).toBeLessThan(deployOrder);
+    });
+
+    describe('Phase 3 — sous-domaine Cloudflare alloué au déploiement', () => {
+      const root = {
+        id: 'dom1',
+        name: 'arumdigital.com',
+        zoneId: 'z1',
+        cnameTarget: null,
+        status: 'ACTIVE' as const,
+        createdAt: new Date('2026-09-01T10:00:00Z'),
+        updatedAt: new Date('2026-09-01T10:00:00Z'),
+      };
+
+      it('racine configurée + sous-domaine saisi ⇒ allocate appelé, update écrit subdomain/fqdn/domainId et detail URL', async () => {
+        mockPrisma.service.findFirst.mockResolvedValue(serviceRow());
+        mockPrisma.deployment.create.mockResolvedValue(deploymentRow({ status: 'PENDING', coolifyUuid: null }));
+        mockTransport.createGitApp.mockResolvedValue({ uuid: 'app-1' });
+        mockTransport.deployApp.mockResolvedValue(undefined);
+        mockPrisma.deployment.update.mockResolvedValue(deploymentRow());
+        mockCloudflare.findActiveRootDomain.mockResolvedValue(root);
+        mockCloudflare.allocateClientSubdomain.mockResolvedValue({ subdomain: 'monapp', fqdn: 'monapp.arumdigital.com' });
+
+        await service.create({ serviceId: 'svc1', repoFullName: 'owner/repo', subdomain: 'monapp' }, actor);
+
+        expect(mockCloudflare.allocateClientSubdomain).toHaveBeenCalledWith(
+          expect.objectContaining({ root, requested: 'monapp', fallbackHost: 'portal.exemple.com' }),
+        );
+        expect(mockPrisma.deployment.update).toHaveBeenCalledWith(
+          expect.objectContaining({
+            data: expect.objectContaining({
+              subdomain: 'monapp',
+              fqdn: 'monapp.arumdigital.com',
+              domainId: 'dom1',
+              detail: expect.stringContaining('https://monapp.arumdigital.com'),
+            }),
+          }),
+        );
+        expect(mockAudit.record).toHaveBeenCalledWith(expect.objectContaining({ action: 'deploy.domain' }));
+        // Ordre : l'allocation DNS (après création de l'app) précède le run.
+        const dnsOrder = mockCloudflare.allocateClientSubdomain.mock.invocationCallOrder[0];
+        const deployOrder = mockTransport.deployApp.mock.invocationCallOrder[0];
+        expect(dnsOrder).toBeLessThan(deployOrder);
+      });
+
+      it('racine NON configurée ⇒ aucun appel allocation, déploiement normal', async () => {
+        mockPrisma.service.findFirst.mockResolvedValue(serviceRow());
+        mockPrisma.deployment.create.mockResolvedValue(deploymentRow({ status: 'PENDING', coolifyUuid: null }));
+        mockTransport.createGitApp.mockResolvedValue({ uuid: 'app-1' });
+        mockTransport.deployApp.mockResolvedValue(undefined);
+        mockPrisma.deployment.update.mockResolvedValue(deploymentRow());
+        mockCloudflare.findActiveRootDomain.mockResolvedValue(null);
+
+        await service.create({ serviceId: 'svc1', repoFullName: 'owner/repo' }, actor);
+
+        expect(mockCloudflare.allocateClientSubdomain).not.toHaveBeenCalled();
+      });
+
+      it('échec d’allocation ⇒ best-effort : ligne DEPLOYING quand même + audit deploy.domain.warn', async () => {
+        mockPrisma.service.findFirst.mockResolvedValue(serviceRow());
+        mockPrisma.deployment.create.mockResolvedValue(deploymentRow({ status: 'PENDING', coolifyUuid: null }));
+        mockTransport.createGitApp.mockResolvedValue({ uuid: 'app-1' });
+        mockTransport.deployApp.mockResolvedValue(undefined);
+        mockPrisma.deployment.update.mockResolvedValue(deploymentRow());
+        mockCloudflare.findActiveRootDomain.mockResolvedValue(root);
+        mockCloudflare.allocateClientSubdomain.mockRejectedValue(new Error('Sous-domaine déjà pris : monapp.arumdigital.com'));
+
+        const out = await service.create({ serviceId: 'svc1', repoFullName: 'owner/repo', subdomain: 'monapp' }, actor);
+
+        expect(out.status).toBe('DEPLOYING');
+        expect(mockTransport.deployApp).toHaveBeenCalled(); // jamais bloqué par le DNS
+        expect(mockAudit.record).toHaveBeenCalledWith(expect.objectContaining({ action: 'deploy.domain.warn' }));
+      });
     });
 
     it('Phase 12 — aucun pack ⇒ applyAppLimits jamais appelé', async () => {

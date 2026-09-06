@@ -17,7 +17,7 @@ describe('CategoriesService', () => {
   const actor = { sub: 'admin', email: 'admin@example.com' };
   const INCLUDE = {
     recommendedPack: {
-      select: { id: true, name: true, ramMb: true, cpuCores: true, diskGb: true, bandwidth: true },
+      select: { id: true, name: true, ramMb: true, cpuCores: true, storageLimit: true, bandwidth: true },
     },
     _count: { select: { products: true } },
   };

@@ -69,7 +69,10 @@ export interface CoolifyGitAppResult {
 
 /** Limites Docker d'une application Coolify (Phase 12) — champs opt. :
  *  `cpus` = limits_cpus (ex "0.5", "1"), `memory` = limits_memory (ex "512m",
- *  "1g"). Appliquées via PATCH /applications/:uuid. */
+ *  "1g"). Appliquées en une seule PATCH /applications/:uuid (champs natifs).
+ *  NB : le quota disque (Plan.storage_limit) est ENREGISTRÉ sur le pack mais
+ *  PAS ENCORE ACTIF — aucun `--storage-opt`/`custom_docker_run_options` n'est
+ *  poussé pour l'instant (système de quota prévu après la mise en prod). */
 export interface CoolifyAppLimits {
   cpus?: string;
   memory?: string;
@@ -395,10 +398,10 @@ class NodePanelTransport extends PanelTransport {
   }
 
   /**
-   * Applique les limites Docker (RAM/CPU) à une app Coolify (Phase 12) via
-   * `PATCH /applications/:uuid` (verbe update Coolify v4) avec `limits_cpus` /
-   * `limits_memory`. Seuls les champs fournis sont envoyés. NB : best-effort
-   * côté service — l'échec ne doit pas bloquer le déploiement de l'app.
+   * Applique les limites Docker (RAM/CPU) à une app Coolify (Phase 12)
+   * via `PATCH /applications/:uuid` (verbe update Coolify v4) avec
+   * `limits_cpus` / `limits_memory`. Seuls les champs fournis sont envoyés.
+   * NB : best-effort côté service — l'échec ne doit pas bloquer le déploiement.
    */
   async applyAppLimits(
     target: PanelTarget,

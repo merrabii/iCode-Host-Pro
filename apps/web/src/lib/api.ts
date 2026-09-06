@@ -341,13 +341,14 @@ export interface ProductAdmin {
   category?: { id: string; name: string } | null;
   pack?: PackMin | null;
 }
-/** Référence pack (limites présentées à l'admin + client). */
+/** Référence pack (limites présentées à l'admin + client). storageLimit = quota
+ *  disque ENREGISTRÉ mais NON actif encore (système de quota après la mise en prod). */
 export interface PackMin {
   id: string;
   name: string;
   ramMb: number;
   cpuCores: number;
-  diskGb: number | null;
+  storageLimit: number | null;
   bandwidth: string | null;
   status?: string;
 }
@@ -358,7 +359,7 @@ export interface PackAdmin {
   description?: string | null;
   ramMb: number;
   cpuCores: number;
-  diskGb: number | null;
+  storageLimit: number | null;
   bandwidth: string | null;
   status: string;
   createdAt: string;
@@ -382,7 +383,7 @@ export type PackInput = {
   description?: string;
   ramMb?: number;
   cpuCores?: number;
-  diskGb?: number | null;
+  storageLimit?: number | null;
   bandwidth?: string;
   status?: string;
 };
@@ -432,6 +433,87 @@ export const checkServer = (t: string, id: string) =>
 // Phase 9 (ADR-010): vérification de l'API du panneau serveur (Hestia/Coolify).
 export const verifyServerPanel = (t: string, id: string) =>
   apiJson(`/api/servers/${id}/panel-verify`, t, { method: 'POST' });
+// ── Phase 3 — DNS & Cloudflare (ADMIN) ───────────────────────────────────────
+// Le contrôle DNS est LIVE via l'API Cloudflare. La clé est write-only : le
+// backend ne renvoie jamais le jeton, seulement `hasApiToken`.
+export interface CloudflareSettings {
+  id: string | null;
+  hasApiToken: boolean;
+  accountEmail: string | null;
+  rootDomainId: string | null;
+  rootDomain: { id: string; name: string; cnameTarget: string | null } | null;
+  createdAt: string | null;
+  updatedAt: string | null;
+}
+export interface CloudflareZone {
+  id: string;
+  name: string;
+  status: string;
+  paused: boolean;
+}
+export interface CloudflareDomain {
+  id: string;
+  name: string;
+  zoneId: string;
+  cnameTarget: string | null;
+  status: 'ACTIVE' | 'DISABLED';
+  isRoot: boolean;
+  clientSubdomainCount: number;
+  createdAt: string;
+  updatedAt: string;
+}
+export type DnsRecordType = 'A' | 'AAAA' | 'CNAME' | 'MX' | 'TXT' | 'SRV' | 'NS' | 'CAA';
+export interface DnsRecord {
+  id: string;
+  type: string;
+  name: string;
+  content: string;
+  proxied?: boolean;
+  ttl?: number;
+}
+export const getCloudflareSettings = (t: string) => apiJson('/api/admin/cloudflare', t);
+export const updateCloudflareSettings = (
+  t: string,
+  dto: { apiToken?: string; accountEmail?: string },
+) => apiJson('/api/admin/cloudflare', t, { method: 'PUT', body: JSON.stringify(dto) });
+/** Vérifie le jeton + liste les zones du compte (jamais le jeton dans la réponse). */
+export const verifyCloudflare = (t: string) =>
+  apiJson('/api/admin/cloudflare/verify', t, { method: 'POST' });
+export const listCloudflareZones = (t: string) => apiJson('/api/admin/cloudflare/zones', t);
+export const listCloudflareDomains = (t: string) => apiJson('/api/admin/cloudflare/domains', t);
+export const registerCloudflareDomain = (
+  t: string,
+  dto: { zoneId: string; name: string; cnameTarget?: string },
+) => apiJson('/api/admin/cloudflare/domains', t, { method: 'POST', body: JSON.stringify(dto) });
+export const updateCloudflareDomain = (
+  t: string,
+  id: string,
+  patch: { cnameTarget?: string; status?: 'ACTIVE' | 'DISABLED' },
+) => apiJson(`/api/admin/cloudflare/domains/${id}`, t, { method: 'PATCH', body: JSON.stringify(patch) });
+export const deleteCloudflareDomain = (t: string, id: string) =>
+  apiJson(`/api/admin/cloudflare/domains/${id}`, t, { method: 'DELETE' });
+/** Sélectionne (≤ 1) le domaine racine des sous-domaines client ; null = désélectionner. */
+export const setCloudflareRoot = (t: string, domainId: string | null) =>
+  apiJson('/api/admin/cloudflare/root', t, { method: 'POST', body: JSON.stringify({ domainId }) });
+export const listCloudflareRecords = (t: string, domainId: string) =>
+  apiJson(`/api/admin/cloudflare/domains/${domainId}/records`, t);
+export const createCloudflareRecord = (
+  t: string,
+  domainId: string,
+  dto: { type: DnsRecordType; name: string; content: string; proxied?: boolean; ttl?: number },
+) =>
+  apiJson(`/api/admin/cloudflare/domains/${domainId}/records`, t, {
+    method: 'POST',
+    body: JSON.stringify(dto),
+  });
+export const deleteCloudflareRecord = (t: string, domainId: string, recordId: string) =>
+  apiJson(`/api/admin/cloudflare/domains/${domainId}/records/${recordId}`, t, { method: 'DELETE' });
+/** Disponibilité d'un sous-domaine sous une racine (check de l'UI/du client). */
+export const checkSubdomainAvailability = (t: string, subdomain: string, domainId: string) =>
+  apiJson('/api/admin/cloudflare/check', t, {
+    method: 'POST',
+    body: JSON.stringify({ subdomain, domainId }),
+  });
 export const listProducts = (t: string) => apiJson('/api/products', t);
 export const createProduct = (
   t: string,
@@ -932,6 +1014,9 @@ export interface Deployment {
   branch: string;
   status: DeploymentStatus;
   detail?: string | null;
+  /** Phase 3 — URL reachable du sous-domaine gratuit alloué (monapp.arumdigital.com). */
+  subdomain?: string | null;
+  fqdn?: string | null;
   createdAt: string;
   updatedAt: string;
   /** Références masquées — jamais l'UUID Coolify ni l'adresse du serveur. */
@@ -972,5 +1057,7 @@ export const createDeployment = (
     branch?: string;
     buildPack?: BuildPack;
     appName?: string;
+    /** Phase 3 — sous-domaine gratuit choisi (vide/absent = slug auto). */
+    subdomain?: string;
   },
 ) => apiJson('/api/client/deployments', t, { method: 'POST', body: JSON.stringify(dto) });

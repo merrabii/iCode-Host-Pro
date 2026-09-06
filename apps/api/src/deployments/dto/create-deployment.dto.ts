@@ -51,4 +51,15 @@ export class CreateDeploymentDto {
   @IsNotEmpty()
   @MaxLength(100)
   appName?: string;
+
+  // Phase 3 — sous-domaine gratuit choisi par le client sous le domaine racine
+  // (ex "monapp" → monapp.arumdigital.com). Vide/absent = slug automatique depuis
+  // le nom de la Service. Alloué + CNAME créé via Cloudflare au déploiement.
+  @IsOptional()
+  @IsString()
+  @Matches(/^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/, {
+    message: 'Sous-domaine invalide (lettres minuscules, chiffres, tirets).',
+  })
+  @MaxLength(63)
+  subdomain?: string;
 }

@@ -34,7 +34,7 @@ export class PacksService {
         description: dto.description ?? null,
         ramMb: dto.ramMb,
         cpuCores: dto.cpuCores ?? 1,
-        diskGb: dto.diskGb ?? null,
+        storageLimit: dto.storageLimit ?? null,
         bandwidth: PacksService.toBandwidth(dto.bandwidth) ?? null,
         status: dto.status ?? PackStatus.ACTIVE,
       },
@@ -76,7 +76,7 @@ export class PacksService {
       description?: string | null;
       ramMb?: number;
       cpuCores?: number;
-      diskGb?: number | null;
+      storageLimit?: number | null;
       bandwidth?: string | null;
       status?: PackStatus;
     } = {};
@@ -84,7 +84,7 @@ export class PacksService {
     if (dto.description !== undefined) data.description = dto.description;
     if (dto.ramMb !== undefined) data.ramMb = dto.ramMb;
     if (dto.cpuCores !== undefined) data.cpuCores = dto.cpuCores;
-    if (dto.diskGb !== undefined) data.diskGb = dto.diskGb;
+    if (dto.storageLimit !== undefined) data.storageLimit = dto.storageLimit;
     if (dto.bandwidth !== undefined) data.bandwidth = PacksService.toBandwidth(dto.bandwidth) ?? null;
     if (dto.status !== undefined) data.status = dto.status;
     const pack = await this.prisma.hostingPack.update({

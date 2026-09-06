@@ -302,8 +302,8 @@ export default function ConnaissancePage() {
 
       {/* ── Éditeur (dessin) ─────────────────────────────────────────────── */}
       {editing && (
-        <div className="drawer-overlay" onClick={() => setEditing(null)}>
-          <div className="drawer" onClick={(e) => e.stopPropagation()} style={{ width: 'min(680px, 100vw)' }}>
+        <div className="drawer-overlay">
+          <div className="drawer" style={{ width: 'min(680px, 100%)' }}>
             <div className="drawer-head">
               <div className="flex-1">
                 <div className="drawer-title">{editing === 'new' ? 'Nouvel article' : 'Éditer l’article'}</div>

@@ -231,7 +231,10 @@ model HostingPack {
   description String?
   ramMb       Int // RAM (Mo)
   cpuCores    Float      @default(1) // cœurs (fraction autorisée, ex 0.5)
-  diskGb      Int? // disque (Go)
+  storageLimit Int? // stockage limite (Go) — VALEUR ENREGISTRÉE, quota NON actif
+  // encore (architecture Plan.cpu_limit / memory_limit / storage_limit : seule la
+  // RAM/CPU sont appliqués à la création ; le système de quota disque arrive après
+  // la mise en prod).
   bandwidth   String? // bande passante, label libre ex « 1 To / mois »
   status      PackStatus @default(ACTIVE)
   createdAt   DateTime   @default(now())
@@ -442,11 +445,83 @@ model Deployment {
   coolifyUuid  String? // UUID de l'application Coolify (jamais exposé au client)
   status       DeploymentStatus @default(PENDING)
   detail       String?
+  // Phase 3 (Cloudflare) : sous-domaine gratuit alloué au déploiement. `fqdn`
+  // (ex monapp.arumdigital.com) est l'URL reachable exposée au client ; elle est
+  // portée par la classe ClientSubdomain (l'enregistrement DNS créé sur Cloudflare).
+  subdomain    String?
+  domainId     String?
+  domain       Domain?            @relation(fields: [domainId], references: [id], onDelete: SetNull)
+  fqdn         String?            @unique
+  clientSubdomain ClientSubdomain?
   createdAt    DateTime         @default(now())
   updatedAt    DateTime         @updatedAt
 
   @@index([userId])
   @@index([serviceId])
+  @@index([status])
+}
+
+// ── Phase 3 — DNS & sous-domaines Cloudflare (demande propriétaire) ──────────
+// Le contrôle DNS EST Cloudflare ("proxy live") : la table des enregistrements
+// lit/écrit directement l'API v4 (Bearer). Les tables locales ne PORTENT que la
+// configuration : le compte (CloudflareSetting, SINGLETON comme SecuritySetting),
+// les zones racines importées (Domain, la "liste" que l'admin sélectionne) et
+// les sous-domaines alloués aux apps client (ClientSubdomain).
+// Le jeton est AES-256-GCM au repos (CryptoService) et JAMAIS renvoyé par l'API
+// (seule une vue `hasApiToken`).
+
+enum DomainStatus {
+  ACTIVE
+  DISABLED // retiré de l'UI mais conservé (aucune nouvelle allocation)
+}
+
+enum SubdomainStatus {
+  PENDING // en attente de création côté Cloudflare
+  CREATED // enregistrement CNAME créé (recordId)
+  ERROR // échec de création DNS
+}
+
+// SINGLETON (un champ racine, ≤ 1 domaine racine) — même patron que SecuritySetting.
+model CloudflareSetting {
+  id           String   @id @default(cuid())
+  apiTokenEnc  String? // jeton Cloudflare API, AES-256-GCM — jamais exposé
+  accountEmail String?
+  rootDomainId String?  @unique // ≤ 1 racine sélectionnée (singleton)
+  rootDomain   Domain?  @relation("RootDomain", fields: [rootDomainId], references: [id], onDelete: SetNull)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
+// Zones racines importées depuis le compte Cloudflare ("la liste" admin).
+model Domain {
+  id          String             @id @default(cuid())
+  name        String             @unique // ex arumdigital.com
+  zoneId      String             @unique // zone Cloudflare (id de zone)
+  // Hostname cible des CNAME clients (ex panel.arumdigital.com). Si non renseigné,
+  // fallback : hostname du serveur associé à la Service déployée.
+  cnameTarget String?
+  status      DomainStatus       @default(ACTIVE)
+  rootOf      CloudflareSetting? @relation("RootDomain") // 1:1 — la racine sélectionnée
+  clientSubdomains ClientSubdomain[]
+  deployments Deployment[]
+  createdAt   DateTime           @default(now())
+  updatedAt   DateTime           @updatedAt
+}
+
+// Allocation d'un sous-domaine libre à l'app d'un client (au déploiement).
+model ClientSubdomain {
+  id           String          @id @default(cuid())
+  subdomain    String          // ex "monapp" (partie sous le domaine racine)
+  domainId     String
+  domain       Domain          @relation(fields: [domainId], references: [id], onDelete: Cascade)
+  fqdn         String          @unique // ex monapp.arumdigital.com
+  recordId     String?         // id de l'enregistrement DNS Cloudflare créé
+  status       SubdomainStatus @default(PENDING)
+  deploymentId String?         @unique // ≤ 1 sous-domaine par déploiement
+  deployment   Deployment?     @relation(fields: [deploymentId], references: [id], onDelete: SetNull)
+  createdAt    DateTime        @default(now())
+
+  @@index([domainId])
   @@index([status])
 }
 

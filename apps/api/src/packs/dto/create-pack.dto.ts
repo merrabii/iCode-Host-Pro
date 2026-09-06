@@ -24,7 +24,9 @@ export class CreatePackDto {
   description?: string;
 
   // Limites de ressources — RAM obligatoire ; CPU par défaut à 1 (validation
-  // IsPositive pour rejeter 0/négatif), disque >= 0 (opt), bande passante libellé.
+  // IsPositive pour rejeter 0/négatif). `storageLimit` = quota disque (Go),
+  // VALEUR ENREGISTRÉE mais système de quota NON actif encore (Plan.cpu_limit/
+  // memory_limit/storage_limit) ; seuls RAM/CPU sont appliqués pour l'instant.
   @IsInt()
   @Min(1)
   ramMb!: number;
@@ -37,7 +39,7 @@ export class CreatePackDto {
   @IsOptional()
   @IsInt()
   @Min(1)
-  diskGb?: number;
+  storageLimit?: number;
 
   @IsOptional()
   @IsString()

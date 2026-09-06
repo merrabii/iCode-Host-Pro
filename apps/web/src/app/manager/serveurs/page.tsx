@@ -185,16 +185,8 @@ export default function ManagerServeursPage() {
     if (phase === 'ready' && token) void load(token);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [phase, token]);
-
-  // Échap ferme le panneau latéral (tant qu'aucune requête n'est en cours).
-  useEffect(() => {
-    if (!drawer) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && busy === null) setDrawer(null);
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [drawer, busy]);
+  // NOTE : la modale ne se ferme NI par Échap NI par clic extérieur — uniquement
+  // par « Annuler » / ✕ (retour utilisateur). Aucun raccord implicite ici.
 
   async function load(t: string) {
     const r = await listServers(t);
@@ -731,14 +723,10 @@ export default function ManagerServeursPage() {
         )}
       </div>
 
-      {/* Panneau latéral de création / édition */}
+      {/* Fenêtre modale centrée de création / édition (fermeture UNIQUEMENT
+          par « Annuler » / ✕ — pas de clic sur le fond, pas d'Échap). */}
       {drawer && (
-        <div
-          className="drawer-overlay"
-          onClick={(e) => {
-            if (e.target === e.currentTarget && busy === null) setDrawer(null);
-          }}
-        >
+        <div className="drawer-overlay">
           <div className="drawer" role="dialog" aria-modal="true" aria-label={drawerTitle}>
             <div className="drawer-head">
               <div className="flex-1">

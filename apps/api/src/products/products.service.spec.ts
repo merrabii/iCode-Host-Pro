@@ -25,7 +25,7 @@ describe('ProductsService', () => {
         name: true,
         ramMb: true,
         cpuCores: true,
-        diskGb: true,
+        storageLimit: true,
         bandwidth: true,
         status: true,
       },

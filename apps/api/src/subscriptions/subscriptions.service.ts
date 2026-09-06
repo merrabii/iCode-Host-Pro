@@ -222,7 +222,7 @@ export class SubscriptionsService {
               select: {
                 id: true,
                 name: true,
-                pack: { select: { id: true, name: true, ramMb: true, cpuCores: true, diskGb: true, bandwidth: true } },
+                pack: { select: { id: true, name: true, ramMb: true, cpuCores: true, storageLimit: true, bandwidth: true } },
               },
             },
           },

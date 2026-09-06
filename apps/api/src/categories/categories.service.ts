@@ -18,7 +18,7 @@ export type CategoryView = ProductCategory & {
     name: string;
     ramMb: number;
     cpuCores: number;
-    diskGb: number | null;
+    storageLimit: number | null;
     bandwidth: string | null;
   } | null;
   _count?: { products: number };
@@ -30,7 +30,7 @@ const PACK_SELECT = {
     name: true,
     ramMb: true,
     cpuCores: true,
-    diskGb: true,
+    storageLimit: true,
     bandwidth: true,
   },
 };

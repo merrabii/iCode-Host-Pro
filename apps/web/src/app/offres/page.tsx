@@ -116,7 +116,7 @@ export default function OffresPage() {
                       <div className="offres-resources">
                         {p.pack.ramMb ? <span>{p.pack.ramMb} Mo RAM</span> : null}
                         {p.pack.cpuCores ? <span>{p.pack.cpuCores} CPU</span> : null}
-                        {p.pack.diskGb ? <span>{p.pack.diskGb} Go</span> : null}
+                        {p.pack.storageLimit ? <span>{p.pack.storageLimit} Go</span> : null}
                         {p.pack.bandwidth ? <span>{p.pack.bandwidth}</span> : null}
                       </div>
                     )}

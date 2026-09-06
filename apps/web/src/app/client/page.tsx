@@ -136,6 +136,8 @@ export default function ClientPage() {
   const [detected, setDetected] = useState<DetectResult | null>(null);
   const [depAppName, setDepAppName] = useState('');
   const [depBuildPack, setDepBuildPack] = useState<BuildPack>('nixpacks');
+  // Phase 3 — sous-domaine gratuit (optionnel) ; vide = slug auto.
+  const [depSubdomain, setDepSubdomain] = useState('');
 
   const load = useCallback(
     async (t: string) => {
@@ -320,6 +322,7 @@ export default function ClientPage() {
       serviceId: depServiceId,
       repoFullName: depRepo,
       branch,
+      subdomain: depSubdomain.trim() || undefined,
     });
     if (!r.ok) return toast.error(apiError(r, 'Déploiement impossible.'));
     toast.ok('Déploiement déclenché — statut en direct ci-dessous.');
@@ -363,6 +366,7 @@ export default function ClientPage() {
       branch: detected.defaultBranch, // branche auto (non éditée dans l'UI)
       buildPack: depBuildPack,
       appName: depAppName.trim() || undefined,
+      subdomain: depSubdomain.trim() || undefined,
     });
     if (!r.ok) return toast.error(apiError(r, 'Déploiement impossible.'));
     toast.ok('Déploiement déclenché — statut en direct ci-dessous.');
@@ -527,7 +531,7 @@ export default function ClientPage() {
                       <div className="status-row-sub">
                         Service
                         {svc.subscription?.product?.pack && (
-                          <span className="muted"> · pack {svc.subscription.product.pack.name} ({svc.subscription.product.pack.ramMb} Mo · {svc.subscription.product.pack.cpuCores} CPU{svc.subscription.product.pack.diskGb ? ` · ${svc.subscription.product.pack.diskGb} Go` : ''})</span>
+                          <span className="muted"> · pack {svc.subscription.product.pack.name} ({svc.subscription.product.pack.ramMb} Mo · {svc.subscription.product.pack.cpuCores} CPU{svc.subscription.product.pack.storageLimit ? ` · ${svc.subscription.product.pack.storageLimit} Go` : ''})</span>
                         )}
                       </div>
                     </div>
@@ -611,6 +615,18 @@ export default function ClientPage() {
                               </option>
                             ))}
                         </Select>
+                      </Field>
+                      <Field
+                        label="Sous-domaine (optionnel)"
+                        hint="Libre ; vide = slug auto depuis le nom du service."
+                      >
+                        <Input
+                          className="input-sm"
+                          placeholder="mon-app"
+                          value={depSubdomain}
+                          disabled={isImp}
+                          onChange={(e) => setDepSubdomain(e.target.value)}
+                        />
                       </Field>
                       <Button disabled={isImp || !depRepo || !depServiceId} onClick={deploy}>
                         Déployer
@@ -697,6 +713,18 @@ export default function ClientPage() {
                                   ))}
                               </Select>
                             </Field>
+                            <Field
+                              label="Sous-domaine (optionnel)"
+                              hint="Libre ; vide = slug auto. Vous obtenez une URL en https://."
+                            >
+                              <Input
+                                className="input-sm"
+                                placeholder="mon-app"
+                                value={depSubdomain}
+                                disabled={isImp}
+                                onChange={(e) => setDepSubdomain(e.target.value)}
+                              />
+                            </Field>
                             <Button
                               disabled={isImp || !detected.repoUrl || !depServiceId}
                               onClick={deployUrl}
@@ -742,6 +770,19 @@ export default function ClientPage() {
                               branche {d.branch} · service {d.service?.name ?? '—'}
                               {d.buildPack ? ` · build ${d.buildPack}` : ''}
                               {d.appName ? ` · app « ${d.appName} »` : ''}
+                              {d.fqdn ? (
+                                <>
+                                  {' · '}
+                                  <a
+                                    href={`https://${d.fqdn}`}
+                                    target="_blank"
+                                    rel="noreferrer"
+                                    style={{ color: 'var(--accent)', fontWeight: 600 }}
+                                  >
+                                    app : https://{d.fqdn}
+                                  </a>
+                                </>
+                              ) : null}
                               {d.status === 'FAILED' && d.detail ? ` · ${d.detail}` : ''} ·{' '}
                               {new Date(d.updatedAt).toLocaleString()}
                             </div>

@@ -38,7 +38,7 @@ describe('PacksService', () => {
         description: null,
         ramMb: 1024,
         cpuCores: 1,
-        diskGb: null,
+        storageLimit: null,
         bandwidth: null,
         status: 'ACTIVE',
       },
@@ -52,7 +52,7 @@ describe('PacksService', () => {
   it('keeps trimmed bandwidth string and explicit ram/cpu/status', async () => {
     mockPrisma.hostingPack.create.mockResolvedValue({});
     await service.create(
-      { name: 'Pro', ramMb: 2048, cpuCores: 2, diskGb: 50, bandwidth: ' 1 To / mois ', status: 'DRAFT' },
+      { name: 'Pro', ramMb: 2048, cpuCores: 2, storageLimit: 50, bandwidth: ' 1 To / mois ', status: 'DRAFT' },
       actor,
     );
     expect(mockPrisma.hostingPack.create).toHaveBeenCalledWith({
@@ -61,7 +61,7 @@ describe('PacksService', () => {
         description: null,
         ramMb: 2048,
         cpuCores: 2,
-        diskGb: 50,
+        storageLimit: 50,
         bandwidth: '1 To / mois',
         status: 'DRAFT',
       },

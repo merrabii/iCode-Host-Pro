@@ -28,7 +28,7 @@ import {
 import { IconLayers, IconPencil, IconPlus, IconTrash, IconX } from '@/components/icons';
 
 const PACK_STATUSES = ['DRAFT', 'ACTIVE', 'SUSPENDED', 'DISABLED'];
-const EMPTY = { name: '', description: '', ramMb: '', cpuCores: '1', diskGb: '', bandwidth: '' };
+const EMPTY = { name: '', description: '', ramMb: '', cpuCores: '1', storageLimit: '', bandwidth: '' };
 
 export default function ManagerPacksPage() {
   const { phase, me, token } = useAdminSession();
@@ -63,7 +63,7 @@ export default function ManagerPacksPage() {
       description: p.description ?? '',
       ramMb: String(p.ramMb),
       cpuCores: String(p.cpuCores),
-      diskGb: p.diskGb != null ? String(p.diskGb) : '',
+      storageLimit: p.storageLimit != null ? String(p.storageLimit) : '',
       bandwidth: p.bandwidth ?? '',
     });
     setShowForm(true);
@@ -81,15 +81,15 @@ export default function ManagerPacksPage() {
     const cpuCores = f.cpuCores.trim() === '' ? 1 : Number(f.cpuCores);
     if (!Number.isFinite(cpuCores) || cpuCores <= 0)
       return toast.error('CPU (cœurs) : nombre strictement positif requis.');
-    const diskGb = f.diskGb.trim() === '' ? null : Number(f.diskGb);
-    if (diskGb != null && (!Number.isInteger(diskGb) || diskGb < 1))
-      return toast.error('Disque (Go) : entier >= 1 requis.');
+    const storageLimit = f.storageLimit.trim() === '' ? null : Number(f.storageLimit);
+    if (storageLimit != null && (!Number.isInteger(storageLimit) || storageLimit < 1))
+      return toast.error('Disque (Go) : entier >= 1 requis (quota enregistré, non actif).');
     const payload = {
       name: f.name.trim(),
       description: f.description.trim() || undefined,
       ramMb,
       cpuCores,
-      diskGb,
+      storageLimit,
       bandwidth: f.bandwidth.trim() || undefined,
     };
     setBusy('save');
@@ -176,8 +176,8 @@ export default function ManagerPacksPage() {
               <Field label="CPU (cœurs)">
                 <Input type="number" min={0.25} step={0.25} value={f.cpuCores} onChange={(e) => field('cpuCores', e.target.value)} placeholder="1" />
               </Field>
-              <Field label="Disque (Go)">
-                <Input type="number" min={1} step={1} value={f.diskGb} onChange={(e) => field('diskGb', e.target.value)} placeholder="20" />
+              <Field label="Disque (Go)" hint="Quota enregistré — système de quota non actif encore">
+                <Input type="number" min={1} step={1} value={f.storageLimit} onChange={(e) => field('storageLimit', e.target.value)} placeholder="20" />
               </Field>
               <Field label="Bande passante">
                 <Input value={f.bandwidth} onChange={(e) => field('bandwidth', e.target.value)} placeholder="1 To / mois" />
@@ -229,7 +229,7 @@ export default function ManagerPacksPage() {
                     </td>
                     <td><Badge tone="violet">{p.ramMb} Mo</Badge></td>
                     <td>{p.cpuCores} cœurs</td>
-                    <td>{p.diskGb != null ? `${p.diskGb} Go` : '—'}</td>
+                    <td>{p.storageLimit != null ? `${p.storageLimit} Go` : '—'}</td>
                     <td>{p.bandwidth ?? '—'}</td>
                     <td>{p._count?.products ?? 0}</td>
                     <td>

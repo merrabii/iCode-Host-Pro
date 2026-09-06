@@ -30,6 +30,7 @@ export const ADMIN_NAV: NavSection[] = [
       { label: 'Souscriptions & services', href: '/manager/subscriptions', icon: IconBoxes },
       { label: 'Invitations', href: '/manager/invitations', icon: IconMail },
       { label: 'Configuration mail', href: '/manager/mail', icon: IconMail },
+      { label: 'DNS & Cloudflare', href: '/manager/dns', icon: IconGlobe },
       { label: "Journal d'audit", href: '/manager/journal', icon: IconFileText },
     ],
   },

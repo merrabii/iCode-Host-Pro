@@ -28,6 +28,7 @@ import {
   PanelTarget,
   PanelTransportFactory,
 } from '../servers/panel-transport.factory';
+import { CloudflareService } from '../cloudflare/cloudflare.service';
 import { CreateDeploymentDto } from './dto/create-deployment.dto';
 import { DetectResult, GithubRepo, GithubService } from './github.service';
 
@@ -46,7 +47,10 @@ type DeploymentWithRefs = Deployment & {
 /** Mapping best-effort du statut brut Coolify vers notre DeploymentStatus. */
 function mapCoolifyStatus(raw: string): DeploymentStatus | null {
   const s = raw.toLowerCase();
-  if (['running', 'exited', 'finished', 'success', 'successful', 'deployed'].includes(s)) {
+  // Coolify rend l'état d'une app sous la forme « <état>:<santé> » (ex
+  // « running:healthy », « running:unknown », « exited:unhealthy »). Toute
+  // variante « running»* = l'app TOURNE → ACTIVE.
+  if (s.startsWith('running') || ['exited', 'finished', 'success', 'successful', 'deployed'].includes(s)) {
     return DeploymentStatus.ACTIVE;
   }
   if (['queued', 'in_progress', 'starting', 'building', 'deploying', 'processing', 'pending'].includes(s)) {
@@ -77,6 +81,7 @@ export class DeploymentsService {
     private readonly crypto: CryptoService,
     private readonly github: GithubService,
     private readonly panelFactory: PanelTransportFactory,
+    private readonly cloudflare: CloudflareService,
   ) {}
 
   private async requireDeployEnabled(): Promise<void> {
@@ -226,6 +231,43 @@ export class DeploymentsService {
           });
         }
       }
+      // Phase 3 — sous-domaine gratuit (CNAME → hostname Coolify) via Cloudflare,
+      // APRÈS les limites et AVANT le run. Best-effort comme les limites : un
+      // échec (sous-domaine pris, DNS indisponible…) n'interrompt pas le déploiement.
+      let dns: { subdomain?: string; fqdn?: string; domainId?: string } = {};
+      const root = await this.cloudflare.findActiveRootDomain();
+      if (root) {
+        try {
+          const alloc = await this.cloudflare.allocateClientSubdomain({
+            root,
+            requested: dto.subdomain,
+            seed: appName || service.name,
+            fallbackHost: server.hostname,
+            deploymentId: row.id,
+          });
+          dns = { subdomain: alloc.subdomain, fqdn: alloc.fqdn, domainId: root.id };
+          deployDetail += ` App : https://${alloc.fqdn}.`;
+          await this.audit.record({
+            actorId: actor.sub,
+            actorEmail: actor.email,
+            action: 'deploy.domain',
+            resourceType: 'deployment',
+            resourceId: row.id,
+            details: { coolifyUuid: app.uuid, subdomain: alloc.subdomain, fqdn: alloc.fqdn, root: root.name },
+          });
+        } catch (err) {
+          const m = err instanceof Error ? err.message : String(err);
+          deployDetail += ` (DNS : ${m})`;
+          await this.audit.record({
+            actorId: actor.sub,
+            actorEmail: actor.email,
+            action: 'deploy.domain.warn',
+            resourceType: 'deployment',
+            resourceId: row.id,
+            details: { coolifyUuid: app.uuid, requested: dto.subdomain, root: root.name, message: m },
+          });
+        }
+      }
       await transport.deployApp(target, app.uuid);
       const updated = await this.prisma.deployment.update({
         where: { id: row.id },
@@ -233,6 +275,7 @@ export class DeploymentsService {
           coolifyUuid: app.uuid,
           status: DeploymentStatus.DEPLOYING,
           detail: deployDetail,
+          ...dns,
         },
         include: {
           service: { select: { id: true, name: true } },
@@ -354,7 +397,9 @@ export class DeploymentsService {
     return { service, server, pack };
   }
 
-  /** Limites Coolify dérivées d'un pack ACTIVE (RAM/CPU). null = rien à appliquer. */
+  /** Limites Coolify dérivées d'un pack ACTIVE (RAM/CPU). null = rien à appliquer.
+   *  Le quota disque (Plan.storage_limit) est enregistré mais NON appliqué :
+   *  système de quota prévu après la mise en prod. */
   private packLimits(pack: HostingPack | null): CoolifyAppLimits | null {
     if (!pack || pack.status !== PackStatus.ACTIVE) return null;
     const limits: CoolifyAppLimits = {};

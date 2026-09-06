@@ -2,7 +2,9 @@
 // (api panels Coolify/Hestia locales) : aucun réseau externe, timeout court.
 import * as http from 'node:http';
 import { AddressInfo } from 'node:net';
-import { PanelTransportFactory } from './panel-transport.factory';
+import {
+  PanelTransportFactory,
+} from './panel-transport.factory';
 
 describe('PanelTransportFactory / NodePanelTransport', () => {
   const factory = new PanelTransportFactory();

@@ -1,5 +1,8 @@
 # CHANGELOG
 
+## Décision quota disque (2026-09-06) — Plan.storage_limit enregistré mais INACTIF
+La limitation disque (machinerie `--storage-opt`/`custom_docker_run_options` + `mergeStorageOpt`/`storageOptFromGb` + injection `diskGb` au déploiement + tests associés) a été **supprimée**. Le champ du pack est renommé `diskGb` → **`storageLimit`** (migration `20260906010000_rename_pack_disk_to_storage_limit`, valeur préservée) et aligné sur l'architecture `Plan { cpu_limit, memory_limit, storage_limit }`. **Seuls RAM/CPU sont appliqués** à la création de l'app Coolify ; `storageLimit` est affiché/enregistré (admin + offres) mais **le système de quota disque sera branché après la mise en prod** (toujours 320 tests verts, API :3001 prête).
+
 ## Phase 10bis.5 — DÉPLOIEMENT PAR URL COLLÉE + DÉTECTION AUTO (la liaison GitHub devient OPTION) — IMPLEMENTED 2026-09-03 (chaîne verte reverifiée : unit 280, e2e 149, tsc api+web, web build 19 routes ; en attente validation propriétaire → commit + push)
 ### Added
 - **Mode « coller l'URL d'un dépôt git »** : `POST /api/client/deployments/detect {url}` → détection **automatique et best-effort** (branche par défaut, langage, build pack suggéré via l'API GitHub **publique SANS token** + vérif Dockerfile) — aucun compte GitHub requis. Champs éditables côté client : **Build pack** (nixpacks/dockerfile/dockercompose/static) + **Nom de l'app**.
