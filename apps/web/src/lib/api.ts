@@ -1011,7 +1011,8 @@ export type BuildPack = (typeof BUILD_PACKS)[number];
 export interface Deployment {
   id: string;
   userId: string;
-  serviceId: string;
+  // Phase 13 — optionnel : déployer sans Service (cible résolue par pack→module).
+  serviceId?: string | null;
   serverId?: string | null;
   repoFullName: string;
   /** URL git collée (mode URL) — null en mode GitHub lié. */
@@ -1056,11 +1057,29 @@ export const detectDeployment = (t: string, url: string) =>
 export const listMyDeployments = (t: string) => apiJson('/api/client/deployments', t);
 export const getMyDeployment = (t: string, id: string) =>
   apiJson(`/api/client/deployments/${id}`, t);
-/** Déploiement : mode GitHub lié (repoFullName) OU mode URL (repoUrl) — exactement un. */
+/** Quota d'apps du pack ACTIF (Phase 13) — compteur « N utilisées / M autorisées ». */
+export interface ClientDeployQuota {
+  pack: {
+    name: string;
+    ramMb: number;
+    cpuCores: number;
+    storageLimit: number | null;
+    maxApps: number | null;
+  };
+  used: number;
+}
+/** Réponse de listMyDeployments (Phase 13) : apps + quota du pack. */
+export interface ClientDeploymentsPayload {
+  deployments: Deployment[];
+  quota: ClientDeployQuota | null;
+}
+/** Déploiement : mode GitHub lié (repoFullName) OU mode URL (repoUrl) — exactement un.
+ *  `serviceId` est OPTIONNEL (Phase 13) : absent, la cible est résolue depuis le
+ *  pack ACTIF du client (abonnement ACTIVE → produit → pack → module A/B). */
 export const createDeployment = (
   t: string,
   dto: {
-    serviceId: string;
+    serviceId?: string;
     repoFullName?: string;
     repoUrl?: string;
     branch?: string;

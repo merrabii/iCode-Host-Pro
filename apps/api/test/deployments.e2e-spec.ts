@@ -42,12 +42,18 @@ describe('Deployments GitHub → Coolify (e2e, Phase 10bis)', () => {
   // Coutures : transport panneau factice (verify + ops de déploiement) + GitHub.
   const fakeVerify = jest.fn().mockResolvedValue({ ok: true, detail: 'FAKE PANEL OK' });
   const fakeCreateGitApp = jest.fn().mockResolvedValue({ uuid: 'coolify-app-1' });
+  const fakeCreateProject = jest.fn().mockResolvedValue({ uuid: 'coolify-proj-1', name: 'client-x' });
+  const fakeListProjects = jest
+    .fn()
+    .mockResolvedValue([{ uuid: 'coolify-proj-1', name: 'Projet partagé' }]);
   const fakeDeployApp = jest.fn().mockResolvedValue(undefined);
   const fakeDeploymentStatus = jest.fn().mockResolvedValue({ rawStatus: 'in_progress' });
   const fakeFactory: PanelTransportFactory = {
     create: (): PanelTransport => ({
       verify: fakeVerify as unknown as PanelTransport['verify'],
       createGitApp: fakeCreateGitApp,
+      createProject: fakeCreateProject,
+      listProjects: fakeListProjects,
       deployApp: fakeDeployApp,
       applyAppLimits: jest.fn().mockResolvedValue(undefined),
       deploymentStatus: fakeDeploymentStatus,

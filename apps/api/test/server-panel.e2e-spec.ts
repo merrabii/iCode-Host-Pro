@@ -37,6 +37,8 @@ describe('Server panel verify (e2e, Phase 9)', () => {
     create: (): PanelTransport => ({
       verify: fakeVerify as unknown as PanelTransport['verify'],
       createGitApp: jest.fn(),
+      createProject: jest.fn(),
+      listProjects: jest.fn(),
       deployApp: jest.fn(),
       applyAppLimits: jest.fn(),
       deploymentStatus: jest.fn(),

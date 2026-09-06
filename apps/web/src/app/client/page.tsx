@@ -30,6 +30,7 @@ import {
   returnFromImpersonation,
   revokeSupportCode,
   type BuildPack,
+  type ClientDeployQuota,
   type Deployment,
   type DetectResult,
   type GithubLinkStatus,
@@ -181,11 +182,18 @@ export default function ClientPage() {
     if (r.ok) setRepos((r.data as GithubRepo[]) ?? []);
   }, []);
 
-  // Déploiements + rafraîchissement live des statuts en cours.
+  // Déploiements + rafraîchissement live des statuts en cours + quota du pack (Phase 13).
+  const [quota, setQuota] = useState<ClientDeployQuota | null>(null);
+
   const loadDeployments = useCallback(async (t: string) => {
     const r = await listMyDeployments(t);
     if (!r.ok) return;
-    let list = (r.data as Deployment[]) ?? [];
+    const payload = r.data as { deployments: Deployment[]; quota: ClientDeployQuota | null } | Deployment[] | null;
+    // Ancien format (fallback) : tableau direct. Nouveau (Phase 13) : { deployments, quota }.
+    let list = Array.isArray(payload) ? payload : (payload?.deployments ?? []);
+    if (payload && !Array.isArray(payload)) {
+      setQuota(payload.quota);
+    }
     const live = await Promise.all(
       list.filter((d) => d.status === 'DEPLOYING').map((d) => getMyDeployment(t, d.id)),
     );
@@ -316,10 +324,9 @@ export default function ClientPage() {
   }
 
   async function deploy() {
-    if (!depRepo || !depServiceId) return;
+    if (!depRepo) return;
     const branch = depBranch.trim() || 'main';
     const r = await createDeployment(token, {
-      serviceId: depServiceId,
       repoFullName: depRepo,
       branch,
       subdomain: depSubdomain.trim() || undefined,
@@ -350,18 +357,9 @@ export default function ClientPage() {
     toast.ok(d.detail ? `Détecté — ${d.detail}` : 'Dépôt détecté — vérifiez puis déployez.');
   }
 
-  function onUrlServiceChange(id: string) {
-    setDepServiceId(id);
-    if (!depAppName.trim()) {
-      const svc = services.find((s) => s.id === id);
-      if (svc) setDepAppName(svc.name);
-    }
-  }
-
   async function deployUrl() {
-    if (!detected?.repoUrl || !depServiceId) return;
+    if (!detected?.repoUrl) return;
     const r = await createDeployment(token, {
-      serviceId: depServiceId,
       repoUrl: detected.repoUrl,
       branch: detected.defaultBranch, // branche auto (non éditée dans l'UI)
       buildPack: depBuildPack,
@@ -600,25 +598,9 @@ export default function ClientPage() {
                           onChange={(e) => setDepBranch(e.target.value)}
                         />
                       </Field>
-                      <Field label="Service cible">
-                        <Select
-                          value={depServiceId}
-                          disabled={isImp}
-                          onChange={(e) => setDepServiceId(e.target.value)}
-                        >
-                          <option value="">Choisir un service actif…</option>
-                          {services
-                            .filter((s) => s.status === 'ACTIVE')
-                            .map((s) => (
-                              <option key={s.id} value={s.id}>
-                                {s.name}
-                              </option>
-                            ))}
-                        </Select>
-                      </Field>
                       <Field
                         label="Sous-domaine (optionnel)"
-                        hint="Libre ; vide = slug auto depuis le nom du service."
+                        hint="Libre ; vide = slug auto depuis le nom de l'app."
                       >
                         <Input
                           className="input-sm"
@@ -628,7 +610,7 @@ export default function ClientPage() {
                           onChange={(e) => setDepSubdomain(e.target.value)}
                         />
                       </Field>
-                      <Button disabled={isImp || !depRepo || !depServiceId} onClick={deploy}>
+                      <Button disabled={isImp || !depRepo} onClick={deploy}>
                         Déployer
                       </Button>
                     </div>
@@ -697,22 +679,6 @@ export default function ClientPage() {
                                 ))}
                               </Select>
                             </Field>
-                            <Field label="Service cible">
-                              <Select
-                                value={depServiceId}
-                                disabled={isImp}
-                                onChange={(e) => onUrlServiceChange(e.target.value)}
-                              >
-                                <option value="">Choisir un service actif…</option>
-                                {services
-                                  .filter((s) => s.status === 'ACTIVE')
-                                  .map((s) => (
-                                    <option key={s.id} value={s.id}>
-                                      {s.name}
-                                    </option>
-                                  ))}
-                              </Select>
-                            </Field>
                             <Field
                               label="Sous-domaine (optionnel)"
                               hint="Libre ; vide = slug auto. Vous obtenez une URL en https://."
@@ -726,7 +692,7 @@ export default function ClientPage() {
                               />
                             </Field>
                             <Button
-                              disabled={isImp || !detected.repoUrl || !depServiceId}
+                              disabled={isImp || !detected.repoUrl}
                               onClick={deployUrl}
                             >
                               Déployer
@@ -741,6 +707,29 @@ export default function ClientPage() {
                           </EmptyState>
                         )
                       )}
+                    </div>
+                  )}
+
+                  {quota && (
+                    <div className="stack" style={{ marginBottom: 16, padding: '12px 16px', border: '1px solid var(--border)', borderRadius: 8, background: 'var(--tint-blue-bg)' }}>
+                      <div className="row" style={{ alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8 }}>
+                        <div className="row" style={{ gap: 16, alignItems: 'center' }}>
+                          <span className="muted" style={{ fontSize: 13 }}>
+                            <b>Plan :</b> {quota.pack.name} · {quota.pack.ramMb} Mo RAM · {quota.pack.cpuCores} CPU
+                            {quota.pack.storageLimit ? ` · {quota.pack.storageLimit} Go disque` : ''}
+                          </span>
+                          <Badge tone="info">
+                            {quota.pack.maxApps ? (
+                              <>Apps : {quota.used} / {quota.pack.maxApps}</>
+                            ) : (
+                              <>Apps : {quota.used} / illimité</>
+                            )}
+                          </Badge>
+                        </div>
+                        <span className="muted" style={{ fontSize: 12 }}>
+                          {deployments.length} déploiement(s)
+                        </span>
+                      </div>
                     </div>
                   )}
 
@@ -761,35 +750,43 @@ export default function ClientPage() {
                   {deployments.length === 0 ? (
                     <EmptyState>Aucun déploiement pour l&apos;instant.</EmptyState>
                   ) : (
-                    <div className="stack">
+                    <div className="grid">
                       {deployments.map((d) => (
-                        <div key={d.id} className="status-row">
-                          <div className="status-row-main">
-                            <div className="status-row-title">{d.repoFullName}</div>
-                            <div className="status-row-sub">
-                              branche {d.branch} · service {d.service?.name ?? '—'}
-                              {d.buildPack ? ` · build ${d.buildPack}` : ''}
-                              {d.appName ? ` · app « ${d.appName} »` : ''}
-                              {d.fqdn ? (
-                                <>
-                                  {' · '}
-                                  <a
-                                    href={`https://${d.fqdn}`}
-                                    target="_blank"
-                                    rel="noreferrer"
-                                    style={{ color: 'var(--accent)', fontWeight: 600 }}
-                                  >
-                                    app : https://{d.fqdn}
-                                  </a>
-                                </>
-                              ) : null}
-                              {d.status === 'FAILED' && d.detail ? ` · ${d.detail}` : ''} ·{' '}
-                              {new Date(d.updatedAt).toLocaleString()}
+                        <div key={d.id} className="panel" style={{ padding: 16 }}>
+                          <div className="row" style={{ justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 8 }}>
+                            <div className="status-row-title" style={{ fontSize: 15, fontWeight: 600 }}>
+                              {d.appName ?? d.repoFullName.split('/').pop() ?? 'App'}
                             </div>
+                            <Badge tone={statusTone(DEP_TONE(d.status))}>
+                              {DEP_STATUS_LABEL[d.status] ?? d.status}
+                            </Badge>
                           </div>
-                          <Badge tone={statusTone(DEP_TONE(d.status))}>
-                            {DEP_STATUS_LABEL[d.status] ?? d.status}
-                          </Badge>
+                          <div className="status-row-sub muted" style={{ fontSize: 12.5, marginBottom: 12 }}>
+                            <div>Repo : <b>{d.repoFullName}</b></div>
+                            <div>Branche : {d.branch} · Build : {d.buildPack ?? '—'}</div>
+                            {d.fqdn && (
+                              <div>
+                                <a
+                                  href={`https://${d.fqdn}`}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  style={{ color: 'var(--accent)', fontWeight: 500 }}
+                                >
+                                  https://{d.fqdn}
+                                </a>
+                              </div>
+                            )}
+                            {d.status === 'FAILED' && d.detail && (
+                              <div className="muted" style={{ color: 'var(--danger)' }}>
+                                {d.detail}
+                              </div>
+                            )}
+                            <div>{new Date(d.updatedAt).toLocaleString()}</div>
+                          </div>
+                          <div className="row" style={{ gap: 16, marginTop: 8, paddingTop: 8, borderTop: '1px solid var(--border)', fontSize: 12.5 }}>
+                            <span><b>RAM :</b> {quota?.pack.ramMb ?? '—'} Mo</span>
+                            <span><b>CPU :</b> {quota?.pack.cpuCores ?? '—'} cœurs</span>
+                          </div>
                         </div>
                       ))}
                     </div>

@@ -562,16 +562,34 @@ describe('DeploymentsService', () => {
   });
 
   describe('listMine() / findMine()', () => {
-    it('listMine ne renvoie que les déploiements du client, masqués', async () => {
+    it('listMine ne renvoie que les déploiements du client, masqués + quota du pack ACTIF', async () => {
       mockPrisma.deployment.findMany.mockResolvedValue([deploymentRow()]);
+      // Pack ACTIF du compte (module lié, maxApps=2) → quota exposé au client.
+      mockPrisma.subscription.findFirst.mockResolvedValue({
+        product: { pack: { id: 'pack1', name: 'Starter', status: 'ACTIVE', ramMb: 1024, cpuCores: 1, storageLimit: 20, maxApps: 2, bandwidth: null } },
+      });
+      mockPrisma.deployment.count.mockResolvedValue(1);
       const out = await service.listMine(actor);
       expect(mockPrisma.deployment.findMany).toHaveBeenCalledWith({
         where: { userId: 'u1' },
         include: expect.anything(),
         orderBy: { createdAt: 'desc' },
       });
-      expect(out).toHaveLength(1);
-      expect(out[0]).not.toHaveProperty('coolifyUuid');
+      expect(out.deployments).toHaveLength(1);
+      expect(out.deployments[0]).not.toHaveProperty('coolifyUuid');
+      expect(out.quota).toEqual({
+        pack: expect.objectContaining({ name: 'Starter', maxApps: 2, ramMb: 1024, cpuCores: 1 }),
+        used: 1,
+      });
+    });
+
+    it('listMine : aucun pack ACTIF ⇒ quota null (pas de compteur à afficher)', async () => {
+      mockPrisma.deployment.findMany.mockResolvedValue([]);
+      mockPrisma.subscription.findFirst.mockResolvedValue(null);
+      const out = await service.listMine(actor);
+      expect(out.deployments).toHaveLength(0);
+      expect(out.quota).toBeNull();
+      expect(mockPrisma.deployment.count).not.toHaveBeenCalled();
     });
 
     it('findMine : 404 pour un déploiement d’un autre client', async () => {

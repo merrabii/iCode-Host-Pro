@@ -42,6 +42,26 @@ export type DeploymentView = Omit<Deployment, 'coolifyUuid'> & {
   server?: { id: string; name: string } | null;
 };
 
+/** Quota d'apps du pack exposé au client (Phase 13) — le compteur
+ *  « N utilisées / M autorisées » du dashboard + les limites RAM/CPU par app.
+ *  `maxApps = null` ⇒ illimité. `used` = apps non-FAILED du compte. */
+export interface ClientDeployQuota {
+  pack: {
+    name: string;
+    ramMb: number;
+    cpuCores: number;
+    storageLimit: number | null;
+    maxApps: number | null;
+  };
+  used: number;
+}
+
+/** Réponse de listMine (Phase 13) : les déploiements + le quota du pack actif. */
+export interface ClientDeploymentsPayload {
+  deployments: DeploymentView[];
+  quota: ClientDeployQuota | null;
+}
+
 type DeploymentWithRefs = Deployment & {
   service?: { id: string; name: string } | null;
   server?: { id: string; name: string } | null;
@@ -347,8 +367,9 @@ export class DeploymentsService {
     }
   }
 
-  /** Les déploiements du client (service + nom de serveur inclus). */
-  async listMine(actor: Actor): Promise<DeploymentView[]> {
+  /** Les déploiements du client (service + nom de serveur inclus) + le quota
+   *  d'apps du pack ACTIF (Phase 13) pour le compteur du dashboard. */
+  async listMine(actor: Actor): Promise<ClientDeploymentsPayload> {
     const rows = await this.prisma.deployment.findMany({
       where: { userId: actor.sub },
       include: {
@@ -357,7 +378,34 @@ export class DeploymentsService {
       },
       orderBy: { createdAt: 'desc' },
     });
-    return rows.map((r) => this.toView(r));
+    const quota = await this.resolveQuota(actor.sub);
+    return { deployments: rows.map((r) => this.toView(r)), quota };
+  }
+
+  /** Quota d'apps du pack ACTIF du compte : `{ pack, used }`, ou null si aucun
+   *  pack/module n'est actif (pas de quota à afficher). `used` = apps non-FAILED,
+   *  exactement le même décompte que l'enforcement `maxApps` de create(). */
+  private async resolveQuota(userId: string): Promise<ClientDeployQuota | null> {
+    const subscription = await this.prisma.subscription.findFirst({
+      where: { userId, status: SubscriptionStatus.ACTIVE },
+      include: { product: { include: { pack: true } } },
+      orderBy: { createdAt: 'desc' },
+    });
+    const pack = subscription?.product?.pack ?? null;
+    if (!pack || pack.status !== PackStatus.ACTIVE) return null;
+    const used = await this.prisma.deployment.count({
+      where: { userId, status: { not: DeploymentStatus.FAILED } },
+    });
+    return {
+      pack: {
+        name: pack.name,
+        ramMb: pack.ramMb,
+        cpuCores: pack.cpuCores,
+        storageLimit: pack.storageLimit,
+        maxApps: pack.maxApps,
+      },
+      used,
+    };
   }
 
   /**
