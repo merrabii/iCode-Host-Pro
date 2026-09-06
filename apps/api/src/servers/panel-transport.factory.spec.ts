@@ -455,6 +455,108 @@ describe('PanelTransportFactory / NodePanelTransport', () => {
       }
     });
 
+    it('listProjects GETs /projects and maps the success-envelope data array', async () => {
+      let path = '';
+      let authHeader: string | undefined;
+      const srv = await serve((req, res) => {
+        path = req.url ?? '';
+        authHeader = req.headers.authorization;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            success: true,
+            data: [
+              { uuid: 'proj-1', name: 'Projet partagé', description: 'tous les clients' },
+              { uuid: 'proj-2', name: 'client-ab12cd' },
+            ],
+          }),
+        );
+      });
+      try {
+        const out = await factory.create(timeoutMs).listProjects(base(srv.url));
+        expect(out).toEqual([
+          { uuid: 'proj-1', name: 'Projet partagé', description: 'tous les clients' },
+          { uuid: 'proj-2', name: 'client-ab12cd', description: undefined },
+        ]);
+        expect(path).toBe('/api/v1/projects');
+        expect(authHeader).toBe('Bearer tok-deploy');
+      } finally {
+        await srv.close();
+      }
+    });
+
+    it('listProjects rejects when Coolify returns no data array', async () => {
+      const srv = await serve((_req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true }));
+      });
+      try {
+        await expect(factory.create(timeoutMs).listProjects(base(srv.url))).rejects.toThrow(/projets/);
+      } finally {
+        await srv.close();
+      }
+    });
+
+    it('listProjects rejects with the HTTP status on 401 (bad token)', async () => {
+      const srv = await serve((_req, res) => {
+        res.writeHead(401);
+        res.end('unauthorized');
+      });
+      try {
+        await expect(factory.create(timeoutMs).listProjects(base(srv.url))).rejects.toThrow(/401/);
+      } finally {
+        await srv.close();
+      }
+    });
+
+    it('createProject POSTs /projects (env.success + server_uuid) and returns the created uuid', async () => {
+      let method = '';
+      let path = '';
+      let authHeader: string | undefined;
+      let body = '';
+      const srv = await serve((req, res) => {
+        method = req.method ?? '';
+        path = req.url ?? '';
+        authHeader = req.headers.authorization;
+        req.on('data', (c: Buffer) => (body += c.toString()));
+        req.on('end', () => {
+          res.writeHead(201, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: true, data: { uuid: 'proj-new' } }));
+        });
+      });
+      try {
+        const out = await factory.create(timeoutMs).createProject(base(srv.url), {
+          name: 'client-ab12cd',
+          description: 'Projet dédié du client',
+          serverUuid: '0',
+        });
+        expect(out).toEqual({ uuid: 'proj-new', name: 'client-ab12cd' });
+        expect(method).toBe('POST');
+        expect(path).toBe('/api/v1/projects');
+        expect(authHeader).toBe('Bearer tok-deploy');
+        const parsed = JSON.parse(body) as Record<string, string>;
+        expect(parsed.name).toBe('client-ab12cd');
+        expect(parsed.description).toBe('Projet dédié du client');
+        expect(parsed.server_uuid).toBe('0');
+      } finally {
+        await srv.close();
+      }
+    });
+
+    it('createProject rejects when Coolify returns no project uuid', async () => {
+      const srv = await serve((_req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true, data: {} }));
+      });
+      try {
+        await expect(
+          factory.create(timeoutMs).createProject(base(srv.url), { name: 'client-x' }),
+        ).rejects.toThrow(/uuid/);
+      } finally {
+        await srv.close();
+      }
+    });
+
     it('refuses deploy ops on a non-Coolify provider (Hestia)', async () => {
       const hestiaTarget = { ...target, provider: 'HESTIA' as const, baseUrl: 'http://127.0.0.1:1/api/' };
       await expect(
@@ -468,6 +570,10 @@ describe('PanelTransportFactory / NodePanelTransport', () => {
       await expect(factory.create(timeoutMs).deploymentStatus(hestiaTarget, 'x')).rejects.toThrow(/Coolify uniquement/);
       await expect(
         factory.create(timeoutMs).applyAppLimits(hestiaTarget, 'x', { memory: '512m' }),
+      ).rejects.toThrow(/Coolify uniquement/);
+      await expect(factory.create(timeoutMs).listProjects(hestiaTarget)).rejects.toThrow(/Coolify uniquement/);
+      await expect(
+        factory.create(timeoutMs).createProject(hestiaTarget, { name: 'x' }),
       ).rejects.toThrow(/Coolify uniquement/);
     });
   });

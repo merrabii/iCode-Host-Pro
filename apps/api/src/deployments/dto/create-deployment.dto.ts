@@ -9,17 +9,21 @@ import {
 } from 'class-validator';
 import { BUILD_PACKS } from '../github.service';
 
-// Phase 10bis (N) : un déploiement = un dépôt git + le Service ACTIVE du client
-// (affecté par l'admin à un serveur Coolify connecté). DEUX modes (10bis.5) :
+// Phase 10bis (N) : un déploiement = un dépôt git + une cible. DEUX modes
+// (10bis.5) :
 //  - mode GitHub lié : `repoFullName` (owner/repo autodétecté) ;
 //  - mode URL collée : `repoUrl` (détection auto, sans liaison GitHub) — le
 //    client peut corriger `buildPack` (suggéré) et `appName`.
 // Exactement un des deux (`repoFullName` | `repoUrl`) est requis.
+// `serviceId` est OPTIONNEL depuis la Phase 13 : la cible est alors résolue
+// automatiquement depuis le pack ACTIF du client (abonnement → produit → pack →
+// module A/B). Un `serviceId` fourni honore le comportement historique.
 export class CreateDeploymentDto {
+  @IsOptional()
   @IsString()
   @IsNotEmpty()
   @MaxLength(200)
-  serviceId!: string;
+  serviceId?: string;
 
   @ValidateIf((o) => !o.repoUrl)
   @IsString()

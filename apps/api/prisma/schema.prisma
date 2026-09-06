@@ -56,6 +56,7 @@ model User {
   ticketMessages    TicketMessage[]
   knowledgeArticles KnowledgeArticle[] // articles de base de connaissance (Phase 11)
   deployments       Deployment[] // déploiements GitHub → Coolify (Phase 10bis)
+  clientProjects    ClientProject[] // projets Coolify dédiés du client (Module B)
 
   @@unique([oauthProvider, oauthSubject])
   @@index([email])
@@ -226,22 +227,94 @@ model Product {
 }
 
 model HostingPack {
-  id          String     @id @default(cuid())
-  name        String     @unique
-  description String?
-  ramMb       Int // RAM (Mo)
-  cpuCores    Float      @default(1) // cœurs (fraction autorisée, ex 0.5)
-  storageLimit Int? // stockage limite (Go) — VALEUR ENREGISTRÉE, quota NON actif
+  id                 String            @id @default(cuid())
+  name               String            @unique
+  description        String?
+  ramMb              Int // RAM (Mo)
+  cpuCores           Float             @default(1) // cœurs (fraction autorisée, ex 0.5)
+  storageLimit       Int? // stockage limite (Go) — VALEUR ENREGISTRÉE, quota NON actif
   // encore (architecture Plan.cpu_limit / memory_limit / storage_limit : seule la
   // RAM/CPU sont appliqués à la création ; le système de quota disque arrive après
   // la mise en prod).
-  bandwidth   String? // bande passante, label libre ex « 1 To / mois »
-  status      PackStatus @default(ACTIVE)
-  createdAt   DateTime   @default(now())
-  updatedAt   DateTime   @updatedAt
+  bandwidth          String? // bande passante, label libre ex « 1 To / mois »
+  // Quota d'applications du plan (Phase 13) : 1 / 5 / 10… null = illimité. Le
+  // nombre d'apps du client sous l'abonnement ACTIF lié à ce pack est plafonné.
+  maxApps            Int?
+  // Méthode de déploiement du plan (Phase 13) : le module (A projet partagé /
+  // B projet client) qui héberge les apps de ce pack. null = déploiement non
+  // configuré pour ce pack (le module par défaut actif fait office de fallback).
+  deploymentModuleId String?
+  deploymentModule   DeploymentModule? @relation(fields: [deploymentModuleId], references: [id], onDelete: SetNull)
+  status             PackStatus        @default(ACTIVE)
+  createdAt          DateTime          @default(now())
+  updatedAt          DateTime          @updatedAt
 
   products   Product[] // packs référencés par des produits (Restrict)
   categories ProductCategory[] // catégories dont ce pack est le recommandé
+}
+
+// ── Phase 13 — modules/méthodes de déploiement (A/B) ─────────────────────────
+// Un DeploymentModule définit COMMENT les apps client sont placées sur Coolify :
+//  - SHARED_PROJECT (Module A) : toutes les apps vont dans UN projet Coolify
+//    partagé, choisi par l'admin (liste live, page Packs) — généralisé pour le
+//    serveur du module.
+//  - PER_CLIENT_PROJECT (Module B) : chaque client a SON projet Coolify, nommé
+//    avec un id client unique (retrouvable par le support), créé à la première
+//    app ; toutes les apps du client y vivent.
+// Les HostingPack sont liés à un module (pack → module). Overrides optionnels de
+// limites de ressource appliqués aux apps déployées par ce module.
+enum DeploymentModuleKind {
+  SHARED_PROJECT // Module A — projet partagé
+  PER_CLIENT_PROJECT // Module B — projet dédié par client
+}
+
+model DeploymentModule {
+  id                   String               @id @default(cuid())
+  name                 String               @unique // ex « Module A — projet partagé »
+  code                 String               @unique // ex "A", "B", "C"…
+  kind                 DeploymentModuleKind
+  description          String?
+  isActive             Boolean              @default(true)
+  // Serveur Coolify sur lequel le module déploie (doit être COOLIFY + connecté).
+  serverId             String?
+  server               Server?              @relation(fields: [serverId], references: [id], onDelete: SetNull)
+  // Module A : projet Coolify partagé sélectionné par l'admin (liste live).
+  sharedProjectUuid    String?
+  sharedProjectName    String? // snapshot lisible (affiché au support)
+  // Module B : préfixe du nom du projet client (ex « client » → client-<uid>).
+  perClientPrefix      String               @default("client")
+  // Overrides de limites appliqués aux apps de CE module (optionnel).
+  overrideRamMb        Int?
+  overrideCpuCores     Float?
+  overrideStorageLimit Int?
+  createdAt            DateTime             @default(now())
+  updatedAt            DateTime             @updatedAt
+
+  packs          HostingPack[] // plans liés à ce module
+  clientProjects ClientProject[] // projets client créés par ce module (Module B)
+  deployments    Deployment[]
+}
+
+// Projet Coolify dédié d'un client (Module B) — UN par (client, serveur, module).
+// Créé paresseusement à la première app (POST /projects Coolify, idempotent) ou
+// via l'action admin « Créer le projet maintenant » (page Utilisateurs).
+model ClientProject {
+  id          String           @id @default(cuid())
+  userId      String
+  user        User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  serverId    String
+  server      Server           @relation(fields: [serverId], references: [id], onDelete: Cascade)
+  moduleId    String
+  module      DeploymentModule @relation(fields: [moduleId], references: [id], onDelete: Cascade)
+  name        String // ex « client-<uid> »
+  projectUuid String // uuid du projet Coolify
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+
+  deployments Deployment[] // apps déployées dans ce projet (tracabilité)
+
+  @@unique([userId, serverId, moduleId])
+  @@index([userId])
 }
 
 model ProductCategory {
@@ -284,14 +357,14 @@ model Server {
   // alimentés/décryptés uniquement côté API ; `apiTokenEnc` est toujours chiffré
   // au repos (AES-256-GCM via CryptoService, clé maîtresse ENCRYPTION_KEY) et
   // JAMAIS renvoyé par l'API (seul `hasApiToken` l'est, dans la vue masquée).
-  apiBaseUrl      String? // URL de base de l'API du panneau (ex. https://panel.exemple.com/api/v1)
-  apiTokenEnc     String? // jeton/clé d'accès API chiffré au repos (jamais déchiffré côté client)
-  apiUser         String? // utilisateur API (Hestia : « api » ; Coolify : inutilisé)
+  apiBaseUrl         String? // URL de base de l'API du panneau (ex. https://panel.exemple.com/api/v1)
+  apiTokenEnc        String? // jeton/clé d'accès API chiffré au repos (jamais déchiffré côté client)
+  apiUser            String? // utilisateur API (Hestia : « api » ; Coolify : inutilisé)
   coolifyProjectUuid String? // projet Coolify cible pour les déploiements (uuid) ; défaut "0" si absent
-  coolifyServerUuid String? // serveur Coolify cible (uuid) ; défaut "0" si absent
-  panelVerifiedAt DateTime? // dernier POST /api/servers/:id/panel-verify
-  panelOk         Boolean? // résultat du dernier test API (true = panneau joignable + authentifié)
-  panelDetail     String? // détail lisible du dernier test API
+  coolifyServerUuid  String? // serveur Coolify cible (uuid) ; défaut "0" si absent
+  panelVerifiedAt    DateTime? // dernier POST /api/servers/:id/panel-verify
+  panelOk            Boolean? // résultat du dernier test API (true = panneau joignable + authentifié)
+  panelDetail        String? // détail lisible du dernier test API
 
   // Métriques annoncées du serveur (Phase 9bis) — auto-détectées via l'API du
   // panneau quand c'est possible (Hestia `sysinfo`), sinon saisies manuellement
@@ -304,8 +377,10 @@ model Server {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  services    Service[] // services this host is assigned to (Phase 5)
-  deployments Deployment[] // déploiements GitHub → Coolify sur ce serveur (Phase 10bis)
+  services          Service[] // services this host is assigned to (Phase 5)
+  deployments       Deployment[] // déploiements GitHub → Coolify sur ce serveur (Phase 10bis)
+  deploymentModules DeploymentModule[] // modules/méthodes de déploiement de ce serveur (Phase 13)
+  clientProjects    ClientProject[] // projets Coolify client hébergés ici (Module B)
 }
 
 // ── Phase 4 — audit journal (ADR-019) ────────────────────────────────────────
@@ -430,31 +505,40 @@ enum DeploymentStatus {
 }
 
 model Deployment {
-  id           String           @id @default(cuid())
-  userId       String
-  user         User             @relation(fields: [userId], references: [id], onDelete: Cascade)
-  serviceId    String
-  service      Service          @relation(fields: [serviceId], references: [id], onDelete: Cascade)
-  serverId     String?
-  server       Server?          @relation(fields: [serverId], references: [id], onDelete: SetNull)
-  repoFullName String // "owner/repo" tel que détecté sur GitHub (mode GH lié) ou dérivé de l'URL (mode URL)
-  repoUrl      String? // URL git collée par le client (mode URL 10bis.5) — null en mode GitHub lié
-  buildPack    String? // build pack envoyé à Coolify (nixpacks/dockerfile/…) — jamais exposé en infrastructure
-  appName      String? // nom de l'application côté Coolify (mode URL : modifiable par le client)
-  branch       String           @default("main")
-  coolifyUuid  String? // UUID de l'application Coolify (jamais exposé au client)
-  status       DeploymentStatus @default(PENDING)
-  detail       String?
+  id                 String            @id @default(cuid())
+  userId             String
+  user               User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  // Phase 13 : optionnel — le client peut déployer SANS choisir un Service (la
+  // cible est résolue depuis le pack ACTIF → module A/B). Null en mode auto.
+  serviceId          String?
+  service            Service?          @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+  serverId           String?
+  server             Server?           @relation(fields: [serverId], references: [id], onDelete: SetNull)
+  repoFullName       String // "owner/repo" tel que détecté sur GitHub (mode GH lié) ou dérivé de l'URL (mode URL)
+  repoUrl            String? // URL git collée par le client (mode URL 10bis.5) — null en mode GitHub lié
+  buildPack          String? // build pack envoyé à Coolify (nixpacks/dockerfile/…) — jamais exposé en infrastructure
+  appName            String? // nom de l'application côté Coolify (mode URL : modifiable par le client)
+  branch             String            @default("main")
+  coolifyUuid        String? // UUID de l'application Coolify (jamais exposé au client)
+  status             DeploymentStatus  @default(PENDING)
+  detail             String?
   // Phase 3 (Cloudflare) : sous-domaine gratuit alloué au déploiement. `fqdn`
   // (ex monapp.arumdigital.com) est l'URL reachable exposée au client ; elle est
   // portée par la classe ClientSubdomain (l'enregistrement DNS créé sur Cloudflare).
-  subdomain    String?
-  domainId     String?
-  domain       Domain?            @relation(fields: [domainId], references: [id], onDelete: SetNull)
-  fqdn         String?            @unique
-  clientSubdomain ClientSubdomain?
-  createdAt    DateTime         @default(now())
-  updatedAt    DateTime         @updatedAt
+  subdomain          String?
+  domainId           String?
+  domain             Domain?           @relation(fields: [domainId], references: [id], onDelete: SetNull)
+  fqdn               String?           @unique
+  clientSubdomain    ClientSubdomain?
+  // Phase 13 — projet Coolify qui héberge l'app (monitoring + support). Le
+  // module (A partagé / B client) et le projet client (Module B) sont tracés.
+  coolifyProjectUuid String?
+  moduleId           String?
+  module             DeploymentModule? @relation(fields: [moduleId], references: [id], onDelete: SetNull)
+  clientProjectId    String?
+  clientProject      ClientProject?    @relation(fields: [clientProjectId], references: [id], onDelete: SetNull)
+  createdAt          DateTime          @default(now())
+  updatedAt          DateTime          @updatedAt
 
   @@index([userId])
   @@index([serviceId])
@@ -494,28 +578,28 @@ model CloudflareSetting {
 
 // Zones racines importées depuis le compte Cloudflare ("la liste" admin).
 model Domain {
-  id          String             @id @default(cuid())
-  name        String             @unique // ex arumdigital.com
-  zoneId      String             @unique // zone Cloudflare (id de zone)
+  id               String             @id @default(cuid())
+  name             String             @unique // ex arumdigital.com
+  zoneId           String             @unique // zone Cloudflare (id de zone)
   // Hostname cible des CNAME clients (ex panel.arumdigital.com). Si non renseigné,
   // fallback : hostname du serveur associé à la Service déployée.
-  cnameTarget String?
-  status      DomainStatus       @default(ACTIVE)
-  rootOf      CloudflareSetting? @relation("RootDomain") // 1:1 — la racine sélectionnée
+  cnameTarget      String?
+  status           DomainStatus       @default(ACTIVE)
+  rootOf           CloudflareSetting? @relation("RootDomain") // 1:1 — la racine sélectionnée
   clientSubdomains ClientSubdomain[]
-  deployments Deployment[]
-  createdAt   DateTime           @default(now())
-  updatedAt   DateTime           @updatedAt
+  deployments      Deployment[]
+  createdAt        DateTime           @default(now())
+  updatedAt        DateTime           @updatedAt
 }
 
 // Allocation d'un sous-domaine libre à l'app d'un client (au déploiement).
 model ClientSubdomain {
   id           String          @id @default(cuid())
-  subdomain    String          // ex "monapp" (partie sous le domaine racine)
+  subdomain    String // ex "monapp" (partie sous le domaine racine)
   domainId     String
   domain       Domain          @relation(fields: [domainId], references: [id], onDelete: Cascade)
   fqdn         String          @unique // ex monapp.arumdigital.com
-  recordId     String?         // id de l'enregistrement DNS Cloudflare créé
+  recordId     String? // id de l'enregistrement DNS Cloudflare créé
   status       SubdomainStatus @default(PENDING)
   deploymentId String?         @unique // ≤ 1 sous-domaine par déploiement
   deployment   Deployment?     @relation(fields: [deploymentId], references: [id], onDelete: SetNull)

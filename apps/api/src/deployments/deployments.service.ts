@@ -7,6 +7,8 @@ import {
 } from '@nestjs/common';
 import {
   Deployment,
+  DeploymentModule,
+  DeploymentModuleKind,
   DeploymentStatus,
   HostingPack,
   PackStatus,
@@ -14,6 +16,7 @@ import {
   ServerPanelProvider,
   Service,
   ServiceStatus,
+  SubscriptionStatus,
 } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuditService } from '../audit/audit.service';
@@ -171,17 +174,36 @@ export class DeploymentsService {
       repoUrl = `https://github.com/${repoFullName}.git`;
     }
 
-    const { service, server, pack } = await this.resolveCoolifyTarget(dto.serviceId, actor.sub);
+    // Phase 13 — cible résolue depuis le pack ACTIF → module A/B quand aucun
+    // Service n'est choisi ; un `serviceId` fourni honore le comportement
+    // historique (serveur du Service + pack de son abonnement).
+    const { server, pack, module, projectUuid, clientProjectId, service } =
+      await this.resolveDeployTarget(actor.sub, dto.serviceId);
+    // Quota d'apps du pack (Phase 13) : count des apps du client hors FAILED.
+    // Appliqué AVANT toute création côté Coolify.
+    if (pack?.maxApps != null && pack.maxApps > 0) {
+      const used = await this.prisma.deployment.count({
+        where: { userId: actor.sub, status: { not: DeploymentStatus.FAILED } },
+      });
+      if (used >= pack.maxApps) {
+        throw new ForbiddenException(
+          `Quota d'applications atteint (${used}/${pack.maxApps}). Supprimez une application ou passez à un plan supérieur.`,
+        );
+      }
+    }
+
     const branch = dto.branch?.trim() ? dto.branch.trim() : (detectedBranch ?? 'main');
     const buildPack = dto.buildPack ?? suggestedBuildPack ?? 'nixpacks';
-    const appName = dto.appName?.trim() ? dto.appName.trim() : service.name;
+    const appName = dto.appName?.trim()
+      ? dto.appName.trim()
+      : (service?.name ?? repoFullName.split('/')[1] ?? 'mon-app');
     const target = this.buildTarget(server);
     const transport = this.panelFactory.create();
 
     const row = await this.prisma.deployment.create({
       data: {
         userId: actor.sub,
-        serviceId: service.id,
+        serviceId: service?.id ?? null,
         serverId: server.id,
         repoFullName,
         repoUrl: dto.repoUrl ? repoUrl : null,
@@ -189,6 +211,10 @@ export class DeploymentsService {
         appName,
         branch,
         status: DeploymentStatus.PENDING,
+        // Phase 13 — traçabilité du projet/module qui héberge l'app.
+        coolifyProjectUuid: projectUuid,
+        moduleId: module?.id ?? null,
+        clientProjectId: clientProjectId ?? null,
       },
     });
 
@@ -196,15 +222,16 @@ export class DeploymentsService {
       const app = await transport.createGitApp(target, {
         repoUrl,
         branch,
-        serviceName: service.name,
+        serviceName: service?.name ?? appName,
         buildPack,
         appName,
-        projectUuid: server.coolifyProjectUuid ?? undefined,
+        projectUuid: projectUuid ?? server.coolifyProjectUuid ?? undefined,
         serverUuid: server.coolifyServerUuid ?? undefined,
       });
-      // Phase 12 — applique les limites RAM/CPU du pack du produit AVANT de
-      // lancer le déploiement. Best-effort : un échec n'interrompt pas l'app.
-      const limits = this.packLimits(pack);
+      // Phase 12/13 — applique les limites RAM/CPU du pack (overrides du module
+      // prioritaires) AVANT de lancer le déploiement. Best-effort : un échec
+      // n'interrompt pas l'app. Le quota disque reste enregistré, non appliqué.
+      const limits = this.packLimits(pack, module);
       let deployDetail = 'Déploiement déclenché sur Coolify.';
       if (limits) {
         try {
@@ -241,7 +268,7 @@ export class DeploymentsService {
           const alloc = await this.cloudflare.allocateClientSubdomain({
             root,
             requested: dto.subdomain,
-            seed: appName || service.name,
+            seed: appName || service?.name || 'app',
             fallbackHost: server.hostname,
             deploymentId: row.id,
           });
@@ -294,9 +321,11 @@ export class DeploymentsService {
           buildPack,
           appName,
           mode: dto.repoUrl ? 'url' : 'github',
-          serviceId: service.id,
+          serviceId: service?.id ?? null,
           serverId: server.id,
           coolifyUuid: app.uuid,
+          moduleId: module?.id ?? null,
+          projectUuid: projectUuid ?? null,
         },
       });
       return this.toView(updated);
@@ -357,54 +386,182 @@ export class DeploymentsService {
   // ── Internes ───────────────────────────────────────────────────────────────
 
   /**
-   * Cible = le Service ACTIVE du client, affecté par l'admin à un serveur
-   * `panelProvider=COOLIFY` dont la vérification API a réussi (panelOk=true) —
-   * « le serveur Coolify actuellement connecté ».
+   * Phase 13 — cible de déploiement. Deux chemins :
+   *  1. `serviceId` fourni (et appartenant au client) → comportement historique :
+   *     serveur = celui du Service ACTIVE, pack = pack de son abonnement.
+   *  2. `serviceId` absent → résolution automatique depuis le pack ACTIF du
+   *     client (abonnement ACTIVE → produit → pack) → module de déploiement.
+   * Le projet Coolify est ensuite déduit du module (A = projet partagé configuré ;
+   * B = projet dédié du client, créé paresseusement à la première app).
    */
-  private async resolveCoolifyTarget(
-    serviceId: string,
+  private async resolveDeployTarget(
     userId: string,
-  ): Promise<{ service: Service; server: Server; pack: HostingPack | null }> {
-    const service = await this.prisma.service.findFirst({
-      where: { id: serviceId, subscription: { userId } },
+    serviceId?: string,
+  ): Promise<{
+    server: Server;
+    pack: HostingPack | null;
+    module: DeploymentModule | null;
+    projectUuid?: string;
+    clientProjectId?: string;
+    service: Service | null;
+  }> {
+    // ── 1. Mode historique : un Service du client est fourni ────────────────
+    if (serviceId) {
+      const service = await this.prisma.service.findFirst({
+        where: { id: serviceId, subscription: { userId } },
+        include: {
+          server: true,
+          subscription: {
+            include: { product: { include: { pack: { include: { deploymentModule: true } } } } },
+          },
+        },
+      });
+      if (!service) {
+        throw new NotFoundException('Service introuvable.');
+      }
+      if (service.status !== ServiceStatus.ACTIVE) {
+        throw new BadRequestException('Service non actif : impossible de déployer.');
+      }
+      const server = this.requireCoolifyServer(service.server);
+      const pack = service.subscription?.product?.pack ?? null;
+      const module = pack?.deploymentModule ?? null;
+      const project = await this.resolveProject(module, server, userId);
+      return { server, pack, module, ...project, service };
+    }
+
+    // ── 2. Mode auto : pack ACTIF du client → module A/B ────────────────────
+    const subscription = await this.prisma.subscription.findFirst({
+      where: { userId, status: SubscriptionStatus.ACTIVE },
       include: {
-        server: true,
-        subscription: {
-          include: { product: { include: { pack: true } } },
+        product: {
+          include: { pack: { include: { deploymentModule: { include: { server: true } } } } },
         },
       },
+      orderBy: { createdAt: 'desc' },
     });
-    if (!service) {
-      throw new NotFoundException('Service introuvable.');
+    const pack = subscription?.product?.pack ?? null;
+    if (!pack || pack.status !== PackStatus.ACTIVE) {
+      throw new ForbiddenException(
+        "Aucun pack d'hébergement actif : impossible de déployer.",
+      );
     }
-    if (service.status !== ServiceStatus.ACTIVE) {
-      throw new BadRequestException('Service non actif : impossible de déployer.');
+    const module = pack.deploymentModule ?? (await this.findDefaultModule());
+    if (!module) {
+      throw new BadRequestException(
+        "Déploiement non configuré pour votre pack (aucun module de déploiement). Contactez l'équipe support.",
+      );
     }
-    const server = service.server;
+    if (module.isActive !== true) {
+      throw new BadRequestException(
+        'Le module de déploiement de votre pack est désactivé. Contactez le support.',
+      );
+    }
+    const server = this.requireCoolifyServer(module.server);
+    const project = await this.resolveProject(module, server, userId);
+    return { server, pack, module, ...project, service: null };
+  }
+
+  /** Vérifie que le serveur est Coolify + connecté (panelOk + credentials). */
+  private requireCoolifyServer(server: Server | null | undefined): Server {
     if (!server || server.panelProvider !== ServerPanelProvider.COOLIFY) {
       throw new BadRequestException(
-        'Ce service n’est pas affecté à un serveur Coolify connecté.',
+        'Le serveur Coolify de cette cible n’est pas configuré.',
       );
     }
     if (server.panelOk !== true || !server.apiBaseUrl || !server.apiTokenEnc) {
       throw new BadRequestException(
-        'Le serveur Coolify de ce service n’est pas connecté (vérification API en échec).',
+        'Le serveur Coolify de cette cible n’est pas connecté (vérification API en échec).',
       );
     }
-    // Pack du produit auquel le client est abonné — nul si le produit n'a pas de
-    // pack (ou de relation abonnement→produit résolue).
-    const pack = service.subscription?.product?.pack ?? null;
-    return { service, server, pack };
+    return server;
+  }
+
+  /** Module actif « par défaut » — fallback quand le pack n'a pas de module lié. */
+  private async findDefaultModule(): Promise<(DeploymentModule & { server: Server | null }) | null> {
+    return this.prisma.deploymentModule.findFirst({
+      where: { isActive: true },
+      include: { server: true },
+      orderBy: [{ code: 'asc' }],
+    });
+  }
+
+  /** Résout le projet Coolify du module (A partagé / B client dédié). */
+  private async resolveProject(
+    module: DeploymentModule | null,
+    server: Server,
+    userId: string,
+  ): Promise<{ projectUuid?: string; clientProjectId?: string }> {
+    if (!module) {
+      // Aucun module configuré → comportement historique : projet du serveur.
+      return { projectUuid: server.coolifyProjectUuid ?? undefined };
+    }
+    if (module.kind === DeploymentModuleKind.SHARED_PROJECT) {
+      if (!module.sharedProjectUuid) {
+        throw new BadRequestException(
+          "Le module partagé n'a pas de projet Coolify configuré (page Packs).",
+        );
+      }
+      return { projectUuid: module.sharedProjectUuid };
+    }
+    // Module B — projet Coolify dédié du client, créé à la première app.
+    const cp = await this.getOrCreateClientProject(userId, server, module);
+    return { projectUuid: cp.projectUuid, clientProjectId: cp.id };
+  }
+
+  /**
+   * Projet Coolify dédié du client (Module B) : existe → renvoyé ; sinon créé
+   * paresseusement sur Coolify (`POST /projects`, idempotent via @@unique) puis
+   * persisté. Nom = `<perClientPrefix>-<id client>` — retrouvable par le support.
+   */
+  private async getOrCreateClientProject(
+    userId: string,
+    server: Server,
+    module: DeploymentModule,
+  ): Promise<{ id: string; projectUuid: string }> {
+    const key = { userId, serverId: server.id, moduleId: module.id };
+    const existing = await this.prisma.clientProject.findUnique({
+      where: { userId_serverId_moduleId: key },
+    });
+    if (existing) return { id: existing.id, projectUuid: existing.projectUuid };
+
+    const name = `${module.perClientPrefix}-${userId}`;
+    const created = await this.panelFactory
+      .create()
+      .createProject(this.buildTarget(server), {
+        name,
+        description: 'Projet Coolify dédié du client (Module B).',
+        serverUuid: server.coolifyServerUuid ?? '0',
+      });
+    try {
+      const row = await this.prisma.clientProject.create({
+        data: { ...key, name, projectUuid: created.uuid },
+      });
+      return { id: row.id, projectUuid: row.projectUuid };
+    } catch (err) {
+      // Course concurrente : le projet a été persisté entre-temps → on reprend
+      // la ligne existante (P2002 = violation de la contrainte unique).
+      if ((err as { code?: string }).code === 'P2002') {
+        const row = await this.prisma.clientProject.findUnique({
+          where: { userId_serverId_moduleId: key },
+        });
+        if (row) return { id: row.id, projectUuid: row.projectUuid };
+      }
+      throw err;
+    }
   }
 
   /** Limites Coolify dérivées d'un pack ACTIVE (RAM/CPU). null = rien à appliquer.
-   *  Le quota disque (Plan.storage_limit) est enregistré mais NON appliqué :
-   *  système de quota prévu après la mise en prod. */
-  private packLimits(pack: HostingPack | null): CoolifyAppLimits | null {
+   *  Phase 13 : les overrides du module (`overrideRamMb`/`overrideCpuCores`)
+   *  priment sur le pack. Le quota disque (Plan.storage_limit, y compris
+   *  `overrideStorageLimit`) reste enregistré mais NON appliqué — système de
+   *  quota prévu après la mise en prod. */
+  private packLimits(pack: HostingPack | null, module?: DeploymentModule | null): CoolifyAppLimits | null {
     if (!pack || pack.status !== PackStatus.ACTIVE) return null;
+    const ramMb = module?.overrideRamMb ?? pack.ramMb;
+    const cpuCores = module?.overrideCpuCores ?? pack.cpuCores;
     const limits: CoolifyAppLimits = {};
-    if (pack.cpuCores && pack.cpuCores > 0) limits.cpus = cpusFromCores(pack.cpuCores);
-    if (pack.ramMb && pack.ramMb > 0) limits.memory = memoryFromMb(pack.ramMb);
+    if (cpuCores && cpuCores > 0) limits.cpus = cpusFromCores(cpuCores);
+    if (ramMb && ramMb > 0) limits.memory = memoryFromMb(ramMb);
     return limits.cpus || limits.memory ? limits : null;
   }
 

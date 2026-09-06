@@ -99,6 +99,20 @@ export interface CoolifyDeploymentStatusResult {
   detail?: string;
 }
 
+// Phase 13 (ADR Module A/B) — projets Coolify (module A = projet partagé).
+export interface CoolifyProject {
+  uuid: string;
+  name: string;
+  description?: string | null;
+}
+
+export interface CoolifyCreateProjectInput {
+  name: string;
+  description?: string | null;
+  /** uuid du serveur Coolify (Environment.host). Requis par la v4.1 — fallback "0". */
+  serverUuid?: string;
+}
+
 export abstract class PanelTransport {
   abstract verify(target: PanelTarget): Promise<PanelVerifyResult>;
 
@@ -118,6 +132,13 @@ export abstract class PanelTransport {
     target: PanelTarget,
     uuid: string,
   ): Promise<CoolifyDeploymentStatusResult>;
+
+  // Phase 13 — projets Coolify (COOLIFY uniquement).
+  abstract listProjects(target: PanelTarget): Promise<CoolifyProject[]>;
+  abstract createProject(
+    target: PanelTarget,
+    input: CoolifyCreateProjectInput,
+  ): Promise<{ uuid: string; name: string }>;
 }
 
 // ── Runtime ───────────────────────────────────────────────────────────
@@ -482,6 +503,89 @@ class NodePanelTransport extends PanelTransport {
       rawStatus: raw,
       detail: raw === 'unknown' ? 'Statut Coolify illisible' : undefined,
     };
+  }
+
+  /**
+   * Phase 13 (Module A/B) — liste les projets Coolify (`GET /projects`,
+   * enveloppe `success` : { success: true, data: [...] }). Chaque item expose
+   * `uuid`/`name` — c'est depuis cette liste live que l'admin choisit le projet
+   * partagé d'un module A sur la page Packs.
+   */
+  async listProjects(target: PanelTarget): Promise<CoolifyProject[]> {
+    this.assertCoolify(target);
+    const base = target.baseUrl.replace(/\/+$/, '');
+    const { status, body } = await httpGet(
+      `${base}/projects`,
+      { Authorization: `Bearer ${target.token}` },
+      target.strictTls,
+      this.timeoutMs,
+    );
+    if (status !== 200) {
+      throw new Error(
+        `Coolify API : liste des projets refusée (HTTP ${status})${body ? ` — ${body.slice(0, 200)}` : ''}`,
+      );
+    }
+    let parsed: { data?: unknown } = {};
+    try {
+      parsed = JSON.parse(body) as { data?: unknown };
+    } catch {
+      /* corps non JSON */
+    }
+    if (!Array.isArray(parsed.data)) {
+      throw new Error('Coolify API : réponse sans liste de projets.');
+    }
+    return parsed.data
+      .map((item) => {
+        const p = item as { uuid?: unknown; name?: unknown; description?: unknown };
+        return {
+          uuid: typeof p.uuid === 'string' ? p.uuid : '',
+          name: typeof p.name === 'string' ? p.name : '',
+          description: typeof p.description === 'string' ? p.description : undefined,
+        };
+      })
+      .filter((p) => p.uuid && p.name);
+  }
+
+  /**
+   * Phase 13 (Module B) — crée un projet Coolify (`POST /projects`, enveloppe
+   * `success` : { success: true, data: { uuid } }). NB : Coolify v4 exige un
+   * jeton API ROOT ; un jeton lecture seule répond 403. Le `server_uuid`
+   * (Environment.host) est transmis quand fourni — défaut "0" sinon.
+   */
+  async createProject(
+    target: PanelTarget,
+    input: CoolifyCreateProjectInput,
+  ): Promise<{ uuid: string; name: string }> {
+    this.assertCoolify(target);
+    const base = target.baseUrl.replace(/\/+$/, '');
+    const { status, body } = await httpJson(
+      'POST',
+      `${base}/projects`,
+      { Authorization: `Bearer ${target.token}` },
+      target.strictTls,
+      this.timeoutMs,
+      JSON.stringify({
+        name: input.name,
+        description: input.description ?? undefined,
+        server_uuid: input.serverUuid ?? '0',
+      }),
+    );
+    if (status !== 200 && status !== 201) {
+      throw new Error(
+        `Coolify API : création du projet refusée (HTTP ${status})${body ? ` — ${body.slice(0, 200)}` : ''}`,
+      );
+    }
+    let parsed: { data?: { uuid?: unknown } } = {};
+    try {
+      parsed = JSON.parse(body) as { data?: { uuid?: unknown } };
+    } catch {
+      /* corps non JSON */
+    }
+    const uuid = parsed.data && typeof parsed.data.uuid === 'string' ? parsed.data.uuid : '';
+    if (!uuid) {
+      throw new Error('Coolify API : réponse sans uuid de projet.');
+    }
+    return { uuid, name: input.name };
   }
 }
 

@@ -11,7 +11,10 @@ describe('DeploymentsService', () => {
     user: { findUnique: jest.fn() },
     service: { findFirst: jest.fn() },
     server: { findUnique: jest.fn() },
-    deployment: { create: jest.fn(), findMany: jest.fn(), findFirst: jest.fn(), update: jest.fn() },
+    subscription: { findFirst: jest.fn() },
+    deploymentModule: { findFirst: jest.fn() },
+    clientProject: { findUnique: jest.fn(), create: jest.fn() },
+    deployment: { create: jest.fn(), count: jest.fn(), findMany: jest.fn(), findFirst: jest.fn(), update: jest.fn() },
     cloudflareSetting: { findFirst: jest.fn(), create: jest.fn(), update: jest.fn(), updateMany: jest.fn() },
     domain: { findFirst: jest.fn(), findUnique: jest.fn() },
     clientSubdomain: { findFirst: jest.fn(), create: jest.fn() },
@@ -31,6 +34,7 @@ describe('DeploymentsService', () => {
   };
   const mockTransport = {
     createGitApp: jest.fn(),
+    createProject: jest.fn(),
     applyAppLimits: jest.fn(),
     deployApp: jest.fn(),
     deploymentStatus: jest.fn(),
@@ -644,6 +648,276 @@ describe('DeploymentsService', () => {
       mockCrypto.decrypt.mockReturnValue('gh-token');
       mockGithub.fetchUser.mockResolvedValue({ login: 'octocat' });
       await expect(service.linkStatus(actor)).resolves.toEqual({ linked: true, login: 'octocat' });
+    });
+  });
+
+  describe("create() — Phase 13 : cible par module A/B sans service + quota d'apps", () => {
+    const moduleRow = (over: Record<string, unknown> = {}) => ({
+      id: 'modA',
+      name: 'Module A — projet partagé',
+      code: 'A',
+      kind: 'SHARED_PROJECT',
+      description: null,
+      isActive: true,
+      serverId: 'srv-coolify',
+      sharedProjectUuid: 'proj-shared',
+      sharedProjectName: 'Projet partagé',
+      perClientPrefix: 'client',
+      overrideRamMb: null,
+      overrideCpuCores: null,
+      overrideStorageLimit: null,
+      server: serverRow(), // serveur Coolify connecté du module
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      ...over,
+    });
+    const moduleB = (over: Record<string, unknown> = {}) =>
+      moduleRow({
+        id: 'modB',
+        code: 'B',
+        kind: 'PER_CLIENT_PROJECT',
+        sharedProjectUuid: null,
+        sharedProjectName: null,
+        ...over,
+      });
+    const packWithModule = (over: Record<string, unknown> = {}) => {
+      const pack = over.deploymentModule === undefined ? { deploymentModule: moduleRow() } : {};
+      return {
+        id: 'pack1',
+        name: 'Starter 1 Go',
+        status: 'ACTIVE',
+        ramMb: 512,
+        cpuCores: 1,
+        storageLimit: 20,
+        bandwidth: null,
+        maxApps: null,
+        deploymentModuleId: 'modA',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        ...pack,
+        ...over,
+      };
+    };
+    const activeSubscription = (pack: unknown) => ({
+      id: 'sub-act',
+      userId: 'u1',
+      productId: 'prod1',
+      status: 'ACTIVE',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      product: { id: 'prod1', pack },
+    });
+    const happyMocks = () => {
+      mockPrisma.deployment.create.mockResolvedValue(deploymentRow({ status: 'PENDING', coolifyUuid: null }));
+      mockTransport.createGitApp.mockResolvedValue({ uuid: 'app-1' });
+      mockTransport.deployApp.mockResolvedValue(undefined);
+      mockPrisma.deployment.update.mockResolvedValue(deploymentRow());
+    };
+
+    it('mode auto (sans serviceId) : pack ACTIF → module A → app dans le projet partagé, serviceId null', async () => {
+      mockPrisma.subscription.findFirst.mockResolvedValue(
+        activeSubscription(packWithModule({ deploymentModule: moduleRow() })),
+      );
+      happyMocks();
+
+      const out = await service.create({ repoFullName: 'owner/repo' }, actor);
+
+      expect(mockPrisma.subscription.findFirst).toHaveBeenCalledWith({
+        where: { userId: 'u1', status: 'ACTIVE' },
+        include: expect.anything(),
+        orderBy: { createdAt: 'desc' },
+      });
+      expect(mockPrisma.deployment.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          userId: 'u1',
+          serviceId: null,
+          serverId: 'srv-coolify',
+          moduleId: 'modA',
+          coolifyProjectUuid: 'proj-shared',
+          clientProjectId: null,
+        }),
+      });
+      expect(mockTransport.createGitApp).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ projectUuid: 'proj-shared' }),
+      );
+      expect(out.status).toBe('DEPLOYING');
+    });
+
+    it('mode auto : aucun abonnement/pack ACTIF → 403, rien n’est créé', async () => {
+      mockPrisma.subscription.findFirst.mockResolvedValue(null);
+      await expect(service.create({ repoFullName: 'owner/repo' }, actor)).rejects.toBeInstanceOf(
+        ForbiddenException,
+      );
+      expect(mockPrisma.deployment.create).not.toHaveBeenCalled();
+    });
+
+    it('mode auto : pack ACTIF sans module lié ni module par défaut → 400 lisible', async () => {
+      mockPrisma.subscription.findFirst.mockResolvedValue(
+        activeSubscription(packWithModule({ deploymentModule: null })),
+      );
+      mockPrisma.deploymentModule.findFirst.mockResolvedValue(null);
+      await expect(service.create({ repoFullName: 'owner/repo' }, actor)).rejects.toBeInstanceOf(
+        BadRequestException,
+      );
+      expect(mockPrisma.deployment.create).not.toHaveBeenCalled();
+    });
+
+    it('module A sans projet partagé configuré → 400', async () => {
+      mockPrisma.subscription.findFirst.mockResolvedValue(
+        activeSubscription(packWithModule({ deploymentModule: moduleRow({ sharedProjectUuid: null }) })),
+      );
+      await expect(service.create({ repoFullName: 'owner/repo' }, actor)).rejects.toThrow(
+        /projet Coolify configuré/,
+      );
+      expect(mockPrisma.deployment.create).not.toHaveBeenCalled();
+    });
+
+    it('module B : projet client créé paresseusement à la première app, toutes les apps y vivent', async () => {
+      mockPrisma.subscription.findFirst.mockResolvedValue(
+        activeSubscription(packWithModule({ deploymentModule: moduleB() })),
+      );
+      mockPrisma.clientProject.findUnique.mockResolvedValue(null); // pas encore créé
+      mockTransport.createProject.mockResolvedValue({ uuid: 'proj-client', name: 'client-u1' });
+      mockPrisma.clientProject.create.mockResolvedValue({
+        id: 'cp1',
+        userId: 'u1',
+        serverId: 'srv-coolify',
+        moduleId: 'modB',
+        name: 'client-u1',
+        projectUuid: 'proj-client',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+      happyMocks();
+
+      const out = await service.create({ repoFullName: 'owner/repo' }, actor);
+
+      expect(mockTransport.createProject).toHaveBeenCalledWith(
+        expect.objectContaining({ provider: 'COOLIFY', token: 'coolify-token' }),
+        expect.objectContaining({ name: 'client-u1', serverUuid: '0' }),
+      );
+      expect(mockPrisma.clientProject.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          userId: 'u1',
+          serverId: 'srv-coolify',
+          moduleId: 'modB',
+          name: 'client-u1',
+          projectUuid: 'proj-client',
+        }),
+      });
+      expect(mockPrisma.deployment.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          serviceId: null,
+          moduleId: 'modB',
+          coolifyProjectUuid: 'proj-client',
+          clientProjectId: 'cp1',
+        }),
+      });
+      expect(mockTransport.createGitApp).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ projectUuid: 'proj-client' }),
+      );
+      expect(out.status).toBe('DEPLOYING');
+    });
+
+    it('module B : projet déjà existant → réutilisé, aucun POST /projects', async () => {
+      mockPrisma.subscription.findFirst.mockResolvedValue(
+        activeSubscription(packWithModule({ deploymentModule: moduleB() })),
+      );
+      mockPrisma.clientProject.findUnique.mockResolvedValue({
+        id: 'cp1',
+        userId: 'u1',
+        serverId: 'srv-coolify',
+        moduleId: 'modB',
+        name: 'client-u1',
+        projectUuid: 'proj-client',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+      happyMocks();
+
+      await service.create({ repoFullName: 'owner/repo' }, actor);
+
+      expect(mockTransport.createProject).not.toHaveBeenCalled();
+      expect(mockPrisma.clientProject.create).not.toHaveBeenCalled();
+      expect(mockTransport.createGitApp).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ projectUuid: 'proj-client' }),
+      );
+    });
+
+    it("quota d'apps : atteint (2/2) → 403 avec le compteur, rien n'est créé", async () => {
+      mockPrisma.subscription.findFirst.mockResolvedValue(
+        activeSubscription(packWithModule({ maxApps: 2 })),
+      );
+      mockPrisma.deployment.count.mockResolvedValue(2);
+
+      await expect(service.create({ repoFullName: 'owner/repo' }, actor)).rejects.toBeInstanceOf(
+        ForbiddenException,
+      );
+      expect(mockPrisma.deployment.count).toHaveBeenCalledWith({
+        where: { userId: 'u1', status: { not: 'FAILED' } },
+      });
+      expect(mockPrisma.deployment.create).not.toHaveBeenCalled();
+      expect(mockTransport.createGitApp).not.toHaveBeenCalled();
+    });
+
+    it("quota d'apps : sous la limite (1/2) → déploiement autorisé", async () => {
+      mockPrisma.subscription.findFirst.mockResolvedValue(
+        activeSubscription(packWithModule({ maxApps: 2 })),
+      );
+      mockPrisma.deployment.count.mockResolvedValue(1);
+      happyMocks();
+
+      const out = await service.create({ repoFullName: 'owner/repo' }, actor);
+      expect(out.status).toBe('DEPLOYING');
+    });
+
+    it("quota illimité (maxApps null) → count jamais appelé", async () => {
+      mockPrisma.subscription.findFirst.mockResolvedValue(activeSubscription(packWithModule()));
+      happyMocks();
+      await service.create({ repoFullName: 'owner/repo' }, actor);
+      expect(mockPrisma.deployment.count).not.toHaveBeenCalled();
+    });
+
+    it('overrides du module (RAM/CPU) priment sur le pack dans applyAppLimits', async () => {
+      mockPrisma.subscription.findFirst.mockResolvedValue(
+        activeSubscription(
+          packWithModule({ deploymentModule: moduleRow({ overrideRamMb: 2048, overrideCpuCores: 2 }) }),
+        ),
+      );
+      happyMocks();
+
+      await service.create({ repoFullName: 'owner/repo' }, actor);
+
+      expect(mockTransport.applyAppLimits).toHaveBeenCalledWith(
+        expect.anything(),
+        'app-1',
+        { cpus: '2', memory: '2g' },
+      );
+    });
+
+    it('serviceId fourni : pack avec module → le projet du module est utilisé (comportement historique + module)', async () => {
+      const serviceWithPack = serviceRow({
+        subscription: {
+          id: 'sub1',
+          product: { id: 'prod1', pack: packWithModule({ deploymentModule: moduleRow() }) },
+        },
+      });
+      mockPrisma.service.findFirst.mockResolvedValue(serviceWithPack);
+      happyMocks();
+
+      await service.create({ serviceId: 'svc1', repoFullName: 'owner/repo' }, actor);
+
+      expect(mockPrisma.subscription.findFirst).not.toHaveBeenCalled();
+      expect(mockTransport.createGitApp).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ projectUuid: 'proj-shared' }),
+      );
+      expect(mockPrisma.deployment.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({ serviceId: 'svc1', moduleId: 'modA' }),
+      });
     });
   });
 });
