@@ -36,6 +36,8 @@ export class PacksService {
         cpuCores: dto.cpuCores ?? 1,
         storageLimit: dto.storageLimit ?? null,
         bandwidth: PacksService.toBandwidth(dto.bandwidth) ?? null,
+        maxApps: dto.maxApps ?? null,
+        deploymentModuleId: dto.deploymentModuleId ?? null,
         status: dto.status ?? PackStatus.ACTIVE,
       },
       include: { _count: { select: { products: true, categories: true } } },
@@ -54,7 +56,11 @@ export class PacksService {
   async findAll(): Promise<PackView[]> {
     return this.prisma.hostingPack.findMany({
       orderBy: { createdAt: 'desc' },
-      include: { _count: { select: { products: true, categories: true } } },
+      include: {
+        _count: { select: { products: true, categories: true } },
+        // Phase 13 — module de déploiement lié (affiche A/B/C… dans l'UI).
+        deploymentModule: { select: { id: true, code: true, name: true, kind: true } },
+      },
     });
   }
 
@@ -78,6 +84,8 @@ export class PacksService {
       cpuCores?: number;
       storageLimit?: number | null;
       bandwidth?: string | null;
+      maxApps?: number | null;
+      deploymentModuleId?: string | null;
       status?: PackStatus;
     } = {};
     if (dto.name !== undefined) data.name = dto.name;
@@ -86,6 +94,8 @@ export class PacksService {
     if (dto.cpuCores !== undefined) data.cpuCores = dto.cpuCores;
     if (dto.storageLimit !== undefined) data.storageLimit = dto.storageLimit;
     if (dto.bandwidth !== undefined) data.bandwidth = PacksService.toBandwidth(dto.bandwidth) ?? null;
+    if (dto.maxApps !== undefined) data.maxApps = dto.maxApps;
+    if (dto.deploymentModuleId !== undefined) data.deploymentModuleId = dto.deploymentModuleId;
     if (dto.status !== undefined) data.status = dto.status;
     const pack = await this.prisma.hostingPack.update({
       where: { id },

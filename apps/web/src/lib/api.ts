@@ -351,6 +351,10 @@ export interface PackMin {
   storageLimit: number | null;
   bandwidth: string | null;
   status?: string;
+  // Phase 13 — quota d'apps + module de déploiement lié.
+  maxApps?: number | null;
+  deploymentModuleId?: string | null;
+  deploymentModule?: { id: string; code: string; name: string } | null;
 }
 /** Vue admin d'un pack d'hébergement. */
 export interface PackAdmin {
@@ -362,6 +366,8 @@ export interface PackAdmin {
   storageLimit: number | null;
   bandwidth: string | null;
   status: string;
+  maxApps?: number | null;
+  deploymentModule?: { id: string; code: string; name: string } | null;
   createdAt: string;
   updatedAt: string;
   _count?: { products: number; categories: number };
@@ -386,6 +392,9 @@ export type PackInput = {
   storageLimit?: number | null;
   bandwidth?: string;
   status?: string;
+  // Phase 13 — quota d'apps (null = illimité) + module de déploiement lié.
+  maxApps?: number | null;
+  deploymentModuleId?: string | null;
 };
 export type CategoryInput = {
   name?: string;
@@ -1061,3 +1070,50 @@ export const createDeployment = (
     subdomain?: string;
   },
 ) => apiJson('/api/client/deployments', t, { method: 'POST', body: JSON.stringify(dto) });
+
+// ═══ Phase 13 — Modules/méthodes de déploiement (A/B) ════════════════════════
+export type DeploymentModuleKind = 'SHARED_PROJECT' | 'PER_CLIENT_PROJECT';
+/** Module/méthode de déploiement (Module A = projet partagé, B = projet client). */
+export interface DeploymentModule {
+  id: string;
+  name: string;
+  code: string;
+  kind: DeploymentModuleKind;
+  description?: string | null;
+  isActive: boolean;
+  serverId?: string | null;
+  server?: { id: string; name: string; hostname: string } | null;
+  sharedProjectUuid?: string | null;
+  sharedProjectName?: string | null;
+  perClientPrefix: string;
+  overrideRamMb?: number | null;
+  overrideCpuCores?: number | null;
+  overrideStorageLimit?: number | null;
+  createdAt: string;
+  updatedAt: string;
+  _count?: { packs: number; clientProjects: number };
+}
+export type DeploymentModuleInput = {
+  name?: string;
+  code?: string;
+  kind?: DeploymentModuleKind;
+  description?: string;
+  isActive?: boolean;
+  serverId?: string | null;
+  sharedProjectUuid?: string | null;
+  sharedProjectName?: string | null;
+  perClientPrefix?: string;
+  overrideRamMb?: number | null;
+  overrideCpuCores?: number | null;
+  overrideStorageLimit?: number | null;
+};
+export const listDeploymentModules = (t: string) => apiJson('/api/admin/deployment-modules', t);
+export const createDeploymentModule = (t: string, dto: DeploymentModuleInput) =>
+  apiJson('/api/admin/deployment-modules', t, { method: 'POST', body: JSON.stringify(dto) });
+export const updateDeploymentModule = (t: string, id: string, dto: DeploymentModuleInput) =>
+  apiJson(`/api/admin/deployment-modules/${id}`, t, { method: 'PATCH', body: JSON.stringify(dto) });
+export const deleteDeploymentModule = (t: string, id: string) =>
+  apiJson(`/api/admin/deployment-modules/${id}`, t, { method: 'DELETE' });
+/** Liste LIVE des projets Coolify du serveur du module (choix du projet partagé A). */
+export const listDeploymentModuleProjects = (t: string, id: string) =>
+  apiJson(`/api/admin/deployment-modules/${id}/projects`, t);

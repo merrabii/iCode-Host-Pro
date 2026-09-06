@@ -46,6 +46,18 @@ export class CreatePackDto {
   @MaxLength(60)
   bandwidth?: string;
 
+  // Phase 13 — quota d'applications du plan (1 / 5 / 10… ; null = illimité).
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  maxApps?: number;
+
+  // Phase 13 — module/méthode de déploiement lié à ce pack (A/B/C…).
+  @IsOptional()
+  @IsString()
+  @IsNotEmpty()
+  deploymentModuleId?: string;
+
   @IsOptional()
   @IsEnum(PackStatus)
   status?: PackStatus;
