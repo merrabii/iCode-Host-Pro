@@ -5,7 +5,7 @@ import { useRouter } from 'next/navigation';
 import { AppShell } from '@/components/app-shell';
 import { Badge, Button, EmptyState, PageLoading } from '@/components/ui';
 import { useToast } from '@/components/toast';
-import { brand } from '@/config/brand';
+import { useBrand } from '@/components/brand-provider';
 import { IconCheck, IconChevronRight, IconGlobe, IconLayers, IconServer, IconShield } from '@/components/icons';
 import {
   apiError,
@@ -25,6 +25,7 @@ const PERKS = ['Souscription mensuelle sans engagement', 'Création de compte à
 export default function OffresPage() {
   const router = useRouter();
   const toast = useToast();
+  const { brand } = useBrand();
   const [products, setProducts] = useState<PublicProduct[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [ordering, setOrdering] = useState<string | null>(null);

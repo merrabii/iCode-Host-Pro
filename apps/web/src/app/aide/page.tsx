@@ -14,7 +14,7 @@ import {
   type KnowledgeType,
 } from '@/lib/api';
 import { IconBook, IconChevronRight, IconLifeBuoy, IconSearch } from '@/components/icons';
-import { brand } from '@/config/brand';
+import { useBrand } from '@/components/brand-provider';
 
 const TYPE_LABEL: Record<KnowledgeType, string> = {
   INFORMATIVE: 'Info',
@@ -40,6 +40,7 @@ function sanitize(html: string): string {
 
 export default function AidePage() {
   const toast = useToast();
+  const { brand } = useBrand();
   const [loading, setLoading] = useState(true);
   const [articles, setArticles] = useState<KnowledgeArticleSummary[]>([]);
   const [categories, setCategories] = useState<string[]>([]);

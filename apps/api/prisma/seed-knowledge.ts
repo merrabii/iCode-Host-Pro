@@ -710,6 +710,45 @@ const ADMIN_ARTICLES: Article[] = [
       ),
     tags: ['modules', 'deploiement', 'pack', 'quota', 'monitoring', 'howto'],
   },
+  {
+    audience: 'ADMIN',
+    type: 'HOWTO',
+    title: 'Configurer la marque (white-label / Apparence)',
+    slug: 'howto-configurer-la-marque',
+    summary:
+      'Rebrander toute la plateforme au nom d’un client depuis Administration → Apparence : nom, sous-titre, hostname, logo et couleurs.',
+    body:
+      h2('Objectif') +
+      p(
+        'La plateforme est vendue à plusieurs clients, une marque par installation. La page Administration → Apparence centralise tous les détails de marque : identité, logo et couleurs. Les changements s’appliquent immédiatement (aucun redémarrage).',
+      ) +
+      h2('Étape 1 — Identité') +
+      ul([
+        'Nom de la marque (obligatoire) : s’affiche dans le haut, la sidebar, le titre de l’onglet et le logo « par défaut » (initiales).',
+        'Sous-titre : phrase de présentation.',
+        'Tag (pilule) : ex. « CLOUD » — laissez vide pour n’en afficher aucun.',
+        'Hostname : domaine de la marque. Il est stocké et affiché seulement — le routage multi-tenant n’est pas activé (une marque par installation).',
+      ]) +
+      h2('Étape 2 — Logo') +
+      ul([
+        `${code('Par défaut')} : initiales du nom sur la pastille dégradé (couleurs de la marque).`,
+        `${code('Texte')} : wordmark stylisé (logoText saisi, ou le nom si vide).`,
+        `${code('Image')} : import d’un fichier PNG, JPEG ou WebP, taille max 2 Mo — le SVG est refusé (sécurité XSS). L’ancien logo est supprimé.`,
+      ]) +
+      h2('Étape 3 — Couleurs') +
+      ul([
+        'Couleur primaire (obligatoire, hex) : pilote les badges, les items actifs, le halo, le globe et la plupart des touches (tout le reste est dérivé automatiquement).',
+        'Couleur accent (optionnelle, hex) : laissez vide pour une dérivation automatique de la primaire.',
+        'Un aperçu du CSS injecté est affiché — la couleur change sans rechargement de page.',
+      ]) +
+      h2('Étape 4 — Valider ou réinitialiser') +
+      ul([
+        '« Enregistrer » applique et persiste en base ; la marque survit à un redémarrage de l’API.',
+        '« Réinitialiser le style » (avec confirmation) restaure l’apparence actuelle : iCode Host Pro, sous-titre par défaut, vert #00b377, logo par défaut.',
+      ]) +
+      p('Chaque modification (identité, couleurs, logo, reset) est journalisée dans le journal d’audit sous action `branding.*`.'),
+    tags: ['branding', 'marque', 'white-label', 'apparence', 'howto', 'phase-14'],
+  },
 ];
 
 // ── Base CLIENT (centre d’aide public /aide) ────────────────────────────────

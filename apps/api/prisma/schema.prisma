@@ -684,3 +684,32 @@ model KnowledgeArticle {
   @@index([audience, status])
   @@index([audience, category])
 }
+
+// Phase 14 (ADR-0xx): branding white-label, SINGLETON (une ligne, id fixe
+// 'brand'). La plateforme est vendue à plusieurs marques (un brand/install) :
+// partie publique `GET /api/brand` alimente le front (nom/logo/couleurs), et
+// l'admin configure via /manager/apparence. Valeurs par défaut = marque actuelle
+// (celle gravée dans web/src/config/brand.ts + tokens --brand-*). primaryColor
+// pilote toute l'UI (les autres teintes en dérivent), reset restaure les défauts.
+enum BrandLogoType {
+  DEFAULT // initiales du nom (tile), logo actuel par défaut
+  TEXT // wordmark : nom stylisé (logoText)
+  IMAGE // image importée (fichier servi via /branding/*)
+}
+
+model BrandConfig {
+  id           String        @id // singleton — id fixe 'brand'
+  name         String        @default("iCode Host Pro")
+  sub          String        @default("Self-hosted hosting control plane")
+  tagline      String? // tag de pilule (ex. "CLOUD", null = aucun)
+  hostname     String? // domaine de la marque (stocké/affiché, non routant pour l'instant)
+  logoType     BrandLogoType @default(DEFAULT)
+  logoText     String? // wordmark si logoType = TEXT
+  logoUrl      String? // chemin relatif /branding/<file> si logoType = IMAGE
+  logoShowText Boolean       @default(false) // IMAGE : afficher aussi le wordmark
+  primaryColor String        @default("#00b377")
+  accentColor  String? // null = dérivé de primary
+  updatedById  String? // acteur admin (audit/affichage, sans relation forte)
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+}

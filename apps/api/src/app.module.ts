@@ -19,6 +19,7 @@ import { KnowledgeModule } from './knowledge/knowledge.module';
 import { DeploymentsModule } from './deployments/deployments.module';
 import { CloudflareModule } from './cloudflare/cloudflare.module';
 import { MonitoringModule } from './monitoring/monitoring.module';
+import { BrandingModule } from './branding/branding.module';
 import { loadAppConfig } from './config/configuration';
 
 @Module({
@@ -46,6 +47,7 @@ import { loadAppConfig } from './config/configuration';
     DeploymentsModule,
     CloudflareModule,
     MonitoringModule,
+    BrandingModule,
   ],
 })
 export class AppModule {}

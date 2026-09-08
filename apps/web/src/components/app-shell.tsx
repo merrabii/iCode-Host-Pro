@@ -3,7 +3,8 @@
 import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
 import { useEffect, useState, type ComponentType, type ReactNode } from 'react';
-import { brand, brandInitials } from '@/config/brand';
+import { useBrand } from './brand-provider';
+import { BrandLogo } from './brand-logo';
 import { roleLabel } from '@/lib/session';
 import { IconChevronDown, IconLogOut, IconRefresh, IconUser } from './icons';
 import { ThemeToggle } from './theme-toggle';
@@ -55,7 +56,7 @@ export function ImpersonationBanner({
 export function AppShell({
   me,
   nav,
-  tenant = { label: 'Espace', name: brand.name },
+  tenant = { label: 'Espace' },
   footStatus = 'Système opérationnel',
   info = [],
   banner = null,
@@ -75,6 +76,7 @@ export function AppShell({
 }) {
   const pathname = usePathname();
   const router = useRouter();
+  const { brand } = useBrand();
 
   // Tiroir de navigation mobile (repliée < 900px).
   const [navOpen, setNavOpen] = useState(false);
@@ -140,16 +142,20 @@ export function AppShell({
               <span />
             </button>
           )}
-          <Link href={brand.home} className="logo-badge" aria-label={brand.name}>
-            {brandInitials()}
+          <Link
+            href="/"
+            className={brand.logoType === 'DEFAULT' ? 'logo-badge' : 'logo-badge-wrap'}
+            aria-label={brand.name}
+          >
+            <BrandLogo size={brand.logoType === 'DEFAULT' ? 24 : 30} />
           </Link>
           <div className="brand-col">
             <div className="brand-line">
               <span className="brand-title">{brand.name}</span>
-              {brand.tag && (
+              {brand.tagline && (
                 <span className="pill-tag">
                   <span className="dot" />
-                  {brand.tag}
+                  {brand.tagline}
                 </span>
               )}
             </div>
@@ -195,9 +201,13 @@ export function AppShell({
         <aside className="sidebar">
           <div className="tenant-label">{tenant.label}</div>
           <div className="tenant-box">
-            <span className="logo-badge" aria-hidden>
-              {brandInitials()}
-            </span>
+            {brand.logoType === 'DEFAULT' ? (
+              <span className="logo-badge" aria-hidden>
+                <BrandLogo size={24} />
+              </span>
+            ) : (
+              <BrandLogo size={26} />
+            )}
             <div className="brand-col flex-1">
               <span className="brand-title">{tenant.name ?? brand.name}</span>
               <span className="brand-sub">{brand.sub}</span>
@@ -240,7 +250,13 @@ export function AppShell({
           />
           <aside className={`mobile-nav${navOpen ? ' open' : ''}`} aria-label="Navigation mobile">
             <div className="mobile-nav-head">
-              <span className="logo-badge" aria-hidden>{brandInitials()}</span>
+              {brand.logoType === 'DEFAULT' ? (
+                <span className="logo-badge" aria-hidden>
+                  <BrandLogo size={24} />
+                </span>
+              ) : (
+                <BrandLogo size={26} />
+              )}
               <div className="brand-col flex-1">
                 <span className="brand-title">{brand.name}</span>
                 <span className="brand-sub">{brand.sub}</span>

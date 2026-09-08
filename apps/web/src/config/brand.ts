@@ -21,3 +21,37 @@ export function brandInitials(name: string = brand.name): string {
   if (words.length === 1) return words[0].slice(0, 2).toUpperCase();
   return (words[0][0] + words[1][0]).toUpperCase();
 }
+
+/** Mode de logo — aligné sur l'enum Prisma BrandLogoType. */
+export type BrandLogoType = 'DEFAULT' | 'TEXT' | 'IMAGE';
+
+/** Vue complète du branding renvoyée par GET /api/brand (Phase 14). */
+export type BrandView = {
+  name: string;
+  sub: string;
+  tagline: string | null;
+  hostname: string | null;
+  logoType: BrandLogoType;
+  logoText: string | null;
+  logoUrl: string | null;
+  logoShowText: boolean;
+  primaryColor: string;
+  accentColor: string | null;
+};
+
+/**
+ * Valeurs PAR DÉFAUT = marque actuelle gravée ici (et #00b377 dans globals.css).
+ * Utilisé en fallback si GET /api/brand échoue et pour l'aperçu « reset ».
+ */
+export const defaultBrandView: BrandView = {
+  name: brand.name,
+  sub: brand.sub,
+  tagline: brand.tag,
+  hostname: null,
+  logoType: 'DEFAULT',
+  logoText: null,
+  logoUrl: null,
+  logoShowText: false,
+  primaryColor: '#00b377',
+  accentColor: null,
+};

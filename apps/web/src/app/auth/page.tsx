@@ -6,7 +6,7 @@ import { AppShell } from '@/components/app-shell';
 import { useToast } from '@/components/toast';
 import { Button, Field, Input } from '@/components/ui';
 import { Turnstile } from '@/components/turnstile';
-import { brand } from '@/config/brand';
+import { useBrand } from '@/components/brand-provider';
 import { IconCheck, IconServer, IconShield, IconUsers } from '@/components/icons';
 import { roleRank, ROLE_RANK } from '@/lib/session';
 import {
@@ -498,6 +498,7 @@ const AUTH_POINTS = [
 ];
 
 function Shell({ children }: { children: React.ReactNode }) {
+  const { brand } = useBrand();
   return (
     <AppShell me={null} nav={[]} bare>
       <div className="auth-split">
@@ -522,7 +523,7 @@ function Shell({ children }: { children: React.ReactNode }) {
             ))}
           </ul>
           <div className="auth-aside-foot">
-            <span className="pill-tag"><span className="dot" /> {brand.tag}</span>
+            <span className="pill-tag"><span className="dot" /> {brand.tagline}</span>
             <span className="muted" style={{ fontSize: 12.5 }}>
               Plateforme sécurisée · données chiffrées au repos
             </span>

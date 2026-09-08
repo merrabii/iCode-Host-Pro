@@ -1209,3 +1209,60 @@ export interface ProjectConsumption {
 }
 export const listProjectsConsumption = (t: string) =>
   apiJson('/api/admin/monitoring/projects', t);
+
+// ═══ Phase 14 — Branding white-label (admin) ═══════════════════════════════════
+export type BrandLogoType = 'DEFAULT' | 'TEXT' | 'IMAGE';
+export interface BrandingPublic {
+  name: string;
+  sub: string;
+  tagline: string | null;
+  hostname: string | null;
+  logoType: BrandLogoType;
+  logoText: string | null;
+  logoUrl: string | null;
+  logoShowText: boolean;
+  primaryColor: string;
+  accentColor: string | null;
+}
+export type BrandingInput = {
+  name?: string;
+  sub?: string;
+  tagline?: string | null;
+  hostname?: string | null;
+  logoType?: BrandLogoType;
+  logoText?: string | null;
+  logoShowText?: boolean;
+  primaryColor?: string;
+  accentColor?: string | null;
+};
+export const updateBranding = (t: string, dto: BrandingInput) =>
+  apiJson('/api/admin/branding', t, { method: 'PATCH', body: JSON.stringify(dto) });
+export const resetBranding = (t: string) =>
+  apiJson('/api/admin/branding/reset', t, { method: 'POST' });
+/**
+ * Upload du logo (multipart, champ `file`) — PNG/JPEG/WebP ≤ 2 Mo, SVG refusé.
+ * Retourne le branding mis à jour. Réessaie une fois après rotation du jeton (401).
+ */
+export async function uploadBrandLogo(token: string, file: File): Promise<ApiResult> {
+  const doUpload = async (tok: string): Promise<ApiResult> => {
+    const fd = new FormData();
+    fd.append('file', file);
+    const res = await fetch('/api/admin/branding/logo', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${tok}` },
+      body: fd,
+    });
+    let data: unknown = null;
+    try {
+      data = await res.json();
+    } catch {
+      /* non-JSON body */
+    }
+    return { ok: res.ok, status: res.status, data };
+  };
+  const first = await doUpload(token);
+  if (first.status !== 401) return first;
+  const fresh = await getAccessToken();
+  if (fresh && fresh !== token) return doUpload(fresh);
+  return first;
+}

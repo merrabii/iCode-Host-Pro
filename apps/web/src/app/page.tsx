@@ -2,7 +2,7 @@
 
 import Link from 'next/link';
 import { AppShell } from '@/components/app-shell';
-import { brand } from '@/config/brand';
+import { useBrand } from '@/components/brand-provider';
 import {
   IconBoxes,
   IconChevronRight,
@@ -55,6 +55,7 @@ const FEATURES = [
 ] as const;
 
 export default function Home() {
+  const { brand } = useBrand();
   return (
     <AppShell me={null} nav={[]} bare={false} footStatus="Tous les services opérationnels">
       <div className="landing">
