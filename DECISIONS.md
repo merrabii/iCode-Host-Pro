@@ -86,6 +86,10 @@ le complète avec les credentials + la vérification d'API.
 - ADR-027 Sécurité, comptes & support (below) — 2026-09-02, Phase 10.
 - ADR-028 Base de connaissance + clés Turnstile admin (below) — 2026-09-02, Phase 11.
 - ADR-030 Déploiement GitHub → Coolify (below) — 2026-09-03, Phase 10bis.
+- ADR-031 Catalogue Produit → Catégorie + Pack avec limites appliquées à Coolify (below) — 2026-09-05, Phase 12.
+- ADR-032 Modules de déploiement A/B + projet client + monitoring (below) — 2026-09-06, Phase 13.
+- ADR-033 Contrôle DNS Cloudflare admin + sous-domaine client (below) — 2026-09-05.
+- ADR-034 Plateforme multi-brand / white-label configurable (below) — 2026-09-08, Phase 14.
 
 ## ADR-011 — Socle config minimal (Phase 0)
 **Status: APPROVED** (2026-08-30, Phase 0 GO)
@@ -598,6 +602,50 @@ lier GitHub reste une option mais pas la seule ») — réponses AskUserQuestion
   `SecuritySetting`) ; aucun `Service` ACTIVE ; jeton API Coolify stocké refusé (403 « You are not
   allowed to access the API » — token périmé/read-only ⇒ mettre un jeton ROOT/write et re-vérifier
   le panneau sur `/manager/serveurs`).
+
+## ADR-031 — Catalogue Produit → Catégorie + Pack avec limites appliquées à Coolify (Phase 12)
+**Status: IMPLEMENTED** (2026-09-05, commit `1d2527d`, poussé — propriétaire enchaînait sur la Phase 12 après la 10bis.5).
+Decision:
+- Le catalogue passe d'un `Product` nu à l'offre structurée : **`ProductCategory`** (catégories) + **`HostingPack`** (plan porteur des **limites de ressources** `ramMb` / `cpuCores` / `storageLimit`). `Product` lié via `categoryId?`/`packId?`. Migration additive.
+- Modules backend **`categories`** + **`packs`** : CRUD admin (audité), **recommandation de pack**, **suppression protégée** si référencé (même pattern 409 que produits).
+- **Limites réellement appliquées au déploiement** : `applyPack` → **`PATCH /applications/{uuid}`** (RAM/CPU du pack) **AVANT** `deployApp`, best-effort. **`deployApp` → `POST /applications/{uuid}/deploy` (vérifié live Coolify 4.1.2)**.
+- **Serveur Coolify cibles configurables** : `Server.coolifyProjectUuid`/`coolifyServerUuid` (le défaut `'0'` n'existe pas sur 4.1.2 → l'admin choisit le projet/serveur réels).
+- Web : `/manager/packs` + `/manager/categories`, produits enrichis (catégorie+pack), `/offres` + espace client (limites), `/manager/serveurs` (uuid Coolify).
+- Vérifié : **297 unit (31 suites) + 149 e2e verts** + tsc API/web + build web + **validation réelle Coolify** (app « Test limits pack » avec `limits_cpus=1`/`limits_memory=1g`).
+- Le `storageLimit` est **enregistré/affiché mais le quota disque INACTIF** (branché après mise en prod) — voir « Décision quota disque » (CHANGELOG).
+
+## ADR-032 — Modules de déploiement A/B + projet client + monitoring (Phase 13, « ADR Module »)
+**Status: IMPLEMENTED** (2026-09-06/07, commits `0bfd856` → `52cae27`, poussés).
+Decision: le client déploie **sans choisir un Service** — la cible est résolue depuis son **pack ACTIF → module A/B**. Placement Coolify à deux modes :
+- **`DeploymentModule`** + enum `DeploymentModuleKind {SHARED_PROJECT | PER_CLIENT_PROJECT}` (migrations `add_deployment_modules_and_client_projects` + `fix_deployment_module_kind_enum`) : `name`/`code` uniques, `isActive`, `serverId` (COOLIFY connecté), `sharedProjectUuid/Name` **(Module A = projet partagé du serveur, choisi par l'admin via liste live)**, `perClientPrefix` `client` **(Module B = projet client dédié)**, overrides `overrideRamMb/overrideCpuCores/overrideStorageLimit`. Lié aux `HostingPack` (`maxApps`).
+- **`ClientProject`** (Module B, `@@unique([userId,serverId,moduleId])`) : `name` « client-<uid> », `projectUuid` ; créé **paresseusement** à la première app (`POST /projects`, idempotent) ou via l'action admin « Créer le projet maintenant » (`POST /api/admin/users/:id/project`, page Utilisateurs).
+- **Quota d'apps** : `HostingPack.maxApps` + comptage par module/projet (le client ne peut pas dépasser son quota, N/M affiché).
+- **`Deployment.serviceId` devient optionnel** (migration `make_deployment_service_optional`) ; `Deployment` + `coolifyProjectUuid?`/`moduleId?`/`clientProjectId?` (tracé monitoring/support) ; `getOrCreateClientProject` publique.
+- **PanelTransport Coolify projets** : `createProject`/`listProjects` (fix `{success}` sans tableau — `52cae27`), `applyPack` (PATCH /applications RAM/CPU avant deploy), `deployApp` **`POST /deploy` (vérifié live ; `/applications/{uuid}/deploy` = 404)**.
+- **Monitoring** : `GET /api/admin/monitoring/projects` (agrège les déploiements par projet Coolify) + page `/manager/monitoring`.
+- **Web `/client` refonte** : hero + stats + cartes apps quota N/M, **suppression d'app 2 étapes** (`DELETE /api/client/deployments/:id`, purge best-effort App + **sous-domaine Cloudflare DNS**, quota libéré), **upgrade pack** (`PATCH /api/client/subscriptions/:id/upgrade`, même ligne, données conservées) ; +5 articles admin connaissance.
+- **Auth** : fenêtre de réutilisation **10 s** sur refresh (rotation concurrente). `start.sh` relance plateforme.
+- Invariants : `coolifyUuid`/jetons **jamais exposés** (cohérent ADR-021/ADR-030) ; `deployEnabled` reste la garde global (OFF par défaut).
+
+## ADR-033 — Contrôle DNS Cloudflare admin + sous-domaine client (Phase 3 Cloudflare)
+**Status: IMPLEMENTED** (2026-09-05, commit `5395840`, poussé — consigné au rattrapage car le commit portait par erreur « ADR-030 », déjà pris par 10bis).
+Decision: contrôle DNS Cloudflare complet depuis l'admin + **sous-domaine client alloué automatiquement au déploiement** :
+- Modèles (migration `20260905001000_add_cloudflare_dns`, drift orphelin enterré) : **`CloudflareSetting`** (clé API **AES-256-GCM chiffrée, jamais renvoyée**), **`Domain`** (zones racines importables, choix du domaine racine, `DomainStatus`), **`ClientSubdomain`** (`fqdn` unique, `SubdomainStatus`).
+- Module `cloudflare` : zones importables, domaines racine, **enregistrements DNS live (proxied)**, allocation sous-domaine client.
+- **Allocation auto** : `Deployment` + `subdomain`/`domainId`/`fqdn`/`clientSubdomain` — CNAME → hostname Coolify ; **`fqdn`** = URL reachable exposée au client.
+- **Quota disque clean-up (même commit)** : machinerie `--storage-opt`/`mergeStorageOpt` supprimée ; `diskGb` → **`storageLimit`** (migration `rename_pack_disk_to_storage_limit`, valeur préservée), aligné `Plan.cpu_limit/memory_limit/storage_limit` — **enregistré + affiché, quota PAS actif** (branché après mise en prod).
+- Vérifié **en LIVE (clé réelle)** : zones validées, CNAME créer/lister/supprimer, allocation OK.
+
+## ADR-034 — Plateforme multi-brand / white-label configurable (Phase 14, branding admin)
+**Status: IMPLEMENTED** (2026-09-08, commits `2cf7b1d` + `8e5abcf`, poussés — validés 2× par le propriétaire).
+Decision: la marque n'est plus codée en dur — tout détail éditable depuis `/manager/apparence`, persisté en base, appliqué sans flash. **Un brand par installation** (pas de routage multi-tenant).
+- **`BrandConfig` singleton** (migration `add_brand_config` + `add_brand_logo_show_text` → 25 migrations) : `name`, `sub`, `tagline?`, `hostname?`, `logoType` (`BrandLogoType {DEFAULT TEXT IMAGE}`), `logoText?`, `logoUrl?`, **`logoShowText`**, `primaryColor` (`#00b377` par défaut), `accentColor?`, `updatedById?`. Ligne garantie par `onModuleInit` (idempotent).
+- **API** : `GET /api/brand` (**public**) · `PATCH /api/admin/branding` (hex validé, audit `branding.update`) · `POST reset` (défauts, fichier supprimé) · `POST logo` (PNG/JPEG/WebP ≤ 2 Mo, **SVG refusé XSS**, audit `branding.logo`) · **`POST logo/remove`** (`8e5abcf` : fichier supprimé, retour DEFAULT, audit `branding.logo-remove`).
+- **FIX ORB** : `logoUrl` stocké sous **`/api/branding/...`** (le chemin `/branding/...` 404 → `ERR_BLOCKED_BY_ORB`) ; assets servis par `@Controller('branding')`.
+- **Logo IMAGE — image seule** (`logoShowText=false`) : masque nom/sous-titre/tag dans topbar/sidebar ; `logoShowText=true` → image + wordmark (fallback nom).
+- **Nom de marque FACULTATIF** : une marque « image seule » n'affiche pas de nom ; sous-titre/tag se vident correctement (l'ancienne sauvegarde échouait sur le nom requis).
+- **Application sans flash** : `generateMetadata()` + `<style :root>` injecté (`--brand-*` `!important` → recolor badges/glows/globe/touches) ; `BrandProvider`/`BrandLogo` ; `globals.css` dérive les verts via `color-mix(var(--brand-primary))`. `config/brand.ts` = source des défauts. Article « Configurer la marque » seedé.
+- Invariants : rebrand Code Diali **différé à la fin du projet** (règle owner) ; SVG/interdit + ≤ 2 Mo.
 
 # REJECTED
 None recorded in this clean baseline.

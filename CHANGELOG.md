@@ -3,6 +3,70 @@
 ## Décision quota disque (2026-09-06) — Plan.storage_limit enregistré mais INACTIF
 La limitation disque (machinerie `--storage-opt`/`custom_docker_run_options` + `mergeStorageOpt`/`storageOptFromGb` + injection `diskGb` au déploiement + tests associés) a été **supprimée**. Le champ du pack est renommé `diskGb` → **`storageLimit`** (migration `20260906010000_rename_pack_disk_to_storage_limit`, valeur préservée) et aligné sur l'architecture `Plan { cpu_limit, memory_limit, storage_limit }`. **Seuls RAM/CPU sont appliqués** à la création de l'app Coolify ; `storageLimit` est affiché/enregistré (admin + offres) mais **le système de quota disque sera branché après la mise en prod** (toujours 320 tests verts, API :3001 prête).
 
+## Phase 14 — PLATEFORME MULTI-BRAND / WHITE-LABEL CONFIGURABLE (branding admin « Apparence ») — IMPLEMENTED 2026-09-08 (commits `2cf7b1d`, `8e5abcf`, poussés)
+La marque n'est plus codée en dur : tout détail éditable depuis `/manager/apparence`, persisté en base, appliqué sans flash à toute l'UI. **Un brand par installation** (choix utilisateur — pas de routage multi-tenant).
+### Added
+- **`BrandConfig` singleton** (migration `20260908010000_add_brand_config`, id +1 → **24 migrations** ; puis `20260908020000_add_brand_logo_show_text` → **25**) : `name`, `sub`, `tagline?`, `hostname?`, `logoType` (enum `BrandLogoType {DEFAULT TEXT IMAGE}`), `logoText?`, `logoUrl?`, **`logoShowText Boolean @default(false)`**, `primaryColor` (défaut `#00b377`), `accentColor?`, `updatedById?`. Ligne garantiée par `onModuleInit` (idempotent, aucun seed requis).
+- **Module API `branding`** : `GET /api/brand` (**public**, sans guard — nom/logo/couleurs, jamais `updatedById`) · `PATCH /api/admin/branding` (ADMIN, hex `#rrggbb` validé, audit `branding.update`) · `POST /api/admin/branding/reset` (restaure iCode Host Pro + vert `#00b377`, supprime le fichier logo, audit `branding.reset`) · `POST /api/admin/branding/logo` (multipart, **PNG/JPEG/WebP ≤ 2 Mo, SVG refusé (XSS)**, fichier `public/branding/logo-<rand>.png`, audit `branding.logo`) · **`POST /api/admin/branding/logo/remove`** (nouveau `8e5abcf` : supprime le fichier, `logoUrl=null`, retour DEFAULT, audit `branding.logo-remove`).
+- **Assets servis** via `BrandingAssetsController` `@Controller('branding')` → `/api/branding/:file` (`res.sendFile`). **FIX affichage** : `logoUrl` stocké sous **`/api/branding/...`** (préfixe global `/api`) — l'image échappe à l'ORB du navigateur (le chemin d'origine `/branding/...` 404 → `ERR_BLOCKED_BY_ORB`).
+- **Page admin `/manager/apparence`** : Identité (nom **« vide si image seule »** — le nom devient **FACULTATIF**, plus d'erreur « il faut écrire quelque chose » ; sous-titre/tag se vident alors correctement), Logo (radio DEFAULT/TEXT/IMAGE + texte si TEXT + import + aperçu + **« Supprimer le logo »** + case **« Afficher aussi le texte à côté du logo »** = `logoShowText`, décochée = image seule sans texte), Couleurs (primaire + accent optionnel + aperçu du CSS injecté), boutons Enregistrer / Réinitialiser / Actualiser. Sidebar admin : entrée « Apparence ».
+- **Application sans flash** : `generateMetadata()` + `<style dangerouslySetInnerHTML>` sur `:root` injecté dans `layout.tsx` (variables `--brand-*` en `!important` → recolor de badges/active/glows/globe/touches) ; `BrandProvider`/`BrandLogo` rendent DEFAULT (initiales) / TEXT (wordmark, fallback nom) / IMAGE (`<img>` seul si `logoShowText=false`, sinon image+wordmark). `globals.css` dérive les verts via `color-mix(var(--brand-primary))`. `app-shell` masque la colonne texte (`brand-col`) quand `logoType=IMAGE` (image seule).
+- **Refactor marque** : `config/brand.ts` devient la **source des défauts** (`defaultBrand`). Article connaissance « Configurer la marque » **seedé (idempotent)**.
+### Changed
+- `schema.prisma` (+`BrandConfig` + enum + migration) · `app.module.ts` (import BrandingModule) · `update-branding.dto.ts` (**nom facultatif** — le DTO permet `name:''`, `@IsOptional` ; tags nullables — Phase 14 `8e5abcf`) · `branding.service.ts` (+`setLogo` écrit `/api/branding/`, +`removeLogo`, best-effort unlink fichier) · `app-shell.tsx` (masque texte en IMAGE) · `api.ts` (+`removeBrandLogo`, dto étendu `logoShowText`) · `.gitignore` (`public/branding/*.png`, garde `.gitkeep`).
+### Verified (2026-09-08)
+- **Unit** : suite `branding.service.spec` **15 tests verts** (singleton garanti, update hex valide/invalide, reset + suppression fichier, setLogo refuse sans buffer/>2 Mo/SVG + enregistre + `logoUrl` `/api/branding/logo-<16 hex>.png` + supprime l'ancien, `removeLogo` → DEFAULT + fichier supprimé + audit + no-op si absent). Test réel navigateur (Chrome + cookies injectés) : **IMAGE seule** → topbar `imgCount:1` / `brandTextNodes:0` (nom/sous-titre/tag masqués) ; **IMAGE + texte** → wordmark à côté ; image chargée (`naturalWidth>0`), zéro ORB.
+- **Test réel replay** : nom Code Diali conservé **sans toucher aux couleurs** (vert `#00b377` inchangé) — demandé par le propriétaire.
+- Suites pré-existantes **non régressées** (aucun changement de contrat client) ; migrations 24→25 in sync ; `prisma migrate status` up to date.
+### Pending
+- **VALIDÉ par le propriétaire (2 fois) ✓ — commit `2cf7b1d` + `8e5abcf` poussés.** Rebrand Code Diali **différé à la fin du projet** (règle conservée). Prochaine étape de gouvernance : rattrapage Phases 12–14 (ce fichier).
+
+## Phase 13 — MODULES DE DÉPLOIEMENT A/B + PROJET CLIENT + MONITORING + DASHBOARD CLIENT MODERNE (7 parties, « ADR Module ») — IMPLEMENTED 2026-09-06/07 (commits `0bfd856`, `734d60d`, `c008c84`, `855bdb3`, `52cae27`, poussés)
+Le client déploie **sans choisir un Service** : la cible est résolue depuis son **pack actif → module A/B**. Deux modes de placement Coolify (Module A = projet partagé, Module B = projet client dédié), quota d'apps, monitoring, purge app, upgrade.
+### Added
+- **`DeploymentModule` + enum `DeploymentModuleKind {SHARED_PROJECT | PER_CLIENT_PROJECT}`** (migration `20260906020000_add_deployment_modules_and_client_projects`, correction enum `20260907010000_fix_deployment_module_kind_enum`) : `name`/`code` uniques, `isActive`, `serverId` (COOLIFY connecté), `sharedProjectUuid/Name` (Module A), `perClientPrefix` (Module B, défaut `client`), overrides `overrideRamMb/overrideCpuCores/overrideStorageLimit`, lié aux `HostingPack` (`maxApps`).
+- **`ClientProject`** (Module B, UN par client/serveur/module `@@unique([userId,serverId,moduleId])`) : `name` « client-<uid> », `projectUuid` Coolify ; créé **paresseusement à la première app** (idempotent `POST /projects`) ou via l'action admin « Créer le projet maintenant » (page Utilisateurs).
+- **PanelTransport Coolify étendu** (projets) : `createProject`/`listProjects` (fix `52cae27` : enveloppe `{success}` sans tableau) / cible `coolifyProjectUuid`/`coolifyServerUuid` du serveur ; **`applyPack` → `PATCH /applications`** (RAM/CPU **avant** `deployApp`) ; **`deployApp` → `POST /applications/{uuid}/deploy`** (**vérifié live** : `/deploy` OK, `/applications/{uuid}/deploy` = 404 sur Coolify 4.1.2).
+- **Quota d'apps** : `HostingPack.maxApps?` + comptage par module/projet — le client ne peut pas dépasser son quota (N/M affiché).
+- **Client deploy sans Service** (migration `20260906030000_make_deployment_service_optional`) : `Deployment.serviceId` devient **optionnel** — résolution cible = pack ACTIF → module A/B ; `deployments.service.getOrCreateClientProject` rendue publique ; `Deployment` + `coolifyProjectUuid?`/`moduleId?`/`clientProjectId?` (tracé monitoring/support).
+- **Modules admin** (`deployment-modules.controller/service` + `upsert-deployment-module.dto` + page Packs étendue) : créer/activer les modules A/B, liaison Pack↔module (`maxApps`), **projets live** (liste Coolify réelle pour Module A), projets client (Module B).
+- **Monitoring** (`monitoring.service.getProjectsConsumption()` + `GET /api/admin/monitoring/projects`) : agrège les déploiements par projet Coolify + page `/manager/monitoring` (barres de ressources, badges danger, tri par consommation).
+- **Admin users Module B** : `users.service.findAll` inclut `clientProjects`, `POST /api/admin/users/:id/project` (ADMIN) — créer le projet client d'un client. Colonne + bouton sur `/manager/utilisateurs`.
+- **Web `/client` refonte moderne** : hero + stats + **cartes apps avec quota (N/M)**, **suppression d'app en 2 étapes** (`DELETE /api/client/deployments/:id`, purge best-effort app Coolify + **sous-domaine Cloudflare DNS**, quotal libéré), **mise à niveau de plan** (`PATCH /api/client/subscriptions/:id/upgrade`, même ligne d'abonnement, données conservées), lien gestion `/profil`.
+- **Auth** : fenêtre de réutilisation **10 s** sur refresh (rotation concurrente → plus de déconnexions intempestives).
+- **Base de connaissance** : +5 articles admin PUBLISHED (2 HOWTO offre + modules A/B, informatifs/techniques).
+- **`start.sh`** : relance plateforme Postgres → API (3001) → Web (3000).
+### Verified (2026-09-06/07)
+- Unit/e2e et typecheck API+web + `web build` verts sur chaque sous-phase (backend 1-3, module admin 4, autismo 5, monitoring 6, dashboard 7). **Validation réelle Coolify** (`portal.arumdigital.com:8000`) : app « Test limits pack » avec `limits_cpus=1`/`limits_memory=1g` appliqués.
+- Routes client pré-existantes (10bis) non régressées ; `deployEnabled` reste une garde (OFF par défaut).
+### Pending
+- **Phase 13 poussée.** Monitoring/quotas **branchés** ; le quota **disque** (`storageLimit`) reste **INACTIF** (décision « après mise en prod » — voir « Décision quota disque »).
+
+## Phase 12 — CATALOGUE PRODUIT → CATÉGORIE + PACK AVEC LIMITES APPLIQUÉES À COOLIFY (ADR-031) — IMPLEMENTED 2026-09-05 (commit `1d2527d`, poussé)
+Le catalogue passe d'un `Product` nu à l'offre structurée **Catégorie + Pack (limites de ressources)**, et le déploiement **applique réellement les limites RAM/CPU du pack** au moment de créer l'app Coolify.
+### Added
+- **Modèles** : `ProductCategory` (catégories de catalogue) + `HostingPack` (plan avec `ramMb`, `cpuCores`, `storageLimit` — voir décision quota disque, `maxApps` en Phase 13) — **migration additive** (catégories + packs + `Product.categoryId?`/`packId?`).
+- **Modules backend `categories` + `packs`** : CRUD admin (audité, **suppression protégée** si référencé — même pattern que produits 409), **recommandation de pack** par serveur/catégorie.
+- **Déploiement applique les limites** : `applyPack` → `PATCH /applications/{uuid}` (RAM/CPU du pack) **AVANT** `deployApp`, **best-effort**. **`deployApp` → `POST /applications/{uuid}/deploy`** (**vérifié live** : `/deploy` existe sur Coolify 4.1.2, `/deploy` vs `/applications/{uuid}/deploy` différencié).
+- **Serveur Coolify cibles configurables** : `Server.coolifyProjectUuid`/`coolifyServerUuid` (le défaut `'0'` n'existe pas sur 4.1.2 → l'admin choisit le projet/serveur réels).
+- **Web** : pages `/manager/packs` + `/manager/categories`, produits enrichis (catégorie + pack), `/offres` + espace client (limites affichées), `/manager/serveurs` (uuid Coolify).
+### Verified (2026-09-05)
+- **Specs : 297 unitaires (31 suites) + 149 e2e verts** ; tsc API + web PASS ; `web build` PASS.
+- **Validation réelle Coolify** : app « Test limits pack » déployée avec `limits_cpus=1` + `limits_memory=1g` (limites du pack réellement posées sur l'app).
+### Pending
+- **Phase 12 poussée.** Alimenté ensuite par la Phase 13 (module A/B + projet client) + Cloudflare DNS.
+
+## Phase 3 (Cloudflare DNS) — CONTRÔLE DNS CLOUDFLARE ADMIN + SOUS-DOMAINE CLIENT + QUOTA DISQUE CLEAN-UP — IMPLEMENTED 2026-09-05 (commit `5395840`, poussé)
+Contrôle DNS Cloudflare complet depuis l'admin (domaines + enregistrements live proxied) et **sous-domaine client alloué automatiquement au déploiement** (CNAME → hostname Coolify).
+### Added
+- **Modèle Cloudflare** (migration `20260905001000_add_cloudflare_dns` — drift orphelin enterré) : `CloudflareSetting` (clé API **chiffrée AES-256-GCM, jamais renvoyée**), `Domain` (zones racines importables, choix du domaine racine, `DomainStatus`), `ClientSubdomain` (**`fqdn` unique**, `SubdomainStatus`).
+- **Module API `cloudflare`** (`cloudflare.controller/service/transport` + `dto`) : zones importables/lister/créer, domaines racine, **enregistrements DNS live (proxied)**, allocation de sous-domaine client.
+- **Allocation auto au déploiement** : `Deployment` + `subdomain`/`domainId`/`fqdn`/`clientSubdomain` — CNAME → hostname Coolify, `fqdn` (ex `monapp.arumdigital.com`) = URL reachable exposée au client.
+- **Quota disque clean-up** : machinerie `--storage-opt`/`mergeStorageOpt` **supprimée** ; `diskGb` → **`storageLimit`** (migration `20260906010000_rename_pack_disk_to_storage_limit`, valeur préservée), aligné `Plan.cpu_limit/memory_limit/storage_limit` — **enregistré + affiché mais quota PAS actif** (branché après mise en prod).
+- **Vérifié en LIVE (clé réelle)** : zones validées, CNAME créer/lister/supprimer, allocation sous-domaine OK.
+### Pending
+- **Phase Cloudflare poussée** (dans le même commit que la décision quota disque). La purge app Phase 13 (`52cae27`) réutilise cette allocation pour supprimer le sous-domaine.
+
 ## Phase 10bis.5 — DÉPLOIEMENT PAR URL COLLÉE + DÉTECTION AUTO (la liaison GitHub devient OPTION) — IMPLEMENTED 2026-09-03 (chaîne verte reverifiée : unit 280, e2e 149, tsc api+web, web build 19 routes ; en attente validation propriétaire → commit + push)
 ### Added
 - **Mode « coller l'URL d'un dépôt git »** : `POST /api/client/deployments/detect {url}` → détection **automatique et best-effort** (branche par défaut, langage, build pack suggéré via l'API GitHub **publique SANS token** + vérif Dockerfile) — aucun compte GitHub requis. Champs éditables côté client : **Build pack** (nixpacks/dockerfile/dockercompose/static) + **Nom de l'app**.

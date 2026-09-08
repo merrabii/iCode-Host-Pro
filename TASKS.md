@@ -690,6 +690,10 @@ PROVISIONING/ACTIVE/PROBLEM piloté par la connexion, test de connectivité depu
 - [x] Turnstile (ADR-027, Phase 10 — `TurnstileService` non-obligatoire, enforce sur login + support/access quand activé).
 - [x] OAuth / MFA (ADR-027, Phase 10 — Google+GitHub login/inscription-commande/liaison ; MFA TOTP + email OTP self-service, `mfaRequiredForAdmins` optionnel).
 - [x] Tickets + support L1/L2/L3 + code 6 chiffres + impersonation admin (ADR-027, Phase 10).
+- [x] Catalogue Produit → Catégorie + Pack avec limites appliquées à Coolify (ADR-031, Phase 12 — commit `1d2527d` poussé).
+- [x] Contrôle DNS Cloudflare admin + sous-domaine client + quota disque clean-up (ADR-033, commit `5395840` poussé).
+- [x] Modules de déploiement A/B + projet client + monitoring + dashboard client moderne (ADR-032, Phase 13 — commits `0bfd856`→`52cae27` poussés).
+- [x] Plateforme multi-brand / white-label configurable (ADR-034, Phase 14 — commits `2cf7b1d`+`8e5abcf` poussés, validés 2× par le propriétaire).
 - [ ] Asset storage.
 - [ ] Reverse proxy/SSL.
 - [ ] Observability.
@@ -896,6 +900,64 @@ Réponse au retour propriétaire : port Coolify non mentionné, IP non auto-dét
   - **Ligne `deployEnabled` supprimée après smoke (état initial restauré).**
 - **Causes racines du « rien ne se passe sur l'espace client » (à corriger par le propriétaire)** : (1) **`deployEnabled` est OFF** (aucune ligne `SecuritySetting` → flag par défaut) ⇒ le panneau « Déploiements » n'apparaît pas sur `/client` ; (2) **aucun `Service` ACTIVE** n'existe ⇒ même avec le flag ON, le client n'a rien sur quoi déployer ; (3) **jeton API Coolify stocké refusé** par le vrai serveur (`403 « You are not allowed to access the API »` sur `portal.arumdigital.com:8000` — token périmé/read-only) ⇒ le smoke deploy complet réel est bloqué côté infra, pas côté code. Pour valider le cycle complet : activer `deployEnabled` dans `/manager/securite`, affecter un `Service` ACTIVE au serveur coolify-portal, et re-vérifier le panneau Coolify (`/manager/serveurs`) avec un jeton **ROOT/write**.
 - NB : flaky pré-existant documenté `invitations.service.spec` (passe en isolation) — NON touché par 10bis.5.
+
+# PHASES 12 — 15 (+ CLOUDFLARE DNS) : IMPLÉMENTÉES ET POUSSÉES (rattrapage gouvernance 2026-09-08)
+
+## Phase 3 (Cloudflare DNS) — CONTRÔLE DNS CLOUDFLARE ADMIN + SOUS-DOMAINE CLIENT + QUOTA DISQUE CLEAN-UP — 2026-09-05 (commit `5395840`, poussé)
+- Files created: `apps/api/src/cloudflare/` — `cloudflare.module.ts`, `cloudflare.controller.ts` (`GET/POST /api/cloudflare/...` — zones importables, domaines racine, enregistrements DNS live proxied, allocation sous-domaine client), `cloudflare.service.ts` (525 lignes), `cloudflare.transport.ts` (API Cloudflare réelle, bearer chiffré), `cloudflare.transport.spec.ts` (163), `cloudflare.service.spec.ts` (230), `dto/cloudflare.dto.ts` (83).
+- Files modified (Prisma, migrations) : migration `20260905001000_add_cloudflare_dns` — modèles `CloudflareSetting` (clé **AES-256-GCM chiffrée, jamais renvoyée**), `Domain` (zones racines, `DomainStatus`), `ClientSubdomain` (`fqdn` unique, `SubdomainStatus`) ; migration `20260906010000_rename_pack_disk_to_storage_limit` (`diskGb` → `storageLimit`, valeur préservée). `Deployment` + `subdomain`/`domainId`/`fqdn`/`clientSubdomain` (allocation auto CNAME → hostname Coolify).
+- **Quota disque clean-up (même commit)** : machinerie `--storage-opt`/`custom_docker_run_options` + `mergeStorageOpt`/`storageOptFromGb` **supprimée** ; `storageLimit` aligné `Plan.cpu_limit/memory_limit/storage_limit` — **enregistré + affiché mais quota PAS actif** (branché après mise en prod, voir CHANGELOG « Décision quota disque »).
+- **Vérification LIVE (clé réelle)** : zones validées, CNAME créer/lister/supprimer, allocation OK.
+- Files modified: `apps/web/src/lib/api.ts` (+Cloudflare types/helpers), `apps/web/src/app/manager/dns/page.tsx` (+., contrôle DNS admin).
+- Command: `prisma migrate status` in sync (**+2 migrations**).
+
+## Phase 12 — CATALOGUE PRODUIT → CATÉGORIE + PACK AVEC LIMITES APPLIQUÉES À COOLIFY (ADR-031) — 2026-09-05 (commit `1d2527d`, poussé)
+- Files modified: `apps/api/prisma/schema.prisma` — modèles `ProductCategory` + `HostingPack` (`ramMb`/`cpuCores`/`storageLimit`), `Product` + `categoryId?`/`packId?` ; migrations catégories + packs (additives).
+- Files created: `apps/api/src/categories/` (controller 69, module 14, `categories.service.ts` 163 + spec 94, `dto/create-category.dto.ts`) — CRUD admin, suppression protégée (409 si référencé) ; `apps/api/src/packs/` (controller 69, module 13, `packs.service.ts` 124 + spec 104, `dto/create-pack.dto.ts` 52) — CRUD admin + recommandation de pack.
+- Files modified: `apps/api/src/deployments/deployments.service.ts` +63 — **`applyPack` → `PATCH /applications/{uuid}`** (RAM/CPU du pack) **AVANT** `deployApp` best-effort ; **`deployApp` → `POST /applications/{uuid}/deploy` (vérifié live, `/applications/{uuid}/deploy` = 404 sur Coolify 4.1.2)** ; `panel-transport.factory.ts` +71 (projets/serveurs cibles `coolifyProjectUuid`/`coolifyServerUuid`). `products.service.ts` +86 (liaison catégorie/pack). `servers.service.ts` +6 (uuid Coolify). `subscriptions.service.ts` +11. `create-server.dto.ts` +14. `create-product.dto.ts` +12.
+- Files created (web): `apps/web/src/app/manager/packs/page.tsx` (268), `apps/web/src/app/manager/categories/page.tsx` (238) ; modified `manager/produits/page.tsx` +77 (catégorie+pack), `manager/serveurs/page.tsx` +32, `offres/page.tsx` +11, `client/page.tsx` +7, `config/nav.ts` +4, `lib/api.ts` +97.
+- Files created: `docs/DESIGN_SYSTEM.md` (307 lignes — documentation du design system).
+- Command/Verified: **unit 297 (31 suites) + e2e 149 verts** ; tsc API + web PASS ; `web build` PASS ; **validation réelle Coolify** : app « Test limits pack » avec `limits_cpus=1`/`limits_memory=1g`.
+- Files modified: CHANGELOG.md, DECISIONS.md (**ADR-031**), TASKS.md (cette section), PROJECT_STATUS.md.
+
+## Phase 13 — MODULES DE DÉPLOIEMENT A/B + PROJET CLIENT + MONITORING + DASHBOARD CLIENT MODERNE (ADR-032, « ADR Module », 7 parties) — 2026-09-06/07 (commits `0bfd856`, `734d60d`, `c008c84`, `855bdb3`, `52cae27`, poussés)
+### 13 backend 1-3 (0bfd856, +890/-93)
+- Files modified: `apps/api/prisma/schema.prisma` (+188/-) — modèles `DeploymentModule` + enum `DeploymentModuleKind {SHARED_PROJECT PER_CLIENT_PROJECT}` (`name`/`code` uniques, `isActive`, `serverId`, `sharedProjectUuid/Name`, `perClientPrefix` `client`, overrides `overrideRamMb/overrideCpuCores/overrideStorageLimit`, lié aux packs `maxApps`), `ClientProject` (Module B, `@@unique([userId,serverId,moduleId])`, `projectUuid`), `HostingPack.maxApps?` ; migrations `20260906020000_add_deployment_modules_and_client_projects` (+ `20260907010000_fix_deployment_module_kind_enum`). `Deployment` + `coolifyProjectUuid`/`moduleId`/`clientProjectId`.
+- Files modified: `apps/api/src/deployments/deployments.service.ts` (+231 — résolution cible pack→module, `getOrCreateClientProject` publique, quota maxApps, purge best-effort) + spec (+276) ; `dto/create-deployment.dto.ts` (+10) ; `panel-transport.factory.ts` (+104 — `createProject`/`listProjects`/`applyPack`/`deployApp` **`POST /deploy`** (vérifié live ; `/applications/{uuid}/deploy` = 404)) + spec (+106).
+
+### 13.4 — Modules admin + liaison pack (734d60d, +847)
+- Files created: `apps/api/src/deployments/deployment-modules.controller.ts` (79), `deployments/deployment-modules.service.ts` (184), `dto/upsert-deployment-module.dto.ts` (87). Files modified: `deployments.module.ts` (+12), `packs/dto/create-pack.dto.ts` (+12), `packs.service.ts` (+12, liaison pack↔module + maxApps). Web: `manager/packs/page.tsx` (+423 — modules A/B, maxApps, **projets live Module A**, projets client Module B), `lib/api.ts` (+58).
+
+### 13.5 — Client deploy sans service + dashboard apps moderne (c008c84, +174)
+- Files modified: `schema` migration `20260906030000_make_deployment_service_optional` (`Deployment.serviceId` nullable, mode auto) ; `deployments.service.ts` (+54), spec (+24) ; web `client/page.tsx` (+147 — panneau apps moderne quota N/M), `lib/api.ts` (+25) ; e2e +6/+2.
+
+### 13.6 — Admin users Module B project + monitoring (855bdb3, +655)
+- Files created: `apps/api/src/monitoring/` — `monitoring.controller.ts` (`GET /api/admin/monitoring/projects`, ADMIN), `monitoring.module.ts`, `monitoring.service.ts` (173 — **`getProjectsConsumption()`** agrège déploiements par projet Coolify), `app.module.ts` + MonitoringModule. Files modified: `users.service.ts` +89 (findAll inclut `clientProjects`, **`createClientProject`** action admin) + spec +120, `users.controller.ts` (+10 `POST /api/admin/users/:id/project`). Web: `manager/monitoring/page.tsx` (161 — barres ressources, badges danger, tri consommation), `manager/utilisateurs/page.tsx` (+36 — colonne + bouton), `icons.tsx` (+IconChartBar), `config/nav.ts` (+Monitoring projets), `lib/api.ts` +27.
+
+### 13.7 — Dashboard client moderne + suppression app + upgrade pack + articles admin (52cae27, +1329)
+- Files modified: `apps/web/src/app/client/page.tsx` (+887 — **refonte complète** : hero, stats, **cartes apps quota N/M**, **suppression d'app 2 étapes** (`DELETE /api/client/deployments/:id`, purge best-effort app Coolify + **sous-domaine Cloudflare DNS**, quota libéré), **upgrade pack** (`PATCH /api/client/subscriptions/:id/upgrade`, même ligne, données conservées), lien `/profil`) ; `globals.css` (+120 — classes `.dash-*`/`.bar-*`, répare monitoring) ; `lib/api.ts` +58.
+- Files modified (backend): `deployments.controller.ts` (+8 `DELETE :id`) + `deployments.service.ts` (+92 purge) ; `subscriptions/client.controller.ts` (+11) + `dto/upgrade-subscription.dto.ts` (13) + `subscriptions.service.ts` (+64 upgrade) ; `auth.service.ts` (+32 — **fenêtre de réutilisation 10 s** sur refresh, rotation concurrente) ; `panel-transport.factory.ts` (+87, fix `listProjects` enveloppe `{success}` sans tableau → rejetée à juste titre) + spec +10 ; `users.module.ts` (+5 MonitoringModule).
+- Files created: `apps/api/prisma/seed-knowledge.ts` (+174 — **+5 articles admin PUBLISHED** : offre + modules A/B) ; `start.sh` (109 — relance Postgres → API :3001 → Web :3000).
+- Verified: unit/e2e + tsc api/web + `web build` verts à chaque sous-phase ; validation réelle Coolify (« Test limits pack » `limits_cpus=1`/`limits_memory=1g` appliqués).
+- Files modified: CHANGELOG.md, DECISIONS.md (**ADR-032**), TASKS.md (cette section), PROJECT_STATUS.md.
+
+## Phase 14 — PLATEFORME MULTI-BRAND / WHITE-LABEL CONFIGURABLE (branding admin « Apparence ») — 2026-09-08 (commits `2cf7b1d`, `8e5abcf`, poussés — validés 2× par le propriétaire)
+### 14.1 (2cf7b1d, branding + fix logo image)
+- Files modified: `apps/api/prisma/schema.prisma` (+29) — **`BrandConfig` singleton** (id fixe `'brand'`, `name`, `sub`, `tagline?`, `hostname?`, `logoType` enum `BrandLogoType {DEFAULT TEXT IMAGE}`, `logoText?`, `logoUrl?`, `primaryColor` `#00b377`, `accentColor?`, `updatedById?`) ; migrations `20260908010000_add_brand_config` (22) + `20260908020000_add_brand_logo_show_text` (4, `logoShowText Boolean @default(false)`). **25 migrations** in sync.
+- Files created: `apps/api/src/branding/` — `branding.module.ts` (onModuleInit garantit la ligne, idempotent), `brand-public.controller.ts` (`GET /api/brand` sans guard), `admin-branding.controller.ts` (PATCH `/api/admin/branding`, POST reset, POST logo — FileInterceptor PNG/JPEG/WebP ≤ 2 Mo, **SVG refusé XSS**), `branding-assets.controller.ts` (`@Controller('branding')` → **`/api/branding/:file`** `res.sendFile`), `branding.service.ts` (247 — setLogo/removeLogo/reset/update/toPublic), `dto/update-branding.dto.ts`, `branding.service.spec.ts` (224, puis 15 tests). `.gitignore` `public/branding/*.png` + `.gitkeep`. **FIX ORB** : `logoUrl` stocké sous `/api/branding/...` (chemin `/branding/...` 404 → ERR_BLOCKED_BY_ORB).
+- Files modified: `app.module.ts` (+BrandingModule) ; `seed-knowledge.ts` (+39 — article « Configurer la marque » idempotent).
+- Files created (web): `app/manager/apparence/page.tsx` (288 — Identité/Logo/Couleurs/reset) ; `components/brand-provider.tsx`, `components/brand-logo.tsx`, `lib/brand-palette.ts`, `lib/brand-data.ts`. Files modified: `layout.tsx` (+29 — `generateMetadata()` + `<style :root>` `--brand-*` sans flash), `app-shell.tsx` (+36 — BrandLogo/Provider), `globals.css` (+62 — verts dérivés `color-mix(var(--brand-primary))`), `config/brand.ts` (défauts `defaultBrand`), pages `/`, `/offres`, `/auth`, `/aide` (+brand), `lib/api.ts`.
+
+### 14.2 (8e5abcf, logo image seule / suppression / identité facultative)
+- Files modified: `branding.service.ts` (+42 — **`removeLogo`** : unlink best-effort, `logoUrl=null`, retour DEFAULT, audit `branding.logo-remove` ; `setLogo` attend `/api/branding/`) ; `admin-branding.controller.ts` (+8 — **`POST /api/admin/branding/logo/remove`**) ; `dto/update-branding.dto.ts` (**nom FACULTATIF** `@IsOptional` — plus d'erreur « il faut écrire quelque chose » ; tags nullables) ; `branding.service.spec.ts` (+40, 15 tests).
+- Files modified (web): `app/manager/apparence/page.tsx` (+41 — case **« Afficher aussi le texte à côté du logo »** `logoShowText`, bouton **« Supprimer le logo »**, label nom « vide si image seule ») ; `app-shell.tsx` (+34 — masque colonne texte `brand-col` quand `logoType=IMAGE` en topbar + sidebar) ; `lib/api.ts` (+3 `removeBrandLogo`).
+- Verified: **unit 15 tests branding verts** ; **test réel navigateur (Chrome + cookies)** : IMAGE seule → topbar `imgCount:1`/`brandTextNodes:0` (nom/sous-titre/tag masqués), IMAGE+texte → wordmark ; image `naturalWidth>0`, zéro ORB. Suites pré-existantes non régressées ; migrations 24→25 in sync.
+- Files modified: CHANGELOG.md, DECISIONS.md (**ADR-034**), TASKS.md (cette section), PROJECT_STATUS.md.
+
+## Rattrapage gouvernance (2026-09-08)
+- Action: la gouvernance accusait un retard (jusqu'à la Phase 11) alors que git montrait Phases 12, 13, 14 + Cloudflare DNS **implémentées ET poussées**. Rattrapage : CHANGELOG.md (+4 phases), DECISIONS.md (+**ADR-031/032/033/034**), PROJECT_STATUS.md (état global → Phase 14, state/verified/pending/decisions/next à jour), TASKS.md (cette section). Aucun code modifié.
+- Constat : `origin/main` à jour (ahead 0) ; 25 migrations in sync ; `git status` propre (seul `.claude/settings.json` modifié, hors gouvernance).
+- **Ne rien pousser pour ce rattrapage sans ok explicite du propriétaire** (règle conservée).
 
 # COMPLETED HISTORY
 - Clean baseline (Pre-Phase 0): documentation pack + first AI orientation.
