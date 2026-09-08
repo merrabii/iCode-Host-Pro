@@ -132,6 +132,10 @@ export abstract class PanelTransport {
     target: PanelTarget,
     uuid: string,
   ): Promise<CoolifyDeploymentStatusResult>;
+  /** Supprime une application Coolify (COOLIFY uniquement) — libère le quota
+   *  quand le client supprime son app (Phase 13). Best-effort côté service :
+   *  l'échec réseau n'empêche pas la suppression locale. */
+  abstract deleteApplication(target: PanelTarget, uuid: string): Promise<void>;
 
   // Phase 13 — projets Coolify (COOLIFY uniquement).
   abstract listProjects(target: PanelTarget): Promise<CoolifyProject[]>;
@@ -506,10 +510,34 @@ class NodePanelTransport extends PanelTransport {
   }
 
   /**
-   * Phase 13 (Module A/B) — liste les projets Coolify (`GET /projects`,
-   * enveloppe `success` : { success: true, data: [...] }). Chaque item expose
-   * `uuid`/`name` — c'est depuis cette liste live que l'admin choisit le projet
-   * partagé d'un module A sur la page Packs.
+   * Supprime une application Coolify (`DELETE /applications/:uuid`, vérifié
+   * live 4.1.2 — renvoie 200 + corps `{"status":"success"}`). La suppression
+   * d'une app libère le quota d'apps du pack côté plateforme (maxApps).
+   */
+  async deleteApplication(target: PanelTarget, uuid: string): Promise<void> {
+    this.assertCoolify(target);
+    const base = target.baseUrl.replace(/\/+$/, '');
+    const { status, body } = await httpRequest(
+      'DELETE',
+      `${base}/applications/${encodeURIComponent(uuid)}`,
+      { Authorization: `Bearer ${target.token}` },
+      target.strictTls,
+      this.timeoutMs,
+    );
+    if (status !== 200 && status !== 204) {
+      throw new Error(
+        `Coolify API : suppression de l'application refusée (HTTP ${status})${body ? ` — ${body.slice(0, 200)}` : ''}`,
+      );
+    }
+  }
+
+  /**
+   * Phase 13 (Module A/B) — liste les projets Coolify (`GET /projects`).
+   * NB : Coolify v4 renvoie un TABLEAU NU (`[...]`), pas l'enveloppe `success`.
+   * On accepte les deux formes (tableau nu, ou `{ data: [...] }` / `{ projects:
+   * [...] }`) pour rester robuste. Chaque item expose `uuid`/`name` — c'est
+   * depuis cette liste live que l'admin choisit le projet partagé d'un module A
+   * sur la page Packs.
    */
   async listProjects(target: PanelTarget): Promise<CoolifyProject[]> {
     this.assertCoolify(target);
@@ -525,16 +553,27 @@ class NodePanelTransport extends PanelTransport {
         `Coolify API : liste des projets refusée (HTTP ${status})${body ? ` — ${body.slice(0, 200)}` : ''}`,
       );
     }
-    let parsed: { data?: unknown } = {};
+    let parsed: unknown;
     try {
-      parsed = JSON.parse(body) as { data?: unknown };
+      parsed = JSON.parse(body) as unknown;
     } catch {
-      /* corps non JSON */
-    }
-    if (!Array.isArray(parsed.data)) {
       throw new Error('Coolify API : réponse sans liste de projets.');
     }
-    return parsed.data
+    // Un tableau JSON nu (containers v4, même vide) est une réponse valide ; une
+    // enveloppe objet SANS tableau `data`/`projects` est malformée → rejeter au
+    // lieu de renvoyer une liste vide trompeuse.
+    let list: unknown[] | null = null;
+    if (Array.isArray(parsed)) {
+      list = parsed;
+    } else if (parsed && typeof parsed === 'object') {
+      const obj = parsed as Record<string, unknown>;
+      if (Array.isArray(obj.data)) list = obj.data;
+      else if (Array.isArray(obj.projects)) list = obj.projects;
+    }
+    if (list === null) {
+      throw new Error('Coolify API : réponse sans liste de projets.');
+    }
+    return list
       .map((item) => {
         const p = item as { uuid?: unknown; name?: unknown; description?: unknown };
         return {
@@ -547,10 +586,11 @@ class NodePanelTransport extends PanelTransport {
   }
 
   /**
-   * Phase 13 (Module B) — crée un projet Coolify (`POST /projects`, enveloppe
-   * `success` : { success: true, data: { uuid } }). NB : Coolify v4 exige un
-   * jeton API ROOT ; un jeton lecture seule répond 403. Le `server_uuid`
-   * (Environment.host) est transmis quand fourni — défaut "0" sinon.
+   * Phase 13 (Module B) — crée un projet Coolify (`POST /projects`). NB : ce
+   * Coolify (v4) n'accepte QUE `name` + `description` — le champ `server_uuid`
+   * est REJETÉ (« This field is not allowed. ») et la description tolère peu de
+   * ponctuation (pas d'accents), on garde un libellé propre. Un jeton API ROOT
+   * est requis ; un jeton lecture seule répond 403.
    */
   async createProject(
     target: PanelTarget,
@@ -558,6 +598,12 @@ class NodePanelTransport extends PanelTransport {
   ): Promise<{ uuid: string; name: string }> {
     this.assertCoolify(target);
     const base = target.baseUrl.replace(/\/+$/, '');
+    // Ne PAS envoyer server_uuid : Coolify v4 le refuse. Description assainie
+    // (lettres/chiffres/espaces/punctuation basique uniquement).
+    const cleanDescription = (input.description ?? '')
+      .replace(/[^A-Za-z0-9 .,_!?'"()+-/@&]/g, ' ')
+      .trim()
+      .slice(0, 120);
     const { status, body } = await httpJson(
       'POST',
       `${base}/projects`,
@@ -566,8 +612,7 @@ class NodePanelTransport extends PanelTransport {
       this.timeoutMs,
       JSON.stringify({
         name: input.name,
-        description: input.description ?? undefined,
-        server_uuid: input.serverUuid ?? '0',
+        ...(cleanDescription ? { description: cleanDescription } : {}),
       }),
     );
     if (status !== 200 && status !== 201) {
@@ -575,13 +620,17 @@ class NodePanelTransport extends PanelTransport {
         `Coolify API : création du projet refusée (HTTP ${status})${body ? ` — ${body.slice(0, 200)}` : ''}`,
       );
     }
-    let parsed: { data?: { uuid?: unknown } } = {};
+    let parsed: unknown;
     try {
-      parsed = JSON.parse(body) as { data?: { uuid?: unknown } };
+      parsed = JSON.parse(body) as unknown;
     } catch {
-      /* corps non JSON */
+      throw new Error('Coolify API : réponse sans uuid de projet.');
     }
-    const uuid = parsed.data && typeof parsed.data.uuid === 'string' ? parsed.data.uuid : '';
+    // Accepte `{ data: { uuid } }`, `{ data: "<uuid>" }` ou `{ uuid }` (v4).
+    const obj = (parsed ?? {}) as Record<string, unknown>;
+    const inner = obj.data && typeof obj.data === 'object' ? (obj.data as Record<string, unknown>) : obj;
+    const raw = typeof obj.data === 'string' ? obj.data : inner.uuid;
+    const uuid = typeof raw === 'string' ? raw : '';
     if (!uuid) {
       throw new Error('Coolify API : réponse sans uuid de projet.');
     }

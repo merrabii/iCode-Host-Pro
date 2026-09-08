@@ -14,6 +14,7 @@ import {
   createMySubscription,
   createTicket,
   decodeJwt,
+  deleteMyDeployment,
   fetchMe,
   generateSupportCode,
   getMyDeployment,
@@ -29,6 +30,7 @@ import {
   listPublicProducts,
   returnFromImpersonation,
   revokeSupportCode,
+  upgradeMySubscription,
   type BuildPack,
   type ClientDeployQuota,
   type Deployment,
@@ -36,6 +38,7 @@ import {
   type GithubLinkStatus,
   type GithubRepo,
   type Me,
+  type ProductRef,
   type Service,
   type Subscription,
   type Ticket,
@@ -49,13 +52,13 @@ import {
   EmptyState,
   Field,
   Input,
-  PageIntro,
   PageLoading,
   Panel,
   Select,
+  StatCard,
   statusTone,
 } from '@/components/ui';
-import { IconBox } from '@/components/icons';
+import { IconBox, IconCheck, IconKey, IconLifeBuoy, IconPlus, IconRefresh, IconServer, IconTrash } from '@/components/icons';
 
 type Phase = 'loading' | 'denied' | 'ready';
 
@@ -64,6 +67,7 @@ interface Product {
   name: string;
   kind: string;
   status: string;
+  pack?: ProductRef['pack'] | null;
 }
 
 const SUB_STATUS_LABEL: Record<string, string> = {
@@ -94,6 +98,49 @@ const DEP_STATUS_LABEL: Record<string, string> = {
   ACTIVE: 'Déployé',
   FAILED: 'Échec',
 };
+
+/** Barre de progression quota/ressource (classes Phase 13 dans globals.css). */
+function UsageBar({
+  label,
+  used,
+  limit,
+  unit = '',
+}: {
+  label: string;
+  used: number;
+  limit: number | null;
+  unit?: string;
+}) {
+  if (limit == null || limit <= 0) {
+    return (
+      <div className="bar-wrap">
+        <div className="bar-meta">
+          <span className="bar-label">{label}</span>
+          <span className="muted">Illimité</span>
+        </div>
+        <div className="bar-track">
+          <div className="bar-fill neutral" style={{ width: '100%' }} />
+        </div>
+      </div>
+    );
+  }
+  const pct = Math.min(100, Math.round((used / limit) * 100));
+  const over = used > limit;
+  return (
+    <div className="bar-wrap">
+      <div className="bar-meta">
+        <span className="bar-label">{label}</span>
+        <span className={over ? 'danger-text' : 'muted'}>
+          {used} / {limit} {unit}
+          {over && <Badge tone="danger">DÉPASSÉ</Badge>}
+        </span>
+      </div>
+      <div className="bar-track">
+        <div className={`bar-fill ${over ? 'danger' : 'ok'}`} style={{ width: `${pct}%` }} />
+      </div>
+    </div>
+  );
+}
 
 export default function ClientPage() {
   const router = useRouter();
@@ -129,7 +176,6 @@ export default function ClientPage() {
   const [deployments, setDeployments] = useState<Deployment[]>([]);
   const [depRepo, setDepRepo] = useState('');
   const [depBranch, setDepBranch] = useState('');
-  const [depServiceId, setDepServiceId] = useState('');
   // Mode URL collée (Phase 10bis.5) — détection auto, champs éditables.
   const [depTab, setDepTab] = useState<'github' | 'url'>('github');
   const [depUrl, setDepUrl] = useState('');
@@ -139,6 +185,12 @@ export default function ClientPage() {
   const [depBuildPack, setDepBuildPack] = useState<BuildPack>('nixpacks');
   // Phase 3 — sous-domaine gratuit (optionnel) ; vide = slug auto.
   const [depSubdomain, setDepSubdomain] = useState('');
+  // Quota d'apps du pack ACTIF (Phase 13).
+  const [quota, setQuota] = useState<ClientDeployQuota | null>(null);
+  // Suppression d'une app (confirmation en deux temps) + mise à niveau du plan.
+  const [confirmDel, setConfirmDel] = useState<string | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  const [upgradingId, setUpgradingId] = useState<string | null>(null);
 
   const load = useCallback(
     async (t: string) => {
@@ -183,8 +235,6 @@ export default function ClientPage() {
   }, []);
 
   // Déploiements + rafraîchissement live des statuts en cours + quota du pack (Phase 13).
-  const [quota, setQuota] = useState<ClientDeployQuota | null>(null);
-
   const loadDeployments = useCallback(async (t: string) => {
     const r = await listMyDeployments(t);
     if (!r.ok) return;
@@ -371,6 +421,40 @@ export default function ClientPage() {
     void loadDeployments(token);
   }
 
+  /**
+   * Suppression d'une app (Phase 13) : confirmation en deux temps, puis
+   * DELETE /client/deployments/:id (app Coolify + CNAME supprimés best-effort,
+   * quota libéré). Après suppression, le compteur d'apps du plan baisse.
+   */
+  async function deleteApp(d: Deployment) {
+    if (confirmDel !== d.id) {
+      setConfirmDel(d.id);
+      return;
+    }
+    setConfirmDel(null);
+    setDeleting(true);
+    const r = await deleteMyDeployment(token, d.id);
+    setDeleting(false);
+    if (!r.ok) return toast.error(apiError(r, 'Suppression impossible.'));
+    toast.ok(`Application « ${d.appName ?? d.repoFullName.split('/').pop()} » supprimée — quota libéré.`);
+    void loadDeployments(token);
+  }
+
+  /**
+   * Mise à niveau du plan (Phase 13) : bascule la MÊME souscription ACTIVE vers
+   * un produit/pack supérieur — applications et données préservées, seules les
+   * limites/quota des prochains déploiements changent.
+   */
+  async function upgradeTo(subId: string, productId: string) {
+    setUpgradingId(productId);
+    const r = await upgradeMySubscription(token, subId, productId);
+    setUpgradingId(null);
+    if (!r.ok) return toast.error(apiError(r, 'Mise à niveau impossible.'));
+    toast.ok('Plan mis à niveau — vos applications sont conservées.');
+    void load(token);
+    void loadDeployments(token);
+  }
+
   async function onReturn() {
     try {
       await returnFromImpersonation(token);
@@ -405,147 +489,94 @@ export default function ClientPage() {
     );
   }
 
-  const activeSubs = subs.filter((s) => s.status === 'ACTIVE');
+  const activeSub = subs.find((s) => s.status === 'ACTIVE') ?? null;
+  const currentPack = activeSub?.product?.pack ?? null;
+  const availablePlans = products.filter((p) => p.status === 'ACTIVE' && p.pack);
   const banner = isImp ? (
     <ImpersonationBanner targetEmail={me?.email ?? ''} kind={impKind} onReturn={onReturn} />
   ) : null;
 
   return (
     <AppShell me={me} nav={CLIENT_NAV} tenant={{ label: 'Espace client' }} banner={banner}>
-      <div className="wrap-md">
-        <PageIntro
-          eyebrow="Espace client"
-          title="Mes services"
-          sub="Catalogue, souscriptions, services, accès support et tickets. L’hébergement est géré par l’administrateur : aucune donnée d’infrastructure n’est exposée."
-        />
-
-        <Panel
-          title="Catalogue produits"
-          sub={products.length > 0 ? `${products.filter((p) => p.status === 'ACTIVE' || p.status === 'SUSPENDED').length} offre(s) disponible(s)` : undefined}
-        >
-          {products.length === 0 ? (
-            <EmptyState>Aucun produit disponible.</EmptyState>
-          ) : (
-            <div className="stack">
-              {products
-                .filter((p) => p.status === 'ACTIVE' || p.status === 'SUSPENDED')
-                .map((p) => (
-                  <div key={p.id} className="status-row">
-                    <span className="status-icon">
-                      <IconBox />
-                    </span>
-                    <div className="status-row-main">
-                      <div className="status-row-title">{p.name}</div>
-                      <div className="status-row-sub">
-                        type {p.kind}
-                        {p.status !== 'ACTIVE' ? ` · ${p.status}` : ''}
-                      </div>
-                    </div>
-                    <Button size="sm" onClick={() => subscribe(p.id)} disabled={isImp}>
-                      Souscrire
-                    </Button>
-                  </div>
-                ))}
-            </div>
-          )}
-        </Panel>
-
-        <div className="mt">
-          <Panel title="Mes souscriptions" sub="Une offre demandée reste en attente jusqu’à l’approbation par l’admin.">
-            {subs.length === 0 ? (
-              <EmptyState>Demande l&apos;une des offres ci-dessus.</EmptyState>
-            ) : (
-              <div className="stack">
-                {subs.map((s) => (
-                  <div key={s.id} className="status-row">
-                    <div className="status-row-main">
-                      <div className="status-row-title">{s.product?.name ?? s.productId}</div>
-                      <div className="status-row-sub">Souscription</div>
-                    </div>
-                    <Badge tone={statusTone(s.status)}>{SUB_STATUS_LABEL[s.status] ?? s.status}</Badge>
-                    {!isImp && ['PENDING', 'ACTIVE', 'SUSPENDED'].includes(s.status) && (
-                      <Button size="sm" variant="secondary" onClick={() => cancelSub(s.id)}>
-                        Annuler
-                      </Button>
-                    )}
-                  </div>
-                ))}
-              </div>
-            )}
-          </Panel>
+      <div className="wrap-lg">
+        {/* ── Héros ─────────────────────────────────────────────────────── */}
+        <div className="dash-hero">
+          <div>
+            <div className="hero-eyebrow">Espace client</div>
+            <h2>Bonjour{me?.name ? `, ${me.name.split(' ')[0]}` : ''} 👋</h2>
+            <p>
+              Gérez vos applications, votre plan d’hébergement et vos demandes de support depuis
+              un seul tableau de bord. L’infrastructure reste pilotée par l’équipe.
+            </p>
+          </div>
+          <div className="dash-hero-actions">
+            <a className="quick-link" href="/profil">
+              <IconKey /> Gérer mon compte
+            </a>
+            <a className="quick-link" href="/aide">
+              <IconLifeBuoy /> Centre d’aide
+            </a>
+          </div>
         </div>
 
-        <div className="mt">
-          <Panel title="Demander un service" sub="Uniquement sur une souscription active.">
-            {activeSubs.length === 0 ? (
-              <EmptyState>
-                Aucune souscription active. Une fois une souscription approuvée par l&apos;admin, tu pourras
-                demander un service ici.
-              </EmptyState>
-            ) : (
-              <div className="stack">
-                {activeSubs.map((s) => (
-                  <div key={s.id} className="status-row">
-                    <div className="status-row-main">
-                      <div className="status-row-title">{s.product?.name ?? s.productId}</div>
-                      <div className="status-row-sub">Souscription active</div>
-                    </div>
-                    <Input
-                      className="input-sm"
-                      placeholder="Nom du service"
-                      value={serviceName[s.id] ?? ''}
-                      disabled={isImp}
-                      onChange={(e) => setServiceName({ ...serviceName, [s.id]: e.target.value })}
-                    />
-                    <Button
-                      size="sm"
-                      disabled={isImp || !(serviceName[s.id] ?? '').trim()}
-                      onClick={() => requestService(s.id)}
-                    >
-                      Demander
-                    </Button>
-                  </div>
-                ))}
-              </div>
-            )}
-          </Panel>
-        </div>
+        {/* ── Aperçu (stat cards) ───────────────────────────────────────── */}
+        {deployEnabled && quota && (
+          <div className="stat-row">
+            <StatCard
+              label="Applications"
+              value={quota.used}
+              unit={quota.pack.maxApps ? `/ ${quota.pack.maxApps}` : '/ ∞'}
+              warn={quota.pack.maxApps != null && quota.used > quota.pack.maxApps}
+              tone="primary"
+              icon={<IconBox />}
+              sub={quota.pack.maxApps
+                ? quota.used >= quota.pack.maxApps
+                  ? 'Quota atteint — supprimez ou passez au plan supérieur'
+                  : `${quota.pack.maxApps - quota.used} place(s) restante(s)`
+                : 'Illimité'}
+            />
+            <StatCard
+              label="RAM par app"
+              value={quota.pack.ramMb}
+              unit="Mo"
+              tone="info"
+              icon={<IconServer />}
+              sub="Limite appliquée par déploiement"
+            />
+            <StatCard
+              label="CPU par app"
+              value={quota.pack.cpuCores}
+              unit="cœurs"
+              tone="violet"
+              icon={<IconServer />}
+              sub="Limite appliquée par déploiement"
+            />
+            <StatCard
+              label="Plan actuel"
+              value={quota.pack.name}
+              tone="amber"
+              icon={<IconCheck />}
+              sub={activeSub?.product?.name ?? 'Pack actif'}
+            />
+          </div>
+        )}
 
-        <div className="mt">
-          <Panel title="Mes services" sub="Les serveurs ne sont jamais exposés côté client.">
-            {services.length === 0 ? (
-              <EmptyState>Aucun service pour l&apos;instant.</EmptyState>
-            ) : (
-              <div className="stack">
-                {services.map((svc) => (
-                  <div key={svc.id} className="status-row">
-                    <div className="status-row-main">
-                      <div className="status-row-title">
-                        {svc.name}
-                        {svc.subscription?.product?.name && (
-                          <span className="muted cell-sub"> · {svc.subscription.product.name}</span>
-                        )}
-                      </div>
-                      <div className="status-row-sub">
-                        Service
-                        {svc.subscription?.product?.pack && (
-                          <span className="muted"> · pack {svc.subscription.product.pack.name} ({svc.subscription.product.pack.ramMb} Mo · {svc.subscription.product.pack.cpuCores} CPU{svc.subscription.product.pack.storageLimit ? ` · ${svc.subscription.product.pack.storageLimit} Go` : ''})</span>
-                        )}
-                      </div>
-                    </div>
-                    <Badge tone={statusTone(svc.status)}>{SERVICE_STATUS_LABEL[svc.status] ?? svc.status}</Badge>
-                  </div>
-                ))}
-              </div>
-            )}
-          </Panel>
-        </div>
-
+        {/* ── Mes applications (déploiement + cartes) ───────────────────── */}
         {deployEnabled && (
           <div className="mt">
+            <div className="section-title">
+              <h3>Mes applications</h3>
+              <span className="muted">
+                {deployments.length} déploiement(s) ·{' '}
+                <Button variant="ghost" size="sm" disabled={isImp} onClick={() => loadDeployments(token)}>
+                  <IconRefresh /> Actualiser
+                </Button>
+              </span>
+            </div>
+
             <Panel
-              title="Déploiements"
-              sub="Deux façons de déployer sur votre service d’hébergement (serveur Coolify géré par l’admin) : coller l’URL d’un dépôt git (détection automatique), ou choisir un dépôt de votre compte GitHub lié."
+              title="Déployer une application"
+              sub="Deux façons : coller l’URL d’un dépôt git (détection automatique), ou choisir un dépôt de votre compte GitHub lié. La cible (serveur + projet Coolify) est résolue automatiquement depuis votre pack."
             >
               {!github ? (
                 <EmptyState>Chargement…</EmptyState>
@@ -611,7 +642,7 @@ export default function ClientPage() {
                         />
                       </Field>
                       <Button disabled={isImp || !depRepo} onClick={deploy}>
-                        Déployer
+                        <IconPlus /> Déployer
                       </Button>
                     </div>
                   ) : (
@@ -643,7 +674,10 @@ export default function ClientPage() {
                       </div>
 
                       {detected ? (
-                        <div className="stack" style={{ padding: '12px', border: '1px solid var(--border)', borderRadius: 8 }}>
+                        <div
+                          className="stack"
+                          style={{ padding: '14px 16px', border: '1px solid var(--border)', borderRadius: 12, background: 'var(--card-bg-2)' }}
+                        >
                           <div className="row" style={{ gap: 12, flexWrap: 'wrap' }}>
                             <div className="muted" style={{ fontSize: 13 }}>
                               Repo : <b style={{ color: 'var(--text)' }}>{detected.repoFullName ?? detected.repoUrl}</b>
@@ -691,11 +725,8 @@ export default function ClientPage() {
                                 onChange={(e) => setDepSubdomain(e.target.value)}
                               />
                             </Field>
-                            <Button
-                              disabled={isImp || !detected.repoUrl}
-                              onClick={deployUrl}
-                            >
-                              Déployer
+                            <Button disabled={isImp || !detected.repoUrl} onClick={deployUrl}>
+                              <IconPlus /> Déployer
                             </Button>
                           </div>
                         </div>
@@ -710,215 +741,427 @@ export default function ClientPage() {
                     </div>
                   )}
 
+                  {/* Quota d'apps du pack — compteur + barre (Phase 13). */}
                   {quota && (
-                    <div className="stack" style={{ marginBottom: 16, padding: '12px 16px', border: '1px solid var(--border)', borderRadius: 8, background: 'var(--tint-blue-bg)' }}>
-                      <div className="row" style={{ alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8 }}>
-                        <div className="row" style={{ gap: 16, alignItems: 'center' }}>
-                          <span className="muted" style={{ fontSize: 13 }}>
-                            <b>Plan :</b> {quota.pack.name} · {quota.pack.ramMb} Mo RAM · {quota.pack.cpuCores} CPU
-                            {quota.pack.storageLimit ? ` · {quota.pack.storageLimit} Go disque` : ''}
-                          </span>
-                          <Badge tone="info">
-                            {quota.pack.maxApps ? (
-                              <>Apps : {quota.used} / {quota.pack.maxApps}</>
-                            ) : (
-                              <>Apps : {quota.used} / illimité</>
-                            )}
-                          </Badge>
-                        </div>
-                        <span className="muted" style={{ fontSize: 12 }}>
-                          {deployments.length} déploiement(s)
-                        </span>
-                      </div>
-                    </div>
-                  )}
-
-                  <div className="row" style={{ justifyContent: 'space-between' }}>
-                    <span className="muted" style={{ fontSize: 13 }}>
-                      {deployments.length} déploiement(s) sur votre compte
-                    </span>
-                    <Button
-                      variant="secondary"
-                      size="sm"
-                      disabled={isImp}
-                      onClick={() => loadDeployments(token)}
+                    <div
+                      className="stack"
+                      style={{
+                        padding: '14px 16px',
+                        border: '1px solid var(--border)',
+                        borderRadius: 12,
+                        background: 'var(--tint-blue-bg)',
+                      }}
                     >
-                      Actualiser
-                    </Button>
-                  </div>
-
-                  {deployments.length === 0 ? (
-                    <EmptyState>Aucun déploiement pour l&apos;instant.</EmptyState>
-                  ) : (
-                    <div className="grid">
-                      {deployments.map((d) => (
-                        <div key={d.id} className="panel" style={{ padding: 16 }}>
-                          <div className="row" style={{ justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 8 }}>
-                            <div className="status-row-title" style={{ fontSize: 15, fontWeight: 600 }}>
-                              {d.appName ?? d.repoFullName.split('/').pop() ?? 'App'}
-                            </div>
-                            <Badge tone={statusTone(DEP_TONE(d.status))}>
-                              {DEP_STATUS_LABEL[d.status] ?? d.status}
-                            </Badge>
-                          </div>
-                          <div className="status-row-sub muted" style={{ fontSize: 12.5, marginBottom: 12 }}>
-                            <div>Repo : <b>{d.repoFullName}</b></div>
-                            <div>Branche : {d.branch} · Build : {d.buildPack ?? '—'}</div>
-                            {d.fqdn && (
-                              <div>
-                                <a
-                                  href={`https://${d.fqdn}`}
-                                  target="_blank"
-                                  rel="noreferrer"
-                                  style={{ color: 'var(--accent)', fontWeight: 500 }}
-                                >
-                                  https://{d.fqdn}
-                                </a>
-                              </div>
-                            )}
-                            {d.status === 'FAILED' && d.detail && (
-                              <div className="muted" style={{ color: 'var(--danger)' }}>
-                                {d.detail}
-                              </div>
-                            )}
-                            <div>{new Date(d.updatedAt).toLocaleString()}</div>
-                          </div>
-                          <div className="row" style={{ gap: 16, marginTop: 8, paddingTop: 8, borderTop: '1px solid var(--border)', fontSize: 12.5 }}>
-                            <span><b>RAM :</b> {quota?.pack.ramMb ?? '—'} Mo</span>
-                            <span><b>CPU :</b> {quota?.pack.cpuCores ?? '—'} cœurs</span>
-                          </div>
-                        </div>
-                      ))}
+                      <UsageBar
+                        label={`Quota d'applications — plan ${quota.pack.name}`}
+                        used={quota.used}
+                        limit={quota.pack.maxApps}
+                      />
                     </div>
                   )}
                 </div>
               )}
             </Panel>
+
+            {/* Cartes des applications */}
+            <div className="mt">
+              {deployments.length === 0 ? (
+                <EmptyState>Déployez votre première application ci-dessus.</EmptyState>
+              ) : (
+                <div className="grid">
+                  {deployments.map((d) => (
+                    <div key={d.id} className="panel app-card">
+                      <div className="app-card-head">
+                        <div className="app-card-title">
+                          {d.appName ?? d.repoFullName.split('/').pop() ?? 'App'}
+                        </div>
+                        <Badge tone={statusTone(DEP_TONE(d.status))}>
+                          {DEP_STATUS_LABEL[d.status] ?? d.status}
+                        </Badge>
+                      </div>
+
+                      {d.fqdn && (
+                        <a
+                          href={`https://${d.fqdn}`}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="btn-secondary btn-sm"
+                          style={{ alignSelf: 'flex-start' }}
+                        >
+                          https://{d.fqdn}
+                        </a>
+                      )}
+
+                      <div className="app-card-meta">
+                        <span className="app-chip">{d.repoFullName}</span>
+                        <span className="app-chip">branche {d.branch}</span>
+                        <span className="app-chip">{d.buildPack ?? '—'}</span>
+                      </div>
+
+                      {d.status === 'FAILED' && d.detail && (
+                        <div className="muted" style={{ fontSize: 12.5, color: 'var(--tint-red-fg)' }}>
+                          {d.detail}
+                        </div>
+                      )}
+                      <div className="muted" style={{ fontSize: 11.5 }}>
+                        Créé le {new Date(d.createdAt).toLocaleString()}
+                      </div>
+
+                      <div className="app-card-foot">
+                        <div className="row" style={{ gap: 14, fontSize: 12.5 }}>
+                          <span>
+                            <b>RAM :</b> {quota?.pack.ramMb ?? '—'} Mo
+                          </span>
+                          <span>
+                            <b>CPU :</b> {quota?.pack.cpuCores ?? '—'} cœurs
+                          </span>
+                        </div>
+                        <Button
+                          variant={confirmDel === d.id ? 'danger' : 'secondary'}
+                          size="sm"
+                          disabled={isImp || deleting}
+                          onClick={() => deleteApp(d)}
+                        >
+                          <IconTrash />
+                          {confirmDel === d.id ? 'Confirmer ?' : 'Supprimer'}
+                        </Button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
           </div>
         )}
 
+        {/* ── Mon plan + mise à niveau ──────────────────────────────────── */}
         <div className="mt">
+          <div className="section-title">
+            <h3>Mon plan d’hébergement</h3>
+            <span className="muted">La mise à niveau conserve vos applications et vos données.</span>
+          </div>
+
           <Panel
-            title="Accès support"
-            sub="Générez un code à 6 chiffres et transmettez-le au support (par téléphone) pour qu’il consulte votre espace en lecture seule."
+            title={activeSub ? 'Souscription active' : 'Aucune souscription active'}
+            sub={
+              activeSub
+                ? `${activeSub.product?.name ?? activeSub.productId} · souscrite le ${new Date(activeSub.createdAt).toLocaleDateString()}`
+                : 'Souscrivez à une offre ci-dessous pour déployer vos applications.'
+            }
           >
-            {shownCode ? (
-              <div className="stack">
-                <p className="muted" style={{ fontSize: 13 }}>
-                  Code d&apos;accès (affiché une seule fois) :
-                </p>
-                <div className="row">
-                  <code className="input-mono access-code">{shownCode}</code>
-                  <Button variant="secondary" size="sm" onClick={revokeCode} disabled={isImp}>
-                    Révoquer le code
-                  </Button>
+            {activeSub && currentPack ? (
+              <div className="plan-card">
+                <div className="plan-card-head">
+                  <div>
+                    <div className="plan-name">{currentPack.name}</div>
+                    <div className="muted" style={{ fontSize: 12.5 }}>
+                      Pack d’hébergement actif
+                    </div>
+                  </div>
+                  <Badge tone="ok">ACTIF</Badge>
                 </div>
-                {codeExpiry && (
-                  <p className="muted" style={{ fontSize: 12 }}>
-                    Expire le {new Date(codeExpiry).toLocaleString()}.
-                  </p>
-                )}
-              </div>
-            ) : codeActive ? (
-              <div className="row" style={{ justifyContent: 'space-between' }}>
-                <span className="muted" style={{ fontSize: 13 }}>
-                  Un code est actif jusqu&apos;au {codeExpiry ? new Date(codeExpiry).toLocaleString() : '—'}.
-                </span>
-                <Button variant="secondary" size="sm" onClick={revokeCode} disabled={isImp}>
-                  Révoquer
-                </Button>
+                <div className="plan-specs">
+                  <span className="app-chip">RAM {currentPack.ramMb} Mo / app</span>
+                  <span className="app-chip">CPU {currentPack.cpuCores} cœurs / app</span>
+                  {currentPack.storageLimit && (
+                    <span className="app-chip">Disque {currentPack.storageLimit} Go</span>
+                  )}
+                  <span className="app-chip">
+                    {currentPack.maxApps
+                      ? `${currentPack.maxApps} app(s) max`
+                      : 'Apps illimitées'}
+                  </span>
+                  {currentPack.deploymentModule && (
+                    <span className="app-chip">Module {currentPack.deploymentModule.code} — {currentPack.deploymentModule.name}</span>
+                  )}
+                </div>
               </div>
             ) : (
-              <Button onClick={generateCode} disabled={isImp}>
-                Générer un code
-              </Button>
+              <EmptyState>
+                {subs.length === 0
+                  ? 'Demandez une offre ci-dessous : une souscription active débloque le déploiement.'
+                  : 'Votre souscription est en attente d’approbation par l’admin.'}
+              </EmptyState>
+            )}
+
+            {activeSub && availablePlans.length > 0 && (
+              <div className="stack mt" style={{ marginTop: 16 }}>
+                <div className="muted" style={{ fontSize: 12.5 }}>
+                  Changer de plan (mise à niveau) :
+                </div>
+                {availablePlans
+                  .filter((p) => p.id !== activeSub.productId)
+                  .map((p) => (
+                    <div key={p.id} className="upgrade-row">
+                      <div className="upgrade-main">
+                        <div className="upgrade-title">{p.name}</div>
+                        <div className="upgrade-sub">
+                          {p.pack
+                            ? `${p.pack.name} · ${p.pack.ramMb} Mo RAM · ${p.pack.cpuCores} CPU${p.pack.maxApps ? ` · ${p.pack.maxApps} apps` : ' · apps illimitées'}${p.pack.storageLimit ? ` · ${p.pack.storageLimit} Go` : ''}`
+                            : 'Pack non configuré'}
+                        </div>
+                      </div>
+                      <Button
+                        size="sm"
+                        disabled={isImp || upgradingId === p.id}
+                        busy={upgradingId === p.id}
+                        onClick={() => upgradeTo(activeSub.id, p.id)}
+                      >
+                        Mettre à niveau
+                      </Button>
+                    </div>
+                  ))}
+              </div>
+            )}
+
+            {!activeSub && (
+              <div className="stack mt" style={{ marginTop: 16 }}>
+                {availablePlans.length === 0 ? (
+                  <EmptyState>Aucune offre disponible pour l&apos;instant.</EmptyState>
+                ) : (
+                  availablePlans.map((p) => (
+                    <div key={p.id} className="upgrade-row">
+                      <div className="upgrade-main">
+                        <div className="upgrade-title">{p.name}</div>
+                        <div className="upgrade-sub">
+                          {p.pack
+                            ? `${p.pack.name} · ${p.pack.ramMb} Mo RAM · ${p.pack.cpuCores} CPU${p.pack.maxApps ? ` · ${p.pack.maxApps} apps` : ' · apps illimitées'}`
+                            : 'Pack non configuré'}
+                        </div>
+                      </div>
+                      <Button size="sm" disabled={isImp} onClick={() => subscribe(p.id)}>
+                        Souscrire
+                      </Button>
+                    </div>
+                  ))
+                )}
+              </div>
             )}
           </Panel>
         </div>
 
+        {/* ── Souscriptions & services ──────────────────────────────────── */}
         <div className="mt">
-          <Panel title="Mes tickets" sub="Ouvrez un ticket auprès du support (L1 vous répond, puis escalade vers L2/L3 si besoin).">
-            {!isImp && (
-              <div className="stack mb">
-                <div className="inline-form">
-                  <Field label="Sujet">
-                    <Input value={tSubject} onChange={(e) => setTSubject(e.target.value)} />
-                  </Field>
-                  <Button onClick={openTicket} disabled={!tSubject.trim() || !tBody.trim()}>
-                    Ouvrir un ticket
-                  </Button>
-                </div>
-                <Field label="Description du problème">
-                  <Input value={tBody} onChange={(e) => setTBody(e.target.value)} />
-                </Field>
-              </div>
-            )}
+          <div className="section-title">
+            <h3>Souscriptions &amp; services</h3>
+            <span className="muted">Les serveurs ne sont jamais exposés côté client.</span>
+          </div>
 
-            {tickets.length === 0 ? (
-              <EmptyState>Aucun ticket pour l&apos;instant.</EmptyState>
-            ) : (
-              <div className="stack">
-                {tickets.map((t) => {
-                  const open = openTicketId === t.id;
-                  return (
-                    <div key={t.id} className="panel ticket-msg">
-                      <button
-                        type="button"
-                        className="status-row"
-                        style={{ width: '100%', background: 'transparent', border: 0, textAlign: 'left', cursor: 'pointer' }}
-                        onClick={() => setOpenTicketId(open ? null : t.id)}
-                      >
-                        <div className="status-row-main">
-                          <div className="status-row-title">{t.subject}</div>
-                          <div className="status-row-sub">
-                            {TICKET_STATUS_LABEL[t.status] ?? t.status}
-                            {t.escalatedTo && ` · escaladé vers ${t.escalatedTo}`} ·{' '}
-                            {new Date(t.updatedAt).toLocaleString()}
-                          </div>
-                        </div>
-                        <Badge tone={statusTone(TICKET_TONE(t.status))}>{TICKET_STATUS_LABEL[t.status] ?? t.status}</Badge>
-                      </button>
-
-                      {open && (
-                        <div className="stack mt" style={{ padding: '0 4px' }}>
-                          {t.messages?.map((m) => (
-                            <div key={m.id} className="ticket-msg">
-                              <div className="row" style={{ gap: 8 }}>
-                                <b style={{ fontSize: 12.5 }}>{m.authorEmail}</b>
-                                <span className="muted" style={{ fontSize: 11.5 }}>
-                                  {new Date(m.createdAt).toLocaleString()}
-                                </span>
-                              </div>
-                              <div className="mt-sm" style={{ fontSize: 13.5, whiteSpace: 'pre-wrap' }}>
-                                {m.body}
-                              </div>
-                            </div>
-                          ))}
-                          {!isImp && (
-                            <div className="row">
-                              <Input
-                                className="flex-1"
-                                placeholder="Votre réponse…"
-                                value={ticketReply[t.id] ?? ''}
-                                onChange={(e) => setTicketReply({ ...ticketReply, [t.id]: e.target.value })}
-                              />
-                              <Button
-                                size="sm"
-                                disabled={!(ticketReply[t.id] ?? '').trim()}
-                                onClick={() => sendTicketReply(t.id)}
-                              >
-                                Répondre
-                              </Button>
-                            </div>
-                          )}
-                        </div>
+          <div className="bottom-grid">
+            <Panel
+              title="Mes souscriptions"
+              sub="Une offre demandée reste en attente jusqu’à l’approbation par l’admin."
+            >
+              {subs.length === 0 ? (
+                <EmptyState>Demandez l&apos;une des offres ci-dessus.</EmptyState>
+              ) : (
+                <div className="stack">
+                  {subs.map((s) => (
+                    <div key={s.id} className="status-row">
+                      <span className="status-icon">
+                        <IconServer />
+                      </span>
+                      <div className="status-row-main">
+                        <div className="status-row-title">{s.product?.name ?? s.productId}</div>
+                        <div className="status-row-sub">Souscription</div>
+                      </div>
+                      <Badge tone={statusTone(s.status)}>{SUB_STATUS_LABEL[s.status] ?? s.status}</Badge>
+                      {!isImp && ['PENDING', 'ACTIVE', 'SUSPENDED'].includes(s.status) && (
+                        <Button size="sm" variant="secondary" onClick={() => cancelSub(s.id)}>
+                          Annuler
+                        </Button>
                       )}
                     </div>
-                  );
-                })}
-              </div>
-            )}
-          </Panel>
+                  ))}
+                </div>
+              )}
+            </Panel>
+
+            <Panel
+              title="Mes services"
+              sub="Demandez un service sous une souscription active."
+            >
+              {services.length === 0 ? (
+                <EmptyState>
+                  {activeSub ? 'Aucun service pour l’instant — demandez-en un ci-dessous.' : 'Aucune souscription active pour demander un service.'}
+                </EmptyState>
+              ) : (
+                <div className="stack">
+                  {services.map((svc) => (
+                    <div key={svc.id} className="status-row">
+                      <span className="status-icon">
+                        <IconServer />
+                      </span>
+                      <div className="status-row-main">
+                        <div className="status-row-title">{svc.name}</div>
+                        <div className="status-row-sub">
+                          Service
+                          {svc.subscription?.product?.pack && (
+                            <span className="muted">
+                              {' '}
+                              · pack {svc.subscription.product.pack.name} ({svc.subscription.product.pack.ramMb} Mo · {svc.subscription.product.pack.cpuCores} CPU)
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                      <Badge tone={statusTone(svc.status)}>{SERVICE_STATUS_LABEL[svc.status] ?? svc.status}</Badge>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {activeSub && (
+                <div className="row mt" style={{ gap: 8 }}>
+                  <Input
+                    className="flex-1"
+                    placeholder="Nom du nouveau service"
+                    value={serviceName[activeSub.id] ?? ''}
+                    disabled={isImp}
+                    onChange={(e) => setServiceName({ ...serviceName, [activeSub.id]: e.target.value })}
+                  />
+                  <Button
+                    size="sm"
+                    disabled={isImp || !(serviceName[activeSub.id] ?? '').trim()}
+                    onClick={() => requestService(activeSub.id)}
+                  >
+                    Demander
+                  </Button>
+                </div>
+              )}
+            </Panel>
+          </div>
+        </div>
+
+        {/* ── Support & tickets ─────────────────────────────────────────── */}
+        <div className="mt">
+          <div className="section-title">
+            <h3>Support &amp; assistance</h3>
+            <span className="muted">Code d’accès en lecture seule + tickets.</span>
+          </div>
+
+          <div className="bottom-grid">
+            <Panel
+              title="Accès support"
+              sub="Générez un code à 6 chiffres et transmettez-le au support (par téléphone) pour qu’il consulte votre espace en lecture seule."
+            >
+              {shownCode ? (
+                <div className="stack">
+                  <p className="muted" style={{ fontSize: 13 }}>
+                    Code d&apos;accès (affiché une seule fois) :
+                  </p>
+                  <div className="row">
+                    <code className="input-mono access-code">{shownCode}</code>
+                    <Button variant="secondary" size="sm" onClick={revokeCode} disabled={isImp}>
+                      Révoquer le code
+                    </Button>
+                  </div>
+                  {codeExpiry && (
+                    <p className="muted" style={{ fontSize: 12 }}>
+                      Expire le {new Date(codeExpiry).toLocaleString()}.
+                    </p>
+                  )}
+                </div>
+              ) : codeActive ? (
+                <div className="row" style={{ justifyContent: 'space-between' }}>
+                  <span className="muted" style={{ fontSize: 13 }}>
+                    Un code est actif jusqu&apos;au {codeExpiry ? new Date(codeExpiry).toLocaleString() : '—'}.
+                  </span>
+                  <Button variant="secondary" size="sm" onClick={revokeCode} disabled={isImp}>
+                    Révoquer
+                  </Button>
+                </div>
+              ) : (
+                <Button onClick={generateCode} disabled={isImp}>
+                  Générer un code
+                </Button>
+              )}
+            </Panel>
+
+            <Panel
+              title="Mes tickets"
+              sub="Ouvrez un ticket auprès du support (L1 vous répond, puis escalade vers L2/L3 si besoin)."
+            >
+              {!isImp && (
+                <div className="stack mb">
+                  <div className="inline-form">
+                    <Field label="Sujet">
+                      <Input value={tSubject} onChange={(e) => setTSubject(e.target.value)} />
+                    </Field>
+                    <Button onClick={openTicket} disabled={!tSubject.trim() || !tBody.trim()}>
+                      Ouvrir un ticket
+                    </Button>
+                  </div>
+                  <Field label="Description du problème">
+                    <Input value={tBody} onChange={(e) => setTBody(e.target.value)} />
+                  </Field>
+                </div>
+              )}
+
+              {tickets.length === 0 ? (
+                <EmptyState>Aucun ticket pour l&apos;instant.</EmptyState>
+              ) : (
+                <div className="stack">
+                  {tickets.map((t) => {
+                    const open = openTicketId === t.id;
+                    return (
+                      <div key={t.id} className="panel ticket-msg">
+                        <button
+                          type="button"
+                          className="status-row"
+                          style={{ width: '100%', background: 'transparent', border: 0, textAlign: 'left', cursor: 'pointer' }}
+                          onClick={() => setOpenTicketId(open ? null : t.id)}
+                        >
+                          <div className="status-row-main">
+                            <div className="status-row-title">{t.subject}</div>
+                            <div className="status-row-sub">
+                              {TICKET_STATUS_LABEL[t.status] ?? t.status}
+                              {t.escalatedTo && ` · escaladé vers ${t.escalatedTo}`} ·{' '}
+                              {new Date(t.updatedAt).toLocaleString()}
+                            </div>
+                          </div>
+                          <Badge tone={statusTone(TICKET_TONE(t.status))}>{TICKET_STATUS_LABEL[t.status] ?? t.status}</Badge>
+                        </button>
+
+                        {open && (
+                          <div className="stack mt" style={{ padding: '0 4px' }}>
+                            {t.messages?.map((m) => (
+                              <div key={m.id} className="ticket-msg">
+                                <div className="row" style={{ gap: 8 }}>
+                                  <b style={{ fontSize: 12.5 }}>{m.authorEmail}</b>
+                                  <span className="muted" style={{ fontSize: 11.5 }}>
+                                    {new Date(m.createdAt).toLocaleString()}
+                                  </span>
+                                </div>
+                                <div className="mt-sm" style={{ fontSize: 13.5, whiteSpace: 'pre-wrap' }}>
+                                  {m.body}
+                                </div>
+                              </div>
+                            ))}
+                            {!isImp && (
+                              <div className="row">
+                                <Input
+                                  className="flex-1"
+                                  placeholder="Votre réponse…"
+                                  value={ticketReply[t.id] ?? ''}
+                                  onChange={(e) => setTicketReply({ ...ticketReply, [t.id]: e.target.value })}
+                                />
+                                <Button
+                                  size="sm"
+                                  disabled={!(ticketReply[t.id] ?? '').trim()}
+                                  onClick={() => sendTicketReply(t.id)}
+                                >
+                                  Répondre
+                                </Button>
+                              </div>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </Panel>
+          </div>
         </div>
       </div>
     </AppShell>

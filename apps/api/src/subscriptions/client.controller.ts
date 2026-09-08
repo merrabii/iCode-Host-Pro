@@ -13,6 +13,7 @@ import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { JwtPayload } from '../auth/types';
 import { SubscriptionsService } from './subscriptions.service';
 import { CreateSubscriptionDto } from './dto/create-subscription.dto';
+import { UpgradeSubscriptionDto } from './dto/upgrade-subscription.dto';
 import { CreateServiceDto } from './dto/create-service.dto';
 
 // Phase 5 (ADR-021): client workspace — any authenticated user, ownership
@@ -44,6 +45,16 @@ export class ClientController {
   @ApiOperation({ summary: 'Cancel one of my subscriptions (USER)' })
   cancelMySubscription(@Param('id') id: string, @CurrentUser() actor: JwtPayload) {
     return this.subscriptions.cancelMySubscription(id, actor);
+  }
+
+  @Patch('subscriptions/:id/upgrade')
+  @ApiOperation({ summary: 'Upgrade my ACTIVE subscription to another product/pack (USER)' })
+  upgradeMySubscription(
+    @Param('id') id: string,
+    @Body() dto: UpgradeSubscriptionDto,
+    @CurrentUser() actor: JwtPayload,
+  ) {
+    return this.subscriptions.upgradeMySubscription(id, dto, actor);
   }
 
   @Post('services')

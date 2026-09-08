@@ -4,6 +4,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import {
+  PackStatus,
   ProductStatus,
   Service,
   ServiceStatus,
@@ -15,6 +16,7 @@ import { AuditService } from '../audit/audit.service';
 import { Actor } from '../users/users.service';
 import { CreateSubscriptionDto } from './dto/create-subscription.dto';
 import { UpdateSubscriptionDto } from './dto/update-subscription.dto';
+import { UpgradeSubscriptionDto } from './dto/upgrade-subscription.dto';
 import { CreateServiceDto } from './dto/create-service.dto';
 import { UpdateServiceDto } from './dto/update-service.dto';
 
@@ -150,6 +152,68 @@ export class SubscriptionsService {
       },
       orderBy: { createdAt: 'desc' },
     });
+  }
+
+  /**
+   * USER: mise à niveau d'une souscription ACTIVE vers un autre produit/pack.
+   * La MÊME ligne d'abonnement est basculée (createdAt, services, apps et
+   * données préservés — aucune suppression ni redéploiement) ; les limites
+   * RAM/CPU et le quota d'apps du NOUVEAU pack s'appliquent aux prochains
+   * déploiements. Le produit cible doit être disponible et son pack ACTIVE.
+   */
+  async upgradeMySubscription(
+    id: string,
+    dto: UpgradeSubscriptionDto,
+    actor: Actor,
+  ): Promise<Subscription> {
+    const sub = await this.findMySubscription(id, actor.sub);
+    if (sub.status !== SubscriptionStatus.ACTIVE) {
+      throw new BadRequestException(
+        'Seule une souscription ACTIVE peut être mise à niveau.',
+      );
+    }
+    if (sub.productId === dto.productId) {
+      throw new BadRequestException(
+        'Cette souscription est déjà liée à ce produit.',
+      );
+    }
+    const product = await this.prisma.product.findUnique({
+      where: { id: dto.productId },
+      include: { pack: true },
+    });
+    if (!product) {
+      throw new NotFoundException('Produit introuvable.');
+    }
+    if (
+      product.status === ProductStatus.DRAFT ||
+      product.status === ProductStatus.DISABLED
+    ) {
+      throw new BadRequestException(
+        'Ce produit n’est pas disponible à la souscription.',
+      );
+    }
+    if (!product.pack || product.pack.status !== PackStatus.ACTIVE) {
+      throw new BadRequestException('Le pack de ce produit n’est pas actif.');
+    }
+    const updated = await this.prisma.subscription.update({
+      where: { id },
+      data: { productId: dto.productId },
+    });
+    await this.audit.record({
+      actorId: actor.sub,
+      actorEmail: actor.email,
+      action: 'subscription.upgrade',
+      resourceType: 'subscription',
+      resourceId: id,
+      details: {
+        fromProductId: sub.productId,
+        toProductId: dto.productId,
+        toProductName: product.name,
+        toPackName: product.pack.name,
+        toMaxApps: product.pack.maxApps,
+      },
+    });
+    return updated;
   }
 
   /** USER: cancel an own PENDING/ACTIVE/SUSPENDED subscription → CANCELLED. */

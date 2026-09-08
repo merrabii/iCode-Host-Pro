@@ -260,11 +260,33 @@ export class AuthService {
     const record = await this.prisma.refreshToken.findUnique({
       where: { tokenHash: this.hashToken(refreshToken) },
     });
-    if (
-      !record ||
-      record.revokedAt !== null ||
-      record.expiresAt < new Date()
-    ) {
+    // Rotation race (2 onglets / calls concurrentes) : quand un token vient d'être
+    // roté (révoqué il y a ≤ REUSE_WINDOW_MS), on le considère comme une réutilisation
+    // LÉGITIME concurrente et on émet un nouveau jeu pour le même utilisateur, au lieu
+    // de déconnecter le client « pour rien ». Une vraie réutilisation malveillante
+    // (token volé) est elle aussi marquée `revokedAt` — la fenêtre courte (10 s) la rend
+    // négligeable et l'audit `auth.refresh.reuse` trace l'événement.
+    if (record && record.revokedAt !== null) {
+      const ageMs = Date.now() - record.revokedAt.getTime();
+      if (ageMs <= 10_000) {
+        const user = await this.prisma.user.findUnique({
+          where: { id: record.userId },
+        });
+        if (user) {
+          await this.audit.record({
+            actorId: user.id,
+            actorEmail: user.email,
+            action: 'auth.refresh.reuse',
+            resourceType: 'user',
+            resourceId: user.id,
+            details: { reason: 'rotation-concurrente' },
+          });
+          return this.issueTokens(user);
+        }
+      }
+      throw new UnauthorizedException('Invalid refresh token');
+    }
+    if (!record || record.expiresAt < new Date()) {
       throw new UnauthorizedException('Invalid refresh token');
     }
 

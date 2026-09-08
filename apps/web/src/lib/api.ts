@@ -37,8 +37,8 @@ export interface ApiResult<T = unknown> {
   data: T | null;
 }
 
-/** Mint an access token from the httpOnly refresh cookie, or null if not authed. */
-export async function getAccessToken(): Promise<string | null> {
+/** Raw mint: call /api/auth/refresh (rotates the refresh cookie). Never 401s the app. */
+async function rawMintAccessToken(): Promise<string | null> {
   try {
     const res = await fetch('/api/auth/refresh', { method: 'POST', credentials: 'include' });
     if (!res.ok) return null;
@@ -47,6 +47,23 @@ export async function getAccessToken(): Promise<string | null> {
   } catch {
     return null;
   }
+}
+
+/**
+ * Single-flight access-token mint. Si plusieurs appels arrivent en même temps
+ * (co-montage de hôoks de session, plusieurs apiJson…), UN SEUL /api/auth/refresh
+ * part en vol (le serveur ROTATE la cookie refresh : des rafraîchissements
+ * concurrents se révoqueraient mutuellement → déconnexion « pour rien »). Tous
+ * les appelants partagent la même promesse.
+ */
+let mintInFlight: Promise<string | null> | null = null;
+export function getAccessToken(): Promise<string | null> {
+  if (!mintInFlight) {
+    mintInFlight = rawMintAccessToken().finally(() => {
+      mintInFlight = null;
+    });
+  }
+  return mintInFlight;
 }
 
 /** Fetch the current user profile (public, no passwordHash). */
@@ -62,11 +79,11 @@ export async function fetchMe(token: string): Promise<Me | null> {
   }
 }
 
-/** Authed JSON request; returns {ok,status,data} with a best-effort parsed body. */
-export async function apiJson(
+/** Execute one authed JSON request and parse the body. */
+async function authedJson(
   path: string,
   token: string,
-  init: RequestInit = {},
+  init: RequestInit,
 ): Promise<ApiResult> {
   const headers: Record<string, string> = {
     Authorization: `Bearer ${token}`,
@@ -81,6 +98,27 @@ export async function apiJson(
     /* non-JSON body */
   }
   return { ok: res.ok, status: res.status, data };
+}
+
+/**
+ * Authed JSON request; returns {ok,status,data} with a best-effort parsed body.
+ * Phase 13 UX : quand le jeton d'accès a expiré (401, fenêtre de 15 min), on le
+ * rotte automatiquement via la cookie refresh et on réessaie UNE fois — au lieu
+ * de « déconnecter pour rien » en plein milieu d'une session. Un 403 (forbidden)
+ * ou 404 reste intact.
+ */
+export async function apiJson(
+  path: string,
+  token: string,
+  init: RequestInit = {},
+): Promise<ApiResult> {
+  const first = await authedJson(path, token, init);
+  if (first.status !== 401) return first;
+  const fresh = await getAccessToken();
+  if (fresh && fresh !== token) {
+    return authedJson(path, fresh, init);
+  }
+  return first;
 }
 
 /** Best-effort error message from an ApiResult, falling back to a default. */
@@ -231,6 +269,13 @@ export const createMySubscription = (t: string, productId: string) =>
   apiJson('/api/client/subscriptions', t, { method: 'POST', body: JSON.stringify({ productId }) });
 export const cancelMySubscription = (t: string, id: string) =>
   apiJson(`/api/client/subscriptions/${id}/cancel`, t, { method: 'PATCH' });
+/** Mise à niveau d'une souscription ACTIVE vers un autre produit/pack (Phase 13) —
+ *  la même ligne d'abonnement est basculée : apps et données préservées. */
+export const upgradeMySubscription = (t: string, id: string, productId: string) =>
+  apiJson(`/api/client/subscriptions/${id}/upgrade`, t, {
+    method: 'PATCH',
+    body: JSON.stringify({ productId }),
+  });
 export const listMyServices = (t: string) => apiJson('/api/client/services', t);
 export const createMyService = (t: string, subscriptionId: string, name: string) =>
   apiJson('/api/client/services', t, { method: 'POST', body: JSON.stringify({ subscriptionId, name }) });
@@ -1061,6 +1106,9 @@ export const detectDeployment = (t: string, url: string) =>
 export const listMyDeployments = (t: string) => apiJson('/api/client/deployments', t);
 export const getMyDeployment = (t: string, id: string) =>
   apiJson(`/api/client/deployments/${id}`, t);
+/** Supprime une app du client — libère le quota d'apps du pack (Phase 13). */
+export const deleteMyDeployment = (t: string, id: string) =>
+  apiJson(`/api/client/deployments/${id}`, t, { method: 'DELETE' });
 /** Quota d'apps du pack ACTIF (Phase 13) — compteur « N utilisées / M autorisées ». */
 export interface ClientDeployQuota {
   pack: {

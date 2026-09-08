@@ -288,6 +288,60 @@ const ADMIN_ARTICLES: Article[] = [
       ]),
     tags: ['connaissance', 'aide', 'turnstile', 'phase-11'],
   },
+  {
+    audience: 'ADMIN',
+    type: 'INFORMATIVE',
+    phase: 'Phase 12',
+    title: 'Phase 12 — Catalogue : Catégories, Packs & Produits (ADR-029)',
+    slug: 'phase-12-catalogue-categories-packs',
+    summary:
+      'Classification des offres (Catégorie), gabarit de ressources (Pack : RAM/CPU/disque/bande passante) et Produit du catalogue relié à une catégorie et à un pack.',
+    body:
+      h2('Ce qui a été fait') +
+      p(
+        'Le catalogue passe d’un simple produit (nom + type) à une vraie structure : les catégories classent les offres, les packs portent les ressources (RAM, CPU, stockage, bande passante) et chaque produit est lié à UN pack et à UNE catégorie optionnelle.',
+      ) +
+      h2('Chaîne des objets') +
+      ul([
+        `${code('ProductCategory')} — classification (ex. « Hébergement web », « VPS ») + pack recommandé lors de la création d’un produit de cette catégorie.`,
+        `${code('HostingPack')} — gabarit de ressources : ramMb, cpuCores, storageLimit (enregistré, quota non actif encore), bandwidth (label), maxApps (quota d’apps, Phase 13) et deploymentModuleId (méthode A/B).`,
+        `${code('Product')} — offre visible du catalogue, reliée à categoryId (SetNull) et packId (Restrict).`,
+      ]) +
+      h2('Suppression & dissociation') +
+      ul([
+        'Un produit lié à un pack ne peut PAS être supprimé tant que le pack existe (FK Restrict). Pour dissocier : passer le pack en DISABLED puis retirer la liaison, ou supprimer le pack.',
+        'Retirer un produit du catalogue client = le passer en DISABLED (jamais de suppression destructive).',
+      ]),
+    tags: ['catalogue', 'packs', 'categories', 'produits', 'phase-12'],
+  },
+  {
+    audience: 'ADMIN',
+    type: 'INFORMATIVE',
+    phase: 'Phase 13',
+    title: 'Phase 13 — Modules de déploiement A/B, projets Coolify par client, quota d’apps & monitoring',
+    slug: 'phase-13-modules-deploiement-quota-monitoring',
+    summary:
+      'Deux méthodes de déploiement (Module A projet partagé / Module B projet par client), quota d’apps par pack (maxApps), monitoring des projets avec alertes de dépassement.',
+    body:
+      h2('Ce qui a été fait') +
+      p(
+        'Le déploiement client est désormais piloté par le PACK, pas par un Service choisi manuellement : le pack est lié à un module de déploiement qui décide OÙ les apps vivent sur Coolify.',
+      ) +
+      h2('Les deux modules') +
+      ul([
+        `${code('Module A (SHARED_PROJECT)')} — toutes les apps vont dans UN projet Coolify partagé, choisi par l’admin depuis la liste live (page Packs).`,
+        `${code('Module B (PER_CLIENT_PROJECT)')} — chaque client a SON projet Coolify nommé ${code('client-<id>')}, créé automatiquement à la première app (ou via « Créer le projet maintenant » sur Utilisateurs), retrouvable par le support.`,
+      ]) +
+      h2('Quota d’apps (maxApps)') +
+      p(
+        'Chaque pack fixe un nombre max d’applications (1 / 5 / 10… ou illimité si vide). Le compteur = apps du client hors ÉCHEC. Au-delà → refus 403 « Quota d’applications atteint ». Le client voit « N utilisées / M autorisées » et peut supprimer une app pour libérer une place.',
+      ) +
+      h2('Monitoring') +
+      p(
+        'La page Administration → Monitoring projets agrège les ressources (RAM/CPU/disque = Σ des apps du projet) par projet Coolify, compare au pack et alerte si dépassement, triée par consommation totale décroissante.',
+      ),
+    tags: ['deploiement', 'modules', 'quota', 'monitoring', 'phase-13'],
+  },
 
   // ── TECHNICAL : architecture & sécurité ────────────────────────────────
   {
@@ -387,6 +441,42 @@ const ADMIN_ARTICLES: Article[] = [
         'Prévu pour la Phase 10bis : création d’applications git et déploiement (createGitApp/deployApp).',
       ]),
     tags: ['hestia', 'coolify', 'panel', 'transport', 'api'],
+  },
+  {
+    audience: 'ADMIN',
+    type: 'TECHNICAL',
+    title: 'Chaîne de résolution du déploiement (subscription → product → pack → module → projet Coolify)',
+    slug: 'chaine-resolution-deploiement-pack-module-coolify',
+    summary:
+      'Comment le backend résout la cible Coolify (module A projet partagé / Module B projet client), applique les limites RAM/CPU et le quota d’apps.',
+    body:
+      h2('Résolution (deux chemins)') +
+      ul([
+        `${code('serviceId')} fourni ET appartenant au client → comportement historique : serveur = celui du Service ACTIVE, pack = celui de son abonnement.`,
+        `${code('serviceId')} absent → mode auto (Phase 13) : abonnement ACTIVE le plus récent du client → produit → pack → ${code('deploymentModule')}. Fallback : premier module actif si le pack n’a pas de module lié.`,
+      ]) +
+      h2('Projet Coolify par module') +
+      ul([
+        `Module A — ${code('DeploymentModuleKind.SHARED_PROJECT')} : ${code('server = module.server')} + ${code('projectUuid = module.sharedProjectUuid')}. Si absent → erreur lisible « projet non configuré (page Packs) ».`,
+        `Module B — ${code('DeploymentModuleKind.PER_CLIENT_PROJECT')} : ${code('server = module.server')} + projet dédié ${code('client-<userId>')} via ${code('getOrCreateClientProject')} (${code('POST /projects')} Coolify, idempotent via @@unique).`,
+        `${code('ProjectKind')} n’existe plus : le projet Coolify hosté est ${code('Deployment.coolifyProjectUuid')} + ${code('moduleId/clientProjectId')} pour le monitoring/support.`,
+      ]) +
+      h2('Contrats Coolify confirmés live (v4)') +
+      ul([
+        `${code('GET /projects')} renvoie un TABLEAU NU (pas d’enveloppe success).`,
+        `${code('POST /projects')} n’accepte QUE name + description (server_uuid rejeté, accents interdits — description sanitizée).`,
+        `${code('POST /applications/public')} crée l’app (project_uuid / server_uuid, build pack, repo, branch, nom).`,
+        `${code('PATCH /applications/:uuid')} applique les limites (${code('limits_cpus / limits_memory')}).`,
+        `${code('POST  /deploy')} déclenche le déploiement, ${code('GET /applications/:uuid')} poll le statut.`,
+        `${code('DELETE /applications/:uuid')} supprime une app (Phase 13 — libère le quota).`,
+      ]) +
+      h2('Quota & limites') +
+      ul([
+        `${code('maxApps')} du pack : count(Deployment où userId + status ≠ FAILED) ; appliqué AVANT toute création Coolify ; ${code('null')} = illimité.`,
+        `Limites coolifiées : ${code('packLimits')} (RAM via ${code('memoryFromMb')} → m/g, CPU via ${code('cpusFromCores')} → 1 / 0.5) ; les ${code('overrideRamMb/overrideCpuCores')} du module priment.`,
+        `Quota disque (storageLimit / overrideStorageLimit) enregistré seulement — hors périmètre.`,
+      ]),
+    tags: ['deploiement', 'resolution', 'coolify', 'module', 'quota', 'transport'],
   },
 
   // ── HOWTO : guides d’utilisation admin ─────────────────────────────────
@@ -535,6 +625,90 @@ const ADMIN_ARTICLES: Article[] = [
         'L’escalade (L1 → L2/L3) est journalisée et visible du client.',
       ]),
     tags: ['tickets', 'support', 'howto', 'escalade', 'code'],
+  },
+  {
+    audience: 'ADMIN',
+    type: 'HOWTO',
+    title: 'Créer une offre de bout en bout : Catégorie → Pack → Produit',
+    slug: 'howto-creer-offre-categorie-pack-produit',
+    summary:
+      'Guide détaillé : créer une catégorie, un pack de ressources, puis un produit du catalogue relié aux deux — et le vérifier côté client.',
+    body:
+      h2('Objectif') +
+      p(
+        'Comprendre et reproduire la chaîne complète qui rend une offre visible et déployable : la catégorie classe, le pack porte les ressources et la méthode de déploiement, le produit est l’offre que le client commande.',
+      ) +
+      h2('Étape 1 — Créer une catégorie (optionnelle mais recommandée)') +
+      ul([
+        'Administration → Catégories → « Nouvelle catégorie ».',
+        'Renseigner un nom (ex. « Hébergement web ») et, si vous voulez, le « pack recommandé » : c’est le pack proposé par défaut lors de la création d’un produit dans cette catégorie.',
+      ]) +
+      h2('Étape 2 — Créer le pack de ressources') +
+      ul([
+        'Administration → Packs → « Nouveau pack ».',
+        'Renseigner : nom (ex. « Pack Pro »), description, RAM par app (Mo), CPU par app (cœurs, fraction possible ex. 0.5), stockage (Go, informatique), bande passante (label), statut ACTIVE.',
+        'Quota d’applications (maxApps) : laissez vide pour illimité, ou saisissez 1 / 5 / 10… pour plafonner le nombre d’apps du client.',
+        'Module de déploiement : choisissez le module A ou B (voir l’article dédié « Configurer les modules de déploiement A/B »). C’est lui qui décide où les apps seront créées sur Coolify.',
+      ]) +
+      h2('Étape 3 — Créer le produit du catalogue') +
+      ul([
+        'Administration → Produits → « Nouveau produit ».',
+        'Renseigner : nom (ex. « Hébergement Pro »), type (kind), statut ACTIVE, la catégorie créée à l’étape 1, et le pack créé à l’étape 2.',
+        'Enregistrer : le produit apparaît dans le catalogue client (page Offres / Espace client → catalogue).',
+      ]) +
+      h2('Étape 4 — Vérifier le parcours client') +
+      ul([
+        'Depuis le compte d’un client, commander le produit → souscription PENDING → approbation admin (Souscriptions & services) → ACTIVE.',
+        'Le client peut alors déployer : le pack résout la cible (module → serveur → projet Coolify) et applique les limites RAM/CPU + le quota maxApps.',
+      ]) +
+      h2('Pièges') +
+      ul([
+        'Un produit lié à un pack ne se supprime pas tant que le pack existe (FK Restrict) — passez le pack en DISABLED pour dissocier.',
+        'Retirer une offre du catalogue = passer le produit en DISABLED, pas le supprimer.',
+        'Sans pack ACTIVE lié, le déploiement du client est refusé (« aucun pack actif »).',
+      ]),
+    tags: ['produits', 'packs', 'categories', 'catalogue', 'howto'],
+  },
+  {
+    audience: 'ADMIN',
+    type: 'HOWTO',
+    title: 'Configurer les modules de déploiement A/B et les lier aux packs',
+    slug: 'howto-configurer-modules-deploiement-a-b',
+    summary:
+      'Créer un Module A (projet partagé) ou B (projet par client), le lier à des packs, fixer le quota maxApps, et comprendre le monitoring.',
+    body:
+      h2('Objectif') +
+      p(
+        'Les modules de déploiement décident OÙ les apps client sont créées sur Coolify. Chaque pack est lié à un module ; le client ne choisit plus de service ni de serveur.',
+      ) +
+      h2('Étape 1 — Préparer le serveur Coolify') +
+      ul([
+        'Administration → Serveurs : le serveur doit être de fournisseur Coolify, API vérifiée (panelOk) et credentials renseignés (le jeton doit être ROOT).',
+      ]) +
+      h2('Étape 2 — Créer le(s) module(s) (page Packs → Configuration de déploiement)') +
+      ul([
+        `${code('Module A — projet partagé')} : nom, code « A », type « SHARED_PROJECT », serveur Coolify, puis choisir le projet partagé dans la liste LIVE des projets Coolify (bouton de rafraîchissement). Toutes les apps des packs liés à ce module iront dans CE projet.`,
+        `${code('Module B — projet par client')} : nom, code « B », type « PER_CLIENT_PROJECT », serveur Coolify, préfixe (défaut « client »). Le projet ${code('client-<id>')} de chaque client est créé automatiquement à sa première app, ou via « Créer le projet maintenant » sur la page Utilisateurs.`,
+        'Overrides (optionnels) : RAM/CPU/disque du module priment sur le pack pour les apps déployées par ce module.',
+        'Activer le module (isActive) — un module désactivé bloque le déploiement des packs liés.',
+      ]) +
+      h2('Étape 3 — Lier les packs aux modules + quota') +
+      ul([
+        'Administration → Packs → éditer un pack : choisir le « Module de déploiement » et saisir « maxApps » (vide = illimité).',
+        'Le pack doit être ACTIVE pour que le client puisse déployer.',
+      ]) +
+      h2('Étape 4 — Vérifier et surveiller') +
+      ul([
+        'Déploiement client (mode URL ou GitHub lié) : Module A → l’app apparaît dans le projet partagé ; Module B → le projet client-<id> est créé à la première app.',
+        'Suppression d’une app par le client (carte app → Supprimer) : l’app Coolify et son CNAME Cloudflare sont retirés (best-effort) et le quota est libéré.',
+        'Mise à niveau du plan (Espace client → Mon plan) : la même souscription bascule vers le nouveau pack, les apps existantes sont CONSERVÉES (seules les limites/quota des prochains déploiements changent).',
+        'Monitoring projets (Administration → Monitoring projets) : consommation par projet (Σ des apps) vs pack, alertes de dépassement, tri par total.',
+      ]) +
+      h2('Cas où rien n’est configuré') +
+      p(
+        'Si le pack n’a pas de module, le backend prend le premier module actif par défaut. Si AUCUN module n’existe, le déploiement est refusé avec un message clair demandant de contacter le support.',
+      ),
+    tags: ['modules', 'deploiement', 'pack', 'quota', 'monitoring', 'howto'],
   },
 ];
 

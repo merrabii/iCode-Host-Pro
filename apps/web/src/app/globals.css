@@ -3430,3 +3430,123 @@ select:disabled {
     padding: 22px 4px 10px;
   }
 }
+
+/* ── Phase 13 — barres de progression (quota / consommation) ──────────────── */
+.bar-wrap { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+.bar-meta { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; font-size: 11px; }
+.bar-label { font-weight: 600; color: var(--text-secondary); }
+.bar-track { height: 7px; border-radius: 999px; background: var(--tint-gray-bg); overflow: hidden; }
+.bar-fill { height: 100%; border-radius: 999px; transition: width .45s var(--ease-spring); }
+.bar-fill.ok { background: linear-gradient(90deg, var(--brand-primary), var(--brand-primary-dark)); }
+.bar-fill.danger { background: linear-gradient(90deg, var(--tint-red-fg), var(--tint-red-bg)); }
+.bar-fill.neutral { background: var(--tint-gray-fg); opacity: .4; }
+.danger-text { color: var(--tint-red-fg); font-weight: 700; }
+
+/* ── Tableau de bord client ultra-moderne (Phase 13) ─────────────────────── */
+.dash-hero {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  flex-wrap: wrap;
+  padding: 26px 28px;
+  margin-bottom: 22px;
+  border-radius: 18px;
+  background: linear-gradient(135deg, var(--card-bg-2), var(--card-bg));
+  border: 1px solid var(--border-soft);
+  box-shadow: var(--shadow-soft);
+  position: relative;
+  overflow: hidden;
+}
+.dash-hero::before {
+  content: '';
+  position: absolute;
+  inset: -40% -20% auto auto;
+  width: 320px;
+  height: 320px;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(0, 179, 119, .14), transparent 65%);
+  pointer-events: none;
+}
+.dash-hero h2 { font-size: 22px; font-weight: 800; letter-spacing: -.02em; color: var(--text-primary); }
+.dash-hero p { font-size: 13px; color: var(--text-muted); margin-top: 4px; max-width: 560px; }
+.dash-hero-actions { display: flex; gap: 10px; flex-wrap: wrap; position: relative; }
+
+.quick-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 15px;
+  border-radius: 11px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  background: var(--tint-gray-bg);
+  border: 1px solid var(--border-soft);
+  transition: var(--transition);
+}
+.quick-link:hover { color: var(--active-text); border-color: var(--active-text); background: var(--tint-green-bg); }
+.quick-link svg { width: 15px; height: 15px; }
+
+.stat-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 14px;
+  margin-bottom: 22px;
+}
+
+.app-card { display: flex; flex-direction: column; gap: 12px; }
+.app-card-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+.app-card-title { font-size: 15px; font-weight: 700; color: var(--text-primary); letter-spacing: -.01em; word-break: break-word; }
+.app-card-meta { display: flex; flex-wrap: wrap; gap: 6px; }
+.app-chip {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  background: var(--tint-gray-bg);
+  border-radius: 999px;
+  padding: 4px 10px;
+  white-space: nowrap;
+}
+.app-card-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-soft);
+  margin-top: auto;
+}
+
+.plan-card { display: flex; flex-direction: column; gap: 14px; }
+.plan-card-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.plan-name { font-size: 16px; font-weight: 800; color: var(--text-primary); }
+.plan-specs { display: flex; flex-wrap: wrap; gap: 8px; }
+
+.upgrade-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  flex-wrap: wrap;
+  padding: 14px 16px;
+  border: 1px solid var(--border-soft);
+  border-radius: 12px;
+  transition: var(--transition);
+}
+.upgrade-row:hover { border-color: var(--active-text); background: var(--card-bg-2); }
+.upgrade-main { flex: 1; min-width: 0; }
+.upgrade-title { font-size: 13.5px; font-weight: 700; color: var(--text-primary); }
+.upgrade-sub { font-size: 11.5px; color: var(--text-muted); margin-top: 2px; }
+
+.section-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin: 26px 0 14px;
+}
+.section-title h3 { font-size: 16px; font-weight: 800; letter-spacing: -.01em; color: var(--text-primary); }
+.section-title .muted { font-size: 12.5px; }

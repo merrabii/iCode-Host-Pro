@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Param, Post, UseGuards } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, Post, UseGuards } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
@@ -54,5 +54,11 @@ export class DeploymentsController {
   @ApiOperation({ summary: 'Get one of my deployments — live status poll (Phase 10bis)' })
   findMine(@Param('id') id: string, @CurrentUser() actor: JwtPayload) {
     return this.deployments.findMine(id, actor);
+  }
+
+  @Delete('deployments/:id')
+  @ApiOperation({ summary: 'Delete one of my deployments — frees the app quota (Phase 13)' })
+  remove(@Param('id') id: string, @CurrentUser() actor: JwtPayload) {
+    return this.deployments.remove(id, actor);
   }
 }

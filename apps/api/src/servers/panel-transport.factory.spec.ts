@@ -509,7 +509,7 @@ describe('PanelTransportFactory / NodePanelTransport', () => {
       }
     });
 
-    it('createProject POSTs /projects (env.success + server_uuid) and returns the created uuid', async () => {
+    it('createProject POSTs /projects (env.success) and returns the created uuid', async () => {
       let method = '';
       let path = '';
       let authHeader: string | undefined;
@@ -527,7 +527,7 @@ describe('PanelTransportFactory / NodePanelTransport', () => {
       try {
         const out = await factory.create(timeoutMs).createProject(base(srv.url), {
           name: 'client-ab12cd',
-          description: 'Projet dédié du client',
+          description: 'Projet dedie du client',
           serverUuid: '0',
         });
         expect(out).toEqual({ uuid: 'proj-new', name: 'client-ab12cd' });
@@ -536,8 +536,10 @@ describe('PanelTransportFactory / NodePanelTransport', () => {
         expect(authHeader).toBe('Bearer tok-deploy');
         const parsed = JSON.parse(body) as Record<string, string>;
         expect(parsed.name).toBe('client-ab12cd');
-        expect(parsed.description).toBe('Projet dédié du client');
-        expect(parsed.server_uuid).toBe('0');
+        expect(parsed.description).toBe('Projet dedie du client');
+        // Coolify v4 REJETTE `server_uuid` sur POST /projects (validé en live) —
+        // il ne DOIT PAS être envoyé dans le body.
+        expect(Object.prototype.hasOwnProperty.call(parsed, 'server_uuid')).toBe(false);
       } finally {
         await srv.close();
       }

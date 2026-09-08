@@ -431,6 +431,98 @@ export class DeploymentsService {
     return this.toView(row);
   }
 
+  /**
+   * Supprime une app du client (Phase 13 — libère le quota maxApps pour en
+   * recréer une autre) : best-effort sur Coolify (DELETE de l'application) et
+   * sur Cloudflare (suppression du CNAME du sous-domaine), puis suppression
+   * des rows ClientSubdomain + Deployment. Un échec réseau ne bloque JAMAIS
+   * la suppression locale : l'app peut rester orpheline sur Coolify mais le
+   * quota du compte est libéré immédiatement (audit `*.warn` pour le support).
+   */
+  async remove(id: string, actor: Actor): Promise<{ removed: true; appName: string | null }> {
+    const row = await this.prisma.deployment.findFirst({
+      where: { id, userId: actor.sub },
+      include: { server: true, clientSubdomain: { include: { domain: true } } },
+    });
+    if (!row) {
+      throw new NotFoundException('Déploiement introuvable.');
+    }
+
+    // 1. Coolify — suppression de l'application (best-effort).
+    if (
+      row.coolifyUuid &&
+      row.server &&
+      row.server.panelProvider === ServerPanelProvider.COOLIFY &&
+      row.server.apiBaseUrl &&
+      row.server.apiTokenEnc
+    ) {
+      try {
+        await this.panelFactory
+          .create()
+          .deleteApplication(this.buildTarget(row.server), row.coolifyUuid);
+        await this.audit.record({
+          actorId: actor.sub,
+          actorEmail: actor.email,
+          action: 'deploy.delete.coolify',
+          resourceType: 'deployment',
+          resourceId: id,
+          details: { coolifyUuid: row.coolifyUuid, appName: row.appName },
+        });
+      } catch (err) {
+        const m = err instanceof Error ? err.message : String(err);
+        await this.audit.record({
+          actorId: actor.sub,
+          actorEmail: actor.email,
+          action: 'deploy.delete.coolify.warn',
+          resourceType: 'deployment',
+          resourceId: id,
+          details: { coolifyUuid: row.coolifyUuid, message: m },
+        });
+      }
+    }
+
+    // 2. Cloudflare — suppression de l'enregistrement DNS du sous-domaine
+    //    (best-effort ; recordId peut manquer si la création DNS avait échoué).
+    const cs = row.clientSubdomain;
+    if (cs?.recordId && cs.domainId) {
+      try {
+        await this.cloudflare.deleteDnsRecord(cs.domainId, cs.recordId, actor);
+      } catch (err) {
+        const m = err instanceof Error ? err.message : String(err);
+        await this.audit.record({
+          actorId: actor.sub,
+          actorEmail: actor.email,
+          action: 'deploy.delete.dns.warn',
+          resourceType: 'deployment',
+          resourceId: id,
+          details: { fqdn: cs.fqdn, message: m },
+        });
+      }
+    }
+
+    // 3. Rows locales (ordre respectant les FK : sous-domaine → déploiement).
+    await this.prisma.$transaction(async (tx) => {
+      await tx.clientSubdomain.deleteMany({ where: { deploymentId: id } });
+      await tx.deployment.delete({ where: { id } });
+    });
+
+    await this.audit.record({
+      actorId: actor.sub,
+      actorEmail: actor.email,
+      action: 'deploy.delete',
+      resourceType: 'deployment',
+      resourceId: id,
+      details: {
+        appName: row.appName,
+        repoFullName: row.repoFullName,
+        hadCoolifyApp: Boolean(row.coolifyUuid),
+        hadSubdomain: Boolean(cs),
+        freedQuota: true,
+      },
+    });
+    return { removed: true, appName: row.appName };
+  }
+
   // ── Internes ───────────────────────────────────────────────────────────────
 
   /**
