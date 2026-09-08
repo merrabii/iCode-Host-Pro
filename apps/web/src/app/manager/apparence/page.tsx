@@ -10,6 +10,7 @@ import { ADMIN_NAV } from '@/config/nav';
 import { useAdminSession } from '@/lib/session';
 import {
   apiError,
+  removeBrandLogo,
   resetBranding,
   updateBranding,
   uploadBrandLogo,
@@ -26,6 +27,7 @@ interface FormState {
   logoType: BrandLogoType;
   logoText: string;
   logoUrl: string | null;
+  logoShowText: boolean;
   primaryColor: string;
   accentColor: string; // '' = pas d'accent (dérivé de la primaire)
 }
@@ -39,6 +41,7 @@ function toForm(b: BrandingPublic, keepHostname = ''): FormState {
     logoType: b.logoType ?? 'DEFAULT',
     logoText: b.logoText ?? '',
     logoUrl: b.logoUrl ?? null,
+    logoShowText: b.logoShowText === true,
     primaryColor: b.primaryColor?.toLowerCase() ?? '#00b377',
     accentColor: b.accentColor ?? '',
   };
@@ -66,18 +69,20 @@ export default function ApparencePage() {
     logoType: brand.logoType,
     logoText: brand.logoText ?? '',
     logoUrl: brand.logoUrl,
+    logoShowText: brand.logoShowText === true,
     primaryColor: brand.primaryColor,
     accentColor: brand.accentColor ?? '',
   }));
   const [saving, setSaving] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [removing, setRemoving] = useState(false);
 
   const set = (patch: Partial<FormState>) => setForm((f) => ({ ...f, ...patch }));
 
   async function save() {
     if (!token) return;
+    // Le nom peut être VIDE : une marque « image seule » n'affiche pas de texte.
     const name = form.name.trim();
-    if (!name) { toast.error('Le nom de la marque est requis.'); return; }
     const primary = /^#[0-9a-fA-F]{6}$/.test(form.primaryColor) ? form.primaryColor.toLowerCase() : '';
     if (!primary) { toast.error('Couleur primaire invalide (ex. #00b377).'); return; }
     const accent = form.accentColor.trim();
@@ -89,6 +94,7 @@ export default function ApparencePage() {
       tagline: form.tagline.trim() || null,
       hostname: form.hostname.trim() || null,
       logoType: form.logoType,
+      logoShowText: form.logoShowText,
       primaryColor: primary,
       accentColor: accent ? accent.toLowerCase() : null,
     };
@@ -132,8 +138,21 @@ export default function ApparencePage() {
     setUploading(false);
     if (!res.ok) { toast.error(apiError(res, 'Import du logo impossible.')); return; }
     const b = res.data as BrandingPublic;
-    setForm((f) => ({ ...f, logoType: 'IMAGE', logoUrl: b.logoUrl }));
+    setForm((f) => ({ ...f, logoType: 'IMAGE', logoUrl: b.logoUrl, logoShowText: b.logoShowText === true }));
     toast.ok('Logo importé.');
+    void refresh();
+  }
+
+  async function onRemoveLogo() {
+    if (!token) return;
+    if (!window.confirm('Supprimer ce logo (retour au logo par défaut, initiales) ?')) return;
+    setRemoving(true);
+    const res = await removeBrandLogo(token);
+    setRemoving(false);
+    if (!res.ok) { toast.error(apiError(res, 'Suppression impossible.')); return; }
+    const b = res.data as BrandingPublic;
+    setForm(toForm(b, form.hostname));
+    toast.ok('Logo supprimé.');
     void refresh();
   }
 
@@ -162,7 +181,7 @@ export default function ApparencePage() {
           <div className="panel-head"><b>Identité</b></div>
           <div className="panel-body stack" style={{ gap: 12 }}>
             <label className="field">
-              <span className="field-label">Nom de la marque <span className="req">*</span></span>
+              <span className="field-label">Nom de la marque <span className="muted">(libre — vide si image seule)</span></span>
               <input className="input" value={form.name} onChange={(e) => set({ name: e.target.value })} placeholder="iCode Host Pro" />
             </label>
             <label className="field">
@@ -227,8 +246,24 @@ export default function ApparencePage() {
                     <Button variant="secondary" size="sm" disabled={uploading} busy={uploading} onClick={() => fileRef.current?.click()}>
                       {uploading ? 'Import…' : 'Choisir un logo'}
                     </Button>
+                    {form.logoUrl && (
+                      <Button variant="danger" size="sm" disabled={removing || uploading} busy={removing} onClick={onRemoveLogo}>
+                        {removing ? 'Suppression…' : 'Supprimer le logo'}
+                      </Button>
+                    )}
                   </div>
                 </div>
+                <label className="row" style={{ gap: 8, alignItems: 'center' }}>
+                  <input
+                    type="checkbox"
+                    checked={form.logoShowText}
+                    onChange={(e) => set({ logoShowText: e.target.checked })}
+                    disabled={!form.logoUrl}
+                  />
+                  <span style={{ fontSize: 13 }}>
+                    Afficher aussi le texte à côté du logo (décoché = image seule, sans texte)
+                  </span>
+                </label>
                 <p className="muted" style={{ fontSize: 12 }}>Formats : PNG, JPEG ou WebP — taille max 2 Mo. Le SVG est refusé (sécurité).</p>
               </div>
             )}

@@ -244,4 +244,46 @@ export class BrandingService implements OnModuleInit {
     });
     return toPublic(updated);
   }
+
+  /**
+   * POST /api/admin/branding/logo/remove — supprime le logo image (fichier +
+   * logoUrl) et repasse en logo DEFAULT (initiales). Le nom/sous-titre restent
+   * inchangés ; l'identité peut rester vide (marque « image seule »).
+   */
+  async removeLogo(actor: Actor): Promise<BrandPublic> {
+    await this.ensureSingleton();
+    const current = await this.prisma.brandConfig.findUnique({ where: { id: 'brand' } });
+    const oldUrl = current?.logoUrl ?? null;
+    if (oldUrl) {
+      const dir = BRANDING_DIR();
+      const oldAbs = path.join(dir, path.basename(oldUrl));
+      if (fs.existsSync(oldAbs)) {
+        try {
+          fs.unlinkSync(oldAbs);
+        } catch {
+          /* best-effort — un ancien fichier orphelin est inoffensif */
+        }
+      }
+    }
+
+    const updated = await this.prisma.brandConfig.update({
+      where: { id: 'brand' },
+      data: {
+        logoUrl: null,
+        logoType: BrandLogoType.DEFAULT,
+        logoText: null,
+        logoShowText: false,
+        updatedById: actor.sub,
+      },
+    });
+    await this.audit.record({
+      actorId: actor.sub,
+      actorEmail: actor.email,
+      action: 'branding.logo-remove',
+      resourceType: 'branding',
+      resourceId: 'brand',
+      details: { removedFile: oldUrl ? true : false },
+    });
+    return toPublic(updated);
+  }
 }

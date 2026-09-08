@@ -203,7 +203,7 @@ describe('BrandingService (singleton white-label, Phase 14)', () => {
       const unlinkSpy = jest.spyOn(fs, 'unlinkSync').mockImplementation(() => undefined);
       mockPrisma.brandConfig.findUnique.mockResolvedValue(row({ logoUrl: '/branding/logo-old.png' }));
       mockPrisma.brandConfig.update.mockResolvedValue(
-        row({ logoType: BrandLogoType.IMAGE, logoUrl: '/branding/logo-0123456789abcdef.png' }),
+        row({ logoType: BrandLogoType.IMAGE, logoUrl: '/api/branding/logo-0123456789abcdef.png' }),
       );
 
       const view = await service.setLogo(
@@ -214,11 +214,47 @@ describe('BrandingService (singleton white-label, Phase 14)', () => {
       expect(writeFileSpy).toHaveBeenCalledTimes(1);
       const updateArg = mockPrisma.brandConfig.update.mock.calls[0][0];
       expect(updateArg.data.logoType).toBe(BrandLogoType.IMAGE);
-      expect(updateArg.data.logoUrl).toMatch(/^\/branding\/logo-[0-9a-f]{16}\.png$/);
+      expect(updateArg.data.logoUrl).toMatch(/^\/api\/branding\/logo-[0-9a-f]{16}\.png$/);
       expect(existsSpy).toHaveBeenCalled();
       expect(unlinkSpy).toHaveBeenCalledWith(expect.stringContaining('logo-old.png'));
       expect(mockAudit.record).toHaveBeenCalledWith(expect.objectContaining({ action: 'branding.logo' }));
       expect(view.logoType).toBe(BrandLogoType.IMAGE);
+    });
+  });
+
+  describe('removeLogo', () => {
+    it('passe logoUrl à null, repasse en DEFAULT et supprime le fichier (audit)', async () => {
+      const unlinkSpy = jest.spyOn(fs, 'unlinkSync').mockImplementation(() => undefined);
+      const existsSpy = jest.spyOn(fs, 'existsSync').mockReturnValue(true);
+      mockPrisma.brandConfig.findUnique.mockResolvedValue(row({ logoUrl: '/api/branding/logo-old.png' }));
+      mockPrisma.brandConfig.update.mockResolvedValue(row());
+
+      const view = await service.removeLogo(actor);
+
+      expect(existsSpy).toHaveBeenCalled();
+      expect(unlinkSpy).toHaveBeenCalledWith(expect.stringContaining('logo-old.png'));
+      expect(mockPrisma.brandConfig.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ logoUrl: null, logoType: BrandLogoType.DEFAULT, logoShowText: false }),
+        }),
+      );
+      expect(mockAudit.record).toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'branding.logo-remove' }),
+      );
+      expect(view.logoType).toBe(BrandLogoType.DEFAULT);
+      expect(view.logoUrl).toBeNull();
+    });
+
+    it('est sans effet sur un fichier absent', async () => {
+      const unlinkSpy = jest.spyOn(fs, 'unlinkSync').mockImplementation(() => undefined);
+      const existsSpy = jest.spyOn(fs, 'existsSync').mockReturnValue(false);
+      mockPrisma.brandConfig.findUnique.mockResolvedValue(row());
+      mockPrisma.brandConfig.update.mockResolvedValue(row());
+      await service.removeLogo(actor);
+      expect(unlinkSpy).not.toHaveBeenCalled();
+      expect(mockPrisma.brandConfig.update).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ logoUrl: null }) }),
+      );
     });
   });
 });

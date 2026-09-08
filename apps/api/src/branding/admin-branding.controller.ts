@@ -63,4 +63,12 @@ export class AdminBrandingController {
   uploadLogo(@UploadedFile() file: unknown, @CurrentUser() actor: JwtPayload) {
     return this.branding.setLogo(file as { originalname: string; mimetype: string; size: number; buffer?: Buffer }, actor);
   }
+
+  @Post('logo/remove')
+  @UseGuards(RolesGuard)
+  @Roles(Role.ADMIN)
+  @ApiOperation({ summary: 'Remove brand logo (deletes file, default logo) — ADMIN' })
+  removeLogo(@CurrentUser() actor: JwtPayload) {
+    return this.branding.removeLogo(actor);
+  }
 }

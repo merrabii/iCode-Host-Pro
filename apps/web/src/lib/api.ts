@@ -1239,6 +1239,9 @@ export const updateBranding = (t: string, dto: BrandingInput) =>
   apiJson('/api/admin/branding', t, { method: 'PATCH', body: JSON.stringify(dto) });
 export const resetBranding = (t: string) =>
   apiJson('/api/admin/branding/reset', t, { method: 'POST' });
+/** Supprime le logo image (fichier + logoUrl → logo DEFAULT). Ne touche pas au nom. */
+export const removeBrandLogo = (t: string) =>
+  apiJson('/api/admin/branding/logo/remove', t, { method: 'POST' });
 /**
  * Upload du logo (multipart, champ `file`) — PNG/JPEG/WebP ≤ 2 Mo, SVG refusé.
  * Retourne le branding mis à jour. Réessaie une fois après rotation du jeton (401).

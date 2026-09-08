@@ -149,18 +149,20 @@ export function AppShell({
           >
             <BrandLogo size={brand.logoType === 'DEFAULT' ? 24 : 30} />
           </Link>
-          <div className="brand-col">
-            <div className="brand-line">
-              <span className="brand-title">{brand.name}</span>
-              {brand.tagline && (
-                <span className="pill-tag">
-                  <span className="dot" />
-                  {brand.tagline}
-                </span>
-              )}
+          {brand.logoType !== 'IMAGE' && (
+            <div className="brand-col">
+              <div className="brand-line">
+                <span className="brand-title">{brand.name}</span>
+                {brand.tagline && (
+                  <span className="pill-tag">
+                    <span className="dot" />
+                    {brand.tagline}
+                  </span>
+                )}
+              </div>
+              <span className="brand-sub">{brand.sub}</span>
             </div>
-            <span className="brand-sub">{brand.sub}</span>
-          </div>
+          )}
         </div>
 
         {info.length > 0 && (
@@ -208,10 +210,12 @@ export function AppShell({
             ) : (
               <BrandLogo size={26} />
             )}
-            <div className="brand-col flex-1">
-              <span className="brand-title">{tenant.name ?? brand.name}</span>
-              <span className="brand-sub">{brand.sub}</span>
-            </div>
+            {brand.logoType !== 'IMAGE' && (
+              <div className="brand-col flex-1">
+                <span className="brand-title">{tenant.name ?? brand.name}</span>
+                <span className="brand-sub">{brand.sub}</span>
+              </div>
+            )}
             <IconChevronDown className="chevron" />
           </div>
 

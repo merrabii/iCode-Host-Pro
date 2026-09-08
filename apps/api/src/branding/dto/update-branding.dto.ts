@@ -1,4 +1,4 @@
-import { IsBoolean, IsIn, IsNotEmpty, IsOptional, IsString, Matches } from 'class-validator';
+import { IsBoolean, IsIn, IsOptional, IsString, Matches } from 'class-validator';
 import { BrandLogoType } from '@prisma/client';
 
 /** Hex couleur strict #RRGGBB (minuscules acceptées, normalisées au service). */
@@ -11,9 +11,9 @@ const HEX = /^#[0-9a-fA-F]{6}$/;
  * doivent être des hex #RRGGBB valides.
  */
 export class UpdateBrandingDto {
+  /** Nom de la marque — peut être VIDE : une marque « image seule » n'affiche pas de nom. */
   @IsOptional()
   @IsString()
-  @IsNotEmpty()
   name?: string;
 
   @IsOptional()
