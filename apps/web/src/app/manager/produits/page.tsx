@@ -29,7 +29,8 @@ import {
   Panel,
   Select,
 } from '@/components/ui';
-import { IconBox, IconPlus, IconTrash, IconX } from '@/components/icons';
+import { StoreSettingsDrawer } from '@/components/admin/product-store-settings';
+import { IconBox, IconBoxes, IconPlus, IconTrash, IconX } from '@/components/icons';
 
 const PRODUCT_STATUSES = ['DRAFT', 'ACTIVE', 'SUSPENDED', 'DISABLED'];
 
@@ -46,6 +47,7 @@ export default function ManagerProduitsPage() {
   const [catId, setCatId] = useState('');
   const [packId, setPackId] = useState('');
   const [busy, setBusy] = useState<string | null>(null); // 'create' | product id
+  const [storeProductId, setStoreProductId] = useState<string | null>(null); // drawer « Réglages boutique » ouvert
 
   useEffect(() => {
     if (phase === 'ready' && token) void load(token);
@@ -254,6 +256,14 @@ export default function ManagerProduitsPage() {
                     </td>
                     <td>
                       <div className="row ta-right">
+                        <Button
+                          size="sm"
+                          variant={storeProductId === p.id ? 'primary' : 'secondary'}
+                          onClick={() => setStoreProductId((v) => (v === p.id ? null : p.id))}
+                          title="Réglages boutique (récap /cart, champs de facturation)"
+                        >
+                          <IconBoxes size={14} /> Boutique
+                        </Button>
                         <Button size="sm" variant="danger" disabled={busy === p.id} onClick={() => handleDelete(p)} title="Supprimer le produit">
                           <IconTrash size={14} />
                         </Button>
@@ -264,6 +274,14 @@ export default function ManagerProduitsPage() {
               </tbody>
             </table>
           </div>
+        )}
+
+        {storeProductId && products.some((p) => p.id === storeProductId) && (
+          <StoreSettingsDrawer
+            product={products.find((p) => p.id === storeProductId)!}
+            token={token}
+            onUpdated={() => void load(token)}
+          />
         )}
       </div>
     </AppShell>

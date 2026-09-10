@@ -1,4 +1,4 @@
-# DESIGN SYSTEM — iCode Host Pro (ADR-023)
+# DESIGN SYSTEM — Code Diali (ADR-023)
 
 > **Origine — RÉFÉRENCE VISUELLE PRIORITAIRE** : la page HTML fournie par le propriétaire
 > (dashboard d'hébergement, thèmes dark/light). Le présent document reproduit **son style et

@@ -112,7 +112,7 @@ describe('Mail settings (e2e)', () => {
         user: 'smtp-user',
         password: 'smtp-password-secret',
         fromEmail: 'no-reply@example.com',
-        fromName: 'iCode Host Pro',
+        fromName: 'Code Diali',
       })
       .expect(200);
     expect(res.body.host).toBe('smtp.example.com');

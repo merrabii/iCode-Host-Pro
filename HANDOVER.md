@@ -81,11 +81,11 @@ Reported decisions: ADR-001..005 + 011..014 APPROVED (Phase 0); ADR-015+016 (Pha
 ## Common commands (dev)
 - Install:   `corepack pnpm install`
 - Postgres:  `docker compose up -d postgres` / `docker compose ps`
-- Prisma:    `corepack pnpm --filter @icode-host-pro/api generate` / `... run migrate --name <name>` (use `--name`, never the literal `--` origin it into an interactive prompt)
-- Seed admin:`corepack pnpm --filter @icode-host-pro/api run db:seed` (idempotent; requires ADMIN_EMAIL/ADMIN_PASSWORD in apps/api/.env)
-- Seed knowledge:`corepack pnpm --filter @icode-host-pro/api run db:seed:knowledge` (idempotent create-if-missing by `[audience, slug]`; 34 articles admin+client, never overwrites admin edits; author = oldest ADMIN)
-- Tests:     `corepack pnpm --filter @icode-host-pro/api test` / `... test:e2e`
-- Servers:   `corepack pnpm --filter @icode-host-pro/api start` (quai :3001) ; `corepack pnpm --filter @icode-host-pro/web dev` (quai :3000)
+- Prisma:    `corepack pnpm --filter @codediali/api generate` / `... run migrate --name <name>` (use `--name`, never the literal `--` origin it into an interactive prompt)
+- Seed admin:`corepack pnpm --filter @codediali/api run db:seed` (idempotent; requires ADMIN_EMAIL/ADMIN_PASSWORD in apps/api/.env)
+- Seed knowledge:`corepack pnpm --filter @codediali/api run db:seed:knowledge` (idempotent create-if-missing by `[audience, slug]`; 34 articles admin+client, never overwrites admin edits; author = oldest ADMIN)
+- Tests:     `corepack pnpm --filter @codediali/api test` / `... test:e2e`
+- Servers:   `corepack pnpm --filter @codediali/api start` (quai :3001) ; `corepack pnpm --filter @codediali/web dev` (quai :3000)
 - Build:     `corepack pnpm build`
 Note: pnpm runs via `corepack pnpm ...` on this machine (corepack `enable` is blocked by a protected Program Files dir; the subcommand form needs no admin).
 

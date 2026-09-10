@@ -78,7 +78,7 @@ export default function Home() {
               <Link className="btn-primary btn-lg" href="/auth">
                 Commencer maintenant <IconChevronRight size={16} />
               </Link>
-              <Link className="btn-secondary btn-lg" href="/offres">
+              <Link className="btn-secondary btn-lg" href="/shop">
                 Voir les offres
               </Link>
             </div>
@@ -178,7 +178,7 @@ export default function Home() {
             <Link className="btn-primary btn-lg" href="/auth">
               Se connecter <IconChevronRight size={16} />
             </Link>
-            <Link className="btn-secondary btn-lg" href="/offres">
+            <Link className="btn-secondary btn-lg" href="/shop">
               Découvrir les offres
             </Link>
           </div>

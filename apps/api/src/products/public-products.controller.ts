@@ -1,4 +1,4 @@
-import { Controller, Get } from '@nestjs/common';
+import { Controller, Get, Param } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { ProductsService } from './products.service';
 
@@ -16,5 +16,11 @@ export class PublicProductsController {
   @ApiOperation({ summary: 'Public catalogue — orderable products only (no auth)' })
   findAll() {
     return this.products.findPublicCatalog();
+  }
+
+  @Get(':slug')
+  @ApiOperation({ summary: 'Public product page by slug — orderable products only (no auth), Étape 2' })
+  findBySlug(@Param('slug') slug: string) {
+    return this.products.findPublicBySlug(slug);
   }
 }

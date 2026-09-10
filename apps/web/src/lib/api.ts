@@ -389,6 +389,9 @@ export interface ProductAdmin {
   packId?: string | null;
   category?: { id: string; name: string } | null;
   pack?: PackMin | null;
+  // Réglages store (récap /cart).
+  allowEditConfig?: boolean;
+  installationFeeCents?: number;
 }
 /** Référence pack (limites présentées à l'admin + client). storageLimit = quota
  *  disque ENREGISTRÉ mais NON actif encore (système de quota après la mise en prod). */
@@ -585,6 +588,29 @@ export const updateProduct = (
 export const deleteProduct = (t: string, id: string) =>
   apiJson(`/api/products/${id}`, t, { method: 'DELETE' });
 
+// ── Réglages store par produit (admin) ───────────────────────────────────────
+export const updateStoreSettings = (
+  t: string,
+  id: string,
+  patch: { allowEditConfig?: boolean; installationFeeCents?: number },
+) => apiJson(`/api/products/${id}/store-settings`, t, { method: 'PATCH', body: JSON.stringify(patch) });
+export const listCheckoutFields = (t: string, id: string) =>
+  apiJson(`/api/products/${id}/checkout-fields`, t);
+export const createCheckoutField = (
+  t: string,
+  id: string,
+  dto: { key: string; label: string; type?: string; placeholder?: string; required?: boolean; enabled?: boolean; sortOrder?: number },
+) => apiJson(`/api/products/${id}/checkout-fields`, t, { method: 'POST', body: JSON.stringify(dto) });
+export const updateCheckoutField = (
+  t: string,
+  fieldId: string,
+  dto: { key?: string; label?: string; type?: string; placeholder?: string | null; required?: boolean; enabled?: boolean; sortOrder?: number },
+) => apiJson(`/api/products/checkout-fields/${fieldId}`, t, { method: 'PATCH', body: JSON.stringify(dto) });
+export const deleteCheckoutField = (t: string, fieldId: string) =>
+  apiJson(`/api/products/checkout-fields/${fieldId}`, t, { method: 'DELETE' });
+export const reorderCheckoutFields = (t: string, id: string, ids: string[]) =>
+  apiJson(`/api/products/${id}/checkout-fields/reorder`, t, { method: 'POST', body: JSON.stringify({ ids }) });
+
 // ── Phase 12 (Catalog) — catégories & packs d'hébergement ───────────────────
 export const listCategories = (t: string) => apiJson('/api/categories', t);
 export const createCategory = (t: string, dto: CategoryInput) =>
@@ -701,7 +727,87 @@ export interface PublicProduct {
   // Phase 12 (Catalog) — limites du pack + catégorie exposées au visiteur.
   category?: { id: string; name: string } | null;
   pack?: PackMin | null;
+  // Étape 2 (store) — fiche vitrine : identité publique + prix visible.
+  slug?: string | null;
+  slogan?: string | null;
+  shortDescription?: string | null;
+  description?: string | null;
+  color?: string | null;
+  priceHtCents?: number | null;
+  promoPriceHtCents?: number | null;
+  billingCycle?: string;
+  // Configuration vendable (options à choix + add-ons).
+  options?: ProductChoiceOption[];
+  addons?: ProductAddonView[];
+  // Contrôles du récap /cart (par produit) + taxe + champs de facturation.
+  allowEditConfig?: boolean;
+  installationFeeCents?: number;
+  taxRate?: { id: string; name: string; ratePercent: string | number } | null;
+  checkoutFields?: CheckoutFieldView[];
 }
+
+/** Champ de facturation configurable (admin) exposé au visiteur (enabled only). */
+export interface CheckoutFieldView {
+  id: string;
+  key: string;
+  label: string;
+  type: string; // TEXT | EMAIL | TEL
+  placeholder?: string | null;
+  required: boolean;
+}
+
+/** Option configurable publique : nom + ses choix possibles (avec supplément). */
+export interface ProductChoiceOption {
+  id: string;
+  name: string;
+  required: boolean;
+  choices: { id: string; label: string; priceDeltaHtCents: number }[];
+}
+
+/** Add-on proposé à la commande : nom, description, prix HT par cycle. */
+export interface ProductAddonView {
+  id: string;
+  name: string;
+  description?: string | null;
+  priceHtCents: number;
+}
+
+/** Abréviation lisible du cycle de facturation d'un produit vitrine. */
+export function billingCycleLabel(cycle?: string): string {
+  switch (cycle) {
+    case 'MONTHLY':
+      return '/mois';
+    case 'YEARLY':
+      return '/an';
+    case 'ONETIME':
+      return 'paiement unique';
+    default:
+      return '';
+  }
+}
+
+/** Formate des centimes en monnaie lisible (devise : $, cf. BillingSetting). */
+export function formatCents(cents?: number | null): string {
+  if (cents === null || cents === undefined) return '—';
+  return (cents / 100).toLocaleString('fr-FR', { style: 'currency', currency: 'USD' });
+}
+
+/** Fiche publique d'un produit (Étape 2) : GET /api/public/products/:slug. */
+export async function getPublicProduct(slug: string): Promise<ApiResult> {
+  try {
+    const res = await fetch(`/api/public/products/${encodeURIComponent(slug)}`);
+    let data: unknown = null;
+    try {
+      data = await res.json();
+    } catch {
+      /* non-JSON body */
+    }
+    return { ok: res.ok, status: res.status, data };
+  } catch (e) {
+    return { ok: false, status: 0, data: { message: String(e) } };
+  }
+}
+
 /** Public catalogue — unauthenticated GET (visitor browsing before ordering). */
 export async function listPublicProducts(): Promise<ApiResult> {
   try {

@@ -1,11 +1,11 @@
 /**
  * MARQUE — SEUL ENDROIT qui nomme le produit (design brand-agnostic, ADR-023).
- * Un rebrand (« iCode Host Pro » → « Code Diali » codediali.com, différé par le
- * propriétaire) = modifier ce fichier + les tokens `--brand-primary*` de globals.css.
+ * Brand : « Code Diali » — codediali.com. Modifier ce fichier + les tokens
+ * `--brand-primary*` de globals.css.
  */
 export const brand = {
   /** Nom du produit affiché dans la topbar. */
-  name: 'iCode Host Pro',
+  name: 'Code Diali',
   /** Sous-titre sous le nom. */
   sub: 'Self-hosted hosting control plane',
   /** Tag de pilule (ex. 'CLOUD'). null = aucun. Frappé de la marque librement. */

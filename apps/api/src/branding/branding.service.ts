@@ -16,7 +16,7 @@ import { UpdateBrandingDto } from './dto/update-branding.dto';
  *  + token --brand-primary (#00b377). Le reset restaure exactement ces valeurs. */
 export const BRAND_DEFAULTS = {
   id: 'brand' as const,
-  name: 'iCode Host Pro',
+  name: 'Code Diali',
   sub: 'Self-hosted hosting control plane',
   tagline: 'CLOUD',
   hostname: null as string | null,

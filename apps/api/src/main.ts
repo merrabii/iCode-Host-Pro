@@ -25,7 +25,7 @@ async function bootstrap() {
 
   // OpenAPI contract (ADR-005) + Bearer auth scheme (ADR-015).
   const swaggerConfig = new DocumentBuilder()
-    .setTitle('iCode Host Pro API')
+    .setTitle('Code Diali API')
     .setDescription('Control plane REST contract — Phase 1')
     .setVersion('0.1.0')
     .addTag('auth')
@@ -38,7 +38,7 @@ async function bootstrap() {
 
   const port = config.getOrThrow<number>('port');
   await app.listen(port);
-  console.log(`iCode Host Pro API listening on http://localhost:${port}/${GlobalPrefix}`);
+  console.log(`Code Diali API listening on http://localhost:${port}/${GlobalPrefix}`);
   console.log(`OpenAPI docs on http://localhost:${port}/${GlobalPrefix}/docs`);
 }
 

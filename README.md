@@ -1,4 +1,4 @@
-# iCode Host Pro — Fundamental Project Pack
+# Code Diali — Fundamental Project Pack
 
 **iCode Host Pro** = self-hosted hosting control plane (multiple products, servers
 and infrastructure providers; orchestrates existing systems rather than recreating them).
@@ -37,8 +37,8 @@ real `SELECT 1`, the only DB artifact is Prisma's `_prisma_migrations` baseline.
 ```bash
 pnpm install            # workspaces
 pnpm db:up              # start PostgreSQL container (Docker Desktop)
-pnpm --filter @icode-host-pro/api generate   # generate Prisma client
-pnpm --filter @icode-host-pro/api migrate    # apply baseline migration
+pnpm --filter @codediali/api generate   # generate Prisma client
+pnpm --filter @codediali/api migrate    # apply baseline migration
 pnpm dev                # run web + api (turbo)
 ```
 

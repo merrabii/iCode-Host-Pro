@@ -54,8 +54,8 @@ Do not log only important work. Record all meaningful actions, including small c
 
 ## 2026-08-30 — 0.4 Persistance (Docker up + Prisma — validated)
 - Files created: `docker-compose.yml` (root; PostgreSQL 16, named volume `icode_pg_data`, healthcheck; no Redis — ADR-012), `apps/api/prisma/schema.prisma` (no business models — ADR-014).
-- Commands (owner-run): `docker compose up -d postgres` → container `icode-postgres` started; `corepack pnpm --filter @icode-host-pro/api generate` → Prisma Client v6.19.3 generated.
-- Commands: `corepack pnpm --filter @icode-host-pro/api migrate` → reported "Already in sync, no schema change or pending migration found". Expected for a zero-model schema (ADR-014). **No migration folder and no database tables (including `_prisma_migrations`) were created** — this is the truthful, intended state; connectivity is proven at runtime by the health `SELECT 1`.
+- Commands (owner-run): `docker compose up -d postgres` → container `icode-postgres` started; `corepack pnpm --filter @codediali/api generate` → Prisma Client v6.19.3 generated.
+- Commands: `corepack pnpm --filter @codediali/api migrate` → reported "Already in sync, no schema change or pending migration found". Expected for a zero-model schema (ADR-014). **No migration folder and no database tables (including `_prisma_migrations`) were created** — this is the truthful, intended state; connectivity is proven at runtime by the health `SELECT 1`.
 - `docs/sql-commandes.txt` to be updated (see 0.4/0.8) reflecting no business tables.
 
 ## 2026-08-30 — 0.5 Frontend Next.js (files done; build pending)
@@ -66,8 +66,8 @@ Do not log only important work. Record all meaningful actions, including small c
 
 ## 2026-08-30 — 0.7 Tests (partially executed)
 - Files created: `apps/api/src/health/health.controller.spec.ts` (unit, mocked Prisma), `apps/api/test/app.e2e-spec.ts` (e2e health), `apps/api/test/jest-e2e.json`.
-- Commands (run by owner in local PowerShell because session Bash/PowerShell safety classifier was temporarily unavailable): `corepack pnpm --filter @icode-host-pro/api test` → **2/2 unit tests PASS**.
-- Commands: `corepack pnpm --filter @icode-host-pro/api test:e2e` → **FAILED** (1 e2e): `TypeError: (0, supertest_1.default) is not a function`.
+- Commands (run by owner in local PowerShell because session Bash/PowerShell safety classifier was temporarily unavailable): `corepack pnpm --filter @codediali/api test` → **2/2 unit tests PASS**.
+- Commands: `corepack pnpm --filter @codediali/api test:e2e` → **FAILED** (1 e2e): `TypeError: (0, supertest_1.default) is not a function`.
 - Fix applied: `apps/api/test/app.e2e-spec.ts` import changed from `import request from 'supertest'` to `import request = require('supertest')` (CJS/ts-jest interop without esModuleInterop).
 - Pending: re-run `test:e2e` to confirm; DB connectivity via real `SELECT 1` to be proven.
 
@@ -101,7 +101,7 @@ Do not log only important work. Record all meaningful actions, including small c
 ## 2026-08-31 — 1.1 First business tables + migration (ADR-016)
 - Files created: `apps/api/prisma/schema.prisma` models `User` + `RefreshToken` (+ enum `Role` ADMIN/USER); migration `apps/api/prisma/migrations/20260830053420_init_auth/`.
 - Files modified: `apps/api/.env` / `.env.example` (added `JWT_SECRET`, `JWT_EXPIRES_IN=15m`, `REFRESH_EXPIRES_IN_DAYS=30`, `COOKIE_NAME=ihp_refresh`); `apps/api/src/config/configuration.ts` (load + fail-early require `JWT_SECRET`; expose jwtSecret/jwtExpiresIn/refreshExpiresInDays/cookieName).
-- Commands: `corepack pnpm --filter @icode-host-pro/api run migrate --name init_auth` (first migration baseline — `_prisma_migrations` + `users` + `refresh_tokens` created). `prisma migrate status` → in sync.
+- Commands: `corepack pnpm --filter @codediali/api run migrate --name init_auth` (first migration baseline — `_prisma_migrations` + `users` + `refresh_tokens` created). `prisma migrate status` → in sync.
 - Troubleshooting: a P1002 advisory-lock stale session from a killed migrate blocked `migrate dev`; cleared via `docker compose restart postgres`.
 - DOC for future AI: do NOT pass the literal `--` to the migrate script (drops into an interactive name prompt); use `--name <name>`.
 
@@ -116,9 +116,9 @@ Do not log only important work. Record all meaningful actions, including small c
 - Files modified: `apps/web/next.config.mjs` (same-origin rewrites `/api/:path*` → `${API_UPSTREAM ?? 'http://localhost:3001'}/api/:path*`; keeps httpOnly cookie working), `apps/web/src/app/page.tsx` (link → /auth).
 
 ## 2026-08-31 — 1.4 Build + fix CJS/ESM issue with @nestjs/jwt
-- Commands: `corepack pnpm --filter @icode-host-pro/api build` PASS.
+- Commands: `corepack pnpm --filter @codediali/api build` PASS.
 - Blocker: `test:e2e` failed at import — `@nestjs/jwt@12` ships an ESM-only dist (`import jsonwebtoken from 'jsonwebtoken'`) that CJS jest cannot parse ("Cannot use import statement outside a module"). Both e2e suites failed.
-- Fix: pinned `@nestjs/jwt@^11.0.2` (CJS dist, tailored for Nest 11) via `corepack pnpm --filter @icode-host-pro/api add "@nestjs/jwt@^11.0.0"`.
+- Fix: pinned `@nestjs/jwt@^11.0.2` (CJS dist, tailored for Nest 11) via `corepack pnpm --filter @codediali/api add "@nestjs/jwt@^11.0.0"`.
 - Fix 2 (auth correctness found by e2e): `JwtModule.register({})` was empty, so the guard's `verifyAsync` used the default secret while `AuthService` signed with an explicit one → `GET /users/me` returned 401. Registered the secret via `JwtModule.registerAsync` (inject ConfigService, `getOrThrow('jwtSecret')`, signOptions.expiresIn from config) in `auth.module.ts`, and simplified `issueTokens` to `signAsync(payload)` (secret+expire from module config) — signing and verification now share one config.
 
 ## 2026-08-31 — 1.5 Tests + live smoke (all PASS)
@@ -228,7 +228,7 @@ Do not log only important work. Record all meaningful actions, including small c
 
 ## 2026-08-31 — 4.1 Modèle + migration (ADR-019)
 - Files modified: `apps/api/prisma/schema.prisma` — modèle `AuditLog` (actorId nullable FK User onDelete SetNull, actorEmail dénormalisé, action, resourceType/resourceId polymorphiques, details Json, createdAt; indexes createdAt/resourceType/action) + relation `User.auditLogs`.
-- Command: `corepack pnpm --filter @icode-host-pro/api run migrate --name init_audit` → migration `20260831024151_init_audit` appliquée. `generate` du client a échoué en EPREM (DLL verrouillée par les dev servers en cours) → arrêt de tous les node sauf web, `generate` OK (client v6.19.3 régénéré), puis relance des dev servers API :3001 + web :3000 en fond.
+- Command: `corepack pnpm --filter @codediali/api run migrate --name init_audit` → migration `20260831024151_init_audit` appliquée. `generate` du client a échoué en EPREM (DLL verrouillée par les dev servers en cours) → arrêt de tous les node sauf web, `generate` OK (client v6.19.3 régénéré), puis relance des dev servers API :3001 + web :3000 en fond.
 
 ## 2026-08-31 — 4.2 Backend : AuditService + controller (ADR-019)
 - Files created: `apps/api/src/audit/audit.service.ts` (`record` best-effort + `findAll` paginé/filtré), `audit.controller.ts` (`GET /api/audit` ADMIN only), `audit.module.ts` (`@Global`, exporte AuditService ; ré-enregistre JwtModule + RolesGuard localement pour éviter la dépendance circulaire avec AuthModule), `dto/audit-query.dto.ts` (page/perPage/actorId/action/resourceType/from/to).
@@ -274,7 +274,7 @@ Do not log only important work. Record all meaningful actions, including small c
 
 ## 2026-08-31 — 5.1 Modèle + migration (ADR-020/021)
 - Files modified: `apps/api/prisma/schema.prisma` — modèles `Invitation` (email, tokenHash sha256 unique, issuerId FK User SetNull, expiresAt, usedAt/revokedAt), `Subscription` (userId FK Cascade, productId FK Restrict, status PENDING/ACTIVE/REJECTED/SUSPENDED/CANCELLED), `Service` (name, subscriptionId FK Cascade, serverId nullable FK Server SetNull, status REQUESTED/PROVISIONING/ACTIVE/PROBLEM/SUSPENDED/REMOVED) + enums + back-relations User/Product/Server.
-- Command: `corepack pnpm --filter @icode-host-pro/api run migrate --name init_client_access` → migration `20260831084839_init_client_access` appliquée. `generate` OK (client v6.19.3). `prisma migrate status` in sync (4 migrations).
+- Command: `corepack pnpm --filter @codediali/api run migrate --name init_client_access` → migration `20260831084839_init_client_access` appliquée. `generate` OK (client v6.19.3). `prisma migrate status` in sync (4 migrations).
 - Files modified: `apps/api/src/config/configuration.ts` (+`inviteExpiresInDays` optionnel, défaut 7), `apps/api/.env.example` (INVITE_EXPIRES_IN_DAYS).
 
 ## 2026-08-31 — 5.2 Backend invitations (ADR-020) — inscription fermée
@@ -322,10 +322,10 @@ Do not log only important work. Record all meaningful actions, including small c
 
 ## 2026-08-31 — 6.1 Modèle + migration + crypto (ADR-022)
 - Files modified: `apps/api/prisma/schema.prisma` — modèle `MailSetting` (singleton : id, enabled Boolean @default(false), host, port Int @default(587), secure Boolean @default(false), user?, passwordEnc?, fromEmail, fromName?, timestamps).
-- Command: `corepack pnpm --filter @icode-host-pro/api run migrate --name init_mail` → migration `20260831120703_init_mail` appliquée (5 migrations, `prisma migrate status` in sync). Dev servers arrêtés avant migrate (EPERM DLL) puis vérifiés.
+- Command: `corepack pnpm --filter @codediali/api run migrate --name init_mail` → migration `20260831120703_init_mail` appliquée (5 migrations, `prisma migrate status` in sync). Dev servers arrêtés avant migrate (EPERM DLL) puis vérifiés.
 - Files created: `apps/api/src/crypto/crypto.service.ts` (AES-256-GCM : clé = sha256(ENCRYPTION_KEY), payload base64 `iv||tag||data`, `MailCryptoError` si clé absente), `crypto.module.ts` (non-global, exporte CryptoService).
 - Files modified: `apps/api/src/config/configuration.ts` (+`encryptionKey`/`publicBaseUrl` optionnels — set fail-early intact), `apps/api/.env.example` (+ENCRYPTION_KEY, PUBLIC_BASE_URL), `apps/api/.env` local (gitignored) (+ENCRYPTION_KEY de dev).
-- Deps: `corepack pnpm --filter @icode-host-pro/api add nodemailer` (+`-D @types/nodemailer`) → nodemailer 9.1.0, CJS, jest-safe.
+- Deps: `corepack pnpm --filter @codediali/api add nodemailer` (+`-D @types/nodemailer`) → nodemailer 9.1.0, CJS, jest-safe.
 
 ## 2026-08-31 — 6.2 Backend module mail
 - Files created: `apps/api/src/mail/mail-transport.factory.ts` (couture de test — `create(cfg)` → nodemailer transporter), `mail.service.ts` (sans état : `sendMail(cfg,msg)` → `MailException` avec message SMTP ; `buildInviteMessage` = lien `/auth?invite=<token>&email=<email>` sur `publicBaseUrl`), `mail-settings.service.ts` (get masqué — jamais `passwordEnc`, `hasPassword` seulement ; `update` PATCH-semantics : `enabled=true` requiert host+fromEmail 400, password ''/absent = inchangé, valeur = chiffrée, user/fromName '' = effacés ; `getMailConfig` déchiffre ; `test` sur config enregistrée → ok ou 400 message SMTP + audit `mail.test` ; `sendInvitationMail` ; `isEnabled`), `dto/update-mail-settings.dto.ts` (tout @IsOptional), `dto/test-mail.dto.ts` (IsEmail), `mail-settings.controller.ts` (`@Controller('admin/mail')`, JwtAuthGuard+RolesGuard+@Roles(ADMIN), `GET|PUT /` + `POST /test`), `mail.module.ts`.
@@ -433,7 +433,7 @@ Do not log only important work. Record all meaningful actions, including small c
 
 ## Vérifications
 - `npx tsc --noEmit` dans apps/web → **PASS (exit 0)**.
-- `corepack pnpm --filter @icode-host-pro/web build` → **PASS** (10 routes, exit 0). Note : dev web arrêté le temps du build (risque de corruption `.next`), l'API :3001 est restée up.
+- `corepack pnpm --filter @codediali/web build` → **PASS** (10 routes, exit 0). Note : dev web arrêté le temps du build (risque de corruption `.next`), l'API :3001 est restée up.
 - Smoke HTTP :3000 → 200 sur `/`, `/auth`, `/manager`, `/manager/utilisateurs`, `/manager/journal`, `/manager/invitations`, `/manager/mail`, `/manager/subscriptions`, `/client`. HTML servi : `lang="fr"`, script `ihp-theme` présent ; CSS servi contient les tokens du design system (29 Ko, brand `#00b377`, fonds dark/light).
 - Aucun changement API/DB : pas de migration, pas de test API touché.
 
@@ -447,12 +447,12 @@ Do not log only important work. Record all meaningful actions, including small c
 
 ## 2026-09-01 — 7ter.1 Modèle + migration (ADR-024)
 - Files modified: `apps/api/prisma/schema.prisma` — enum `ServerPanelProvider {NONE HESTIA COOLIFY}` (commenté : cPanel/DirectAdmin futurs) + modèle `Server` étendu (`ipAddress String?`, `port Int?`, `provider String?`, `region String?`, `quotaMaxAccounts Int?`, `strictTls Boolean @default(true)`, `panelProvider ServerPanelProvider @default(NONE)`). Tous optionnels.
-- Command: `corepack pnpm --filter @icode-host-pro/api run migrate --name init_server_details` → migration `20260901021234_init_server_details` appliquée. Dev servers arrêtés avant migrate (EPERM DLL), `prisma generate` OK (client v6.19.3). `prisma migrate status` → **6 migrations** in sync.
+- Command: `corepack pnpm --filter @codediali/api run migrate --name init_server_details` → migration `20260901021234_init_server_details` appliquée. Dev servers arrêtés avant migrate (EPERM DLL), `prisma generate` OK (client v6.19.3). `prisma migrate status` → **6 migrations** in sync.
 
 ## 2026-09-01 — 7ter.2 API serveurs étendue (DTO + service + tests)
 - Files modified: `apps/api/src/servers/dto/create-server.dto.ts` (+7 champs optionnels validés : ipAddress IsString MaxLength 64, port IsInt Min1 Max65535, provider/region MaxLength 64, quotaMaxAccounts IsInt Min0, strictTls IsBoolean, panelProvider IsEnum), `apps/api/src/servers/servers.service.ts` (create whitelist explicite 9 champs), `apps/api/src/servers/servers.service.spec.ts` (+1 test full details : ip/port/provider/region/quota/strictTls/panelProvider via objectContaining ; expect strict étendu aux 7 undefined).
 - Files modified: `apps/api/test/core.e2e-spec.ts` (+1 test : ADMIN POST serveur avec tous les champs ADR-024 → 201, PATCH panelProvider COOLIFY + port 2222 → 200).
-- Commands: `corepack pnpm --filter @icode-host-pro/api build` **PASS** ; `corepack pnpm --filter @icode-host-pro/api test` → **91/91** unit PASS.
+- Commands: `corepack pnpm --filter @codediali/api build` **PASS** ; `corepack pnpm --filter @codediali/api test` → **91/91** unit PASS.
 
 ## 2026-09-01 — 7ter.3 Web : nav + layout + lib/api
 - Files modified: `apps/web/src/config/nav.ts` (+items **Serveurs** (IconServer), **Produits** (IconBox) — ordre Tableau de bord, Serveurs, Produits, Utilisateurs, Souscriptions, Invitations, Mail, Journal).
@@ -466,8 +466,8 @@ Do not log only important work. Record all meaningful actions, including small c
 - Fix: la page serveurs supprimait le statut à l'édition (Draft sans `status`) → `status` ajouté au Draft + `toPatch` inclut `status` + `saveEdit` utilise le patch complet ; faux import `IconChevronDown` et `statusTone` inutilisé supprimés (noUnusedLocals).
 
 ## 2026-09-01 — 7ter.5 Validation (builds + e2e + smoke)
-- Commands: `npx tsc --noEmit` apps/web **PASS** ; `corepack pnpm --filter @icode-host-pro/web build` **PASS** (14 routes statiques — `/manager/serveurs` 5.28 kB, `/manager/produits` 3.80 kB, `/manager` 3.66 kB ; `.next` purgé avant build — leçon Phase 2).
-- Commands: `corepack pnpm --filter @icode-host-pro/api test:e2e` → **62/62, 8 suites PASS** (vert sur Postgres réel ; le nouveau test ADR-024 y compris).
+- Commands: `npx tsc --noEmit` apps/web **PASS** ; `corepack pnpm --filter @codediali/web build` **PASS** (14 routes statiques — `/manager/serveurs` 5.28 kB, `/manager/produits` 3.80 kB, `/manager` 3.66 kB ; `.next` purgé avant build — leçon Phase 2).
+- Commands: `corepack pnpm --filter @codediali/api test:e2e` → **62/62, 8 suites PASS** (vert sur Postgres réel ; le nouveau test ADR-024 y compris).
 - **Redémarrage environnement** : Docker Desktop éteint (le web était « pas accessible ») → docker up (postgres healthy), API :3001 + web :3000 relancés en fond. Smoke :3000 → **200** `/`, `/manager`, `/manager/serveurs`, `/manager/produits` ; proxy `/api` 401 sans session ; login ADMIN → `/users/me` 200, `/api/servers` (4), `/api/products` (2), `/api/manager/summary` (`{products:2 ACTIVE, servers:4, users:16/17}`) ; zéro erreur web/API.
 - **Validation live propriétaire (en cours)** : le propriétaire a créé un serveur `momo | mour.ma | UNKNOWN | ip 10.10.2.36` + un produit `Installation Fees` via l'UI entre deux smoke → preuve que le CRUD écrit réellement.
 - Docs: DECISIONS.md (ADR-024 APPROVED), CHANGELOG.md (Phase 7ter Added/Changed/Verified/Pending), PROJECT_STATUS.md (Phase 7ter), docs/sql-commandes.txt (Phase 7ter DB entry — à compléter), TASKS.md (cette section).
@@ -494,7 +494,7 @@ PROVISIONING/ACTIVE/PROBLEM piloté par la connexion, test de connectivité depu
 - Files modified: `apps/api/prisma/schema.prisma` — `Server` +3 champs nullable (écrits
   uniquement par la sonde, jamais par l'admin) : `lastCheckedAt DateTime?`,
   `lastProbeOk Boolean?` (null = jamais sondé), `lastProbeDetail String?`.
-- Commands: `corepack pnpm --filter @icode-host-pro/api run migrate --name init_server_check`
+- Commands: `corepack pnpm --filter @codediali/api run migrate --name init_server_check`
   → migration `20260901082020_init_server_check` appliquée (dev API arrêté d'abord — leçon
   EPERM DLL) + generate → **7 migrations**, `migrate status` in sync.
 
@@ -540,8 +540,8 @@ PROVISIONING/ACTIVE/PROBLEM piloté par la connexion, test de connectivité depu
   État `probeMap` par serveur (résultat restitué sans rechargement).
 
 ## 2026-09-01 — 8.5 Validation (builds + tests + smoke)
-- Command: `corepack pnpm --filter @icode-host-pro/api test` → **unit 98/98** (12 suites, +7).
-- Command: `corepack pnpm --filter @icode-host-pro/api test:e2e` → **e2e 67/67, 9 suites** (+
+- Command: `corepack pnpm --filter @codediali/api test` → **unit 98/98** (12 suites, +7).
+- Command: `corepack pnpm --filter @codediali/api test:e2e` → **e2e 67/67, 9 suites** (+
   `server-check` 5 tests) PASS sur Postgres réel.
 - Command: `npx tsc --noEmit` apps/web → **PASS**. `web build` → **PASS** (14 routes ;
   `/manager/serveurs` 5.8 kB ; dev web arrêté + `.next` purgé avant build — leçon Phase 2).
@@ -602,7 +602,7 @@ PROVISIONING/ACTIVE/PROBLEM piloté par la connexion, test de connectivité depu
   `apiBaseUrl String?`, `apiTokenEnc String?` (jeton chiffré au repos, jamais exposé),
   `apiUser String?` (Hestia, défaut `api`), `panelVerifiedAt DateTime?`, `panelOk Boolean?`,
   `panelDetail String?`. `panelProvider` existant (ADR-024) réutilisé comme déclencheur.
-- Command: `corepack pnpm --filter @icode-host-pro/api run migrate --name init_server_panel`
+- Command: `corepack pnpm --filter @codediali/api run migrate --name init_server_panel`
   → migration `20260901131323_init_server_panel` appliquée (dev API arrêté d'abord — leçon EPERM
   DLL) + generate → **8 migrations**, in sync.
 
@@ -665,9 +665,9 @@ PROVISIONING/ACTIVE/PROBLEM piloté par la connexion, test de connectivité depu
   `coolify-portal` **conservé** (jacké, voir l'UI `/manager/serveurs` → carte + « Vérifier l'API »).
 
 ## 2026-09-02 — 9.6 Validation (builds + tests)
-- Command: `corepack pnpm --filter @icode-host-pro/api test` → **unit 114/114** (13 suites, +16 :
+- Command: `corepack pnpm --filter @codediali/api test` → **unit 114/114** (13 suites, +16 :
   +6 detail panel-transport +7 unit verifyPanel, net).
-- Command: `corepack pnpm --filter @icode-host-pro/api test:e2e` → **e2e 76/76** (10 suites, +
+- Command: `corepack pnpm --filter @codediali/api test:e2e` → **e2e 76/76** (10 suites, +
   `server-panel` 9 tests) sur Postgres réel.
 - Command: `npx tsc --noEmit` apps/web → **PASS** ; `web build` PASS (14 routes, `/manager/serveurs`
   7.23 kB, marqueurs `panel-verify`/`hasApiToken`/`server.panel.verify` présents).
@@ -720,7 +720,7 @@ Réponse au retour propriétaire : port Coolify non mentionné, IP non auto-dét
 
 ## 2026-09-02 — 10.1 Modèle + migration (ADR-027)
 - Files modified: `apps/api/prisma/schema.prisma` — enum `Role` étendu (+SUPPORT_L1/L2/L3), `User` +`mfaSecretEnc`/`mfaEnabled`/`oauthProvider`/`oauthSubject`/`githubTokenEnc` (+`@@unique([oauthProvider,oauthSubject])`), modèle `SecuritySetting` (singleton, 6 flags `@default(false)`), modèle `SupportCode` (codeHash HMAC, expiresAt, attempts, revokedAt, `@@index([userId])`), enum `TicketStatus`/`TicketPriority`, modèles `Ticket` (+`escalatedTo`/`escalatedAt`) et `TicketMessage` (`authorEmail` dénormalisé).
-- Command: `corepack pnpm --filter @icode-host-pro/api run migrate --name init_security_support` → migration `20260902063000_init_security_support` appliquée → **10 migrations**, in sync. Prisma client régénéré.
+- Command: `corepack pnpm --filter @codediali/api run migrate --name init_security_support` → migration `20260902063000_init_security_support` appliquée → **10 migrations**, in sync. Prisma client régénéré.
 
 ## 2026-09-02 — 10.2 Noyau auth : rôles + rate limiter + security settings + checkout + turnstile
 - Files created: `apps/api/src/auth/roles.ts` (`ROLE_RANK` + helper exporté `roleRank`), `auth/rate-limiter.ts` (fenêtre glissante mémoire par IP, 429, presets login/mfa/register/checkout/support) + `rate-limiter.spec.ts` (6 unit), `auth/security/security-settings.service.ts` (singleton flags, enforcement central) + `security-settings.controller.ts` (`GET/PUT /api/admin/security`, ADMIN) + spec, `auth/checkout.service.ts` (intent `ihp_checkout` signé 10 min) + `checkout.controller.ts` (`POST /api/checkout/intent`, public) + spec, `auth/turnstile.service.ts` (fetch natif siteverify, skip si désactivé/sans clé) + spec, `auth/public-config.controller.ts` (`GET /api/public/products` sous `products/public-products.controller.ts`).
@@ -755,10 +755,10 @@ Réponse au retour propriétaire : port Coolify non mentionné, IP non auto-dét
 - Command (spécifiques) : `corepack pnpm exec jest --config ./test/jest-e2e.json --runInBand support mfa tickets auth-register oauth impersonation security-settings` → **7 suites / 52 tests PASS** (88 s).
 
 ## 2026-09-02 — 10.9 Validation complète (unit → e2e → tsc → build)
-- Command: `corepack pnpm --filter @icode-host-pro/api test` → **unit 212/212 (24 suites)** PASS.
+- Command: `corepack pnpm --filter @codediali/api test` → **unit 212/212 (24 suites)** PASS.
 - Command: `corepack pnpm exec jest --config ./test/jest-e2e.json --runInBand` → **e2e 129/129 (17 suites)** PASS sur Postgres réel (dont les 10 suites pré-existantes — non-régression `GET /api/products` 401, core/client/audit/invitations/mail/server-check/server-panel vertes).
 - Command: `npx tsc --noEmit` apps/api **PASS** ; `npx tsc --noEmit` apps/web **PASS**.
-- Command: `corepack pnpm --filter @icode-host-pro/web exec next build` → **PASS, 18 routes** (`/` , `/_not-found`, `/auth`, `/client`, `/manager`, `/manager/invitations`, `/manager/journal`, `/manager/mail`, `/manager/produits`, `/manager/securite`, `/manager/serveurs`, `/manager/subscriptions`, `/manager/support`, `/manager/utilisateurs`, `/offres`, `/profil`). Dev web arrêté + `.next` purgé avant build (leçon Phase 2).
+- Command: `corepack pnpm --filter @codediali/web exec next build` → **PASS, 18 routes** (`/` , `/_not-found`, `/auth`, `/client`, `/manager`, `/manager/invitations`, `/manager/journal`, `/manager/mail`, `/manager/produits`, `/manager/securite`, `/manager/serveurs`, `/manager/subscriptions`, `/manager/support`, `/manager/utilisateurs`, `/offres`, `/profil`). Dev web arrêté + `.next` purgé avant build (leçon Phase 2).
 - Docs: DECISIONS.md (ADR-027 APPROVED), CHANGELOG.md (Phase 10), PROJECT_STATUS.md, docs/sql-commandes.txt (Phase 10 DB entry), TASKS.md (cette section), HANDOVER.md.
 - En attente: **validation live propriétaire** (settings sécurité, MFA TOTP+email, OAuth Google/GitHub clés de test, inscription à la commande email+pass/OAuth, liaison de compte, impersonation admin → /client + bandeau + Revenir, code 6 chiffres → L2 lecture seule, tickets L1→L2) → **commit + push Phases 8 + 8bis + 9 + 9bis + 10**.
 
@@ -789,10 +789,10 @@ Réponse au retour propriétaire : port Coolify non mentionné, IP non auto-dét
 - **Règles respectées** : tokens `--brand-*` + `config/brand.ts` seuls points de marque (pas de rebrand), design system ADR-023 intouchable, pages converties sans perte de logique.
 
 ## 2026-09-02 — 11.4 Validation complète (unit → e2e → tsc → build) + gouvernance
-- Command: `corepack pnpm --filter @icode-host-pro/api test` → **unit 223/223 (25 suites)** PASS (+10 : knowledge 8, security-settings 8 réécrit, turnstile isConfiguredAsync).
+- Command: `corepack pnpm --filter @codediali/api test` → **unit 223/223 (25 suites)** PASS (+10 : knowledge 8, security-settings 8 réécrit, turnstile isConfiguredAsync).
 - Command: `corepack pnpm exec jest --config ./test/jest-e2e.json --runInBand` → **e2e 132/132 (18 suites)** PASS sur Postgres réel (+2 : `knowledge` 3 tests, `security-settings` +1 clés Turnstile — non-régression intégrale des 16 suites pré-existantes, dont `GET /api/products` 401, core/client/audit/invitations/mail/server-check/server-panel/Phase 10).
 - Command: `npx tsc --noEmit` apps/api **PASS** ; `npx tsc --noEmit` apps/web **PASS**.
-- Command: `corepack pnpm --filter @icode-host-pro/web build` → **PASS, 18 routes** (dev web arrêté + `.next` purgé avant build — leçon Phase 2).
+- Command: `corepack pnpm --filter @codediali/web build` → **PASS, 18 routes** (dev web arrêté + `.next` purgé avant build — leçon Phase 2).
 - Dev servers relancés : API `:3001` health `/api/health` → `{"status":"ok","database":"ok"}` ; web `:3000` Ready.
 - Docs: CHANGELOG.md (Phase 11), PROJECT_STATUS.md, TASKS.md (cette section), docs/sql-commandes.txt (migrations 11 + 12), HANDOVER.md, DECISIONS.md (ADR-028 si applicable).
 - En attente: **validation live propriétaire** → **commit + push Phase 11** → **Phase 10bis (GitHub → déploiement Coolify)**.
@@ -811,17 +811,17 @@ Réponse au retour propriétaire : port Coolify non mentionné, IP non auto-dét
 ## 2026-09-03 — 11.7 Base de connaissance : seed initial réel (double-audience)
 - Files created: `apps/api/prisma/seed-knowledge.ts` — idempotent (create-if-missing par `[audience, slug]`, ne modifie JAMAIS les articles édités par l'admin), auteur = plus ancien ADMIN ou `seed@icode-host.local` en repli, tout PUBLISHED. Contenu : **23 articles ADMIN** (12 INFORMATIVE récap Phase 1→11 issus de CHANGELOG/DECISIONS réels ; 4 TECHNICAL : architecture-monorepo, permissions-roles, securite-applicative, transport-panels ; 7 HOWTO : configurer-serveur, approuver-souscription, configurer-mail, options-securite, base-connaissance, impersonation, tickets) + **11 articles CLIENT** (catégories Premiers pas / Compte & sécurité / Support).
 - Files modified: `apps/api/package.json` — script `db:seed:knowledge` = `ts-node prisma/seed-knowledge.ts`.
-- Command: `corepack pnpm --filter @icode-host-pro/api db:seed:knowledge` → **34 créé(s), 0 existant(s)** ; re-run → **0 créé(s), 34 existant(s) (non modifiés)** — idempotence prouvée sur la DB réelle `icode-postgres` (12 migrations in sync).
+- Command: `corepack pnpm --filter @codediali/api db:seed:knowledge` → **34 créé(s), 0 existant(s)** ; re-run → **0 créé(s), 34 existant(s) (non modifiés)** — idempotence prouvée sur la DB réelle `icode-postgres` (12 migrations in sync).
 
 ## 2026-09-03 — 11.8 Docs : matrice permissions + trafic/quotas (ADR-029 PROPOSED) + parcours commande + DESIGN_HANDOVER
 - Files created: `docs/permissions-matrix.md` (matrice route→accès réelle : public / any-auth / ADMIN / SUPPORT_L1+/L2+, séparation stricte base de connaissance CLIENT+PUBLISHED sans body, règles transversales impersonation anti-escalade / secrets jamais renvoyés) ; `docs/traffic-quotas.md` (analyse 4 couches mesure/quota/limitation/suspension — `Server.quotaMaxAccounts` existe mais NON enforce, suspension manuelle via `User.isActive` ; recommandation = **ADR-029 PROPOSED**, rien d'implémenté) ; `docs/parcours-commande-publique.md` (audit bout en bout du parcours commander-sans-compte, pièces réelles + écarts documentés sans invention : pas de prix/ordre, intent réutilisable, SUSPENDED visible non commandable, pas d'email de confirmation) ; `docs/design/DESIGN_HANDOVER.md` (point d'entrée du futur agent design — 8 règles impératives, carte fichiers fonctionnel vs présentation, comportements à préserver, périmètre hors-design : pas de page paiement, 10bis, rebrand Code Diali différé).
 - Files modified: `DECISIONS.md` — **ADR-029 — Trafic, quotas & suspension : architecture en 4 couches, Status: PROPOSED** (2026-09-03), volontairement PAS ajouté à la liste APPROVED (en attente de validation propriétaire).
 
 ## 2026-09-03 — 11.9 Tests réels (vert sur DB réelle) + correctif isolation e2e
-- Command: `corepack pnpm --filter @icode-host-pro/api test` → **unit 224/224 (25 suites)** PASS (+1 : spec products 409).
-- Command: `corepack pnpm --filter @icode-host-pro/api test:e2e` → **9 échecs pré-existants dans `security-settings` (2) + `oauth` (7)** : suite isolées avec `--runInBand` → PASS (5/5 et 9/9). **Cause racine : clobbering inter-suites** — Postgres partagé + ligne singleton `SecuritySetting` + workers jest parallèles (oauth seed le singleton à `oauthGoogleEnabled:true` pendant que security-settings le reset à false). **Correctif : `apps/api/test/jest-e2e.json` → `"maxWorkers": 1`.** Ré-exécution complète → **e2e 132/132 (18 suites) PASS** sur Postgres réel.
+- Command: `corepack pnpm --filter @codediali/api test` → **unit 224/224 (25 suites)** PASS (+1 : spec products 409).
+- Command: `corepack pnpm --filter @codediali/api test:e2e` → **9 échecs pré-existants dans `security-settings` (2) + `oauth` (7)** : suite isolées avec `--runInBand` → PASS (5/5 et 9/9). **Cause racine : clobbering inter-suites** — Postgres partagé + ligne singleton `SecuritySetting` + workers jest parallèles (oauth seed le singleton à `oauthGoogleEnabled:true` pendant que security-settings le reset à false). **Correctif : `apps/api/test/jest-e2e.json` → `"maxWorkers": 1`.** Ré-exécution complète → **e2e 132/132 (18 suites) PASS** sur Postgres réel.
 - Command: `npx tsc --noEmit` apps/api → **PASS** ; apps/web → **PASS**.
-- Command: `corepack pnpm --filter @icode-host-pro/web build` → **PASS (18 routes**, dev arrêté + `.next` purgé avant build — leçon Phase 2).
+- Command: `corepack pnpm --filter @codediali/web build` → **PASS (18 routes**, dev arrêté + `.next` purgé avant build — leçon Phase 2).
 - Command: seed knowledge validé sur DB réelle (11.7).
 
 ## 2026-09-03 — 11.10 Gouvernance + rapport final

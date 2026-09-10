@@ -143,6 +143,14 @@ export abstract class PanelTransport {
     target: PanelTarget,
     input: CoolifyCreateProjectInput,
   ): Promise<{ uuid: string; name: string }>;
+
+  // Store — provision d'un domaine custom sur une app Coolify (Bloc D). Pose
+  // le fqdn livré au client comme domaine de l'app ; best-effort côté service.
+  abstract setAppDomain(
+    target: PanelTarget,
+    uuid: string,
+    domain: string,
+  ): Promise<void>;
 }
 
 // ── Runtime ───────────────────────────────────────────────────────────
@@ -635,6 +643,36 @@ class NodePanelTransport extends PanelTransport {
       throw new Error('Coolify API : réponse sans uuid de projet.');
     }
     return { uuid, name: input.name };
+  }
+
+  /**
+   * Store — pose le domaine public de l'app (Bloc D). Coolify v4 :
+   * `PATCH /applications/:uuid` body `{ domains: "<fqdn>" }`. Le hostname
+   * Coolify (interne) n'est JAMAIS exposé au client — seul le sous-domaine
+   * gratuit livré par email est communiqué.
+   *
+   * NB (vérifié live 4.1.2) : Coolify REJETTE un domaine sans schéma
+   * (`422 Invalid URL: <fqdn>`). Il exige `https://<fqdn>` — on normalise ici
+   * pour que l'appelant (store) puisse passer le fqdn brut et rester correct.
+   */
+  async setAppDomain(target: PanelTarget, uuid: string, domain: string): Promise<void> {
+    this.assertCoolify(target);
+    const base = target.baseUrl.replace(/\/+$/, '');
+    const clean = domain.trim().replace(/^https?:\/\//, '').replace(/\/+$/, '');
+    const withScheme = `https://${clean}`;
+    const { status, body } = await httpJson(
+      'PATCH',
+      `${base}/applications/${encodeURIComponent(uuid)}`,
+      { Authorization: `Bearer ${target.token}` },
+      target.strictTls,
+      this.timeoutMs,
+      JSON.stringify({ domains: withScheme }),
+    );
+    if (status !== 200 && status !== 204) {
+      throw new Error(
+        `Coolify API : affectation du domaine refusée (HTTP ${status})${body ? ` — ${body.slice(0, 200)}` : ''}`,
+      );
+    }
   }
 }
 

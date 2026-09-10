@@ -249,7 +249,7 @@ export class GithubService {
       const res = await fetch(`https://api.github.com${path}`, {
         headers: {
           Accept: 'application/vnd.github+json',
-          'User-Agent': 'icode-host',
+          'User-Agent': 'codediali',
           'X-GitHub-Api-Version': '2022-11-28',
         },
       });
@@ -291,7 +291,7 @@ export class GithubService {
       headers: {
         Authorization: `Bearer ${token}`,
         Accept: 'application/vnd.github+json',
-        'User-Agent': 'icode-host',
+        'User-Agent': 'codediali',
         'X-GitHub-Api-Version': '2022-11-28',
       },
     });

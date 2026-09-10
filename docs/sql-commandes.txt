@@ -46,8 +46,8 @@ MIGRATIONS:
 IMPORTANT SQL / COMMANDS:
   - Container up:            docker compose up -d postgres
   - Container status:        docker compose ps
-  - Generate client:         corepack pnpm --filter @icode-host-pro/api generate
-  - Run migrations (dev):    corepack pnpm --filter @icode-host-pro/api migrate
+  - Generate client:         corepack pnpm --filter @codediali/api generate
+  - Run migrations (dev):    corepack pnpm --filter @codediali/api migrate
   - Prisma reads DATABASE_URL from apps/api/.env:
     postgresql://icode:icode@localhost:5432/icode_host_pro?schema=public
 
@@ -69,7 +69,7 @@ ROLLBACK NOTES:
 REMARKS FOR FUTURE AI:
   - All domain tables/migrations belong to a FUTURE phase, each requiring a real
     architectural justification. When the first models are added, run
-    `corepack pnpm --filter @icode-host-pro/api migrate` and record here.
+    `corepack pnpm --filter @codediali/api migrate` and record here.
   - Do NOT treat Phase 0's empty schema as a mistake: it implements ADR-014.
 
 ================================================================
@@ -98,7 +98,7 @@ DATABASE ACTIONS:
 MIGRATIONS:
   - Migration folder: apps/api/prisma/migrations/20260830053420_init_auth/
   - Name: `init_auth`. Applied via
-    `corepack pnpm --filter @icode-host-pro/api run migrate --name init_auth`.
+    `corepack pnpm --filter @codediali/api run migrate --name init_auth`.
     NOTE: avoid passing the literal `--`; use the `--name init_auth` form so the
     CLI does not drop into an interactive name prompt (hung when run with `--`).
   - First migration on the project => created `_prisma_migrations` tracking
@@ -109,8 +109,8 @@ MIGRATIONS:
     (drops all in-flight advisory locks) then re-ran the migration.
 
 IMPORTANT SQL / COMMANDS:
-  - Migration (dev):  corepack pnpm --filter @icode-host-pro/api run migrate --name <name>
-  - Deployment:       corepack pnpm --filter @icode-host-pro/api run migrate:deploy
+  - Migration (dev):  corepack pnpm --filter @codediali/api run migrate --name <name>
+  - Deployment:       corepack pnpm --filter @codediali/api run migrate:deploy
   - The two tables created (mirror of Prisma schema; quoted names as generated
     by Prisma):
 
@@ -162,7 +162,7 @@ RESULT:
 
 ROLLBACK NOTES:
   - To revert this migration on dev (destructive, removes data):
-        corepack pnpm --filter @icode-host-pro/api run migrate:deploy  # (not a rollback)
+        corepack pnpm --filter @codediali/api run migrate:deploy  # (not a rollback)
     A true rollback would require a down-migration; none authored. For dev a
     full reset is acceptable:
         docker compose down -v && docker compose up -d postgres
@@ -198,7 +198,7 @@ DATABASE ACTIONS:
 MIGRATIONS:
   - Migration folder: apps/api/prisma/migrations/20260831000649_init_core/
   - Name: `init_core`. Applied via
-    `corepack pnpm --filter @icode-host-pro/api run migrate --name init_core`.
+    `corepack pnpm --filter @codediali/api run migrate --name init_core`.
   - `prisma migrate dev` regenerated the Prisma Client (v6.19.3) automatically.
 
 IMPORTANT SQL / COMMANDS:
@@ -229,8 +229,8 @@ IMPORTANT SQL / COMMANDS:
     );
     CREATE UNIQUE INDEX "Server_name_key" ON "Server"("name");
 
-  - Run migrations (dev):  corepack pnpm --filter @icode-host-pro/api run migrate --name <name>
-  - Admin bootstrap seed:  corepack pnpm --filter @icode-host-pro/api run db:seed
+  - Run migrations (dev):  corepack pnpm --filter @codediali/api run migrate --name <name>
+  - Admin bootstrap seed:  corepack pnpm --filter @codediali/api run db:seed
     Idempotent; creates/promotes the ADMIN from ADMIN_EMAIL/ADMIN_PASSWORD in
     apps/api/.env (gitignored). Placeholders only in .env.example.
 
@@ -247,7 +247,7 @@ RESULT:
 
 ROLLBACK NOTES:
   - A down-migration is not authored. To drop these tables on dev (destructive):
-        corepack pnpm --filter @icode-host-pro/api run migrate:deploy  # no-op
+        corepack pnpm --filter @codediali/api run migrate:deploy  # no-op
     A full dev reset drops everything instead:
         docker compose down -v && docker compose up -d postgres
     then re-run `migrate dev` to re-apply all migrations (init_auth, init_core).
@@ -341,10 +341,10 @@ DATABASE ACTIONS:
 MIGRATIONS:
   - Migration folder: apps/api/prisma/migrations/20260831024151_init_audit/
   - Name: `init_audit`. Applied via
-    `corepack pnpm --filter @icode-host-pro/api run migrate --name init_audit`.
+    `corepack pnpm --filter @codediali/api run migrate --name init_audit`.
   - NOTE: the `prisma generate` inside that run failed with EPERM (query engine
     DLL locked by the running API dev server). Fixed by stopping the dev node
-    processes, running `corepack pnpm --filter @icode-host-pro/api generate`,
+    processes, running `corepack pnpm --filter @codediali/api generate`,
     then restarting the API (:3001) + web (:3000) dev servers.
 
 IMPORTANT SQL / COMMANDS:
@@ -431,7 +431,7 @@ DATABASE ACTIONS:
 MIGRATIONS:
   - Migration folder: apps/api/prisma/migrations/20260831084839_init_client_access/
   - Name: `init_client_access`. Applied via
-    `corepack pnpm --filter @icode-host-pro/api run migrate --name init_client_access`.
+    `corepack pnpm --filter @codediali/api run migrate --name init_client_access`.
   - `prisma migrate status` -> up to date, 4 migrations total (init_auth, init_core,
     init_audit, init_client_access). Prisma Client regenerated v6.19.3.
 
@@ -560,7 +560,7 @@ DATABASE ACTIONS:
 MIGRATIONS:
   - Migration folder: apps/api/prisma/migrations/20260831120703_init_mail/
   - Name: `init_mail`. Applied via
-    `corepack pnpm --filter @icode-host-pro/api run migrate --name init_mail`.
+    `corepack pnpm --filter @codediali/api run migrate --name init_mail`.
   - `prisma migrate status` -> up to date, 5 migrations total (init_auth,
     init_core, init_audit, init_client_access, init_mail). Client regenerated.
   - Requires `ENCRYPTION_KEY` in apps/api/.env(.example) when a password is
@@ -610,7 +610,7 @@ VALIDATION QUERIES:
   - `SELECT action, COUNT(*) FROM "AuditLog"
      WHERE action LIKE 'mail.%' OR action = 'invite.email'
      GROUP BY action;` -> mail.settings.update / mail.test / invite.email.
-  - e2e: `corepack pnpm --filter @icode-host-pro/api run test:e2e`
+  - e2e: `corepack pnpm --filter @codediali/api run test:e2e`
     => 61/61 8 suites (mail 10 tests; overrideProvider(MailTransportFactory))
     -> zero real SMTP contacted.
 
@@ -683,7 +683,7 @@ DATABASE ACTIONS:
 MIGRATIONS:
   - Migration folder: apps/api/prisma/migrations/20260901021234_init_server_details/
   - Name: `init_server_details`. Applied via
-    `corepack pnpm --filter @icode-host-pro/api run migrate --name init_server_details`.
+    `corepack pnpm --filter @codediali/api run migrate --name init_server_details`.
   - NOTE: dev servers stopped before migrate (EPERM DLL), `prisma generate` OK.
   - `prisma migrate status` -> up to date, 6 migrations total (init_auth,
     init_core, init_audit, init_client_access, init_mail, init_server_details).
@@ -745,7 +745,7 @@ CONTEXT:
     n'est jamais forcé).
 
 MIGRATION (7e migration):
-  - `corepack pnpm --filter @icode-host-pro/api run migrate --name init_server_check`
+  - `corepack pnpm --filter @codediali/api run migrate --name init_server_check`
     -> `20260901082020_init_server_check` appliquée + generate (arrêter le dev
     API d'abord — leçon EPERM DLL).
   - SQL généré : 3 ADD COLUMN NULLABLE sur "Server"

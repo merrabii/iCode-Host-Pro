@@ -54,11 +54,11 @@ export class MailService {
     )}&email=${encodeURIComponent(input.email)}`;
     return {
       to: input.to,
-      subject: 'Votre invitation — iCode Host Pro',
+      subject: 'Votre invitation — Code Diali',
       text: [
         'Bonjour,',
         '',
-        'Vous avez été invité(e) à créer un compte sur iCode Host Pro.',
+        'Vous avez été invité(e) à créer un compte sur Code Diali.',
         '',
         "Pour accepter l'invitation, ouvrez ce lien :",
         link,
@@ -78,8 +78,8 @@ export class MailService {
   ): MailMessage {
     const subject =
       kind === 'mfa'
-        ? 'Votre code de connexion — iCode Host Pro'
-        : 'Votre code d’accès support — iCode Host Pro';
+        ? 'Votre code de connexion — Code Diali'
+        : 'Votre code d’accès support — Code Diali';
     const intro =
       kind === 'mfa'
         ? 'Voici votre code de vérification à usage unique.'
@@ -95,7 +95,7 @@ export class MailService {
         `Code : ${code}`,
         '',
         'Ne partagez ce code avec personne d’autre que votre interlocuteur de confiance.',
-        '— iCode Host Pro',
+        '— Code Diali',
       ].join('\n'),
     };
   }

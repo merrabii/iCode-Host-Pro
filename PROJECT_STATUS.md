@@ -1,4 +1,4 @@
-# PROJECT_STATUS — iCode Host Pro
+# PROJECT_STATUS — Code Diali
 
 ## Overall status
 **PHASES 12–14 + CLOUDFLARE DNS IMPLÉMENTÉES ET POUSSÉES — ÉTAT ACTUEL : PHASE 14 (branding admin « Apparence »), commits `2cf7b1d` + `8e5abcf`, validés 2× par le propriétaire, `origin/main` à jour (ahead 0), 25 migrations in sync.** Récapitulatif de la séquence livrée après la 10bis :
@@ -141,7 +141,7 @@ Règles conservées : **ne jamais pousser sans ok explicite** · rebrand Code Di
 
 ## Verified (Phase 7 — real checks, 2026-08-31)
 - `npx tsc --noEmit` dans `apps/web` → **PASS (exit 0)**.
-- `corepack pnpm --filter @icode-host-pro/web build` → **PASS** (10 routes, exit 0). Dev web arrêté pendant le build (risque de corruption `.next` — pratique établie Phase 2) ; API :3001 restée up.
+- `corepack pnpm --filter @codediali/web build` → **PASS** (10 routes, exit 0). Dev web arrêté pendant le build (risque de corruption `.next` — pratique établie Phase 2) ; API :3001 restée up.
 - Smoke HTTP :3000 → **200** sur `/`, `/auth`, `/manager`, `/manager/utilisateurs`, `/manager/journal`, `/manager/invitations`, `/manager/mail`, `/manager/subscriptions`, `/client`. HTML servi : `lang="fr"`, script `ihp-theme` (anti-FOUC) présent ; CSS servi contient les tokens du design system (29 Ko, marque `#00b377`, fonds dark/light).
 - **Aucun changement API/DB** : pas de migration, aucun test API touché (unit 90/90 + e2e 61/61 inchangés depuis la Phase 6).
 

@@ -1,4 +1,4 @@
-# DESIGN SYSTEM — iCode Host Cloud
+# DESIGN SYSTEM — Code Diali
 
 > **Statut : OBLIGATOIRE.** Ce document définit le système de design unique du projet iCode Host.
 > Toute page créée, modifiée ou refactorisée — par n'importe quel modèle ou outil (Claude Code, Cursor, Copilot, humain) — **DOIT** respecter strictement ces règles. Aucune nouvelle palette, aucun nouveau composant "ad hoc", aucune librairie UI externe (Bootstrap, MUI, Ant Design, etc.) ne doit être introduite sans passer d'abord par une mise à jour de ce fichier.

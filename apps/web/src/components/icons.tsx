@@ -116,9 +116,21 @@ export const IconChevronDown = ({ size = 16, className }: IconProps) => (
   </svg>
 );
 
+export const IconChevronUp = ({ size = 16, className }: IconProps) => (
+  <svg {...base(size)} className={className} data-icon="chevron-up">
+    <path d="m6 15 6-6 6 6" />
+  </svg>
+);
+
 export const IconChevronRight = ({ size = 16, className }: IconProps) => (
   <svg {...base(size)} className={className} data-icon="chevron-right">
     <path d="m9 6 6 6-6 6" />
+  </svg>
+);
+
+export const IconChevronLeft = ({ size = 16, className }: IconProps) => (
+  <svg {...base(size)} className={className} data-icon="chevron-left">
+    <path d="m15 6-6 6 6 6" />
   </svg>
 );
 
@@ -268,5 +280,13 @@ export const IconBrush = ({ size = 16, className }: IconProps) => (
   <svg {...base(size)} className={className} data-icon="brush">
     <path d="m9.06 11.9 8.07-8.06a2.85 2.85 0 1 1 4.03 4.03l-8.06 8.08" />
     <path d="M7.07 14.94c-1.66 0-3 1.35-3 3.02 0 1.33-2.5 1.52-2 2.02 1.08 1.1 2.49 2.02 4 2.02 2.2 0 4-1.8 4-4.04a3.01 3.01 0 0 0-3-3.02z" />
+  </svg>
+);
+
+export const IconCart = ({ size = 16, className }: IconProps) => (
+  <svg {...base(size)} className={className} data-icon="cart">
+    <circle cx="8" cy="21" r="1" />
+    <circle cx="19" cy="21" r="1" />
+    <path d="M2.05 2.05h2l2.66 12.42a2 2 0 0 0 2 1.58h9.78a2 2 0 0 0 1.95-1.57l1.65-7.43H5.12" />
   </svg>
 );

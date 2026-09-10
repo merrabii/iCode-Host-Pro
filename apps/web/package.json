@@ -1,8 +1,8 @@
 {
-  "name": "@icode-host-pro/web",
+  "name": "@codediali/web",
   "version": "0.1.0",
   "private": true,
-  "description": "iCode Host Pro frontend (Next.js App Router) — Phase 0 socle",
+  "description": "Code Diali frontend (Next.js App Router) — Phase 0 socle",
   "scripts": {
     "dev": "next dev",
     "build": "next build",

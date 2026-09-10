@@ -207,7 +207,7 @@ describe('MailSettingsService (Phase 6, ADR-022)', () => {
       expect(res.message).toContain('me@example.com');
       expect(mockMail.sendMail).toHaveBeenCalledWith(
         expect.objectContaining({ host: 'smtp.example.com' }),
-        expect.objectContaining({ to: 'me@example.com', subject: 'Test — iCode Host Pro' }),
+        expect.objectContaining({ to: 'me@example.com', subject: 'Test — Code Diali' }),
       );
       expect(mockAudit.record).toHaveBeenCalledWith(
         expect.objectContaining({ action: 'mail.test', details: expect.objectContaining({ ok: true }) }),

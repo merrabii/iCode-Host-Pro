@@ -235,9 +235,9 @@ export class MailSettingsService {
     try {
       await this.mail.sendMail(cfg, {
         to,
-        subject: 'Test — iCode Host Pro',
+        subject: 'Test — Code Diali',
         text: [
-          'Ceci est un email de test envoyé depuis iCode Host Pro.',
+          'Ceci est un email de test envoyé depuis Code Diali.',
           '',
           `Configuration : ${cfg.host}:${cfg.port} (${cfg.secure ? 'TLS implicite' : 'STARTTLS'})`,
           `Expéditeur : ${cfg.fromName ? `${cfg.fromName} <${cfg.fromEmail}>` : cfg.fromEmail}`,

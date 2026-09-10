@@ -13,7 +13,7 @@ describe('MailService (Phase 6, ADR-022)', () => {
     user: 'smtp-user',
     pass: 'smtp-pass',
     fromEmail: 'from@example.com',
-    fromName: 'iCode Host Pro',
+    fromName: 'Code Diali',
   };
 
   beforeEach(() => {
@@ -31,7 +31,7 @@ describe('MailService (Phase 6, ADR-022)', () => {
         email: 'guest@example.com',
       });
       expect(msg.to).toBe('guest@example.com');
-      expect(msg.subject).toBe('Votre invitation — iCode Host Pro');
+      expect(msg.subject).toBe('Votre invitation — Code Diali');
       expect(msg.text).toContain(
         'http://localhost:3000/auth?invite=tok_123&email=guest%40example.com',
       );
@@ -55,7 +55,7 @@ describe('MailService (Phase 6, ADR-022)', () => {
       await service.sendMail(cfg, { to: 'r@x.com', subject: 'S', text: 'B' });
       expect(factory.create).toHaveBeenCalledWith(cfg);
       expect(transporter.sendMail).toHaveBeenCalledWith({
-        from: '"iCode Host Pro" <from@example.com>',
+        from: '"Code Diali" <from@example.com>',
         to: 'r@x.com',
         subject: 'S',
         text: 'B',

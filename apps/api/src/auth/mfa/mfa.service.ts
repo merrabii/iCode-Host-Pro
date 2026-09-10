@@ -207,7 +207,7 @@ export class MfaService {
       where: { id: userId },
       data: { mfaSecretEnc: encrypted },
     });
-    const uri = totp.keyuri(user.email, 'iCode Host Pro', secret);
+    const uri = totp.keyuri(user.email, 'Code Diali', secret);
     return { secret, uri };
   }
 

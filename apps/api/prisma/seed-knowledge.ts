@@ -10,7 +10,7 @@
 //     les articles CLIENT décrivent les fonctions réellement disponibles.
 //   - Auteur : l'admin le plus ancien s'il existe, sinon auteur dénormalisé seed.
 //
-// Usage : `corepack pnpm --filter @icode-host-pro/api db:seed:knowledge`
+// Usage : `corepack pnpm --filter @codediali/api db:seed:knowledge`
 // (nécessite la DB docker `icode-postgres` démarrée, comme db:seed).
 
 import 'dotenv/config';
@@ -744,7 +744,7 @@ const ADMIN_ARTICLES: Article[] = [
       h2('Étape 4 — Valider ou réinitialiser') +
       ul([
         '« Enregistrer » applique et persiste en base ; la marque survit à un redémarrage de l’API.',
-        '« Réinitialiser le style » (avec confirmation) restaure l’apparence actuelle : iCode Host Pro, sous-titre par défaut, vert #00b377, logo par défaut.',
+        '« Réinitialiser le style » (avec confirmation) restaure l’apparence actuelle : Code Diali, sous-titre par défaut, vert #00b377, logo par défaut.',
       ]) +
       p('Chaque modification (identité, couleurs, logo, reset) est journalisée dans le journal d’audit sous action `branding.*`.'),
     tags: ['branding', 'marque', 'white-label', 'apparence', 'howto', 'phase-14'],
@@ -1010,7 +1010,7 @@ async function main(): Promise<void> {
         tags: article.tags,
         publishedAt: new Date(),
         authorId: author?.id ?? null,
-        authorEmail: author?.email ?? 'seed@icode-host.local',
+        authorEmail: author?.email ?? 'seed@codediali.local',
       },
     });
     created += 1;
@@ -1018,7 +1018,7 @@ async function main(): Promise<void> {
 
   console.log(
     `Knowledge seed: ${created} créé(s), ${skipped} existant(s) (non modifiés). ` +
-      `Auteur: ${author?.email ?? 'seed@icode-host.local (aucun admin)'}.`,
+      `Auteur: ${author?.email ?? 'seed@codediali.local (aucun admin)'}.`,
   );
 }
 

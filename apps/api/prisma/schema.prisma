@@ -224,6 +224,185 @@ model Product {
   category   ProductCategory? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
   packId     String?
   pack       HostingPack?     @relation(fields: [packId], references: [id], onDelete: Restrict)
+
+  // ── Phase 15 — Store / Checkout / Wallet / Facturation (prompt type WHMCS) ─
+  // Fiche produit "vitrine" : le catalogue public ne montre QUE status=ACTIVE
+  // (règle métier centrale du store) et `hidden` (masqué) PRIME même sur ACTIVE
+  // (produit accessible uniquement via lien direct). `slug` = URL publique
+  // app.arumdigital.com/store/<slug>. Pricing en cents Int (devise BillingSetting).
+  slug               String?          @unique
+  slogan             String?
+  shortDescription   String? // ≤ 50 mots recommandé (vente croisée)
+  description        String? // HTML basique (br/strong/em) — fiche produit publique
+  color              String?          @default("#00b377")
+  hidden             Boolean          @default(false) // "Créer en tant que Masqué"
+  displayOrder       Int              @default(0)
+  priceHtCents       Int? // prix HT en centimes (ex 9900 = $99.00)
+  promoPriceHtCents  Int? // prix promo HT affiché barré (optionnel)
+  billingCycle       BillingCycle     @default(ONETIME)
+  taxRateId          String? // taux de taxe référencé depuis la config globale
+  taxRate            TaxRate?         @relation(fields: [taxRateId], references: [id], onDelete: SetNull)
+  domainRequired     Boolean          @default(false) // active l'étape "choix du domaine" au checkout
+  welcomeEmailTemplate String? // nom du template d'email de bienvenue (envoyé après provisioning)
+  stockEnabled       Boolean          @default(false)
+  stockQty           Int?
+  crossSell          Boolean          @default(false) // éligibilité aux ventes croisées
+  // Contrôles du récap /cart, par produit (admin).
+  allowEditConfig      Boolean @default(true) // affiche « Modifier la configuration » sur /cart
+  installationFeeCents Int     @default(0)    // prix d'installation affiché sur le récap (0 = à défaut)
+  // Module de provisioning (méthode réutilisable) + paramètres clé/valeur.
+  provisionModuleId  String?
+  provisionModule    ProvisionMethod? @relation(fields: [provisionModuleId], references: [id], onDelete: SetNull)
+  moduleParams       Json? // clé/valeur spécifiques au module pour CE produit (ex. serveur, template)
+  // Onglet 8 — règles des sous-domaines gratuits de CE produit (1:1).
+  freeSubdomainRule  FreeSubdomainRule?
+  // Multi-catégories (cases à cocher — Onglet 4) : la `category` ci-dessus est la
+  // catégorie PRINCIPALE ; `categoryLinks` porte les catégories additionnelles.
+  categoryLinks      ProductCategoryLink[]
+  options            ProductOption[] // options configurables (Onglet 6)
+  addons             ProductAddon[] // suppléments/add-ons (Onglet 7)
+  checkoutFields     ProductCheckoutField[] // champs de facturation configurables (admin)
+  orders             Order[] // commandes passées sur ce produit (Phase 15)
+}
+
+// ── Phase 15 — Taux de taxe (config globale, Onglet 2 référence ces taux) ─────
+// L'admin définit des taux nommés (ex. "TVA 20% Standard", "Exonéré") ; le défaut
+// d'install est Exonéré (0%). Un produit référence un TaxRate ; null = 0%.
+model TaxRate {
+  id          String   @id @default(cuid())
+  name        String   @unique
+  ratePercent Decimal  @db.Decimal(5, 2) // ex 20.00, 5.50, 0.00
+  isDefault   Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  products Product[] // produits référençant ce taux
+}
+
+// ── Phase 15 — Lien produit ↔ catégorie (multi-catégories, Onglet 4) ──────────
+model ProductCategoryLink {
+  id         String          @id @default(cuid())
+  productId  String
+  product    Product         @relation(fields: [productId], references: [id], onDelete: Cascade)
+  categoryId String
+  category   ProductCategory @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+
+  @@unique([productId, categoryId])
+}
+
+// ── Phase 15 — Option configurable (Onglet 6) ────────────────────────────────
+// Option ajustable par le client à l'achat, avec ses choix possibles portant
+// chacun un supplément de prix (ex. "RAM additionnelle: +1/+2/+4 Go → +X/mois").
+model ProductOption {
+  id        String                @id @default(cuid())
+  productId String
+  product   Product               @relation(fields: [productId], references: [id], onDelete: Cascade)
+  name      String
+  required  Boolean               @default(false)
+  sortOrder Int                   @default(0)
+  choices   ProductOptionChoice[]
+
+  @@index([productId])
+}
+
+model ProductOptionChoice {
+  id              String         @id @default(cuid())
+  optionId        String
+  option          ProductOption  @relation(fields: [optionId], references: [id], onDelete: Cascade)
+  label           String
+  priceDeltaHtCents Int // supplément de prix HT en centimes (+$X par cycle)
+  sortOrder       Int            @default(0)
+
+  @@index([optionId])
+}
+
+// ── Phase 15 — Supplément / add-on (Onglet 7) ────────────────────────────────
+// Extension proposable au moment de la commande (sauvegarde quotidienne, IP
+// dédiée…), chacun avec nom, description, prix.
+model ProductAddon {
+  id           String   @id @default(cuid())
+  productId    String
+  product      Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  name         String
+  description  String?
+  priceHtCents Int // prix HT en centimes (par cycle du produit)
+  sortOrder    Int      @default(0)
+
+  @@index([productId])
+}
+
+// ── Phase 15 — Champ de facturation configurable (Onglet admin, par produit) ──
+// L'admin définit les champs que le client remplit à l'étape /cart (nom, email,
+// tél par défaut ; possibilité d'ajouter société, adresse, note…). `key` = identifiant
+// stable (name|email|phone|company|…) réutilisé côté serveur au checkout ; `enabled`
+// retire un champ du formulaire, `required` impose la saisie, `sortOrder` ordonne.
+model ProductCheckoutField {
+  id          String   @id @default(cuid())
+  productId   String
+  product     Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  key         String // name | email | phone | company | custom_*
+  label       String
+  type        CheckoutFieldType @default(TEXT) // TEXT | EMAIL | TEL
+  placeholder String?
+  required    Boolean  @default(false)
+  enabled     Boolean  @default(true)
+  sortOrder   Int      @default(0)
+
+  @@index([productId])
+}
+
+enum CheckoutFieldType {
+  TEXT
+  EMAIL
+  TEL
+}
+
+// ── Phase 15 — Règles des sous-domaines gratuits (Onglet 8, 1:1 par produit) ──
+// Les domaines ELIGIBLES = la liste des zones racines Cloudflare (table Domain,
+// status ACTIVE) — l'admin en ajoute via le module DNS ; le client choisit celui
+// qui lui convient dans une liste déroulante au checkout. `allowedDomainIds`
+// vide = tous les domaines ACTIVE (défaut). Préfixes réservés + contraintes de
+// format alimentent la validation de l'étape domaine du tunnel d'achat.
+model FreeSubdomainRule {
+  id               String   @id @default(cuid())
+  productId        String   @unique
+  product          Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  allowedDomainIds String[] @default([]) // vides = tous les Domain ACTIVE
+  reservedPrefixes String[] @default([]) // mots/prefixes interdits (ex. "admin", "www")
+  minLength        Int      @default(3)
+  maxLength        Int      @default(40)
+  allowedChars     String   @default("a-z0-9-")
+  rejectPattern    String? // regex additionnelle à rejeter (optionnelle)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+}
+
+// ── Phase 15 — Méthode de provisioning réutilisable (Onglet 3) ──────────────
+// Registre de "méthodes de module de provisioning" (nom, endpoint/webhook,
+// actions déclenchées : create_app / dns / ssl / backup…). Un produit choisit une
+// méthode + des moduleParams. DISTINCT de DeploymentModule (placement des apps
+// GitHub→Coolify existant) : ici il s'agit de la méthode d'approvisionnement
+// d'une commande store (app WordPress + sous-domaine + SSL).
+enum ProvisionAction {
+  CREATE_APP
+  CONFIGURE_DNS
+  GENERATE_SSL
+  ENABLE_BACKUP
+}
+
+model ProvisionMethod {
+  id          String            @id @default(cuid())
+  name        String            @unique
+  code        String            @unique // slug machine, ex "icode-wp-orchestrator"
+  description String?
+  endpoint    String? // endpoint/webhook d'appel de la méthode
+  actions     ProvisionAction[] // actions déclenchées par cette méthode
+  isActive    Boolean           @default(true)
+  isSystem    Boolean           @default(false) // méthode intégrée (non supprimable)
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+
+  products Product[]
 }
 
 model HostingPack {
@@ -328,6 +507,7 @@ model ProductCategory {
   updatedAt         DateTime     @updatedAt
 
   products Product[] // produits de cette catégorie (SetNull)
+  productCategoryLinks ProductCategoryLink[] // liens multi-catégories (Phase 15)
 }
 
 model Server {
@@ -699,7 +879,7 @@ enum BrandLogoType {
 
 model BrandConfig {
   id           String        @id // singleton — id fixe 'brand'
-  name         String        @default("iCode Host Pro")
+  name         String        @default("Code Diali")
   sub          String        @default("Self-hosted hosting control plane")
   tagline      String? // tag de pilule (ex. "CLOUD", null = aucun)
   hostname     String? // domaine de la marque (stocké/affiché, non routant pour l'instant)
@@ -712,4 +892,325 @@ model BrandConfig {
   updatedById  String? // acteur admin (audit/affichage, sans relation forte)
   createdAt    DateTime      @default(now())
   updatedAt    DateTime      @updatedAt
+}
+
+// ── Phase 15 — STORE / CHECKOUT / WALLET / FACTURATION (type WHMCS) ──────────
+// Tunnel de vente GRAND PUBLIC (pas de compte obligatoire) + solde prépayé
+// (wallet) + back-office commandes & facturation. Devise par défaut USD,
+// taxe par défaut Exonéré (0%) (décisions propriétaire, 2026-09-08). Argent
+// toujours en CENTS (Int) pour éviter les erreurs de flottant ; taux de taxe en
+// Decimal. Aucun fournisseur de paiement CARTE pour l'instant (virement +
+// transfert manuel d'abord) — PaymentMethodType.CARD réservé pour l'étape 5.
+
+enum BillingCycle {
+  MONTHLY
+  YEARLY
+  ONETIME
+}
+
+enum CustomerAccountType {
+  LIGHT // aucun mot de passe — identifié par email (lien magique / mot de passe temporaire)
+  FULL // compte « complet » (utilisateur existant ou créé)
+}
+
+enum PaymentMethodType {
+  BANK_TRANSFER // virement — coordonnées affichées + référence unique, valide admin/webhook
+  MANUAL_TRANSFER // transfert manuel (Western Union / mobile money…) avec preuve uploadée
+  CARD // carte bancaire (réservé — intégration prestataire à venir, étape 5)
+}
+
+enum FeeType {
+  NONE
+  PERCENT
+  FIXED
+  PERCENT_AND_FIXED
+}
+
+enum WalletTransactionType {
+  CREDIT // recharge du wallet (recharge validée)
+  DEBIT // débit lié à une commande / facture
+  REFUND // remboursement (recrédite le wallet)
+  ADJUSTMENT // ajustement manuel admin
+}
+
+enum WalletTxStatus {
+  PENDING // recharge virement/transfert en attente de validation admin
+  SUCCEEDED
+  FAILED
+  CANCELED
+}
+
+enum OrderStatus {
+  PENDING_PAYMENT // En attente de paiement
+  PAID // Payée
+  PROVISIONING // En cours de provisioning
+  ACTIVE // Active
+  SUSPENDED // Suspendue
+  CANCELLED // Annulée
+  REFUNDED // Remboursée
+}
+
+enum OrderDomainType {
+  NONE // produit sans domaine requis
+  EXISTING_DOMAIN // « Mon domaine existant » — attente de propagation DNS
+  FREE_SUBDOMAIN // sous-domaine gratuit — créé + lié à l'app au provisioning
+}
+
+enum OrderDomainStatus {
+  NONE
+  AWAITING_NS_PROPAGATION // pointe vers des nameservers à vérifier périodiquement
+  READY // sous-domaine créé (DNS + SSL) ou propagation confirmée
+}
+
+enum InvoiceStatus {
+  UNPAID
+  PAID
+  CANCELLED
+  REFUNDED
+  CREDITED // réglé par avoir (credit note)
+}
+
+enum InvoiceLineKind {
+  PRODUCT
+  OPTION
+  ADDON
+  ADJUSTMENT
+  CREDIT
+}
+
+enum ProvisioningStepStatus {
+  PENDING
+  RUNNING
+  SUCCESS
+  FAILED
+  SKIPPED
+}
+
+// ── Client (compte "léger" ou "complet") ───────────────────────────────────
+// Identifié par email. Un client peut exister SANS compte utilisateur
+// « traditionnel » (type LIGHT) : l'accès se fait par lien sécurisé envoyé par
+// email (lien magique / mot de passe temporaire, étape 5). `userId` relie à un
+// compte existant quand il y en a un. `walletBalanceCents` est dérivé des
+// WalletTransaction et mis à jour en $transaction (jamais une simple lecture).
+model Customer {
+  id                String              @id @default(cuid())
+  email             String              @unique
+  name              String
+  phone             String?
+  accountType       CustomerAccountType @default(LIGHT)
+  userId            String?             @unique // comptes « complets » liés à un User
+  walletBalanceCents Int                @default(0)
+  createdAt         DateTime            @default(now())
+  updatedAt         DateTime            @updatedAt
+
+  walletTransactions WalletTransaction[]
+  orders             Order[]
+  invoices           Invoice[]
+
+  @@index([email])
+}
+
+// ── Moyen de paiement (config admin, section 3.2) ──────────────────────────
+// Un moyen par ligne : actif/inactif, type, configuration d'affichage (config
+// Json : coordonnées bancaires, instructions de transfert…), frais éventuels.
+// Les SECRETS (clés API carte) seront stockés chiffrés (`configEnc`,
+// CryptoService AES-256-GCM) à l'étape 5 — JAMAIS renvoyés (seul `hasConfig`).
+model PaymentMethod {
+  id            String            @id @default(cuid())
+  name          String            @unique
+  type          PaymentMethodType
+  isActive      Boolean           @default(false) // activé/désactivé par l'admin (global)
+  displayOrder  Int               @default(0)
+  config        Json? // paramètres NON secrets (coordonnées bancaires, instructions)
+  configEnc     String? // secrets chiffrés (carte) — jamais exposés par l'API
+  feeType       FeeType           @default(NONE)
+  feePercent    Decimal?          @db.Decimal(5, 2) // % si PERCENT
+  feeFixedCents Int? // frais fixe en centimes si FIXED
+  createdAt     DateTime          @default(now())
+  updatedAt     DateTime          @updatedAt
+
+  walletTransactions WalletTransaction[] // recharges via ce moyen
+  orders             Order[] // commandes réglées via ce moyen (snapshot)
+}
+
+// ── Transaction wallet (solde client) ─────────────────────────────────────
+// Journal append-only des CREDIT/DEBIT/REFUND/ADJUSTMENT. `idempotencyKey`
+// UNIQUE garantit l'idempotence de toute opération financière (pas de double
+// débit en cas de double clic/retry, section 7). `reference` = référence
+// humaine unique pour les virements. `proofPath` = preuve de paiement uploadée
+// (virement/transfert), lisible admin + client concerné uniquement.
+model WalletTransaction {
+  id              String              @id @default(cuid())
+  customerId      String
+  customer        Customer            @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  type            WalletTransactionType
+  amountCents     Int // positif
+  currency        String              @default("USD")
+  status          WalletTxStatus      @default(PENDING)
+  paymentMethodId String?
+  paymentMethod   PaymentMethod?      @relation(fields: [paymentMethodId], references: [id], onDelete: SetNull)
+  methodName      String? // snapshot du moyen de paiement
+  reference       String?             @unique // ref. de virement / transfert
+  idempotencyKey  String              @unique
+  orderId         String?
+  invoiceId       String?
+  proofFileName   String? // nom du fichier de preuve uploadé (virement/transfert)
+  proofPath       String? // chemin de la preuve stockée (admin + client seulement)
+  proofMime       String?
+  adminActorId    String? // qui a validé/rejeté une recharge (audit)
+  adminActorEmail String? // snapshot (survit à la suppression de l'acteur)
+  note            String?
+  createdAt       DateTime            @default(now())
+  processedAt     DateTime?
+
+  @@index([customerId])
+  @@index([status])
+}
+
+// ── Commande (Order) ───────────────────────────────────────────────────────
+// Une commande du tunnel de vente public. Montants en cents avec des snapshots
+// dénormalisés (client, produit, paiement) pour une traçabilité qui survit aux
+// changements. `domainType/domainValue` portent le choix de domaine (étape 2.2).
+// `renewsOrderId` chaîne les renouvellements d'abonnement (cycle récurrent).
+model Order {
+  id                String            @id @default(cuid())
+  // Hash déterministe (email + config + montant + moyen) — garantit qu'un
+  // double-clic / retry identique ne crée qu'UNE commande (§7 idempotence).
+  idempotencyKey    String?           @unique
+  customerId        String
+  customer          Customer          @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  customerName      String // snapshot
+  customerEmail     String // snapshot
+  customerPhone     String?
+  productId         String
+  product           Product           @relation(fields: [productId], references: [id], onDelete: Restrict)
+  productName       String // snapshot
+  packId            String? // pack provisionné (ressources/apps)
+  status            OrderStatus       @default(PENDING_PAYMENT)
+  billingCycle      BillingCycle      @default(ONETIME)
+  currency          String            @default("USD")
+  taxRatePercent    Decimal           @default(0) @db.Decimal(7, 4) // taux appliqué (snapshot)
+  amountHtCents     Int // total HT (produit + options + suppléments)
+  taxAmountCents    Int
+  amountTtcCents    Int // total TTC
+  domainType        OrderDomainType   @default(NONE)
+  domainValue       String? // domaine saisi / fqdn choisi
+  domainStatus      OrderDomainStatus @default(NONE)
+  paymentMethodId   String?
+  paymentMethod     PaymentMethod?    @relation(fields: [paymentMethodId], references: [id], onDelete: SetNull)
+  paymentMethodName String? // snapshot
+  walletTransactionId String?         @unique // trace du règlement par wallet
+  optionsSnapshot   Json? // options configurables choisies (label + supplément)
+  addonsSnapshot    Json? // suppléments retenus (label + prix)
+  nextBillingDate   DateTime? // prochaine échéance (cycle récurrent)
+  autoRenew         Boolean           @default(false)
+  renewsOrderId     String?           @unique // commande mère renouvelée
+  createdAt         DateTime          @default(now())
+  updatedAt         DateTime          @updatedAt
+
+  statusHistory OrderStatusHistory[]
+  invoice       Invoice?
+  provisioningLogs ProvisioningLog[]
+
+  @@index([customerId])
+  @@index([status])
+  @@index([productId])
+}
+
+// ── Historique des statuts d'une commande ──────────────────────────────────
+model OrderStatusHistory {
+  id          String      @id @default(cuid())
+  orderId     String
+  order       Order       @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  status      OrderStatus
+  note        String?
+  actorId     String?
+  actorEmail  String?
+  createdAt   DateTime    @default(now())
+
+  @@index([orderId])
+}
+
+// ── Facture (Invoice) ──────────────────────────────────────────────────────
+// Une facture par commande payée (+ factures récurrentes / ad hoc admin).
+// `number` numérotation séquentielle (« YYYY-<seq> », compteur BillingSetting).
+// Lignes DÉTAILLÉES (InvoiceLine) : produit + options + suppléments, chacun avec
+// son prix HT/taxe. `walletTransactionId` trace le règlement par wallet.
+// `creditNoteOfId` : avoir (partiel/total) qui recrédite le wallet client.
+model Invoice {
+  id                        String        @id @default(cuid())
+  number                    String        @unique // ex "2026-0003"
+  orderId                   String?       @unique // ≥ 1 facture par commande
+  order                     Order?        @relation(fields: [orderId], references: [id], onDelete: SetNull)
+  customerId                String
+  customer                  Customer      @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  status                    InvoiceStatus @default(UNPAID)
+  currency                  String        @default("USD")
+  taxRatePercent            Decimal       @default(0) @db.Decimal(7, 4)
+  amountHtCents             Int
+  taxAmountCents            Int
+  amountTtcCents            Int
+  issuedAt                  DateTime      @default(now())
+  dueDate                   DateTime?
+  paidAt                    DateTime?
+  walletTransactionId       String?       @unique // trace du règlement
+  pdfPath                   String? // PDF généré (stocké, téléchargeable)
+  creditNoteOfId            String?       @unique // avoir émis sur cette facture
+  creditNoteOf              Invoice?      @relation("CreditNote", fields: [creditNoteOfId], references: [id], onDelete: SetNull)
+  legalMentionsSnapshot     Json? // mentions légales au moment de l'émission
+  billingAddress            Json? // adresse facturation (snapshot)
+
+  lines        InvoiceLine[]
+  creditNotes  Invoice[] @relation("CreditNote")
+
+  @@index([customerId])
+  @@index([status])
+}
+
+model InvoiceLine {
+  id              String          @id @default(cuid())
+  invoiceId       String
+  invoice         Invoice         @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  kind            InvoiceLineKind
+  label           String
+  qty             Int             @default(1)
+  unitPriceHtCents Int
+  taxRatePercent  Decimal         @default(0) @db.Decimal(7, 4)
+  taxAmountCents  Int
+  totalTtcCents   Int
+  sortOrder       Int             @default(0)
+
+  @@index([invoiceId])
+}
+
+// ── Logs de provisioning d'une commande ────────────────────────────────────
+model ProvisioningLog {
+  id        String                 @id @default(cuid())
+  orderId   String
+  order     Order                  @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  step      String // ex "create_app", "create_subdomain", "ssl", "send_email"
+  status    ProvisioningStepStatus @default(PENDING)
+  message   String?
+  createdAt DateTime               @default(now())
+
+  @@index([orderId])
+}
+
+// ── Paramètres globaux de facturation (SINGLETON, pattern MailSetting) ─────
+// Devise, mentions légales de la société, séquence de numérotation des
+// factures, délais du dunning progressif (rappel J-3, J-0, suspension J+X).
+// Une ligne créée paresseusement (firstOrCreate) aux défauts ci-dessous.
+model BillingSetting {
+  id                  String   @id @default(cuid())
+  currency            String   @default("USD")
+  companyName         String   @default("")
+  companyAddress      String?
+  companyTaxId        String? // n° TVA/SIREN… (affiché sur la facture si renseigné)
+  companyEmail        String?
+  legalMentions       Json? // mentions complémentaires (lignes de pied de facture)
+  invoiceSequence     Int      @default(1) // prochain n° — format « YYYY-<seq> »
+  dunningReminderDays Int      @default(3) // rappel avant échéance (J-3)
+  dunningGraceDays    Int      @default(14) // délai avant suspension (J+14)
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
 }

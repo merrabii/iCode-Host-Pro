@@ -1,8 +1,8 @@
 {
-  "name": "icode-host-pro",
+  "name": "codediali",
   "version": "0.1.0",
   "private": true,
-  "description": "iCode Host Pro — self-hosted hosting control plane (monorepo root)",
+  "description": "Code Diali — self-hosted hosting control plane (monorepo root)",
   "packageManager": "pnpm@9.15.0",
   "engines": {
     "node": ">=22"

@@ -437,7 +437,8 @@ export class CloudflareService {
     requested?: string;
     seed: string;
     fallbackHost: string;
-    deploymentId: string;
+    /** FK → Deployment.id ; null côté store (pas de Deployment rows). */
+    deploymentId?: string;
   }): Promise<AllocatedSubdomain> {
     const { root } = input;
     const t = await this.target();
@@ -466,7 +467,7 @@ export class CloudflareService {
     throw new BadRequestException(`Impossible de trouver un sous-domaine libre sous ${root.name}.`);
   }
 
-  /** Crée le CNAME (proxied, ttl auto) puis la row ClientSubdomain. */
+  /** Crée le CNAME (proxied, ttl auto) puis la row ClientSubdomain. `deploymentId` nullable côté store. */
   private async createSubdomainRecord(args: {
     t: CloudflareTarget;
     transport: CloudflareTransport;
@@ -474,7 +475,7 @@ export class CloudflareService {
     subdomain: string;
     fqdn: string;
     content: string;
-    deploymentId: string;
+    deploymentId?: string;
   }): Promise<AllocatedSubdomain> {
     const { t, transport, root, subdomain, fqdn, content } = args;
     let recordId: string | null = null;

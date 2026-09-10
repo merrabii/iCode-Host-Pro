@@ -1,8 +1,8 @@
 {
-  "name": "@icode-host-pro/api",
+  "name": "@codediali/api",
   "version": "0.1.0",
   "private": true,
-  "description": "iCode Host Pro backend (NestJS) — Phase 0 socle",
+  "description": "Code Diali backend (NestJS) — Phase 0 socle",
   "scripts": {
     "dev": "nest start --watch",
     "build": "nest build",
@@ -13,6 +13,7 @@
     "migrate:deploy": "prisma migrate deploy",
     "db:seed": "ts-node prisma/seed.ts",
     "db:seed:knowledge": "ts-node prisma/seed-knowledge.ts",
+    "db:seed:store": "ts-node prisma/seed-store.ts",
     "test": "jest",
     "test:e2e": "jest --config ./test/jest-e2e.json",
     "lint": "eslint \"src/**/*.ts\""

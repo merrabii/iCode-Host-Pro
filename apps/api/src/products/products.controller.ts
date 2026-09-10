@@ -18,6 +18,12 @@ import { JwtPayload } from '../auth/types';
 import { ProductsService } from './products.service';
 import { CreateProductDto } from './dto/create-product.dto';
 import { UpdateProductDto } from './dto/update-product.dto';
+import { UpdateStoreSettingsDto } from './dto/update-store-settings.dto';
+import {
+  CreateCheckoutFieldDto,
+  UpdateCheckoutFieldDto,
+  ReorderCheckoutFieldsDto,
+} from './dto/checkout-field.dto';
 
 // Phase 2 (ADR-017): Product is a PLATFORM-GLOBAL reference (catalog item).
 // - Read (GET): any authenticated user (ADMIN + USER) — it is a public catalogue
@@ -68,5 +74,70 @@ export class ProductsController {
   @ApiOperation({ summary: 'Delete a product (ADMIN)' })
   remove(@Param('id') id: string, @CurrentUser() actor: JwtPayload) {
     return this.products.remove(id, actor);
+  }
+
+  // ── Réglages store par produit (ADMIN) ────────────────────────────
+  @Patch(':id/store-settings')
+  @UseGuards(RolesGuard)
+  @Roles(Role.ADMIN)
+  @ApiOperation({ summary: 'Update per-product store settings (ADMIN)' })
+  updateStoreSettings(
+    @Param('id') id: string,
+    @Body() dto: UpdateStoreSettingsDto,
+    @CurrentUser() actor: JwtPayload,
+  ) {
+    return this.products.updateStoreSettings(id, dto, actor);
+  }
+
+  @Get(':id/checkout-fields')
+  @UseGuards(RolesGuard)
+  @Roles(Role.ADMIN)
+  @ApiOperation({ summary: 'List checkout fields of a product (ADMIN)' })
+  listCheckoutFields(@Param('id') id: string) {
+    return this.products.listCheckoutFields(id);
+  }
+
+  @Post(':id/checkout-fields')
+  @UseGuards(RolesGuard)
+  @Roles(Role.ADMIN)
+  @ApiOperation({ summary: 'Create a checkout field (ADMIN)' })
+  createCheckoutField(
+    @Param('id') id: string,
+    @Body() dto: CreateCheckoutFieldDto,
+    @CurrentUser() actor: JwtPayload,
+  ) {
+    return this.products.createCheckoutField(id, dto, actor);
+  }
+
+  @Patch('checkout-fields/:fieldId')
+  @UseGuards(RolesGuard)
+  @Roles(Role.ADMIN)
+  @ApiOperation({ summary: 'Update a checkout field (ADMIN)' })
+  updateCheckoutField(
+    @Param('fieldId') fieldId: string,
+    @Body() dto: UpdateCheckoutFieldDto,
+    @CurrentUser() actor: JwtPayload,
+  ) {
+    return this.products.updateCheckoutField(fieldId, dto, actor);
+  }
+
+  @Delete('checkout-fields/:fieldId')
+  @UseGuards(RolesGuard)
+  @Roles(Role.ADMIN)
+  @ApiOperation({ summary: 'Delete a checkout field (ADMIN)' })
+  deleteCheckoutField(@Param('fieldId') fieldId: string, @CurrentUser() actor: JwtPayload) {
+    return this.products.deleteCheckoutField(fieldId, actor);
+  }
+
+  @Post(':id/checkout-fields/reorder')
+  @UseGuards(RolesGuard)
+  @Roles(Role.ADMIN)
+  @ApiOperation({ summary: 'Reorder checkout fields (ADMIN)' })
+  reorderCheckoutFields(
+    @Param('id') id: string,
+    @Body() dto: ReorderCheckoutFieldsDto,
+    @CurrentUser() actor: JwtPayload,
+  ) {
+    return this.products.reorderCheckoutFields(id, dto.ids, actor);
   }
 }

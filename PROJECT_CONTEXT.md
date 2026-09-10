@@ -1,4 +1,4 @@
-# PROJECT_CONTEXT — iCode Host Pro
+# PROJECT_CONTEXT — Code Diali
 
 ## Product
 A self-hosted hosting control plane intended to manage multiple products, servers and infrastructure providers. It orchestrates existing systems rather than unnecessarily recreating them.

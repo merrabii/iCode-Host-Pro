@@ -8,5 +8,6 @@ import { PublicProductsController } from './public-products.controller';
   imports: [AuthModule],
   controllers: [ProductsController, PublicProductsController],
   providers: [ProductsService],
+  exports: [ProductsService],
 })
 export class ProductsModule {}

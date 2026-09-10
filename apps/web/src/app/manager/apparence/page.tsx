@@ -112,7 +112,7 @@ export default function ApparencePage() {
 
   async function reset() {
     if (!token) return;
-    if (!window.confirm('Réinitialiser la marque au style actuel (iCode Host Pro, vert #00b377, logo par défaut) ?')) return;
+    if (!window.confirm('Réinitialiser la marque au style actuel (Code Diali, vert #00b377, logo par défaut) ?')) return;
     setSaving(true);
     const res = await resetBranding(token);
     setSaving(false);
@@ -182,7 +182,7 @@ export default function ApparencePage() {
           <div className="panel-body stack" style={{ gap: 12 }}>
             <label className="field">
               <span className="field-label">Nom de la marque <span className="muted">(libre — vide si image seule)</span></span>
-              <input className="input" value={form.name} onChange={(e) => set({ name: e.target.value })} placeholder="iCode Host Pro" />
+              <input className="input" value={form.name} onChange={(e) => set({ name: e.target.value })} placeholder="Code Diali" />
             </label>
             <label className="field">
               <span className="field-label">Sous-titre</span>

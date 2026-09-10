@@ -24,7 +24,7 @@
 6. **Accessibilité / responsive** : layouts fluides, `max-width:100%`, breakpoints
    1100/900/600px, focus visibles, labels de formulaire.
 7. **Vérification obligatoire après tout changement** :
-   `npx tsc --noEmit` (web) puis `corepack pnpm --filter @icode-host-pro/web build`
+   `npx tsc --noEmit` (web) puis `corepack pnpm --filter @codediali/web build`
    — dev arrêté + purge `.next` avant build (leçon Phase 2).
 8. **Ne pas réécrire les pages métier** : restructurer le design = modifier
    composants et CSS partagés ; la logique de page (chargement, mutations,

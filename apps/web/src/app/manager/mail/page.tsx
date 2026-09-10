@@ -201,7 +201,7 @@ export default function ManagerMailPage() {
                 <Input type="email" value={form.fromEmail} onChange={(e) => setForm({ ...form, fromEmail: e.target.value })} placeholder="no-reply@exemple.com" />
               </Field>
               <Field label="Nom de l’expéditeur" className="flex-1">
-                <Input value={form.fromName} onChange={(e) => setForm({ ...form, fromName: e.target.value })} placeholder="optionnel — iCode Host Pro" />
+                <Input value={form.fromName} onChange={(e) => setForm({ ...form, fromName: e.target.value })} placeholder="optionnel — Code Diali" />
               </Field>
             </div>
 
