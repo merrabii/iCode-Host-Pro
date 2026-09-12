@@ -1,5 +1,6 @@
 import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import {
+  DeploymentStatus,
   OrderStatus,
   ProvisioningStepStatus,
   ProvisionAction,
@@ -9,6 +10,7 @@ import { AuditService } from '../audit/audit.service';
 import { CryptoService } from '../crypto/crypto.service';
 import { MailSettingsService } from '../mail/mail-settings.service';
 import { CloudflareService } from '../cloudflare/cloudflare.service';
+import { clientAreaUrl } from './web-links';
 import {
   PanelKind,
   PanelTarget,
@@ -211,6 +213,99 @@ export class ProvisioningService {
     await this.prisma.orderStatusHistory.create({ data: { orderId, status, note } });
   }
 
+  /**
+   * Limites CPU/RAM d'un pack au format Coolify (`limits_cpus`/`limits_memory`).
+   * Renvoie null si aucun plafond à appliquer (pack inactif ou sans valeur).
+   * Partagé entre la création d'app et `syncAppLimits` (Bloc 2/3).
+   */
+  private buildLimits(pack: { ramMb?: number; cpuCores?: number; status?: string } | null | undefined): { cpus?: string; memory?: string } | null {
+    if (!pack || pack.status !== 'ACTIVE') return null;
+    const limits: { cpus?: string; memory?: string } = {};
+    if (pack.cpuCores && pack.cpuCores > 0) {
+      const n = Math.round(pack.cpuCores * 100) / 100;
+      limits.cpus = Number.isInteger(n) ? String(n) : n.toFixed(2).replace(/0+$/, '').replace(/\.$/, '');
+    }
+    if (pack.ramMb && pack.ramMb > 0) {
+      limits.memory = pack.ramMb < 1024 ? `${Math.round(pack.ramMb)}m` : `${Math.round((pack.ramMb / 1024) * 100) / 100}g`;
+    }
+    return limits.cpus || limits.memory ? limits : null;
+  }
+
+  /**
+   * Bloc 2 — Ré-applique les limites RAM/CPU du pack courant aux apps DÉJÀ
+   * déployées de l'abonné (upgrade sans perte de données). Ne redéploie RIEN :
+   * resize best-effort, par app, des Deployment non-FAILED pourvus d'un
+   * `coolifyUuid` et d'un serveur Coolify. Chaque échec est tracé en audit mais
+   * n'interrompt pas les autres. Déclenché après une commande d'upgrade, exposé
+   * en action admin « Ré-synchroniser les ressources », et réutilisé par le
+   * Bloc 3.
+   */
+  async syncAppLimits(subscriptionId: string): Promise<{
+    subscriptionId: string;
+    checked: number;
+    applied: number;
+    failed: number;
+  }> {
+    const sub = await this.prisma.subscription.findUnique({
+      where: { id: subscriptionId },
+      include: {
+        product: { include: { pack: { include: { deploymentModule: { include: { server: true } } } } } },
+      },
+    });
+    if (!sub) throw new NotFoundException('Abonnement introuvable.');
+
+    const pack = sub.product.pack;
+    const server = pack?.deploymentModule?.server ?? null;
+    const limits = this.buildLimits(pack);
+    if (
+      !server ||
+      server.panelProvider !== 'COOLIFY' ||
+      !server.apiBaseUrl ||
+      !server.apiTokenEnc ||
+      !limits
+    ) {
+      return { subscriptionId, checked: 0, applied: 0, failed: 0 };
+    }
+
+    const apps = await this.prisma.deployment.findMany({
+      where: {
+        userId: sub.userId,
+        status: { not: DeploymentStatus.FAILED },
+        coolifyUuid: { not: null },
+      },
+    });
+
+    const target = this.buildTarget(server as Parameters<ProvisioningService['buildTarget']>[0]);
+    const transport = this.panelFactory.create();
+
+    let applied = 0;
+    let failed = 0;
+    for (const app of apps) {
+      if (!app.coolifyUuid) continue;
+      try {
+        await transport.applyAppLimits(target, app.coolifyUuid, limits);
+        applied += 1;
+        await this.audit.record({
+          action: 'subscription.sync_app_limits',
+          resourceType: 'deployment',
+          resourceId: app.id,
+          details: { subscriptionId, limits, ok: true },
+        });
+      } catch (e) {
+        failed += 1;
+        const msg = e instanceof Error ? e.message : String(e);
+        this.log.warn(`syncAppLimits subscription=${subscriptionId} app=${app.coolifyUuid}: ${msg}`);
+        await this.audit.record({
+          action: 'subscription.sync_app_limits',
+          resourceType: 'deployment',
+          resourceId: app.id,
+          details: { subscriptionId, limits, ok: false, error: msg },
+        });
+      }
+    }
+    return { subscriptionId, checked: apps.length, applied, failed };
+  }
+
   private buildTarget(server: NonNullable<NonNullable<Awaited<ReturnType<ProvisioningService['resolveServer']>>>>): PanelTarget {
     let token: string;
     try {
@@ -247,6 +342,7 @@ export class ProvisioningService {
         customerName: string;
         productId: string;
         product: { name: string; moduleParams?: unknown; pack?: unknown };
+        customer?: { userId?: string | null } | null;
       };
       method: { name: string };
       fqdn: string | null;
@@ -268,7 +364,11 @@ export class ProvisioningService {
   }
 
   private async actionCreateApp(ctx: {
-    order: { id: string; product: { name: string; moduleParams?: unknown; pack?: unknown } };
+    order: {
+      id: string;
+      product: { name: string; moduleParams?: unknown; pack?: unknown };
+      customer?: { userId?: string | null } | null;
+    };
     fqdn: string | null;
     appUuid: string | null;
   }): Promise<{ appUuid?: string; message?: string }> {
@@ -278,6 +378,7 @@ export class ProvisioningService {
       where: { id: ctx.order.id },
       include: { product: { include: { pack: { include: { deploymentModule: { include: { server: true } } } } } } },
     });
+    if (!fullOrder) return { message: 'Commande introuvable — app non créée.' };
     const server = fullOrder?.product.pack?.deploymentModule?.server ?? null;
     if (!server || server.panelProvider !== 'COOLIFY' || !server.apiBaseUrl || !server.apiTokenEnc) {
       return { message: 'Aucun serveur Coolify configuré pour ce produit — app non créée (DNS seul).' };
@@ -291,6 +392,14 @@ export class ProvisioningService {
     }
     const branch = typeof params.branch === 'string' && params.branch.trim() ? String(params.branch).trim() : 'main';
     const buildPack = typeof params.buildPack === 'string' ? String(params.buildPack) : 'nixpacks';
+    // Publie un SPA buildé en statique (Vite → dist). Sans ces deux champs,
+    // nixpacks lancerait un serveur node (le dump a `express`) au lieu de servir
+    // la sortie de build → un sous-domaine qui répond 200 mais à vide.
+    const publishDirectory =
+      typeof params.publishDirectory === 'string' && String(params.publishDirectory).trim()
+        ? String(params.publishDirectory).trim()
+        : undefined;
+    const isStatic = typeof params.isStatic === 'boolean' ? params.isStatic : undefined;
     const appName = typeof params.appName === 'string' && String(params.appName).trim()
       ? String(params.appName).trim()
       : fullOrder?.product.name ?? 'app';
@@ -301,6 +410,30 @@ export class ProvisioningService {
       mod && mod.kind === 'SHARED_PROJECT' && mod.sharedProjectUuid
         ? mod.sharedProjectUuid
         : (server.coolifyProjectUuid ?? undefined);
+    const userId = ctx.order.customer?.userId ?? null;
+    const repoFullName = this.deriveRepoFullName(repoUrl);
+
+    // Phase 16 (Décision C) — l'app du store devient une row **Deployment** liée
+    // au user (via order.customer.userId), visible + supprimable dans « Mes
+    // applications », comptée par le quota du pack. Idempotent : si on redéploie
+    // (retry/relance), on réutilise la row existante (`{ userId, repoFullName }`)
+    // plutôt que d'en créer une doublon.
+    let row:
+      | { id: string; coolifyUuid: string | null; detail: string | null; status: string }
+      | null = null;
+    if (ctx.appUuid) {
+      row = await this.prisma.deployment.findFirst({
+        where: { coolifyUuid: ctx.appUuid },
+        select: { id: true, coolifyUuid: true, detail: true, status: true },
+      });
+    }
+    if (!row && userId && repoFullName) {
+      row = await this.prisma.deployment.findFirst({
+        where: { userId, repoFullName },
+        select: { id: true, coolifyUuid: true, detail: true, status: true },
+      });
+    }
+
     const created = await transport.createGitApp(target, {
       repoUrl,
       branch,
@@ -309,25 +442,23 @@ export class ProvisioningService {
       appName,
       projectUuid,
       serverUuid: server.coolifyServerUuid ?? undefined,
+      publishDirectory,
+      isStatic,
     });
-    // Limites pack (si configuré) — best-effort.
-    try {
-      const pack = fullOrder?.product.pack as { ramMb?: number; cpuCores?: number; status?: string } | null;
-      if (pack && pack.status === 'ACTIVE') {
-        const limits: Record<string, string> = {};
-        if (pack.cpuCores && pack.cpuCores > 0) {
-          const n = Math.round(pack.cpuCores * 100) / 100;
-          limits.cpus = Number.isInteger(n) ? String(n) : n.toFixed(2).replace(/0+$/, '').replace(/\.$/, '');
-        }
-        if (pack.ramMb && pack.ramMb > 0) {
-          limits.memory = pack.ramMb < 1024 ? `${Math.round(pack.ramMb)}m` : `${Math.round((pack.ramMb / 1024) * 100) / 100}g`;
-        }
-        if (limits.cpus || limits.memory) {
-          await transport.applyAppLimits(target, created.uuid, limits as { cpus?: string; memory?: string });
-        }
+    // Sécurité serveur partagé (Bloc 3) — l'application des limites du pack est
+    // OBLIGATOIRE : jamais une app sans plafond sur un box partagé. Si le pack
+    // porte des limites et qu'on ne peut pas les appliquer, on échoue la step
+    // create_app (l'order passe FAILED) plutôt que de laisser l'app sans cap.
+    const limits = this.buildLimits(
+      fullOrder?.product.pack as { ramMb?: number; cpuCores?: number; status?: string } | null,
+    );
+    if (limits) {
+      try {
+        await transport.applyAppLimits(target, created.uuid, limits);
+      } catch (err) {
+        const m = err instanceof Error ? err.message : String(err);
+        throw new Error(`Limites pack non appliquées sur serveur partagé — app NON créée (${m}).`);
       }
-    } catch {
-      // best-effort
     }
     // Si le sous-domaine a déjà été alloué (ordre CONFIGURE_DNS avant CREATE_APP),
     // on le pose sur l'app AVANT le déploiement pour que le premier build porte
@@ -341,7 +472,73 @@ export class ProvisioningService {
       }
     }
     await transport.deployApp(target, created.uuid);
-    return { appUuid: created.uuid, message: `App Coolify créée (${created.uuid}).` };
+
+    // Row Deployment : création (nouvelle app) ou mise à jour du déploiement.
+    const deployDetail = ctx.fqdn ? `App : https://${ctx.fqdn}` : 'Déploiement déclenché sur Coolify.';
+    if (row && userId) {
+      await this.prisma.deployment.update({
+        where: { id: row.id },
+        data: {
+          status: DeploymentStatus.DEPLOYING,
+          detail: deployDetail,
+          coolifyUuid: created.uuid,
+          ...(ctx.fqdn ? { fqdn: ctx.fqdn } : {}),
+        },
+      });
+      await this.audit.record({
+        actorId: userId,
+        actorEmail: fullOrder.customerEmail,
+        action: 'deploy.redeploy.store',
+        resourceType: 'deployment',
+        resourceId: row.id,
+        details: { orderId: ctx.order.id, coolifyUuid: created.uuid, fqdn: ctx.fqdn ?? undefined, source: 'store' },
+      });
+    } else if (userId) {
+      const createdRow = await this.prisma.deployment.create({
+        data: {
+          userId,
+          serverId: server.id,
+          repoFullName: repoFullName ?? appName,
+          repoUrl,
+          buildPack,
+          appName,
+          branch,
+          coolifyUuid: created.uuid,
+          status: DeploymentStatus.DEPLOYING,
+          detail: deployDetail,
+          publishDirectory,
+          coolifyProjectUuid: projectUuid ?? null,
+          moduleId: mod?.id ?? null,
+          ...(ctx.fqdn ? { fqdn: ctx.fqdn } : {}),
+        },
+      });
+      await this.audit.record({
+        actorId: userId,
+        actorEmail: fullOrder.customerEmail,
+        action: 'deploy.create.store',
+        resourceType: 'deployment',
+        resourceId: createdRow.id,
+        details: { orderId: ctx.order.id, repoFullName, buildPack, appName, fqdn: ctx.fqdn ?? undefined, source: 'store' },
+      });
+    }
+    return {
+      appUuid: created.uuid,
+      message: userId
+        ? `App créée et ajoutée à « Mes applications » (${created.uuid}).`
+        : `App Coolify créée (${created.uuid}) — non liée à un compte client.`,
+    };
+  }
+
+  /** « owner/repo » depuis une URL git (git@, https, .git, slash final). */
+  private deriveRepoFullName(url: string): string | null {
+    const cleaned = url
+      .replace(/^git@[^:]+:/, '')
+      .replace(/^https?:\/\//, '')
+      .replace(/^ssh:\/\//, '')
+      .replace(/\.git(\/|$)/, '')
+      .replace(/\/+$/, '');
+    const parts = cleaned.split('/').filter(Boolean);
+    return parts.length >= 2 ? `${parts[0]}/${parts[1]}` : null;
   }
 
   private async actionConfigureDns(ctx: {
@@ -362,10 +559,14 @@ export class ProvisioningService {
     const fallbackHost = (server as { hostname?: string } | null)?.hostname ?? root.cnameTarget ?? 'localhost';
     const seed = ctx.order.customerName || fullOrder?.product.name || 'app';
     // Store: pas de Deployment row — on passe sans deploymentId (ClientSubdomain nullable côté store).
+    // `requested` = sous-domaine choisi par le client au checkout (Plan Gratuit) ;
+    // de la disponibilité est déjà certifiée au checkout, on le repasse ici pour
+    // l'allocation effective → l'app est servie sur https://<choix>.<racine>.
     const alloc = await this.cloudflare.allocateClientSubdomain({
       root,
       seed,
       fallbackHost,
+      requested: fullOrder?.requestedSubdomain ?? undefined,
     });
     // Si l'app a déjà été créée, on pose le domaine dessus puis on redéploie
     // (best-effort) pour que le conteneur redémarre avec traefik relié au
@@ -396,13 +597,16 @@ export class ProvisioningService {
   ): Promise<void> {
     await this.mail.sendPlain({
       to,
-      subject: 'Votre application est prête — Code Diali',
+      subject: 'Votre application est en ligne — Code Diali',
       text: [
         `Bonjour ${name},`,
         '',
-        'Votre application est prête.',
+        'Votre application est prête et en ligne 🎉.',
         '',
         `Accédez-y à l’adresse : https://${fqdn}`,
+        '',
+        'Vous pouvez aussi la retrouver, ainsi que votre abonnement et vos',
+        `factures, dans votre espace client : ${clientAreaUrl()}`,
         '',
         `Commande : ${orderId}`,
         '',

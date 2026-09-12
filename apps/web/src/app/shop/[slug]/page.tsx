@@ -1,25 +1,44 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import Link from 'next/link';
 import { useParams, useRouter } from 'next/navigation';
 import { StoreShell } from '@/components/store-shell';
 import { useCart } from '@/components/cart-provider';
 import { useToast } from '@/components/toast';
-import { IconChevronLeft, IconPlus, IconShield } from '@/components/icons';
+import {
+  IconChartBar,
+  IconCheck,
+  IconChevronLeft,
+  IconDatabase,
+  IconGlobe,
+  IconMail,
+  IconPlus,
+  IconRefresh,
+  IconServer,
+  IconShield,
+} from '@/components/icons';
 import {
   apiError,
   billingCycleLabel,
+  checkStoreSubdomain,
+  fetchMe,
   formatCents,
   getPublicProduct,
+  getSessionToken,
+  type Me,
   type PublicProduct,
 } from '@/lib/api';
 
+/** Pattern d'un sous-domaine libre (comme le DTO API). */
+const SUBDOMAIN_PATTERN = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
+
 /**
- * Fiche produit /shop/[slug]. La page ne touche pas au panier elle-même :
- * le panier est fourni par <CartProvider> qui n'existe qu'À L'INTÉRIEUR de
- * <StoreShell>. Le CTA (« Continuer ») + récap sont donc isolés dans
- * <PurchasePanel>, rendu comme enfant de StoreShell pour être sous le provider.
+ * Fiche produit /shop/[slug] — vitrine moderne et professionnelle. La page ne
+ * touche pas au panier elle-même : le CTA + récap vivent dans <PurchasePanel>
+ * (enfant de <StoreShell>, donc sous <CartProvider>). Le choix du sous-domaine
+ * (produits à FreeSubdomainRule) est porté ici, dans la colonne principale,
+ * juste après le titre — pas dans la colonne prix.
  */
 export default function ShopProductPage() {
   const params = useParams(); // sync dans un composant client (Next 15)
@@ -31,6 +50,13 @@ export default function ShopProductPage() {
 
   const [selected, setSelected] = useState<Record<string, string>>({});
   const [addons, setAddons] = useState<Record<string, boolean>>({});
+
+  // Sous-domaine (produits porteurs d'une FreeSubdomainRule) — état porté ici
+  // pour que le choix vive dans la colonne principale ET verrouille le CTA.
+  const [subdomain, setSubdomain] = useState('');
+  const [fqdn, setFqdn] = useState<string | null>(null);
+  const [subStatus, setSubStatus] = useState<'idle' | 'checking' | 'ok' | 'taken' | 'invalid'>('idle');
+  const checkTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     (async () => {
@@ -51,20 +77,38 @@ export default function ShopProductPage() {
     })();
   }, [slug]);
 
-  const optionsHt = useMemo(() => {
-    let acc = 0;
-    for (const o of product?.options ?? []) {
-      const c = o.choices.find((c) => c.id === selected[o.id]);
-      acc += c?.priceDeltaHtCents ?? 0;
+  // Vérification de dispo du sous-domaine (debounce) tant que le produit en exige un.
+  const needsSubdomain = !!product?.freeSubdomainRule;
+  useEffect(() => {
+    if (!needsSubdomain) { setSubStatus('idle'); setFqdn(null); return; }
+    if (checkTimer.current) clearTimeout(checkTimer.current);
+    const raw = subdomain.trim().toLowerCase();
+    if (!raw) {
+      setSubStatus('idle');
+      setFqdn(null);
+      return;
     }
-    return acc;
-  }, [product, selected]);
+    if (!SUBDOMAIN_PATTERN.test(raw)) {
+      setSubStatus('invalid');
+      setFqdn(null);
+      return;
+    }
+    setSubStatus('checking');
+    checkTimer.current = setTimeout(async () => {
+      if (!product?.slug) { setSubStatus('invalid'); return; }
+      const res = await checkStoreSubdomain(product.slug, raw);
+      if (res) {
+        setFqdn(res.fqdn);
+        setSubStatus(res.available && res.reason !== 'taken' ? 'ok' : 'taken');
+      } else {
+        setSubStatus('invalid');
+      }
+    }, 500);
+    return () => { if (checkTimer.current) clearTimeout(checkTimer.current); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [subdomain, needsSubdomain]);
 
-  const addonsHt = useMemo(() => {
-    let acc = 0;
-    for (const a of product?.addons ?? []) if (addons[a.id]) acc += a.priceHtCents;
-    return acc;
-  }, [product, addons]);
+  useEffect(() => () => { if (checkTimer.current) clearTimeout(checkTimer.current); }, []);
 
   if (notFound) {
     return (
@@ -90,23 +134,41 @@ export default function ShopProductPage() {
             {/* ── Colonne fiche ─────────────────────────────────────── */}
             <div className="store-detail-main">
               <div
-                className="store-detail-banner"
+                className="store-detail-banner store-detail-banner-pro"
                 style={{ background: `linear-gradient(135deg, ${product.color ?? 'var(--brand-primary)'}, color-mix(in srgb, ${product.color ?? 'var(--brand-primary)'} 40%, #000))` }}
               >
-                <span className="store-detail-chip">{product.category?.name ?? product.kind}</span>
+                {product.category?.name && <span className="store-detail-chip">{product.category.name}</span>}
               </div>
 
               <h1 className="store-detail-title">{product.name}</h1>
               {product.slogan && <p className="store-detail-slogan">{product.slogan}</p>}
 
-              {product.pack && (
-                <div className="store-resources">
-                  {product.pack.ramMb ? <span>{product.pack.ramMb} Mo RAM</span> : null}
-                  {product.pack.cpuCores ? <span>{product.pack.cpuCores} CPU</span> : null}
-                  {product.pack.storageLimit ? <span>{product.pack.storageLimit} Go</span> : null}
-                  {product.pack.bandwidth ? <span>{product.pack.bandwidth}</span> : null}
-                </div>
+              {/* ── Sous-domaine au choix (Plan Gratuit…) — juste après le
+                  titre/slogan, PAS dans la colonne prix. */}
+              {needsSubdomain && (
+                <SubdomainChooser
+                  subdomain={subdomain}
+                  setSubdomain={setSubdomain}
+                  fqdn={fqdn}
+                  status={subStatus}
+                  maxLength={product.freeSubdomainRule?.maxLength ?? 40}
+                />
               )}
+
+              {/* ── Ce qui est inclus (grille de caractéristiques) ── */}
+              <section className="store-features">
+                {product.pack && (
+                  <>
+                    {product.pack.ramMb ? <Feature icon={IconServer} label="RAM" value={`${product.pack.ramMb} Mo`} /> : null}
+                    {product.pack.cpuCores ? <Feature icon={IconChartBar} label="CPU" value={`${product.pack.cpuCores}`} /> : null}
+                    {product.pack.storageLimit ? <Feature icon={IconDatabase} label="Stockage" value={`${product.pack.storageLimit} Go`} /> : null}
+                    {product.pack.bandwidth ? <Feature icon={IconGlobe} label="Bande passante" value={product.pack.bandwidth} /> : null}
+                  </>
+                )}
+                <Feature icon={IconGlobe} label="Sous-domaine" value="gratuit inclus" />
+                <Feature icon={IconShield} label="SSL" value="automatique" />
+                <Feature icon={IconMail} label="Support" value="par email" />
+              </section>
 
               {product.shortDescription && <p className="store-detail-desc muted">{product.shortDescription}</p>}
 
@@ -170,6 +232,23 @@ export default function ShopProductPage() {
                   ))}
                 </section>
               )}
+
+              {/* ── Comment ça marche ───────────────────────────────── */}
+              <section className="store-how">
+                <h2>Comment ça marche</h2>
+                <div className="store-how-grid">
+                  <HowStep n="1" title="Commandez" text="Choisissez votre sous-domaine et validez la commande." />
+                  <HowStep n="2" title="Nous déployons" text="Votre application est mise en ligne et sécurisée (SSL)." />
+                  <HowStep n="3" title="En ligne" text="Recevez l'adresse par email et accédez à votre espace client." />
+                </div>
+              </section>
+
+              {/* ── Bande de confiance ──────────────────────────────── */}
+              <div className="store-trust">
+                <span><IconShield size={14} /> SSL gratuit</span>
+                <span><IconRefresh size={14} /> Activation rapide</span>
+                <span>{product.freeSubdomainRule ? <span><IconGlobe size={14} /> Sous-domaine offert</span> : <span><IconMail size={14} /> Support par email</span>}</span>
+              </div>
             </div>
 
             {/* ── Colonne récap / "Continuer" (sous CartProvider) ──── */}
@@ -177,6 +256,8 @@ export default function ShopProductPage() {
               product={product}
               selected={selected}
               addons={addons}
+              subdomainOk={needsSubdomain ? subStatus === 'ok' : true}
+              subdomain={subdomain}
             />
           </div>
         )}
@@ -185,20 +266,113 @@ export default function ShopProductPage() {
   );
 }
 
-/** Récap + CTA « Continuer » → écrit le panier (navigateur) → /cart.
- *  Doit être rendu sous <CartProvider> (donc enfant de <StoreShell>). */
+/** Sélecteur de sous-domaine (colonne principale) — nom + aperçu + dispo en direct. */
+function SubdomainChooser({
+  subdomain,
+  setSubdomain,
+  fqdn,
+  status,
+  maxLength,
+}: {
+  subdomain: string;
+  setSubdomain: (v: string) => void;
+  fqdn: string | null;
+  status: 'idle' | 'checking' | 'ok' | 'taken' | 'invalid';
+  maxLength: number;
+}) {
+  return (
+    <div className="store-subdomain card">
+      <div className="store-subdomain-head">
+        <div>
+          <div className="store-subdomain-label">Choisissez l’adresse de votre application</div>
+          <div className="muted store-subdomain-sub">Un sous-domaine gratuit et unique, activé immédiatement.</div>
+        </div>
+      </div>
+      <div className={`store-subdomain-input${status === 'invalid' ? ' invalid' : ''}${status === 'ok' ? ' ok' : ''}`}>
+        <span className="store-subdomain-prefix">https://</span>
+        <input
+          value={subdomain}
+          onChange={(e) => setSubdomain(e.target.value)}
+          placeholder="mon-app"
+          autoComplete="off"
+          spellCheck={false}
+          maxLength={maxLength}
+        />
+      </div>
+      <p className="store-subdomain-hint muted">
+        {status === 'idle' && fqdn && <>Votre application sera servie sur <b>{fqdn}</b>.</>}
+        {status === 'idle' && !fqdn && <>Lettres et chiffres, tirets autorisés.</>}
+        {status === 'checking' && <>Vérification de disponibilité…</>}
+        {status === 'invalid' && <span className="danger-text">Nom invalide (a–z, 0–9, tirets, sans tiret aux extrémités).</span>}
+        {status === 'taken' && fqdn && <span className="danger-text">Déjà pris : {fqdn}. Essayez un autre nom.</span>}
+        {status === 'ok' && fqdn && <span className="success-text">Disponible — votre app sera sur <b>{fqdn}</b>.</span>}
+      </p>
+    </div>
+  );
+}
+
+function Feature({ icon: Icon, label, value }: { icon: (p: { size?: number }) => ReactNode; label: string; value: string }) {
+  return (
+    <div className="store-feature">
+      <span className="store-feature-ico">{Icon ? <Icon size={16} /> : null}</span>
+      <div>
+        <div className="store-feature-label">{label}</div>
+        <div className="store-feature-value">{value}</div>
+      </div>
+    </div>
+  );
+}
+
+function HowStep({ n, title, text }: { n: string; title: string; text: string }) {
+  return (
+    <div className="store-how-step">
+      <span className="store-how-n">{n}</span>
+      <b>{title}</b>
+      <span className="muted">{text}</span>
+    </div>
+  );
+}
+
+/** Récap + CTA « Continuer » → écrit le panier (navigateur) → /cart. */
 function PurchasePanel({
   product,
   selected,
   addons,
+  subdomainOk,
+  subdomain,
 }: {
   product: PublicProduct;
   selected: Record<string, string>;
   addons: Record<string, boolean>;
+  subdomainOk: boolean;
+  subdomain: string;
 }) {
   const router = useRouter();
   const toast = useToast();
   const { setItem } = useCart();
+
+  // Phase 16 — Plan Gratuit auth-aware : le CTA devient « Commencez gratuitement »
+  // (visiteur, pas de checkout) ou « Créer un nouveau Projet » (déjà connecté).
+  const [user, setUser] = useState<Me | null>(null);
+  const [authReady, setAuthReady] = useState(false);
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      const token = await getSessionToken();
+      if (!token) {
+        if (alive) setAuthReady(true);
+        return;
+      }
+      const me = await fetchMe(token);
+      if (alive) {
+        setUser(me);
+        setAuthReady(true);
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, []);
 
   const optionsHt = useMemo(() => {
     let acc = 0;
@@ -218,7 +392,7 @@ function PurchasePanel({
   const base = product.priceHtCents ?? 0;
   const total = base + optionsHt + addonsHt;
 
-  /** "Continuer" → mémorise la config dans le panier (navigateur) puis /cart. */
+  /** "Continuer" → mémorise la config (dont le sous-domaine) dans le panier puis /cart. */
   function continuer() {
     const optionsMap: Record<string, { id: string; label: string; priceDeltaHtCents: number }> = {};
     for (const o of product.options ?? []) {
@@ -245,17 +419,46 @@ function PurchasePanel({
       },
       options: optionsMap,
       addons: addonsMap,
+      subdomain: product.freeSubdomainRule ? subdomain.trim().toLowerCase() : undefined,
     });
     toast.ok('Produit ajouté au panier.');
     router.push('/cart');
   }
 
+  const canContinue = product.status === 'ACTIVE' && subdomainOk;
+
+  // Plan Gratuit : pas de panier ni de checkout — bouton unique selon la session.
+  const isFree = product.freePlan === true;
+
+  function freeCta() {
+    if (!isFree) return continuer();
+    if (authReady && user) {
+      // Déjà client → créer une app (l'espace client le prouve).
+      router.push('/client/project');
+    } else {
+      // Visiteur → inscription autonome du Plan Gratuit (sans checkout).
+      router.push(`/auth?plan=${encodeURIComponent(product.slug ?? '')}`);
+    }
+  }
+
+  const ctaLabel = isFree
+    ? authReady && user
+      ? 'Créer un nouveau Projet'
+      : 'Commencez gratuitement'
+    : product.status !== 'ACTIVE'
+      ? 'Indisponible'
+      : !subdomainOk
+        ? 'Choisissez un sous-domaine'
+        : 'Continuer';
+
   return (
     <aside className="store-summary" aria-label="Récapitulatif">
       <div className="store-summary-box">
         <h3>{product.name}</h3>
+        <p className="muted" style={{ fontSize: 12.5 }}>{billingCycleLabel(product.billingCycle)}</p>
         <ul className="store-totals">
           <li><span>Souscription</span><span>{formatCents(base)}</span></li>
+          {isFree && <li><span>À la souscription</span><span>{formatCents(0)}</span></li>}
           {optionsHt !== 0 && <li><span>Options</span><span>+{formatCents(optionsHt)}</span></li>}
           {addonsHt !== 0 && <li><span>Suppléments</span><span>+{formatCents(addonsHt)}</span></li>}
         </ul>
@@ -263,19 +466,22 @@ function PurchasePanel({
           <span>Total</span>
           <strong>{formatCents(total)}</strong>
         </div>
-        <p className="muted" style={{ fontSize: 12 }}>{billingCycleLabel(product.billingCycle)}</p>
 
         <button
           type="button"
           className="btn-primary store-cta"
-          onClick={continuer}
-          disabled={product.status !== 'ACTIVE'}
+          onClick={freeCta}
+          disabled={!isFree && !canContinue}
         >
-          {product.status === 'ACTIVE' ? 'Continuer' : 'Indisponible'}
+          {ctaLabel}
         </button>
 
         <span className="muted store-secure-note">
-          <IconShield size={13} /> Vous recevrez vos détails de compte par email.
+          {isFree ? (
+            <><IconCheck size={13} /> Aucune carte requise — débloquez votre espace client immédiatement.</>
+          ) : (
+            <><IconCheck size={13} /> Vous recevrez vos détails d'accès par email.</>
+          )}
         </span>
       </div>
     </aside>

@@ -8,6 +8,7 @@ import {
   listCheckoutFields,
   reorderCheckoutFields,
   updateCheckoutField,
+  updateProduct,
   updateStoreSettings,
   type ProductAdmin,
 } from '@/lib/api';
@@ -49,6 +50,15 @@ export function StoreSettingsDrawer({
   const [installDollars, setInstallDollars] = useState(dollars(product.installationFeeCents));
   const [busy, setBusy] = useState(false);
 
+  // ── Déploiement par défaut (app servie à la première commande) ────────────
+  const [repoUrl, setRepoUrl] = useState(product.moduleParams?.repoUrl ?? '');
+  const [branch, setBranch] = useState(product.moduleParams?.branch ?? '');
+  const [buildPack, setBuildPack] = useState(product.moduleParams?.buildPack ?? '');
+  const [publishDirectory, setPublishDirectory] = useState(product.moduleParams?.publishDirectory ?? '');
+  const [isStatic, setIsStatic] = useState(!!product.moduleParams?.isStatic);
+  const [provisionModuleId, setProvisionModuleId] = useState(product.provisionModuleId ?? '');
+  const [depBusy, setDepBusy] = useState(false);
+
   const [adding, setAdding] = useState(false);
   const [nl, setNl] = useState('');
   const [nt, setNt] = useState('TEXT');
@@ -78,6 +88,24 @@ export function StoreSettingsDrawer({
     setBusy(false);
     if (!r.ok) return toast.error(apiError(r, 'Échec de l’enregistrement des réglages.'));
     toast.ok('Réglages boutique enregistrés.');
+    onUpdated?.();
+  }
+
+  async function saveDeployment() {
+    setDepBusy(true);
+    const r = await updateProduct(token, product.id, {
+      moduleParams: {
+        repoUrl: repoUrl.trim() || '',
+        branch: branch.trim() || '',
+        buildPack: buildPack.trim() || '',
+        publishDirectory: publishDirectory.trim() || '',
+        isStatic,
+      },
+      provisionModuleId: provisionModuleId.trim() || '',
+    });
+    setDepBusy(false);
+    if (!r.ok) return toast.error(apiError(r, 'Échec de l’enregistrement du déploiement.'));
+    toast.ok('Application par défaut enregistrée.');
     onUpdated?.();
   }
 
@@ -175,6 +203,57 @@ export function StoreSettingsDrawer({
         <div>
           <Button onClick={() => void saveSettings()} disabled={busy}>
             {busy ? 'Enregistrement…' : 'Enregistrer les réglages'}
+          </Button>
+        </div>
+      </div>
+
+      {/* Déploiement par défaut (l'app servie à la première commande) */}
+      <div className="section-title" style={{ marginTop: 22 }}>
+        <h3>Application par défaut</h3>
+        <span className="muted" style={{ fontSize: 12 }}>
+          App/site static déployé à la première commande de ce produit.
+        </span>
+      </div>
+      <div className="stack" style={{ gap: 14 }}>
+        <Field label="URL du dépôt / site à déployer" required>
+          <Input
+            value={repoUrl}
+            onChange={(e) => setRepoUrl(e.target.value)}
+            placeholder="https://github.com/merrabii/Code-Diali-Guide-de-Demarrage.git"
+          />
+        </Field>
+        <div className="grid-form" style={{ gap: 10 }}>
+          <Field label="Branche">
+            <Input value={branch} onChange={(e) => setBranch(e.target.value)} placeholder="main" />
+          </Field>
+          <Field label="Build pack">
+            <Input value={buildPack} onChange={(e) => setBuildPack(e.target.value)} placeholder="nixpacks" />
+          </Field>
+          <Field label="Dossier de publication (SPA)">
+            <Input
+              value={publishDirectory}
+              onChange={(e) => setPublishDirectory(e.target.value)}
+              placeholder="/dist (vite build)"
+            />
+          </Field>
+          <div className="row" style={{ gap: 8, alignItems: 'center' }}>
+            <label className="switch">
+              <input type="checkbox" checked={isStatic} onChange={(e) => setIsStatic(e.target.checked)} />
+              <span className="slider" />
+            </label>
+            <span style={{ fontSize: 13 }}>Publier en statique (nginx)</span>
+          </div>
+          <Field label="Méthode de provisioning (id)">
+            <Input
+              value={provisionModuleId}
+              onChange={(e) => setProvisionModuleId(e.target.value)}
+              placeholder="id du ProvisionMethod (coolify-github…)"
+            />
+          </Field>
+        </div>
+        <div>
+          <Button onClick={() => void saveDeployment()} disabled={depBusy}>
+            {depBusy ? 'Enregistrement…' : 'Enregistrer l’application par défaut'}
           </Button>
         </div>
       </div>

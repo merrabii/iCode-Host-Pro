@@ -9,7 +9,7 @@ import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import { Inject, forwardRef } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
-import { ProductStatus, Role, User } from '@prisma/client';
+import { ProductStatus, Role, SubscriptionStatus, User } from '@prisma/client';
 import { createHash, randomBytes } from 'crypto';
 import * as bcrypt from 'bcryptjs';
 import { AuditService } from '../audit/audit.service';
@@ -17,6 +17,7 @@ import { InvitationsService } from '../invitations/invitations.service';
 import { RegisterDto } from './dto/register.dto';
 import { LoginDto } from './dto/login.dto';
 import { AcceptInviteDto } from './dto/accept-invite.dto';
+import { FreeSignupDto } from './dto/free-signup.dto';
 import { AuthTokens, ImpersonationMeta, JwtPayload, LoginResult } from './types';
 import { SaRateLimiter, RATE, rateKey } from './rate-limiter';
 import { TurnstileService } from './turnstile.service';
@@ -76,6 +77,110 @@ export class AuthService {
       details: { productId: checkoutProductId },
     });
     return this.issueTokens(user);
+  }
+
+  /**
+   * Phase 16 — inscription autonome du Plan Gratuit, SANS checkout-intent.
+   * Boundée au produit marqué `freePlan` : un produit payant ne peut PAS passer
+   * par là (il exige toujours le checkout). Crée le compte + l'abonnement
+   * ACTIVE au free, atomiquement. Guardé par rate-limit (comme `register`).
+   */
+  async freeSignup(dto: FreeSignupDto, ip?: string): Promise<AuthTokens> {
+    const rl = this.limiter.consume(rateKey(ip, 'register'), RATE.register.limit, RATE.register.windowMs);
+    if (!rl.allowed) {
+      throw new UnauthorizedException(
+        `Trop de tentatives. Réessayez dans ${Math.ceil(rl.retryAfterMs / 1000)} s.`,
+      );
+    }
+    const product = await this.resolveFreeProduct(dto.planSlug || undefined);
+    const existing = await this.prisma.user.findUnique({ where: { email: dto.email } });
+    if (existing) {
+      throw new ForbiddenException('Un compte existe déjà avec cet email — connectez-vous.');
+    }
+    const passwordHash = await bcrypt.hash(dto.password, 10);
+    const user = await this.createFreeAccount({
+      email: dto.email,
+      name: dto.name ?? null,
+      passwordHash,
+      product,
+    });
+    await this.audit.record({
+      actorId: user.id,
+      actorEmail: user.email,
+      action: 'auth.free.signup',
+      resourceType: 'user',
+      resourceId: user.id,
+      details: { productId: product.id, productName: product.name },
+    });
+    return this.issueTokens(user);
+  }
+
+  /** Résout le Plan Gratuit (flag `freePlan`) — par slug si fourni, sinon le
+   *  premier actif. Partagé par `freeSignup` (email) et le mode OAuth `free`. */
+  async freeProductBySlug(slug?: string) {
+    return this.resolveFreeProduct(slug);
+  }
+
+  private async resolveFreeProduct(slug?: string) {
+    const product = slug
+      ? await this.prisma.product.findFirst({ where: { slug, freePlan: true } })
+      : await this.prisma.product.findFirst({
+          where: { freePlan: true },
+          orderBy: { displayOrder: 'asc' },
+        });
+    if (!product || product.status !== ProductStatus.ACTIVE || product.freePlan !== true) {
+      throw new ForbiddenException('Aucun Plan Gratuit disponible à l’inscription autonome.');
+    }
+    return { id: product.id, name: product.name };
+  }
+
+  /** Shared atomic create pour un compte free (email+password ou OAuth) :
+   *  User + Customer + Subscription ACTIVE (les abonnements sans état créés via
+   *  createOrderAccount restent PENDING par défaut — ici on veut ACTIVE, pas
+   *  d'attente : l'inscription gratuite débloque immédiatement l'espace client). */
+  async createFreeAccount(input: {
+    email: string;
+    name: string | null;
+    passwordHash?: string;
+    oauthProvider?: string;
+    oauthSubject?: string;
+    githubTokenEnc?: string;
+    product: { id: string; name: string };
+  }): Promise<User> {
+    const passwordHash =
+      input.passwordHash ?? (await bcrypt.hash(randomBytes(32).toString('hex'), 10));
+    return this.prisma.$transaction(async (tx) => {
+      const user = await tx.user.create({
+        data: {
+          email: input.email,
+          name: input.name,
+          passwordHash,
+          role: Role.USER,
+          oauthProvider: input.oauthProvider ?? null,
+          oauthSubject: input.oauthSubject ?? null,
+          githubTokenEnc: input.githubTokenEnc ?? null,
+        },
+      });
+      // Abonnement ACTIVE immédiat (pas de paiement → pas d'état PENDING).
+      const subscription = await tx.subscription.create({
+        data: {
+          userId: user.id,
+          productId: input.product.id,
+          status: SubscriptionStatus.ACTIVE,
+        },
+      });
+      await tx.auditLog.create({
+        data: {
+          actorId: user.id,
+          actorEmail: user.email,
+          action: 'subscription.create',
+          resourceType: 'subscription',
+          resourceId: subscription.id,
+          details: { productId: input.product.id, productName: input.product.name, via: 'free-signup' },
+        },
+      });
+      return user;
+    });
   }
 
   /** Shared atomic create for a brand-new order-time account (email+password or OAuth). */

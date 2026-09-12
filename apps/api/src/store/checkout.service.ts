@@ -11,12 +11,17 @@ import {
   InvoiceStatus,
   OrderStatus,
   Prisma,
+  SubscriptionStatus,
 } from '@prisma/client';
 import * as bcrypt from 'bcryptjs';
 import { AuditService } from '../audit/audit.service';
+import { JwtPayload } from '../auth/types';
 import { RATE, rateKey, SaRateLimiter } from '../auth/rate-limiter';
 import { MailSettingsService } from '../mail/mail-settings.service';
 import { PrismaService } from '../prisma/prisma.service';
+import { CloudflareService } from '../cloudflare/cloudflare.service';
+import { regexFromRejectPattern } from './subdomain.util';
+import { clientAreaUrl, loginUrl } from './web-links';
 import { ProductsService, PublicProduct } from '../products/products.service';
 import { CheckoutDto } from './dto/checkout.dto';
 import { ProvisioningService } from './provisioning.service';
@@ -65,14 +70,22 @@ export class CheckoutService {
     private readonly limiter: SaRateLimiter,
     private readonly mail: MailSettingsService,
     private readonly provisioning: ProvisioningService,
+    private readonly cloudflare: CloudflareService,
   ) {}
 
   /**
-   * POST /store/checkout — valide la configuration, recale les montants, crée
-   * User + Customer + Order(PAID) + Invoice(PAID) atomiquement, envoie l'email
-   * avec le mot de passe temporaire.
+   * POST /store/checkout — tunnel de commande UNIQUE pour l'espace client et le
+   * visiteur invité (Bloc 2). Valide la configuration, recale les montants, crée
+   * User + Customer + Order(PAID) + Invoice(PAID) atomiquement (invité) ou
+   * réutilise le compte + abonnement existants (membre connecté → upgrade order
+   * -driven), envoie l'email. Après paiement : upgrade → `syncAppLimits` sur les
+   * apps déjà déployées ; création → provisioning réel (Bloc D).
    */
-  async checkoutGuest(dto: CheckoutDto, ip?: string): Promise<CheckoutResult> {
+  async checkoutGuest(
+    dto: CheckoutDto,
+    ip?: string,
+    user?: JwtPayload | null,
+  ): Promise<CheckoutResult> {
     const rl = this.limiter.consume(
       rateKey(ip, 'store-checkout'),
       RATE.checkoutIntent.limit,
@@ -86,6 +99,9 @@ export class CheckoutService {
 
     // 1. Produit commandable (ACTIVE, non masqué) + configuration vendable.
     const product = await this.products.findPublicBySlug(dto.productSlug);
+    // Sous-domaine choisi (produits porteurs d'une FreeSubdomainRule) : normalisé
+    // + dispo vérifiée (fail-fast). Null sinon → le provisioning auto-génère.
+    const requestedSubdomain = await this.resolveRequestedSubdomain(product, dto.subdomain);
 
     // 2. Moyen de paiement actif (jamais les secrets — PaymentMethod.config est
     //    non secret, configEnc reste chiffré et n'est pas lu ici).
@@ -100,11 +116,66 @@ export class CheckoutService {
     const { lines, amountHtCents, taxAmountCents, amountTtcCents, taxRatePercent } =
       this.buildPricing(product, dto);
 
-    // 4. Clé d'idempotence : hash déterministe de la configuration + montant.
-    const email = dto.email.trim().toLowerCase();
-    const key = this.idempotencyKey(dto, method.id, amountTtcCents, email);
+    // 4. Résolution du compte. Invité → User+Customer créés dans la transaction.
+    //    Client connecté (OptionalJwtAuthGuard) → on RÉUTILISE le User + Customer
+    //    existants (Customer.userId @unique) : email/nom autoritaires depuis le
+    //    jeton, jamais depuis le corps. C'est le chemin « upgrade depuis l'espace
+    //    client » — il passe bien par la procédure de commande store.
+    let member: {
+      userId: string;
+      email: string;
+      name: string;
+      phone: string | null;
+      customerId: string | null;
+    } | null = null;
+    if (user?.sub) {
+      const authed = await this.prisma.user.findUnique({
+        where: { id: user.sub },
+        select: { id: true, email: true, name: true },
+      });
+      if (authed) {
+        // `Customer.userId` est un scalaire @unique (pas de relation Prisma
+        // User↔Customer dans le schéma) → on lit le Customer par userId.
+        const customer = await this.prisma.customer.findUnique({
+          where: { userId: authed.id },
+        });
+        member = {
+          userId: authed.id,
+          email: authed.email,
+          name: authed.name ?? '',
+          phone: customer?.phone ?? null,
+          customerId: customer?.id ?? null,
+        };
+      }
+    }
 
-    // 5. Replay (double-clic / retry identique) : on renvoie la commande déjà
+    // Email/nom de RÉCEPTION (où l'on notifie + à qui on livre l'accès) : pour un
+    // membre, toujours le compte (login). Pour un invité, les coordonnées saisies.
+    const receiptEmail = member ? member.email : dto.email.trim().toLowerCase();
+    const receiptName = member ? member.name : dto.name;
+
+    // Requête (point 6) — membre connecté : choix du détail de facturation.
+    //   true (défaut)  = facturer sous les coordonnées du compte (nom/email/tél. du compte).
+    //   false          = facturer sous d'autres coordonnées (nom/email/téléphone du corps),
+    //                    comme les gros hébergeurs (coordonnées de société sur la facture).
+    // Dans les DEUX cas, l'abonnement et l'espace restent liés au User authentifié
+    // (user.sub, on ne change jamais l'email de connexion) ; seuls la commande et
+    // la facture portent les coordonnées de facturation choisies.
+    const useAccount = !!member && dto.useAccountDetails !== false;
+    const billingName = useAccount ? member!.name : dto.name;
+    const billingEmail = useAccount
+      ? member!.email
+      : dto.email.trim().toLowerCase();
+    const billingPhone = useAccount
+      ? member!.phone ?? null
+      : (dto.phone ?? null);
+
+    // 5. Clé d'idempotence : hash déterministe de la configuration + montant.
+    //    Basée sur les coordonnées de FACTURATION (billingEmail) : un changement
+    //    de mode (compte/autres coordonnées) produit bien une commande distincte.
+    const key = this.idempotencyKey(dto, method.id, amountTtcCents, billingEmail);
+
+    // 6. Replay (double-clic / retry identique) : on renvoie la commande déjà
     //    créée, SANS recréer de compte ni de commande (§7 idempotence).
     const replay = await this.prisma.order.findUnique({ where: { idempotencyKey: key } });
     if (replay) {
@@ -114,44 +185,63 @@ export class CheckoutService {
       return {
         orderId: replay.id,
         invoiceNumber: invoice?.number ?? '',
-        email,
+        email: receiptEmail,
         nextStep: 'provisioning-pending',
       };
     }
 
-    // 6. Un compte avec cet email existe déjà (commandé avec une AUTRE config ou
-    //    par login classique) → on ne crée pas de doublon.
-    const existingUser = await this.prisma.user.findUnique({ where: { email } });
-    if (existingUser) {
-      throw new ConflictException(
-        'Un compte existe déjà avec cet email — connectez-vous pour commander.',
-      );
+    // 7. Invité uniquement : pas de doublon de compte. Un membre déjà connecté ne
+    //    déclenche jamais ce contrôle (c'est son propre compte). Le mot de passe
+    //    temporaire n'existe que pour l'invité.
+    const tempPassword = member ? null : randomBytes(12).toString('hex');
+    const passwordHash = tempPassword ? await bcrypt.hash(tempPassword, 10) : null;
+    if (!member) {
+      const existingUser = await this.prisma.user.findUnique({ where: { email: billingEmail } });
+      if (existingUser) {
+        throw new ConflictException(
+          'Un compte existe déjà avec cet email — connectez-vous pour commander.',
+        );
+      }
     }
 
-    // 7. Transaction atomique post-paiement.
-    const tempPassword = randomBytes(12).toString('hex');
-    const passwordHash = await bcrypt.hash(tempPassword, 10);
+    // 8. Transaction atomique post-paiement.
     try {
       const created = await this.prisma.$transaction(async (tx) => {
-        const user = await tx.user.create({
-          data: { email, name: dto.name, role: 'USER', passwordHash },
-        });
-        const customer = await tx.customer.create({
-          data: {
-            email,
-            name: dto.name,
-            phone: dto.phone ?? null,
-            accountType: CustomerAccountType.FULL,
-            userId: user.id,
-          },
-        });
+        let user: { id: string };
+        let customer: { id: string };
+        if (member) {
+          user = { id: member.userId };
+          customer = member.customerId
+            ? { id: member.customerId }
+            : await tx.customer.create({
+                data: {
+                  email: member.email,
+                  name: member.name,
+                  accountType: CustomerAccountType.FULL,
+                  userId: member.userId,
+                },
+              });
+        } else {
+          user = await tx.user.create({
+            data: { email: billingEmail, name: dto.name, role: 'USER', passwordHash: passwordHash! },
+          });
+          customer = await tx.customer.create({
+            data: {
+              email: billingEmail,
+              name: dto.name,
+              phone: dto.phone ?? null,
+              accountType: CustomerAccountType.FULL,
+              userId: user.id,
+            },
+          });
+        }
         const billing = await this.claimInvoiceSequence(tx);
         const order = await tx.order.create({
           data: {
             customerId: customer.id,
-            customerName: dto.name,
-            customerEmail: email,
-            customerPhone: dto.phone ?? null,
+            customerName: billingName,
+            customerEmail: billingEmail,
+            customerPhone: billingPhone,
             productId: product.id,
             productName: product.name,
             packId: product.packId ?? null,
@@ -171,6 +261,7 @@ export class CheckoutService {
               ? this.addonsSnapshot(dto, product)
               : Prisma.JsonNull,
             idempotencyKey: key,
+            requestedSubdomain,
           },
         });
         const invoice = await tx.invoice.create({
@@ -186,9 +277,9 @@ export class CheckoutService {
             amountTtcCents,
             paidAt: new Date(),
             billingAddress: {
-              name: dto.name,
-              email,
-              phone: dto.phone ?? null,
+              name: billingName,
+              email: billingEmail,
+              phone: billingPhone,
               ...(dto.extraFields ?? {}),
             },
             lines: {
@@ -210,27 +301,72 @@ export class CheckoutService {
             orderId: order.id,
             status: OrderStatus.PAID,
             note: 'Paiement validé (simulation instantanée).',
-            actorEmail: email,
+            actorEmail: billingEmail,
           },
         });
-        return { user, order, invoice, billing };
+
+        // Bloc 1 — modèle d'abonnement order-driven. Tout produit à pack crée ou
+        // UPGRADE l'abonnement du client dès le paiement (le paiement vaut
+        // approbation ; l'admin garde suspendre/réactiver/ré-synchroniser).
+        // Un produit sans pack (ex. Installation Fees) ne crée pas d'abonnement.
+        let subscription: { id: string } | null = null;
+        let subscriptionAction: 'upgraded' | 'created' | null = null;
+        if (product.packId) {
+          const active = await tx.subscription.findFirst({
+            where: { userId: user.id, status: SubscriptionStatus.ACTIVE },
+            orderBy: { createdAt: 'desc' },
+          });
+          if (active) {
+            // Upgrade : repointe la MÊME ligne (données/apps/sous-domaines
+            // préservés), relie la commande à l'origine de l'upgrade.
+            subscription = await tx.subscription.update({
+              where: { id: active.id },
+              data: { productId: product.id, orderId: order.id },
+            });
+            subscriptionAction = 'upgraded';
+          } else {
+            subscription = await tx.subscription.create({
+              data: {
+                userId: user.id,
+                productId: product.id,
+                status: SubscriptionStatus.ACTIVE,
+                orderId: order.id,
+              },
+            });
+            subscriptionAction = 'created';
+          }
+        }
+
+        return { user, order, invoice, billing, subscription, subscriptionAction };
       });
 
       await this.traceAudit(product.id, created.order.id, amountTtcCents, method.id, true);
 
-      // 7. Email best-effort : mot de passe temporaire + annonce du sous-domaine.
-      await this.sendAccountEmail(email, dto.name, tempPassword, created.billing.invoiceNumber)
-        .catch((e) => this.traceAudit(product.id, created.order.id, amountTtcCents, method.id, false, String(e)));
+      // 7. Email best-effort : compte créé (mot de passe temporaire) OU
+      //    confirmation d'abonnement mis à jour (membre) — jamais bloquant.
+      await this.sendPostCheckoutEmail(
+        receiptEmail,
+        receiptName,
+        tempPassword,
+        created.billing.invoiceNumber,
+        created.subscriptionAction,
+      ).catch((e) => this.traceAudit(product.id, created.order.id, amountTtcCents, method.id, false, String(e)));
 
-      // 8. Provisioning réel (Bloc D) : fire-and-forget, jamais bloquant (§10).
-      //    En cas de produit sans ProvisionMethod, provisionOrder passe ACTIVE
-      //    immédiatement sans appel Coolify/Cloudflare.
-      this.provisioning.provisionOrder(created.order.id).catch(() => {});
+      // 8. Provisioning réel, fire-and-forget, jamais bloquant (§10).
+      //    - upgrade : on NE crée PAS de nouvelle app — on ré-applique les
+      //      limites du nouveau pack aux apps déjà déployées (data préservée).
+      //    - création ou produit sans pack (ex. Installation Fees) : provisionOrder,
+      //      qui passe ACTIVE immédiatement s'il n'y a aucune action à exécuter.
+      if (created.subscriptionAction === 'upgraded') {
+        this.provisioning.syncAppLimits(created.subscription!.id).catch(() => {});
+      } else {
+        this.provisioning.provisionOrder(created.order.id).catch(() => {});
+      }
 
       return {
         orderId: created.order.id,
         invoiceNumber: created.billing.invoiceNumber,
-        email,
+        email: receiptEmail,
         nextStep: 'provisioning-pending',
       };
     } catch (e) {
@@ -249,7 +385,7 @@ export class CheckoutService {
           return {
             orderId: existing.id,
             invoiceNumber: inv?.number ?? '',
-            email,
+            email: receiptEmail,
             nextStep: 'provisioning-pending',
           };
         }
@@ -395,19 +531,19 @@ export class CheckoutService {
     });
   }
 
-  /** Hash déterministe : email + slug + options + addons + moyen + montant TTC. */
+  /** Hash déterministe : adresse de facturation + slug + options + addons + moyen + montant TTC. */
   private idempotencyKey(
     dto: CheckoutDto,
     methodId: string,
     amountTtcCents: number,
-    email: string,
+    billingEmail: string,
   ): string {
     const options = [...(dto.options ?? [])]
       .map((o) => `${o.optionId}:${o.choiceId}`)
       .sort()
       .join(',');
     const addons = [...(dto.addonIds ?? [])].sort().join(',');
-    const payload = [email, dto.productSlug, options, addons, methodId, amountTtcCents].join('|');
+    const payload = [billingEmail, dto.productSlug, options, addons, methodId, amountTtcCents].join('|');
     return createHash('sha256').update(payload).digest('hex');
   }
 
@@ -449,32 +585,106 @@ export class CheckoutService {
     });
   }
 
-  /** Email de compte (mot de passe temporaire) — best-effort, jamais bloquant. */
-  private async sendAccountEmail(
+  /**
+   * Email de confirmation post-commande — best-effort, jamais bloquant.
+   * - Invité (nouveau compte) : identifiants + mot de passe temporaire.
+   * - Membre (upgrade) : confirmation que l'abonnement est mis à jour, données
+   *   et applications conservées.
+   */
+  private async sendPostCheckoutEmail(
     to: string,
     name: string,
-    tempPassword: string,
+    tempPassword: string | null,
     invoiceNumber: string,
+    subscriptionAction: 'upgraded' | 'created' | null,
   ): Promise<void> {
-    await this.mail.sendPlain({
-      to,
-      subject: `Vos détails de compte Code Diali — commande ${invoiceNumber}`,
-      text: [
-        `Bonjour ${name},`,
+    const isUpgrade = subscriptionAction === 'upgraded';
+    const isNewAccount = !!tempPassword;
+    const lines: string[] = [
+      `Bonjour ${name},`,
+      '',
+    ];
+    if (isUpgrade) {
+      lines.push(
+        `Votre abonnement a été mis à jour (commande ${invoiceNumber}).`,
+        'Vos données et votre/vos application(s) sont conservées, et les ressources',
+        'de votre nouveau plan ont été appliquées.',
         '',
-        `Votre paiement a bien été validé (commande ${invoiceNumber}).`,
+      );
+    } else {
+      lines.push(
+        `Votre paiement a bien été validé (commande ${invoiceNumber}). Votre`,
+        'abonnement est actif et votre application est en cours de préparation :',
+        'vous recevrez son adresse (sous-domaine) par email dès qu’elle sera en ligne.',
         '',
-        'Voici vos identifiants de compte :',
+      );
+    }
+    // Espace client — où le client suit ses apps, son abonnement et ses factures.
+    lines.push(
+      'Votre espace client :',
+      `  ${clientAreaUrl()}`,
+      '',
+    );
+    if (isNewAccount) {
+      lines.push(
+        'Voici vos identifiants de connexion :',
         `  Email : ${to}`,
         `  Mot de passe temporaire : ${tempPassword}`,
         '',
-        'Connectez-vous puis changez ce mot de passe dès que possible.',
+        'Connectez-vous sur cette page :',
+        `  ${loginUrl()}`,
         '',
-        'Votre application est en cours de préparation. Dès qu’elle sera prête,',
-        'vous recevrez par email l’adresse (sous-domaine) pour y accéder.',
+        'Changez ce mot de passe dès votre première connexion, puis rendez-vous',
+        'dans l’espace client pour suivre votre abonnement et votre application.',
         '',
-        'L’équipe Code Diali',
-      ].join('\n'),
+      );
+    } else {
+      lines.push(
+        'Retrouvez votre abonnement, vos applications et vos factures dans l’espace client.',
+        '',
+      );
+    }
+    lines.push('L’équipe Code Diali');
+    await this.mail.sendPlain({
+      to,
+      subject: isUpgrade
+        ? `Votre abonnement a été mis à jour — commande ${invoiceNumber}`
+        : `Vos accès Code Diali — commande ${invoiceNumber}`,
+      text: lines.join('\n'),
     });
+  }
+
+  /**
+   * Sous-domaine choisi au checkout (produits porteurs d'une FreeSubdomainRule) :
+   * normalisé, dispo vérifiée en fail-fast. Retourne null si absent/non applicable
+   * → le provisioning auto-génère un sous-domaine (comportement Bloc E). La
+   * désallocation atomique reste garantie par allocateClientSubdomain au déploiement.
+   */
+  private async resolveRequestedSubdomain(
+    product: PublicProduct,
+    subdomain?: string,
+  ): Promise<string | null> {
+    const raw = subdomain?.trim();
+    if (!raw) return null;
+    const rule = product.freeSubdomainRule;
+    if (!rule) return null; // produit sans sous-domaine → ignoré
+    const sub = raw.toLowerCase();
+    if (sub.length < (rule.minLength ?? 3) || sub.length > (rule.maxLength ?? 40)) {
+      throw new BadRequestException(
+        `Sous-domaine invalide (longueur ${rule.minLength ?? 3}-${rule.maxLength ?? 40} caractères).`,
+      );
+    }
+    if (rule.rejectPattern && regexFromRejectPattern(rule.rejectPattern)?.test(sub)) {
+      throw new BadRequestException(`Sous-domaine « ${sub} » non autorisé.`);
+    }
+    const domainId =
+      rule.allowedDomainIds?.[0] ??
+      (await this.prisma.domain.findFirst({ where: { status: 'ACTIVE' } }))?.id;
+    if (!domainId) throw new BadRequestException('Aucun domaine racine disponible.');
+    const res = await this.cloudflare.checkSubdomainAvailability(sub, domainId);
+    if (!res.available) {
+      throw new BadRequestException(`Sous-domaine déjà pris : ${res.fqdn}`);
+    }
+    return sub;
   }
 }

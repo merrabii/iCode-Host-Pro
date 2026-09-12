@@ -163,6 +163,179 @@ async function main(): Promise<void> {
   await seedPaymentsAndBilling();
   await seedDefaultTaxRate();
   await seedDeployGithubProduct();
+  await seedFreePlan();
+}
+
+/**
+ * Bloc 6 — « Plan Gratuit » : produit à $0 + pack Starter minimal.
+ *
+ * Objectif (directive D) : un client peut commander le plan gratuit → le
+ * checkout store (Bloc 1) crée un abonnement ACTIVE → l'espace client est réel
+ * (quota affiché, déploiement petit). Le pack est VOLONTAIREMENT petit
+ * (256 Mo / 0.5 CPU / 1 app) pour valider aussi la sécurité Bloc 3 (un build
+ * lourd sous ce petit pack échoue l'APP seule, le serveur reste opérationnel).
+ *
+ * Idempotent : upsert par slug/name ; le pack « Starter » est créé s'il
+ * n'existe pas (rattaché au module de déploiement par défaut actif).
+ */
+async function seedFreePlan(): Promise<void> {
+  const FREE_SLUG = 'plan-gratuit';
+  const FREE_NAME = 'Plan Gratuit';
+
+  // 1. Pack « Starter » minimal (256 Mo / 0.5 CPU / 1 app), rattaché au module
+  // de déploiement. On PRÉFÈRE le module par-client (kind PER_CLIENT_PROJECT) :
+  // c'est la voie éprouvée en Bloc E — le projet partagé du module de type
+  // SHARED_PROJECT peut être hors d'accès du token Coolify (réel : HTTP 403
+  // "You are not allowed to access the API" sur le module A) et bloque CREATE_APP.
+  const perClient =
+    (await prisma.deploymentModule.findFirst({
+      where: { isActive: true, kind: 'PER_CLIENT_PROJECT' },
+    })) ??
+    (await prisma.deploymentModule.findFirst({ where: { isActive: true } }));
+  const module = perClient;
+  let pack = await prisma.hostingPack.findFirst({ where: { name: 'Starter' } });
+  if (!pack) {
+    pack = await prisma.hostingPack.create({
+      data: {
+        name: 'Starter',
+        description: 'Pack d’hébergement minimal du Plan Gratuit — pour valider l’upgrade sans perte (Bloc 6).',
+        ramMb: 256,
+        cpuCores: 0.5,
+        maxApps: 1,
+        status: 'ACTIVE',
+        deploymentModuleId: module?.id ?? null,
+      },
+    });
+    console.log(`  ✔ Pack « Starter » créé (256 Mo / 0.5 CPU / 1 app).`);
+  } else {
+    console.log(`  ✔ Pack « Starter » déjà présent (conservé).`);
+  }
+
+  // 2. Produit « Plan Gratuit » ($0, MONTHLY) relié au pack Starter.
+  const existing = await prisma.product.findFirst({ where: { slug: FREE_SLUG } });
+  const product = existing
+    ? await prisma.product.update({
+        where: { id: existing.id },
+        data: {
+          name: FREE_NAME,
+          status: ProductStatus.ACTIVE,
+          hidden: false,
+          color: '#00b377',
+          displayOrder: 0,
+          packId: pack.id,
+          priceHtCents: 0,
+          billingCycle: BillingCycle.MONTHLY,
+          installationFeeCents: 0,
+          allowEditConfig: true,
+          // Phase 16 — inscription autonome SANS checkout (décision B) : ce
+          // flag débloque /auth/free-signup + le mode OAuth `free`.
+          freePlan: true,
+          slogan: 'Commencez gratuitement — un vrai espace client et un déploiement.',
+          shortDescription:
+            'Une souscription active (payée = 0) vous donne un espace client réel, un quota et un petit déploiement. Vous pouvez passer au plan supérieur à tout moment, sans perdre vos données.',
+        },
+      })
+    : await prisma.product.create({
+        data: {
+          name: FREE_NAME,
+          kind: 'generic',
+          status: ProductStatus.ACTIVE,
+          hidden: false,
+          color: '#00b377',
+          displayOrder: 0,
+          slug: FREE_SLUG,
+          packId: pack.id,
+          priceHtCents: 0,
+          billingCycle: BillingCycle.MONTHLY,
+          installationFeeCents: 0,
+          allowEditConfig: true,
+          // Phase 16 — inscription autonome SANS checkout (décision B).
+          freePlan: true,
+          slogan: 'Commencez gratuitement — un vrai espace client et un déploiement.',
+          shortDescription:
+            'Une souscription active (payée = 0) vous donne un espace client réel, un quota et un petit déploiement. Vous pouvez passer au plan supérieur à tout moment, sans perdre vos données.',
+        },
+      });
+
+  // Champs de facturation (replace idempotent) — détails de compte sur l'email.
+  await prisma.productCheckoutField.deleteMany({ where: { productId: product.id } });
+  await prisma.productCheckoutField.createMany({
+    data: DEFAULT_FIELDS.map((f, i) => ({ ...f, productId: product.id, sortOrder: i })),
+  });
+
+  // 3. Câblage ProvisionMethod réel (occurrence "coolify-github") : le Plan
+  // Gratuit déploie désormais une VRAIE app (site static par défaut) sur le
+  // sous-domaine choisi par le client — pas un simple compte. Actions éprouvées
+  // du Bloc E : CONFIGURE_DNS (sous-domaine demandé) → CREATE_APP → GENERATE_SSL.
+  const method = await prisma.provisionMethod.upsert({
+    where: { code: 'coolify-github' },
+    update: {},
+    create: {
+      name: 'Coolify — Déploiement GitHub',
+      code: 'coolify-github',
+      description:
+        'Attribue le sous-domaine gratuit (Cloudflare) D’ABORD, crée l’application depuis un dépôt GitHub public et y pose le domaine AVANT le premier déploiement, puis gère le SSL.',
+      endpoint: '/applications/public',
+      actions: [
+        ProvisionAction.CONFIGURE_DNS,
+        ProvisionAction.CREATE_APP,
+        ProvisionAction.GENERATE_SSL,
+      ],
+      isActive: true,
+    },
+  });
+
+  // Domaine racine Cloudflare (sous-domaine gratuit) + paramètres du dépôt static.
+  const freeRoot = await prisma.domain.findFirst({
+    where: { status: 'ACTIVE' },
+    orderBy: { createdAt: 'asc' },
+  });
+
+  await prisma.product.update({
+    where: { id: product.id },
+    data: {
+      provisionModuleId: method.id,
+      moduleParams: {
+        // App static par défaut de la première commande : guide de démarrage
+        // Code Diali (Vite/React/Tailwind → vite build → dist). Remplaçable par
+        // l'admin sur la fiche produit (« Application par défaut »).
+        //
+        // NB infra (vérifié live 2026-09-11) : le dépôt est un Vite/React app qui
+        // DOIT être buildé → `build_pack` nixpacks (pas « static », qui sert le
+        // repo brut → page blanche). Le repo porte un `.nvmrc` = 22 (nixpacks
+        // choisit sinon node 18 → échec build, binding @tailwindcss/oxide). On
+        // publie `dist/` statiquement via `publishDirectory` + `isStatic`.
+        repoUrl: 'https://github.com/merrabii/Code-Diali-Guide-de-Demarrage.git',
+        branch: 'main', // branche par défaut de `Code-Diali-Guide-de-Demarrage`
+        buildPack: 'nixpacks', // build réel du repo → dist
+        publishDirectory: '/dist', // publie la sortie `vite build` en statique
+        isStatic: true,
+        appName: 'plan-gratuit',
+      } as Prisma.InputJsonObject,
+    },
+  });
+
+  // Règle de sous-domaine gratuit (même domaine racine + contraintes que
+  // « Deploy my GitHub App ») → le sélecteur de la page produit fonctionne.
+  if (freeRoot) {
+    await prisma.freeSubdomainRule.upsert({
+      where: { productId: product.id },
+      update: { allowedDomainIds: [freeRoot.id] },
+      create: {
+        productId: product.id,
+        allowedDomainIds: [freeRoot.id],
+        reservedPrefixes: ['www', 'mail', 'smtp', 'api', 'panel', 'admin', 'cdn', 'portal', 'host'],
+        minLength: 3,
+        maxLength: 40,
+        allowedChars: 'a-z0-9-',
+        rejectPattern: '(?i)^(www|mail|smtp|api|panel|admin|cdn|portal|host)$',
+      },
+    });
+  }
+
+  console.log(
+    `  ✔ "Plan Gratuit" → /shop/plan-gratuit (0 $/mois) — pack=${pack.name}, method=${method.code}, root=${freeRoot?.name ?? '(aucun)'}.`,
+  );
 }
 
 /**

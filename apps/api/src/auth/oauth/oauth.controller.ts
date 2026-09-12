@@ -38,6 +38,8 @@ interface StatePayload {
   mode: OAuthMode;
   /** Present only in link mode — the account the identity is attached to. */
   sub?: string;
+  /** Present only in free mode — the free-plan slug to subscribe on signup. */
+  plan?: string;
   exp: number;
 }
 
@@ -94,11 +96,20 @@ export class OAuthController {
   @ApiOperation({ summary: 'Start OAuth login (public) — redirects to the provider' })
   async authorize(
     @Param('provider') provider: string,
+    @Query('mode') mode: string | undefined,
+    @Query('plan') plan: string | undefined,
     @Res() res: Response,
   ) {
     if (!this.isProvider(provider)) throw new BadRequestException('Fournisseur inconnu.');
     if (!(await this.oauth.isEnabled(provider))) {
       throw new ForbiddenException('Fournisseur OAuth désactivé.');
+    }
+    // Mode « free » (Plan Gratuit, Phase 16) : inscription autonome sans checkout.
+    if (mode === 'free') {
+      const slug = (plan ?? '').trim();
+      if (!slug) throw new BadRequestException('Plan Gratuit requis (paramètre plan).');
+      await this.redirectToProvider(res, provider, 'free', undefined, slug);
+      return;
     }
     await this.redirectToProvider(res, provider, 'login');
   }
@@ -139,11 +150,12 @@ export class OAuthController {
     provider: OAuthProvider,
     mode: OAuthMode,
     sub?: string,
+    plan?: string,
   ): Promise<void> {
     const ttl = this.oauthTtlSeconds();
     const state = randomBytes(24).toString('base64url');
     const token = await this.jwt.signAsync(
-      { state, mode, sub } as StatePayload,
+      { state, mode, sub, plan } as StatePayload,
       { expiresIn: ttl },
     );
     this.cookies.setOauthState(res, token, ttl);
@@ -198,7 +210,7 @@ export class OAuthController {
     if (payload.mode === 'link' && payload.sub) {
       return this.handleLink(res, provider, payload.sub, profile);
     }
-    return this.handleLoginOrRegister(res, req, provider, profile);
+    return this.handleLoginOrRegister(res, req, provider, profile, payload.mode, payload.plan);
   }
 
   // ── Scenario: link to an existing authenticated account ─────────────────────
@@ -238,9 +250,30 @@ export class OAuthController {
     req: OAuthRequest,
     provider: OAuthProvider,
     profile: { email: string; accessToken: string },
+    mode: OAuthMode | undefined,
+    plan: string | undefined,
   ) {
     const existing = await this.prisma.user.findUnique({ where: { email: profile.email } });
     if (!existing) {
+      // Phase 16 — free mode (Plan Gratuit, no checkout): create the account +
+      // an ACTIVE free subscription, bound to the product flagged `freePlan`.
+      if (mode === 'free') {
+        const fund = await this.auth.freeProductBySlug(plan);
+        const user = await this.auth.createFreeAccount({
+          email: profile.email,
+          name: null,
+          oauthProvider: provider,
+          oauthSubject: profile.email,
+          ...(provider === 'github'
+            ? { githubTokenEnc: this.crypto.encrypt(profile.accessToken) }
+            : {}),
+          product: fund,
+        });
+        await this.auditOauth(user, 'oauth.register.free', provider);
+        const tokens = await this.auth.issueTokens(user);
+        this.cookies.setRefresh(res, tokens.refreshToken);
+        return res.redirect(this.webBaseUrl() + '/client?free=ok');
+      }
       // No account: creation is allowed ONLY during an order (checkout intent).
       const checkoutProductId = await this.checkout.readProductId(
         req.cookies?.[this.cookies.checkoutName],

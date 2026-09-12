@@ -15,6 +15,7 @@ import { CheckoutService } from './checkout.service';
 import { SaRateLimiter, RATE, rateKey } from './rate-limiter';
 import { RegisterDto } from './dto/register.dto';
 import { LoginDto } from './dto/login.dto';
+import { FreeSignupDto } from './dto/free-signup.dto';
 import { AcceptInviteDto } from './dto/accept-invite.dto';
 import { ChangePasswordDto } from './dto/change-password.dto';
 import { CurrentUser } from './decorators/current-user.decorator';
@@ -39,6 +40,20 @@ export class AuthController {
     private readonly limiter: SaRateLimiter,
   ) {
     this.cookieName = this.config.get<string>('cookieName') ?? DEFAULT_COOKIE;
+  }
+
+  @Post('free-signup')
+  @ApiOperation({
+    summary: 'Free-plan self signup (no checkout intent) — email/password only',
+  })
+  async freeSignup(
+    @Body() dto: FreeSignupDto,
+    @Req() req: CookieRequest,
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    const tokens = await this.auth.freeSignup(dto, req.ip);
+    this.setCookie(res, tokens);
+    return { accessToken: tokens.accessToken };
   }
 
   @Post('register')

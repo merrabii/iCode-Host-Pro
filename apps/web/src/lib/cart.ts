@@ -34,6 +34,9 @@ export interface CartItem {
   options: Record<string, { id: string; label: string; priceDeltaHtCents: number }>;
   // addons cochés : addonId → { id, name, priceHtCents }
   addons: Record<string, { id: string; name: string; priceHtCents: number }>;
+  // Sous-domaine choisi par le client (produits à FreeSubdomainRule — Plan Gratuit,
+  // « Deploy my GitHub App »). À défaut (null/absent), l'API le génère.
+  subdomain?: string;
 }
 
 export function emptyCart(): CartItem | null {
@@ -84,6 +87,9 @@ export interface BuyerContact {
   email: string;
   phone: string;
   paymentMethodId?: string;
+  /** Point 6 : membre connecté → true = facturer sous les coordonnées du compte ;
+   *  false = autres coordonnées de facturation ; absent = invité (coordonnées saisies). */
+  useAccountDetails?: boolean;
 }
 
 const CONTACT_KEY = 'codiali.contact.v1';

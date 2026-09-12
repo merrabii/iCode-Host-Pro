@@ -223,13 +223,31 @@ export function inviteLink(token: string, email: string): string {
   return `/auth?${q.toString()}`;
 }
 
-// ── Phase 5 (ADR-021) — client workspace (Subscription / Service) ───────────
+// ── Phase 5 (ADR-021) — client workspace (Subscription) ────────────────────
+// Bloc 4 : la table Service a été supprimée — tout abonnement/service passe par
+// POST /store/checkout (order-driven). Aucune création manuelle.
 export interface ProductRef {
   id: string;
   name: string;
   kind?: string;
   status?: string;
   pack?: PackMin | null;
+}
+export interface SubscriptionOrderRef {
+  id: string;
+  productName?: string | null;
+  status?: string | null;
+  amountTtcCents?: number | null;
+  currency?: string | null;
+  createdAt?: string | null;
+}
+export interface SubscriptionDeploymentRef {
+  id: string;
+  repoFullName: string;
+  appName?: string | null;
+  status?: string | null;
+  fqdn?: string | null;
+  createdAt?: string | null;
 }
 export interface Subscription {
   id: string;
@@ -239,46 +257,81 @@ export interface Subscription {
   createdAt: string;
   updatedAt: string;
   product?: ProductRef;
-  user?: { id: string; email: string; name?: string | null };
-  services?: Array<{ id: string; name: string; status: string }>;
+  /** Commande store à l'origine (création ou upgrade) — 1:1. */
+  order?: SubscriptionOrderRef | null;
+  /** Abonné (admin) — apps déployées incluses (Bloc 5). */
+  user?: {
+    id: string;
+    email: string;
+    name?: string | null;
+    deployments?: SubscriptionDeploymentRef[];
+  };
 }
 export interface ServerRef {
   id: string;
   name: string;
   hostname: string;
 }
-export interface Service {
-  id: string;
-  name: string;
-  status: string;
-  subscriptionId: string;
-  server?: ServerRef | null;
-  subscription?: {
-    id: string;
-    status?: string;
-    product?: ProductRef;
-    user?: { id: string; email: string; name?: string | null };
-  };
-  createdAt: string;
-  updatedAt: string;
-}
 
 // Client-scoped.
 export const listMySubscriptions = (t: string) => apiJson('/api/client/subscriptions', t);
-export const createMySubscription = (t: string, productId: string) =>
-  apiJson('/api/client/subscriptions', t, { method: 'POST', body: JSON.stringify({ productId }) });
 export const cancelMySubscription = (t: string, id: string) =>
   apiJson(`/api/client/subscriptions/${id}/cancel`, t, { method: 'PATCH' });
-/** Mise à niveau d'une souscription ACTIVE vers un autre produit/pack (Phase 13) —
- *  la même ligne d'abonnement est basculée : apps et données préservées. */
-export const upgradeMySubscription = (t: string, id: string, productId: string) =>
-  apiJson(`/api/client/subscriptions/${id}/upgrade`, t, {
-    method: 'PATCH',
-    body: JSON.stringify({ productId }),
+/** Checkout store (Bloc 2/4) : commander/upgrader passe par la procédure de commande.
+ *  Connecté, POST /store/checkout réutilise le compte et upgrade la MÊME
+ *  souscription ACTIVE (produit à pack → repoint productId, data préservée). */
+export const storeCheckout = async (payload: {
+  productSlug: string;
+  name: string;
+  email: string;
+  phone?: string;
+  paymentMethodId: string;
+  options?: Array<{ optionId: string; choiceId: string }>;
+  addonIds?: string[];
+  extraFields?: Record<string, string>;
+  /** Sous-domaine choisi par le client (produits porteurs d'une FreeSubdomainRule). */
+  subdomain?: string;
+  /** Point 6 : membre connecté → facturer sous les coordonnées du compte (true) ou
+   *  sous d'autres coordonnées de facturation (false). Inutile pour l'invité. */
+  useAccountDetails?: boolean;
+}): Promise<ApiResult> => {
+  // Tunnel de commande UNIQUE (Bloc 2) : le checkout API reconnaît le client via
+  // le header `Authorization: Bearer` (OptionalJwtAuthGuard). Sans token → invité.
+  // On CF le jeton (mint via /auth/refresh) quand une session existe, pour que le
+  // membre connecté soit reconnu (upgrade + détails de facturation du compte).
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  const token = await getAccessToken();
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const res = await fetch('/api/store/checkout', {
+    method: 'POST',
+    headers,
+    credentials: 'include',
+    body: JSON.stringify(payload),
   });
-export const listMyServices = (t: string) => apiJson('/api/client/services', t);
-export const createMyService = (t: string, subscriptionId: string, name: string) =>
-  apiJson('/api/client/services', t, { method: 'POST', body: JSON.stringify({ subscriptionId, name }) });
+  let data: unknown = null;
+  try { data = await res.json(); } catch { /* non-JSON */ }
+  return { ok: res.ok, status: res.status, data };
+};
+
+/** Vérif PUBLIC de disponibilité d'un sous-domaine au checkout (POST /store/subdomain/check).
+ *  Contraintes (longueur/allowedChars/rejectPattern) + dispo réelle Cloudflare. */
+export async function checkStoreSubdomain(
+  productSlug: string,
+  subdomain: string,
+): Promise<{ available: boolean; fqdn: string; reason?: string } | null> {
+  try {
+    const res = await fetch('/api/store/subdomain/check', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ productSlug, subdomain }),
+    });
+    if (!res.ok) return null;
+    const data = (await res.json()) as { available: boolean; fqdn: string; reason?: string };
+    return { available: !!data.available, fqdn: data.fqdn, reason: data.reason };
+  } catch {
+    return null;
+  }
+}
 
 // ── Phase 6 (ADR-022) — mail settings + invitation emails ────────────────────
 /** Masked view of the SMTP settings — the stored password is NEVER exposed. */
@@ -392,6 +445,16 @@ export interface ProductAdmin {
   // Réglages store (récap /cart).
   allowEditConfig?: boolean;
   installationFeeCents?: number;
+  // Déploiement par défaut (admin) : l'app/projet servi à la première commande.
+  provisionModuleId?: string | null;
+  moduleParams?: {
+    repoUrl?: string | null;
+    branch?: string | null;
+    buildPack?: string | null;
+    appName?: string | null;
+    publishDirectory?: string | null;
+    isStatic?: boolean | null;
+  } | null;
 }
 /** Référence pack (limites présentées à l'admin + client). storageLimit = quota
  *  disque ENREGISTRÉ mais NON actif encore (système de quota après la mise en prod). */
@@ -583,7 +646,18 @@ export const createProduct = (
 export const updateProduct = (
   t: string,
   id: string,
-  patch: { name?: string; kind?: string; status?: string; categoryId?: string | null; packId?: string | null },
+  patch: {
+    name?: string; kind?: string; status?: string; categoryId?: string | null; packId?: string | null;
+    provisionModuleId?: string | null;
+    moduleParams?: {
+      repoUrl?: string;
+      branch?: string;
+      buildPack?: string;
+      appName?: string;
+      publishDirectory?: string;
+      isStatic?: boolean;
+    };
+  },
 ) => apiJson(`/api/products/${id}`, t, { method: 'PATCH', body: JSON.stringify(patch) });
 export const deleteProduct = (t: string, id: string) =>
   apiJson(`/api/products/${id}`, t, { method: 'DELETE' });
@@ -632,12 +706,9 @@ export const deletePack = (t: string, id: string) =>
 export const adminListSubscriptions = (t: string) => apiJson('/api/admin/subscriptions', t);
 export const adminUpdateSubscription = (t: string, id: string, status: string) =>
   apiJson(`/api/admin/subscriptions/${id}`, t, { method: 'PATCH', body: JSON.stringify({ status }) });
-export const adminListServices = (t: string) => apiJson('/api/admin/services', t);
-export const adminUpdateService = (
-  t: string,
-  id: string,
-  patch: { status?: string; serverId?: string | null },
-) => apiJson(`/api/admin/services/${id}`, t, { method: 'PATCH', body: JSON.stringify(patch) });
+/** Ré-synchronise les limites RAM/CPU du pack sur les apps déployées (Bloc 2/3). */
+export const adminSyncSubscriptionLimits = (t: string, id: string) =>
+  apiJson(`/api/admin/subscriptions/${id}/resync-limits`, t, { method: 'POST' });
 
 // ═══ Phase 10 (ADR-027) — sécurité, comptes & support ════════════════════════
 
@@ -744,6 +815,23 @@ export interface PublicProduct {
   installationFeeCents?: number;
   taxRate?: { id: string; name: string; ratePercent: string | number } | null;
   checkoutFields?: CheckoutFieldView[];
+  // Présence = le produit exige un sous-domaine choisi au checkout (Plan Gratuit,
+  // « Deploy my GitHub App ») → le sélecteur de la page produit s'affiche.
+  freeSubdomainRule?: FreeSubdomainRuleView | null;
+  // Phase 16 — Plan Gratuit : inscription autonome SANS checkout (décision B).
+  // true → bouton « Commencez gratuitement » (visiteur) / « Créer un nouveau
+  // Projet » (connecté) au lieu du tunnel de commande / panier.
+  freePlan?: boolean;
+}
+
+/** Règle de sous-domaine gratuit d'un produit (contraintes + domaines racines). */
+export interface FreeSubdomainRuleView {
+  minLength: number;
+  maxLength: number;
+  allowedChars?: string | null;
+  reservedPrefixes: string[];
+  rejectPattern?: string | null;
+  allowedDomainIds: string[];
 }
 
 /** Champ de facturation configurable (admin) exposé au visiteur (enabled only). */
@@ -879,6 +967,36 @@ export async function register(input: {
 }): Promise<ApiResult> {
   try {
     const res = await fetch('/api/auth/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify(input),
+    });
+    let data: unknown = null;
+    try {
+      data = await res.json();
+    } catch {
+      /* non-JSON body */
+    }
+    return { ok: res.ok, status: res.status, data };
+  } catch (e) {
+    return { ok: false, status: 0, data: { message: String(e) } };
+  }
+}
+
+/**
+ * Phase 16 — inscription autonome du Plan Gratuit, SANS checkout-intent.
+ * Boundée au produit flaggé `freePlan` par le serveur (pas de facture, pas de
+ * moyen de paiement) : crée compte + abonnement ACTIVE. Cookie refresh posé.
+ */
+export async function freeSignup(input: {
+  email: string;
+  password: string;
+  name?: string;
+  planSlug?: string;
+}): Promise<ApiResult> {
+  try {
+    const res = await fetch('/api/auth/free-signup', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       credentials: 'include',
@@ -1166,8 +1284,7 @@ export type BuildPack = (typeof BUILD_PACKS)[number];
 export interface Deployment {
   id: string;
   userId: string;
-  // Phase 13 — optionnel : déployer sans Service (cible résolue par pack→module).
-  serviceId?: string | null;
+  // Bloc 4 : plus de Service — la cible est toujours le pack ACTIF → module A/B.
   serverId?: string | null;
   repoFullName: string;
   /** URL git collée (mode URL) — null en mode GitHub lié. */
@@ -1185,7 +1302,6 @@ export interface Deployment {
   createdAt: string;
   updatedAt: string;
   /** Références masquées — jamais l'UUID Coolify ni l'adresse du serveur. */
-  service?: { id: string; name: string } | null;
   server?: { id: string; name: string } | null;
 }
 /** Résultat de la détection automatique d'une URL (Phase 10bis.5). */
@@ -1232,12 +1348,14 @@ export interface ClientDeploymentsPayload {
   quota: ClientDeployQuota | null;
 }
 /** Déploiement : mode GitHub lié (repoFullName) OU mode URL (repoUrl) — exactement un.
- *  `serviceId` est OPTIONNEL (Phase 13) : absent, la cible est résolue depuis le
- *  pack ACTIF du client (abonnement ACTIVE → produit → pack → module A/B). */
+ *  Bloc 4 : la cible est TOUJOURS le pack ACTIF du client (abonnement ACTIVE →
+ *  produit → pack → module A/B). Aucun `serviceId` — la table Service est supprimée.
+ *  Phase 16 : les champs de build sont PRÉ-REMPLIS depuis `codediali.toml` /
+ *  `netlify.toml` / détection serveur (jamais autoritaires venant du client) —
+ *  le serveur les re-déduit et les applique à Coolify. */
 export const createDeployment = (
   t: string,
   dto: {
-    serviceId?: string;
     repoFullName?: string;
     repoUrl?: string;
     branch?: string;
@@ -1245,8 +1363,50 @@ export const createDeployment = (
     appName?: string;
     /** Phase 3 — sous-domaine gratuit choisi (vide/absent = slug auto). */
     subdomain?: string;
+    // Phase 16 — build « file-based » (page de build professionnelle).
+    baseDirectory?: string;
+    buildCommand?: string;
+    installCommand?: string;
+    publishDirectory?: string;
+    functionsDirectory?: string;
+    environment?: Record<string, string>;
   },
 ) => apiJson('/api/client/deployments', t, { method: 'POST', body: JSON.stringify(dto) });
+
+// ── Phase 16 — config de build « file-based » (Netlify-style) ────────────────
+/** Source qui a produit la config de build (préremplissage, jamais autoritaire). */
+export type BuildConfigSource = 'codediali.toml' | 'netlify.toml' | 'none';
+export interface BuildConfig {
+  pack?: string;
+  baseDirectory?: string;
+  buildCommand?: string;
+  installCommand?: string;
+  publishDirectory?: string;
+  functionsDirectory?: string;
+  /** Variables d'environnement du BUILD (déjà sanitizées par le serveur). */
+  environment: Record<string, string>;
+  source: BuildConfigSource;
+}
+/** Pré-remplit la page de build depuis codediali.toml/netlify.toml/détection. */
+export const previewBuildConfig = (
+  t: string,
+  repoFullName: string,
+  branch?: string,
+) =>
+  apiJson('/api/client/deployments/preview', t, {
+    method: 'POST',
+    body: JSON.stringify({ repoFullName, ...(branch ? { branch } : {}) }),
+  });
+/** Détecte un dépôt vide (aucun fichier sur la branche) avant le déploiement. */
+export const checkRepoEmpty = (
+  t: string,
+  repoFullName: string,
+  branch?: string,
+) =>
+  apiJson('/api/client/deployments/check-empty', t, {
+    method: 'POST',
+    body: JSON.stringify({ repoFullName, ...(branch ? { branch } : {}) }),
+  });
 
 // ═══ Phase 13 — Modules/méthodes de déploiement (A/B) ════════════════════════
 export type DeploymentModuleKind = 'SHARED_PROJECT' | 'PER_CLIENT_PROJECT';

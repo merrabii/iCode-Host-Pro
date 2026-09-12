@@ -27,7 +27,7 @@ ProvisioningService.provisionOrder(orderId)   (fire-and-forget)
 ├─ CREATE_APP ────► PanelTransport.createGitApp(target, {repoUrl, branch, buildPack, ...})
 │     (ensuite)      → POST /applications/public (Coolify)
 │                     → setAppDomain(appUuid, fqdn)  ⚠️ AVANT le déploiement
-│                     → applyAppLimits(pack) (best-effort)
+│                     → applyAppLimits(pack)  ⚠️ OBLIGATOIRE (Bloc 3, voir §6)
 │                     → deployApp(appUuid)  le build porte l'étiquette traefik du fqdn
 │
 └─ GENERATE_SSL ───► best-effort « SSL géré par Cloudflare (proxied) »
@@ -138,6 +138,10 @@ première app validée ci-dessus.
 
 Un sous-domaine client ne répond pas ? Dans l'ordre :
 
+**(Bloc 3 — sécurité des ressources sur serveur partagé)** Avant de diagnostiquer, rappel :
+l'application des limites du pack est **OBLIGATOIRE** (voir §6). Ne JAMAIS laisser une app sans
+plafond sur un box partagé.
+
 1. **DNS** : `nslookup <sous-domaine>.arumdigital.com` → doit renvoyer les IP Cloudflare
    proxied (`188.114.x.y` / `2a06:98c1:…`). Sinon : CNAME absent → vérifier côté Cloudflare.
 2. **App Coolify** : `GET /applications/:uuid` → `status` doit être `running:*`.
@@ -147,6 +151,44 @@ Un sous-domaine client ne répond pas ? Dans l'ordre :
 3. **Étiquette traefik** bonne mais 503 → regarder `ports_exposes` (P5).
 4. **Provisioning** : `GET /store/admin/orders/:id/provision?force=1` (admin) pour relancer une
    étape ratée (idempotent : sous-domaine déjà alloué → repris).
+
+---
+
+## 6. Sécurité des ressources sur serveur partagé (Bloc 3)
+
+Directive sécurité : **un build client lourd ne doit jamais planter le serveur, seulement échouer
+l'app**. Toutes les apps d'un même serveur **partagent** les ressources (on ne réserve rien),
+chacune étant **plafonnée** par les limites de son pack.
+
+### Principe
+- Quand une commande crée une app, le provisioning applique les **limites CPU/RAM du pack**
+  (`limits_cpus` / `limits_memory`) via `PanelTransport.applyAppLimits` → `PATCH /applications/:uuid`.
+- Coolify plafonne le **container applicatif ET de build**. Un build qui dépasse la RAM du pack
+  → **OOM contenu dans le container limité** → l'app passe `FAILED` seule, les autres apps et le
+  serveur restent opérationnels.
+- **Aucune réservation** : la capacité machine est partagée, chaque app est bornée par son propre
+  pack. (Les produits à ressources dédiées/non partagées sont une étape ultérieure.)
+
+### Application des limites : OBLIGATOIRE (fail-closed)
+- Les limites sont appliquées aux **deux chemins de création** :
+  - `DeploymentsService.create()` (Phase 10bis) : si le pack porte des limites et que
+    `applyAppLimits` échoue → la `Deployment` est marquée **FAILED** avec le message
+    « Limites pack non appliquées sur serveur partagé — app NON créée ». L'app n'est jamais laissée
+    sans plafond sur un box partagé.
+  - `ProvisioningService.actionCreateApp()` (store) : idem — un échec d'application des limites
+    échoue la step `create_app` (l'ordre reste en PROVISIONING pour relance admin).
+- **Mise à niveau d'un abonnement (Commander depuis l'espace client)** : le checkout repointe la
+  MÊME souscription, puis `ProvisioningService.syncAppLimits(subscriptionId)` ré-applique les
+  limites du **nouveau** pack aux apps **déjà déployées** (resize best-effort par app, données et
+  sous-domaines préservés). Même action via l'admin : bouton **« Ré-synchroniser les ressources »**
+  sur la page Abonnements.
+
+### Vérification live (GATE A)
+- Créer une app avec un **petit pack** (ex. 256 Mo / 0.5 CPU — le « Plan Gratuit », Bloc 6) lançant
+  un build lourd (nixpacks Node riche) → le build doit être plafonné/OOM **dans son container**,
+  l'app passe FAILED, **le serveur répond toujours** (les autres apps répondent, pas d'OOM serveur).
+- Ressources Espace client : le quota d'apps du pack ACTIF est affiché (RAM/CPU par app, max apps),
+  `syncAppLimits` re-plafonne les apps existantes après un upgrade.
 
 ---
 

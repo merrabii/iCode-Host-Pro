@@ -6,26 +6,27 @@ import {
 import {
   PackStatus,
   ProductStatus,
-  Service,
-  ServiceStatus,
   Subscription,
   SubscriptionStatus,
 } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuditService } from '../audit/audit.service';
 import { Actor } from '../users/users.service';
-import { CreateSubscriptionDto } from './dto/create-subscription.dto';
-import { UpdateSubscriptionDto } from './dto/update-subscription.dto';
 import { UpgradeSubscriptionDto } from './dto/upgrade-subscription.dto';
-import { CreateServiceDto } from './dto/create-service.dto';
-import { UpdateServiceDto } from './dto/update-service.dto';
+import { UpdateSubscriptionDto } from './dto/update-subscription.dto';
+import { ProvisioningService } from '../store/provisioning.service';
 
 // Phase 5 (ADR-021): client workspace. One module, one shared service, two
 // controllers — /client/* (any authenticated, ownership enforced here) and
 // /admin/* (RolesGuard ADMIN at the controller). Client-side lookups always go
 // through findMySubscription / where { userId } so another client's id returns
-// 404 (no existence leak). Provisioning is a STATUS-TRANSITION STUB: no real
-// provider deploy (ADR-010) and no async jobs (ADR-007), still out of scope.
+// 404 (no existence leak).
+//
+// Bloc 1/4 — modèle order-driven : la création ET l'upgrade d'un abonnement
+// passent par la procédure de commande (store checkout) ; le paiement vaut
+// approbation et le checkout crée/upgrade l'abonnement ACTIVE. La table
+// `Service` a été supprimée (Décision c). Ici on ne garde que la lecture
+// client, les transitions d'état admin et le helper d'upgrade interne.
 
 // Admin subscription transitions — strict whitelist (approve/reject only from
 // PENDING; suspend/activate only between ACTIVE and SUSPENDED).
@@ -51,49 +52,12 @@ const SUBSCRIPTION_TRANSITIONS: Record<
   },
 };
 
-// Admin service transitions — provisioning is a stub two-step path.
-const SERVICE_TRANSITIONS: Record<
-  string,
-  { to: ServiceStatus; action: string }
-> = {
-  [`${ServiceStatus.REQUESTED}->${ServiceStatus.PROVISIONING}`]: {
-    to: ServiceStatus.PROVISIONING,
-    action: 'service.provision',
-  },
-  [`${ServiceStatus.PROVISIONING}->${ServiceStatus.ACTIVE}`]: {
-    to: ServiceStatus.ACTIVE,
-    action: 'service.activate',
-  },
-};
-
-// `select` shape for a service returned after an admin update (relations +
-// scalars; used with select, since include cannot mix scalar fields).
-const SERVICE_SELECT = {
-  id: true,
-  name: true,
-  status: true,
-  serverId: true,
-  createdAt: true,
-  updatedAt: true,
-  subscriptionId: true,
-  subscription: {
-    select: {
-      id: true,
-      status: true,
-      product: { select: { id: true, name: true } },
-      user: {
-        select: { id: true, email: true, name: true },
-      },
-    },
-  },
-  server: { select: { id: true, name: true, hostname: true } },
-} as const;
-
 @Injectable()
 export class SubscriptionsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly audit: AuditService,
+    private readonly provisioning: ProvisioningService,
   ) {}
 
   // ───────────────────────── Client-scoped ─────────────────────────────────
@@ -109,57 +73,24 @@ export class SubscriptionsService {
     return sub;
   }
 
-  /** USER: subscribe to a visible product → PENDING. */
-  async createSubscription(
-    dto: CreateSubscriptionDto,
-    actor: Actor,
-  ): Promise<Subscription> {
-    const product = await this.prisma.product.findUnique({
-      where: { id: dto.productId },
-    });
-    if (!product) {
-      throw new NotFoundException('Produit introuvable.');
-    }
-    if (
-      product.status === ProductStatus.DRAFT ||
-      product.status === ProductStatus.DISABLED
-    ) {
-      throw new BadRequestException(
-        'Ce produit n’est pas disponible à la souscription.',
-      );
-    }
-    const subscription = await this.prisma.subscription.create({
-      data: { userId: actor.sub, productId: dto.productId },
-    });
-    await this.audit.record({
-      actorId: actor.sub,
-      actorEmail: actor.email,
-      action: 'subscription.create',
-      resourceType: 'subscription',
-      resourceId: subscription.id,
-      details: { productId: dto.productId, productName: product.name },
-    });
-    return subscription;
-  }
-
-  /** USER: list own subscriptions (product + services included). */
+  /** USER: list own subscriptions (product included). */
   async listMySubscriptions(actor: Actor) {
     return this.prisma.subscription.findMany({
       where: { userId: actor.sub },
       include: {
         product: { select: { id: true, name: true, kind: true, status: true } },
-        services: { select: { id: true, name: true, status: true } },
       },
       orderBy: { createdAt: 'desc' },
     });
   }
 
   /**
-   * USER: mise à niveau d'une souscription ACTIVE vers un autre produit/pack.
-   * La MÊME ligne d'abonnement est basculée (createdAt, services, apps et
-   * données préservés — aucune suppression ni redéploiement) ; les limites
-   * RAM/CPU et le quota d'apps du NOUVEAU pack s'appliquent aux prochains
-   * déploiements. Le produit cible doit être disponible et son pack ACTIVE.
+   * User: mis à niveau d'une souscription ACTIVE vers un autre produit/pack.
+   * Helper INTERNE idempotent — la MÊME ligne d'abonnement est basculée
+   * (createdAt, données et apps préservés — aucune suppression). Le checkout
+   * store (Bloc 1) est le seul chemin public : il repointe l'abonnement puis
+   * `syncAppLimits` ré-applique les nouvelles limites (Bloc 2). Aucune route
+   * publique ne l'expose (Décision 3 : tout passe par la commande).
    */
   async upgradeMySubscription(
     id: string,
@@ -216,13 +147,13 @@ export class SubscriptionsService {
     return updated;
   }
 
-  /** USER: cancel an own PENDING/ACTIVE/SUSPENDED subscription → CANCELLED. */
+  /** USER: cancel an own ACTIVE/SUSPENDED subscription → CANCELLED. */
   async cancelMySubscription(id: string, actor: Actor): Promise<Subscription> {
     const sub = await this.findMySubscription(id, actor.sub);
     if (
-      sub.status !== SubscriptionStatus.PENDING &&
       sub.status !== SubscriptionStatus.ACTIVE &&
-      sub.status !== SubscriptionStatus.SUSPENDED
+      sub.status !== SubscriptionStatus.SUSPENDED &&
+      sub.status !== SubscriptionStatus.PENDING
     ) {
       throw new BadRequestException(
         'Cette souscription ne peut pas être annulée.',
@@ -243,66 +174,34 @@ export class SubscriptionsService {
     return updated;
   }
 
-  /** USER: request a Service under an own ACTIVE subscription → REQUESTED. */
-  async createMyService(dto: CreateServiceDto, actor: Actor): Promise<Service> {
-    const sub = await this.findMySubscription(dto.subscriptionId, actor.sub);
-    if (sub.status !== SubscriptionStatus.ACTIVE) {
-      throw new BadRequestException(
-        'Souscription non active : impossible de demander un service.',
-      );
-    }
-    const service = await this.prisma.service.create({
-      data: { name: dto.name, subscriptionId: sub.id },
-    });
-    await this.audit.record({
-      actorId: actor.sub,
-      actorEmail: actor.email,
-      action: 'service.request',
-      resourceType: 'service',
-      resourceId: service.id,
-      details: { name: service.name, subscriptionId: sub.id },
-    });
-    return service;
-  }
+  // ────────────────────────── Admin-scoped ─────────────────────────────────
 
   /**
-   * USER: list own services. Deliberately WITHOUT the server — the client never
-   * sees infrastructure (ADR-021), so serverId/server are not exposed here (the
-   * scalar serverId is excluded via an explicit select).
+   * ADMIN: list every subscription (Bloc 5 refonte — table « Abonnements »).
+   * Chaque ligne porte : client, produit, pack (limites), commande liée (order
+   * store) et apps déployées (Deployment) pour un aperçu complet de l'admin.
    */
-  async listMyServices(actor: Actor) {
-    return this.prisma.service.findMany({
-      where: { subscription: { userId: actor.sub } },
-      select: {
-        id: true,
-        name: true,
-        status: true,
-        createdAt: true,
-        updatedAt: true,
-        subscription: {
+  async listAllSubscriptions() {
+    return this.prisma.subscription.findMany({
+      include: {
+        product: {
           select: {
             id: true,
-            product: {
+            name: true,
+            kind: true,
+            status: true,
+            pack: {
               select: {
                 id: true,
                 name: true,
-                pack: { select: { id: true, name: true, ramMb: true, cpuCores: true, storageLimit: true, bandwidth: true } },
+                ramMb: true,
+                cpuCores: true,
+                maxApps: true,
+                storageLimit: true,
               },
             },
           },
         },
-      },
-      orderBy: { createdAt: 'desc' },
-    });
-  }
-
-  // ────────────────────────── Admin-scoped ─────────────────────────────────
-
-  /** ADMIN: list every subscription (client, product + services). */
-  async listAllSubscriptions() {
-    return this.prisma.subscription.findMany({
-      include: {
-        product: { select: { id: true, name: true, kind: true, status: true } },
         user: {
           select: {
             id: true,
@@ -310,9 +209,31 @@ export class SubscriptionsService {
             name: true,
             role: true,
             isActive: true,
+            // NB : la table `Service` a disparu (Bloc 4) — les apps du client
+            // sont les Deployment, résolus depuis le pack ACTIF du client.
+            deployments: {
+              select: {
+                id: true,
+                repoFullName: true,
+                appName: true,
+                status: true,
+                fqdn: true,
+                createdAt: true,
+              },
+              orderBy: { createdAt: 'desc' },
+            },
           },
         },
-        services: { select: { id: true, name: true, status: true } },
+        order: {
+          select: {
+            id: true,
+            productName: true,
+            status: true,
+            amountTtcCents: true,
+            currency: true,
+            createdAt: true,
+          },
+        },
       },
       orderBy: { createdAt: 'desc' },
     });
@@ -352,80 +273,14 @@ export class SubscriptionsService {
     return updated;
   }
 
-  /** ADMIN: list every service (client, product + assigned server). */
-  async listAllServices() {
-    return this.prisma.service.findMany({
-      include: {
-        subscription: {
-          include: {
-            user: {
-              select: { id: true, email: true, name: true },
-            },
-            product: { select: { id: true, name: true } },
-          },
-        },
-        server: { select: { id: true, name: true, hostname: true } },
-      },
-      orderBy: { createdAt: 'desc' },
-    });
-  }
-
-  /** ADMIN: assign a server and/or advance the (stubbed) provisioning status. */
-  async updateService(id: string, dto: UpdateServiceDto, actor: Actor) {
-    const service = await this.prisma.service.findUnique({
-      where: { id },
-      include: { server: true },
-    });
-    if (!service) {
-      throw new NotFoundException('Service introuvable.');
-    }
-
-    // Server assignment (client never does this).
-    if (dto.serverId !== undefined && dto.serverId !== service.serverId) {
-      if (dto.serverId !== null) {
-        const server = await this.prisma.server.findUnique({
-          where: { id: dto.serverId },
-        });
-        if (!server) {
-          throw new BadRequestException('Serveur introuvable.');
-        }
-      }
-      await this.audit.record({
-        actorId: actor.sub,
-        actorEmail: actor.email,
-        action: dto.serverId ? 'service.assign' : 'service.remove',
-        resourceType: 'service',
-        resourceId: id,
-        details: { from: service.serverId, to: dto.serverId },
-      });
-    }
-
-    // Status advancement (whitelisted stub path).
-    if (dto.status === undefined || dto.status === service.status) {
-      return this.prisma.service.update({
-        where: { id },
-        data: { serverId: dto.serverId },
-        select: SERVICE_SELECT,
-      });
-    }
-    const transition = SERVICE_TRANSITIONS[`${service.status}->${dto.status}`];
-    if (!transition) {
-      throw new BadRequestException(
-        `Transition ${service.status} → ${dto.status} non autorisée.`,
-      );
-    }
-    await this.audit.record({
-      actorId: actor.sub,
-      actorEmail: actor.email,
-      action: transition.action,
-      resourceType: 'service',
-      resourceId: id,
-      details: { from: service.status, to: transition.to, name: service.name },
-    });
-    return this.prisma.service.update({
-      where: { id },
-      data: { status: transition.to, serverId: dto.serverId },
-      select: SERVICE_SELECT,
-    });
+  /**
+   * ADMIN: ré-synchronise les limites RAM/CPU du pack actif sur les apps déjà
+   * déployées de l'abonné (Bloc 2/3 — action « Ré-synchroniser les ressources »).
+   * Délègue à ProvisioningService.syncAppLimits (resize best-effort par app,
+   * données préservées). Lève NotFound si la souscription n'existe pas.
+   */
+  async syncSubscriptionLimits(id: string) {
+    await this.prisma.subscription.findUniqueOrThrow({ where: { id } });
+    return this.provisioning.syncAppLimits(id);
   }
 }

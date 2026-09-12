@@ -13,6 +13,7 @@ import {
   acceptInvite,
   apiError,
   fetchMe,
+  freeSignup,
   getPublicAuthConfig,
   login,
   mfaConfirm,
@@ -23,7 +24,7 @@ import {
   type PublicAuthConfig,
 } from '@/lib/api';
 
-type Mode = 'login' | 'invite' | 'register';
+type Mode = 'login' | 'invite' | 'register' | 'free';
 
 export default function AuthPage() {
   const router = useRouter();
@@ -36,6 +37,8 @@ export default function AuthPage() {
   const [token, setToken] = useState('');
   // Intent de commande (inscription à la commande) depuis /offres.
   const [productName, setProductName] = useState<string | null>(null);
+  // Phase 16 — inscription autonome du Plan Gratuit (`?plan=<slug>`, sans checkout).
+  const [freeSlug, setFreeSlug] = useState<string | null>(null);
 
   // Config publique sécurité (Turnstile / OAuth / inscription).
   const [config, setConfig] = useState<PublicAuthConfig | null>(null);
@@ -69,6 +72,11 @@ export default function AuthPage() {
       setMode('register');
       const prod = params.get('product');
       if (prod) setProductName(prod === '1' ? null : prod);
+    } else if (params.get('plan')) {
+      // Phase 16 — Plan Gratuit : inscription autonome, PAS d'ordre/paiement.
+      const slug = params.get('plan') as string;
+      setFreeSlug(slug);
+      setMode('free');
     }
 
     // Étape MFA déclenchée depuis le callback OAuth (challenge posé en cookie).
@@ -144,6 +152,15 @@ export default function AuthPage() {
         const data = res.data as { accessToken: string };
         toast.ok('Compte créé — votre commande est enregistrée.');
         await gotoTarget(data.accessToken);
+        return;
+      }
+
+      if (mode === 'free') {
+        const res = await freeSignup({ email, password, name: name || undefined, planSlug: freeSlug ?? undefined });
+        if (!res.ok) throw new Error(apiError(res, 'Inscription au Plan Gratuit impossible.'));
+        const data = res.data as { accessToken: string };
+        toast.ok('Bienvenue ! Votre Plan Gratuit est actif.');
+        router.replace('/client?free=ok');
         return;
       }
 
@@ -396,7 +413,13 @@ export default function AuthPage() {
     <Shell>
       <div className="auth-card">
         <h2>
-          {mode === 'login' ? 'Connexion' : mode === 'register' ? 'Créer un compte pour commander' : 'Accepter l’invitation'}
+          {mode === 'login'
+            ? 'Connexion'
+            : mode === 'register'
+              ? 'Créer un compte pour commander'
+              : mode === 'free'
+                ? 'Commencez gratuitement'
+                : 'Accepter l’invitation'}
         </h2>
         <p>
           {mode === 'login' && 'Accédez à votre espace client et à la console de gestion.'}
@@ -404,6 +427,8 @@ export default function AuthPage() {
             (productName
               ? `Compte créé au moment de votre commande du produit « ${productName} ».`
               : 'Compte créé au moment de passer commande. L’inscription libre reste fermée.')}
+          {mode === 'free' &&
+            'Créez votre compte gratuitement — aucune carte requise. Vous pourrez déployer votre premier projet immédiatement.'}
           {mode === 'invite' && 'Un compte se crée uniquement par invitation (ADR-020).'}
         </p>
 
@@ -411,13 +436,19 @@ export default function AuthPage() {
         {mode !== 'invite' && (config?.oauthGoogleEnabled || config?.oauthGithubEnabled) && (
           <div className="auth-oauth">
             {config.oauthGoogleEnabled && (
-              <a className="btn-secondary btn-oauth" href="/api/auth/oauth/google">
+              <a
+                className="btn-secondary btn-oauth"
+                href={mode === 'free' ? `/api/auth/oauth/google?mode=free&plan=${encodeURIComponent(freeSlug ?? '')}` : '/api/auth/oauth/google'}
+              >
                 <span className="oauth-glyph oauth-g">G</span>
                 Continuer avec Google
               </a>
             )}
             {config.oauthGithubEnabled && (
-              <a className="btn-secondary btn-oauth" href={mode === 'register' ? '/api/auth/oauth/github' : '/api/auth/oauth/github'}>
+              <a
+                className="btn-secondary btn-oauth"
+                href={mode === 'free' ? `/api/auth/oauth/github?mode=free&plan=${encodeURIComponent(freeSlug ?? '')}` : '/api/auth/oauth/github'}
+              >
                 <span className="oauth-glyph oauth-gh">GH</span>
                 Continuer avec GitHub
               </a>
@@ -457,7 +488,13 @@ export default function AuthPage() {
           {config?.turnstileSiteKey && <Turnstile siteKey={config.turnstileSiteKey} onChange={setTurnstileToken} />}
           {error && <ErrorMsg>{error}</ErrorMsg>}
           <Button type="submit" disabled={busy}>
-            {mode === 'login' ? 'Connexion' : mode === 'register' ? 'Créer mon compte & passer la commande' : 'Créer mon compte'}
+            {mode === 'login'
+              ? 'Connexion'
+              : mode === 'register'
+                ? 'Créer mon compte & passer la commande'
+                : mode === 'free'
+                  ? 'Commencez gratuitement — créer mon compte'
+                  : 'Créer mon compte'}
           </Button>
         </form>
 
@@ -480,6 +517,11 @@ export default function AuthPage() {
           {mode === 'register' && (
             <Button variant="secondary" onClick={() => { setMode('login'); resetFlow(); }}>
               J’ai déjà un compte — se connecter
+            </Button>
+          )}
+          {mode === 'free' && (
+            <Button variant="secondary" onClick={() => { setMode('login'); resetFlow(); }}>
+              J’ai déjà un compte — me connecter
             </Button>
           )}
           <a className="btn-secondary btn-oauth" href="/offres" style={{ justifyContent: 'center' }}>

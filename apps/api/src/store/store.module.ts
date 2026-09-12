@@ -11,6 +11,7 @@ import { CheckoutService } from './checkout.service';
 import { PaymentMethodsController } from './payment-methods.controller';
 import { ProvisioningService } from './provisioning.service';
 import { StoreProvisioningAdminController } from './store-provisioning.admin.controller';
+import { StoreSubdomainController } from './store-subdomain.controller';
 
 /**
  * Bloc C/D — module store (tunnel d'achat sans compte, paiement simulé, provisioning).
@@ -24,6 +25,7 @@ import { StoreProvisioningAdminController } from './store-provisioning.admin.con
     BillingPaymentAdminController,
     CheckoutController,
     StoreProvisioningAdminController,
+    StoreSubdomainController,
   ],
   providers: [CheckoutService, ProvisioningService, PanelTransportFactory],
   exports: [ProvisioningService],

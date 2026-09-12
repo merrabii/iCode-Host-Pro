@@ -2,12 +2,11 @@ import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
 import {
   IsArray,
+  IsBoolean,
   IsEmail,
-  IsEnum,
   IsNotEmpty,
   IsOptional,
   IsString,
-  IsUUID,
   Matches,
   MaxLength,
   MinLength,
@@ -72,10 +71,26 @@ export class CheckoutDto {
   @Matches(/^[+0-9 ()-]{6,20}$/, { message: 'phone invalide' })
   phone?: string;
 
+  @ApiPropertyOptional({ description: 'sous-domaine choisi par le client (produits avec sous-domaine)' })
+  @IsOptional()
+  @IsString()
+  @Matches(/^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/, {
+    message: 'Sous-domaine invalide (a-z, 0-9, tirets, pas de tiret aux extrémités).',
+  })
+  subdomain?: string;
+
   @ApiProperty({ description: 'id d’un moyen de paiement actif (PaymentMethod)' })
   @IsString()
   @IsNotEmpty()
   paymentMethodId!: string;
+
+  @ApiPropertyOptional({
+    description:
+      'Membre connecté : true = réutiliser les coordonnées du compte (nom/email, défaut) ; false = facturer sous d’autres coordonnées (nom/email/téléphone du corps) — ex. une société.',
+  })
+  @IsOptional()
+  @IsBoolean()
+  useAccountDetails?: boolean;
 }
 
 /** Représentation lisible (jamais les secrets) d’un moyen de paiement pour /cart/checkout. */

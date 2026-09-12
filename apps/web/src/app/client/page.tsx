@@ -10,8 +10,6 @@ import {
   clearImpToken,
   createDeployment,
   detectDeployment,
-  createMyService,
-  createMySubscription,
   createTicket,
   decodeJwt,
   deleteMyDeployment,
@@ -24,13 +22,11 @@ import {
   githubLinkStatus,
   listGithubRepos,
   listMyDeployments,
-  listMyServices,
   listMySubscriptions,
   listMyTickets,
   listPublicProducts,
   returnFromImpersonation,
   revokeSupportCode,
-  upgradeMySubscription,
   type BuildPack,
   type ClientDeployQuota,
   type Deployment,
@@ -39,7 +35,7 @@ import {
   type GithubRepo,
   type Me,
   type ProductRef,
-  type Service,
+  type PublicProduct,
   type Subscription,
   type Ticket,
 } from '@/lib/api';
@@ -67,6 +63,7 @@ interface Product {
   name: string;
   kind: string;
   status: string;
+  slug?: string | null;
   pack?: ProductRef['pack'] | null;
 }
 
@@ -77,14 +74,7 @@ const SUB_STATUS_LABEL: Record<string, string> = {
   SUSPENDED: 'Suspendue',
   CANCELLED: 'Annulée',
 };
-const SERVICE_STATUS_LABEL: Record<string, string> = {
-  REQUESTED: 'Demandé',
-  PROVISIONING: 'En provisionnement',
-  ACTIVE: 'Actif',
-  PROBLEM: 'Problème',
-  SUSPENDED: 'Suspendu',
-  REMOVED: 'Retiré',
-};
+// Bloc 4 : la table Service a été supprimée — plus de flux « service demandé ».
 const TICKET_STATUS_LABEL: Record<string, string> = {
   OPEN: 'Ouvert',
   IN_PROGRESS: 'En cours',
@@ -154,8 +144,6 @@ export default function ClientPage() {
 
   const [products, setProducts] = useState<Product[]>([]);
   const [subs, setSubs] = useState<Subscription[]>([]);
-  const [services, setServices] = useState<Service[]>([]);
-  const [serviceName, setServiceName] = useState<Record<string, string>>({});
 
   // Support code (accès support).
   const [codeActive, setCodeActive] = useState(false);
@@ -190,19 +178,13 @@ export default function ClientPage() {
   // Suppression d'une app (confirmation en deux temps) + mise à niveau du plan.
   const [confirmDel, setConfirmDel] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
-  const [upgradingId, setUpgradingId] = useState<string | null>(null);
 
   const load = useCallback(
     async (t: string) => {
       try {
-        const [p, s, svc] = await Promise.all([
-          listPublicProducts(),
-          listMySubscriptions(t),
-          listMyServices(t),
-        ]);
+        const [p, s] = await Promise.all([listPublicProducts(), listMySubscriptions(t)]);
         setProducts((p.data as Product[]) ?? []);
         setSubs((s.data as Subscription[]) ?? []);
-        setServices((svc.data as Service[]) ?? []);
       } catch {
         toast.error('Impossible de charger l’espace client.');
       }
@@ -297,10 +279,12 @@ export default function ClientPage() {
   }, [deployEnabled, token, deployments, loadDeployments]);
 
   async function subscribe(productId: string) {
-    const r = await createMySubscription(token, productId);
-    if (!r.ok) return toast.error(apiError(r, 'Impossible de souscrire.'));
-    toast.ok('Souscription envoyée — en attente d’approbation par l’admin.');
-    void load(token);
+    const product = products.find((p) => p.id === productId);
+    const slug = product?.slug;
+    if (!slug) return toast.error('Offre indisponible à la commande.');
+    // Décision 3 (Bloc 1/4) : toute souscription passe par la procédure de
+    // commande store (POST /store/checkout recrée l'abonnement ACTIVE).
+    router.push(`/shop/${slug}`);
   }
 
   async function cancelSub(id: string) {
@@ -310,15 +294,8 @@ export default function ClientPage() {
     void load(token);
   }
 
-  async function requestService(subId: string) {
-    const name = (serviceName[subId] ?? '').trim();
-    if (!name) return;
-    const r = await createMyService(token, subId, name);
-    if (!r.ok) return toast.error(apiError(r, 'Impossible de demander un service.'));
-    setServiceName({ ...serviceName, [subId]: '' });
-    toast.ok('Service demandé.');
-    void load(token);
-  }
+  // Bloc 4 : le flux « demander un service » a été supprimé — tout abonnement
+  // passe par la procédure de commande store.
 
   // Accès support.
   async function generateCode() {
@@ -441,18 +418,16 @@ export default function ClientPage() {
   }
 
   /**
-   * Mise à niveau du plan (Phase 13) : bascule la MÊME souscription ACTIVE vers
-   * un produit/pack supérieur — applications et données préservées, seules les
-   * limites/quota des prochains déploiements changent.
+   * Mise à niveau du plan (Phase 13 → Bloc 1/4) : bascule la MÊME souscription
+   * ACTIVE vers un produit/pack supérieur via la procédure de commande store
+   * (POST /store/checkout repointe l'abonnement existant) — applications et
+   * données préservées, seules les limites/quota changent (resynchronisés).
    */
   async function upgradeTo(subId: string, productId: string) {
-    setUpgradingId(productId);
-    const r = await upgradeMySubscription(token, subId, productId);
-    setUpgradingId(null);
-    if (!r.ok) return toast.error(apiError(r, 'Mise à niveau impossible.'));
-    toast.ok('Plan mis à niveau — vos applications sont conservées.');
-    void load(token);
-    void loadDeployments(token);
+    const product = products.find((p) => p.id === productId);
+    const slug = product?.slug;
+    if (!slug) return toast.error('Offre indisponible à la commande.');
+    router.push(`/shop/${slug}`);
   }
 
   async function onReturn() {
@@ -576,8 +551,17 @@ export default function ClientPage() {
 
             <Panel
               title="Déployer une application"
-              sub="Deux façons : coller l’URL d’un dépôt git (détection automatique), ou choisir un dépôt de votre compte GitHub lié. La cible (serveur + projet Coolify) est résolue automatiquement depuis votre pack."
+              sub="Le flux de création a été enrichi (page de build professionnelle, config codediali.toml, détection de dépôt vide). Continuez ci-dessous."
             >
+              <div className="row" style={{ gap: 10, flexWrap: 'wrap', marginBottom: 14 }}>
+                <a className="btn-primary" href="/client/project">
+                  <IconPlus /> Créer un nouveau Projet
+                </a>
+                <span className="muted" style={{ fontSize: 12.5, alignSelf: 'center' }}>
+                  Page dédiée : repo GitHub ou lien, config de build pré-remplie (codediali.toml),
+                  détection de dépôt vide. Déploiement rapide ci-dessous.
+                </span>
+              </div>
               {!github ? (
                 <EmptyState>Chargement…</EmptyState>
               ) : (
@@ -879,8 +863,8 @@ export default function ClientPage() {
             ) : (
               <EmptyState>
                 {subs.length === 0
-                  ? 'Demandez une offre ci-dessous : une souscription active débloque le déploiement.'
-                  : 'Votre souscription est en attente d’approbation par l’admin.'}
+                  ? 'Commander une offre ci-dessous : une souscription active (payée) débloque le déploiement.'
+                  : 'Votre souscription n’est pas active — passez une commande pour débloquer le déploiement.'}
               </EmptyState>
             )}
 
@@ -903,11 +887,10 @@ export default function ClientPage() {
                       </div>
                       <Button
                         size="sm"
-                        disabled={isImp || upgradingId === p.id}
-                        busy={upgradingId === p.id}
+                        disabled={isImp}
                         onClick={() => upgradeTo(activeSub.id, p.id)}
                       >
-                        Mettre à niveau
+                        Commander
                       </Button>
                     </div>
                   ))}
@@ -940,95 +923,41 @@ export default function ClientPage() {
           </Panel>
         </div>
 
-        {/* ── Souscriptions & services ──────────────────────────────────── */}
+        {/* ── Souscriptions ──────────────────────────────────────────────── */}
         <div className="mt">
           <div className="section-title">
-            <h3>Souscriptions &amp; services</h3>
-            <span className="muted">Les serveurs ne sont jamais exposés côté client.</span>
+            <h3>Souscriptions</h3>
+            <span className="muted">
+              Créées par commande store — chaque commande payée crée ou met à niveau
+              votre abonnement (ACTIVE immédiat). Les serveurs ne sont jamais exposés.
+            </span>
           </div>
 
-          <div className="bottom-grid">
-            <Panel
-              title="Mes souscriptions"
-              sub="Une offre demandée reste en attente jusqu’à l’approbation par l’admin."
-            >
-              {subs.length === 0 ? (
-                <EmptyState>Demandez l&apos;une des offres ci-dessus.</EmptyState>
-              ) : (
-                <div className="stack">
-                  {subs.map((s) => (
-                    <div key={s.id} className="status-row">
-                      <span className="status-icon">
-                        <IconServer />
-                      </span>
-                      <div className="status-row-main">
-                        <div className="status-row-title">{s.product?.name ?? s.productId}</div>
-                        <div className="status-row-sub">Souscription</div>
-                      </div>
-                      <Badge tone={statusTone(s.status)}>{SUB_STATUS_LABEL[s.status] ?? s.status}</Badge>
-                      {!isImp && ['PENDING', 'ACTIVE', 'SUSPENDED'].includes(s.status) && (
-                        <Button size="sm" variant="secondary" onClick={() => cancelSub(s.id)}>
-                          Annuler
-                        </Button>
-                      )}
+          <Panel title="Mes souscriptions" sub="Historique de vos abonnements et mises à niveau.">
+            {subs.length === 0 ? (
+              <EmptyState>L&apos;une des offres ci-dessus crée votre première souscription.</EmptyState>
+            ) : (
+              <div className="stack">
+                {subs.map((s) => (
+                  <div key={s.id} className="status-row">
+                    <span className="status-icon">
+                      <IconServer />
+                    </span>
+                    <div className="status-row-main">
+                      <div className="status-row-title">{s.product?.name ?? s.productId}</div>
+                      <div className="status-row-sub">Souscription</div>
                     </div>
-                  ))}
-                </div>
-              )}
-            </Panel>
-
-            <Panel
-              title="Mes services"
-              sub="Demandez un service sous une souscription active."
-            >
-              {services.length === 0 ? (
-                <EmptyState>
-                  {activeSub ? 'Aucun service pour l’instant — demandez-en un ci-dessous.' : 'Aucune souscription active pour demander un service.'}
-                </EmptyState>
-              ) : (
-                <div className="stack">
-                  {services.map((svc) => (
-                    <div key={svc.id} className="status-row">
-                      <span className="status-icon">
-                        <IconServer />
-                      </span>
-                      <div className="status-row-main">
-                        <div className="status-row-title">{svc.name}</div>
-                        <div className="status-row-sub">
-                          Service
-                          {svc.subscription?.product?.pack && (
-                            <span className="muted">
-                              {' '}
-                              · pack {svc.subscription.product.pack.name} ({svc.subscription.product.pack.ramMb} Mo · {svc.subscription.product.pack.cpuCores} CPU)
-                            </span>
-                          )}
-                        </div>
-                      </div>
-                      <Badge tone={statusTone(svc.status)}>{SERVICE_STATUS_LABEL[svc.status] ?? svc.status}</Badge>
-                    </div>
-                  ))}
-                </div>
-              )}
-              {activeSub && (
-                <div className="row mt" style={{ gap: 8 }}>
-                  <Input
-                    className="flex-1"
-                    placeholder="Nom du nouveau service"
-                    value={serviceName[activeSub.id] ?? ''}
-                    disabled={isImp}
-                    onChange={(e) => setServiceName({ ...serviceName, [activeSub.id]: e.target.value })}
-                  />
-                  <Button
-                    size="sm"
-                    disabled={isImp || !(serviceName[activeSub.id] ?? '').trim()}
-                    onClick={() => requestService(activeSub.id)}
-                  >
-                    Demander
-                  </Button>
-                </div>
-              )}
-            </Panel>
-          </div>
+                    <Badge tone={statusTone(s.status)}>{SUB_STATUS_LABEL[s.status] ?? s.status}</Badge>
+                    {!isImp && ['ACTIVE', 'SUSPENDED'].includes(s.status) && (
+                      <Button size="sm" variant="secondary" onClick={() => cancelSub(s.id)}>
+                        Annuler
+                      </Button>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </Panel>
         </div>
 
         {/* ── Support & tickets ─────────────────────────────────────────── */}

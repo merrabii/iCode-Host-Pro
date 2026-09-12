@@ -1,5 +1,5 @@
 export type OAuthProvider = 'google' | 'github';
-export type OAuthMode = 'login' | 'link';
+export type OAuthMode = 'login' | 'link' | 'free';
 
 export interface OAuthAuthorizeInput {
   redirectUri: string;

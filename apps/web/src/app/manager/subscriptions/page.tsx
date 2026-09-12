@@ -2,12 +2,11 @@
 
 import { useEffect, useState } from 'react';
 import {
-  adminListServices,
   adminListSubscriptions,
-  adminUpdateService,
+  adminSyncSubscriptionLimits,
   adminUpdateSubscription,
   apiError,
-  Service,
+  formatCents,
   Subscription,
 } from '@/lib/api';
 import { useAdminSession } from '@/lib/session';
@@ -22,10 +21,9 @@ import {
   PageIntro,
   PageLoading,
   Panel,
-  Select,
   statusTone,
 } from '@/components/ui';
-import { IconServer } from '@/components/icons';
+import { IconBox, IconRefresh } from '@/components/icons';
 
 const SUB_STATUS_LABEL: Record<string, string> = {
   PENDING: 'En attente',
@@ -34,50 +32,35 @@ const SUB_STATUS_LABEL: Record<string, string> = {
   SUSPENDED: 'Suspendue',
   CANCELLED: 'Annulée',
 };
-const SERVICE_STATUS_LABEL: Record<string, string> = {
-  REQUESTED: 'Demandé',
+const ORDER_STATUS_LABEL: Record<string, string> = {
+  PENDING_PAYMENT: 'En attente de paiement',
+  PAID: 'Payée',
   PROVISIONING: 'En provisionnement',
-  ACTIVE: 'Actif',
-  PROBLEM: 'Problème',
-  SUSPENDED: 'Suspendu',
-  REMOVED: 'Retiré',
+  ACTIVE: 'Active',
+  SUSPENDED: 'Suspendue',
+  CANCELLED: 'Annulée',
+  REFUNDED: 'Remboursée',
 };
-
-interface ServerItem {
-  id: string;
-  name: string;
-  hostname: string;
-  status: string;
-}
+const DEP_STATUS_LABEL: Record<string, string> = {
+  PENDING: 'En file',
+  DEPLOYING: 'En cours',
+  ACTIVE: 'Déployé',
+  FAILED: 'Échec',
+};
 
 export default function ManagerSubscriptionsPage() {
   const { phase, me, token } = useAdminSession();
   const toast = useToast();
   const [subs, setSubs] = useState<Subscription[]>([]);
-  const [services, setServices] = useState<Service[]>([]);
-  const [servers, setServers] = useState<ServerItem[]>([]);
-  const [serverChoice, setServerChoice] = useState<Record<string, string>>({});
+  const [resyncId, setResyncId] = useState<string | null>(null);
 
   async function load(t: string) {
-    const [sr, ss, serversRes] = await Promise.all([
-      adminListSubscriptions(t),
-      adminListServices(t),
-      fetch('/api/servers', { headers: { Authorization: `Bearer ${t}` } }).then((r) => r.json()),
-    ]);
-    if (!sr.ok || !ss.ok) {
-      toast.error('Impossible de charger les souscriptions / services.');
+    const sr = await adminListSubscriptions(t);
+    if (!sr.ok) {
+      toast.error('Impossible de charger les abonnements.');
       return;
     }
     setSubs((sr.data as Subscription[]) ?? []);
-    setServices((ss.data as Service[]) ?? []);
-    const list = serversRes as ServerItem[];
-    setServers(list);
-    // Pre-select a server per service when none is assigned yet.
-    const choice: Record<string, string> = {};
-    for (const svc of ss.data as Service[]) {
-      choice[svc.id] = svc.server?.id ?? (list[0]?.id ?? '');
-    }
-    setServerChoice(choice);
   }
 
   useEffect(() => {
@@ -92,11 +75,17 @@ export default function ManagerSubscriptionsPage() {
     void load(token);
   }
 
-  async function changeService(id: string, patch: { status?: string; serverId?: string }) {
-    const r = await adminUpdateService(token, id, patch);
-    if (!r.ok) return toast.error(apiError(r, 'Transition refusée.'));
-    toast.ok('Service mis à jour.');
-    void load(token);
+  async function resync(id: string) {
+    setResyncId(id);
+    const r = await adminSyncSubscriptionLimits(token, id);
+    setResyncId(null);
+    if (!r.ok) return toast.error(apiError(r, 'Ré-synchronisation impossible.'));
+    const d = r.data as { checked: number; applied: number; failed: number } | null;
+    toast.ok(
+      d
+        ? `Ressources synchronisées : ${d.applied}/${d.checked} app(s) mises aux limites du pack${d.failed ? ` (${d.failed} en échec)` : ''}.`
+        : 'Ressources synchronisées.',
+    );
   }
 
   if (phase === 'loading') {
@@ -120,134 +109,132 @@ export default function ManagerSubscriptionsPage() {
       <div className="wrap-md">
         <PageIntro
           eyebrow="Administration"
-          title="Souscriptions & services"
-          sub="Le client garde le contrôle de ses souscriptions/services ; l’admin approuve et affecte une infrastructure (serveur)."
+          title="Abonnements"
+          sub="Chaque commande store payée crée ou met à niveau l’abonnement ACTIVE du client. L’admin suspend, réactive ou ré-synchronise les ressources des apps déployées."
         />
 
-        <Panel title="Souscriptions client" sub="Approbation / rejet / suspension par transaction d’état.">
+        <Panel
+          title="Abonnements client"
+          sub="Client · pack · produit · commande liée · apps déployées · actions."
+        >
           {subs.length === 0 ? (
-            <EmptyState>Aucune souscription pour l’instant.</EmptyState>
+            <EmptyState>Aucun abonnement pour l’instant — les premières commandes store les créeront.</EmptyState>
           ) : (
             <div className="table-wrap">
               <table className="table">
                 <thead>
                   <tr>
-                    <th>Offre</th>
                     <th>Client</th>
+                    <th>Produit</th>
+                    <th>Pack</th>
+                    <th>Commande</th>
                     <th>Statut</th>
                     <th className="ta-right">Actions</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {subs.map((s) => (
-                    <tr key={s.id}>
-                      <td className="cell-title">{s.product?.name ?? s.productId}</td>
-                      <td className="muted">{s.user?.email ?? '?'}</td>
-                      <td>
-                        <Badge tone={statusTone(s.status)}>{SUB_STATUS_LABEL[s.status] ?? s.status}</Badge>
-                      </td>
-                      <td>
-                        <div className="row ta-right">
-                          {s.status === 'PENDING' && (
+                  {subs.map((s) => {
+                    const pack = s.product?.pack ?? null;
+                    const apps = s.user?.deployments ?? [];
+                    const order = s.order ?? null;
+                    return (
+                      <tr key={s.id}>
+                        <td className="cell-title">
+                          {s.user?.name ?? s.user?.email ?? '?'}
+                          <div className="muted cell-sub">
+                            {s.user?.email}
+                            {apps.length ? ` · ${apps.length} app(s)` : ''}
+                          </div>
+                        </td>
+                        <td className="cell-title">
+                          {s.product?.name ?? s.productId}
+                          <div className="muted cell-sub">{s.product?.kind ?? ''}</div>
+                        </td>
+                        <td className="cell-title">
+                          {pack ? (
                             <>
-                              <Button size="sm" onClick={() => changeSub(s.id, 'ACTIVE')}>Approuver</Button>
-                              <Button size="sm" variant="secondary" onClick={() => changeSub(s.id, 'REJECTED')}>Rejeter</Button>
+                              {pack.name}
+                              <div className="muted cell-sub">
+                                {pack.ramMb} Mo · {pack.cpuCores} CPU
+                                {pack.maxApps ? ` · ${pack.maxApps} apps` : ' · apps ∞'}
+                              </div>
                             </>
+                          ) : (
+                            <span className="muted">—</span>
                           )}
-                          {s.status === 'ACTIVE' && (
-                            <Button size="sm" variant="danger" onClick={() => changeSub(s.id, 'SUSPENDED')}>Suspendre</Button>
+                        </td>
+                        <td className="cell-title">
+                          {order ? (
+                            <>
+                              <span className="muted">{order.productName ?? 'Commande'}</span>
+                              <div className="muted cell-sub">
+                                {formatCents(order.amountTtcCents)} {order.currency}{' '}
+                                · {ORDER_STATUS_LABEL[order.status ?? '' ] ?? order.status ?? ''}
+                                {order.createdAt
+                                  ? ' · ' + new Date(order.createdAt).toLocaleDateString()
+                                  : ''}
+                              </div>
+                            </>
+                          ) : (
+                            <span className="muted">—</span>
                           )}
-                          {s.status === 'SUSPENDED' && (
-                            <Button size="sm" onClick={() => changeSub(s.id, 'ACTIVE')}>Réactiver</Button>
+                        </td>
+                        <td>
+                          <Badge tone={statusTone(s.status)}>
+                            {SUB_STATUS_LABEL[s.status] ?? s.status}
+                          </Badge>
+                          {apps.length > 0 && (
+                            <div className="mt-sm muted" style={{ fontSize: 12 }}>
+                              <IconBox />
+                              {apps.slice(0, 2).map((a) => (
+                                <div key={a.id} className="muted cell-sub">
+                                  {a.appName ?? a.repoFullName}
+                                  {a.fqdn ? ` · ${a.fqdn}` : ''} ·{' '}
+                                  {DEP_STATUS_LABEL[a.status ?? ''] ?? a.status}
+                                </div>
+                              ))}
+                              {apps.length > 2 && (
+                                <div className="muted cell-sub">+{apps.length - 2} autre(s)</div>
+                              )}
+                            </div>
                           )}
-                        </div>
-                      </td>
-                    </tr>
-                  ))}
+                        </td>
+                        <td>
+                          <div className="row ta-right">
+                            {s.status === 'PENDING' && (
+                              <>
+                                <Button size="sm" onClick={() => changeSub(s.id, 'ACTIVE')}>Approuver</Button>
+                                <Button size="sm" variant="secondary" onClick={() => changeSub(s.id, 'REJECTED')}>Rejeter</Button>
+                              </>
+                            )}
+                            {s.status === 'ACTIVE' && (
+                              <Button size="sm" variant="danger" onClick={() => changeSub(s.id, 'SUSPENDED')}>Suspendre</Button>
+                            )}
+                            {s.status === 'SUSPENDED' && (
+                              <Button size="sm" onClick={() => changeSub(s.id, 'ACTIVE')}>Réactiver</Button>
+                            )}
+                            {s.status === 'ACTIVE' && (
+                              <Button
+                                size="sm"
+                                variant="secondary"
+                                disabled={resyncId === s.id}
+                                onClick={() => resync(s.id)}
+                                title="Ré-applique les limites RAM/CPU du pack sur les apps déjà déployées"
+                              >
+                                <IconRefresh />
+                                {resyncId === s.id ? 'Sync…' : 'Ré-synchroniser'}
+                              </Button>
+                            )}
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
           )}
         </Panel>
-
-        <div className="mt">
-          <Panel
-            title="Services demandés"
-            sub="Affecter un serveur existant puis provisionner (stub). Aucune infrastructure n’est exposée au client."
-          >
-            {services.length === 0 ? (
-              <EmptyState>Aucun service pour l’instant.</EmptyState>
-            ) : (
-              <div className="table-wrap">
-                <table className="table">
-                  <thead>
-                    <tr>
-                      <th>Service</th>
-                      <th>Client</th>
-                      <th>Statut</th>
-                      <th className="ta-right">Actions</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {services.map((svc) => (
-                      <tr key={svc.id}>
-                        <td className="cell-title">
-                          {svc.name}
-                          <div className="muted cell-sub">{svc.subscription?.product?.name ?? ''}</div>
-                        </td>
-                        <td className="muted">{svc.subscription?.user?.email ?? '?'}</td>
-                        <td>
-                          <Badge tone={statusTone(svc.status)}>{SERVICE_STATUS_LABEL[svc.status] ?? svc.status}</Badge>
-                        </td>
-                        <td>
-                          {(svc.status === 'REQUESTED' || svc.status === 'PROVISIONING') && (
-                            <div className="row ta-right">
-                              <Select
-                                className="select-sm"
-                                value={serverChoice[svc.id] ?? ''}
-                                onChange={(e) => setServerChoice({ ...serverChoice, [svc.id]: e.target.value })}
-                                aria-label="serveur"
-                              >
-                                <option value="">—</option>
-                                {servers.map((s) => (
-                                  <option key={s.id} value={s.id}>
-                                    {s.name} ({s.hostname})
-                                  </option>
-                                ))}
-                              </Select>
-                              <Button
-                                size="sm"
-                                disabled={!serverChoice[svc.id]}
-                                onClick={() =>
-                                  changeService(svc.id, {
-                                    status: svc.status === 'REQUESTED' ? 'PROVISIONING' : 'ACTIVE',
-                                    serverId: serverChoice[svc.id],
-                                  })
-                                }
-                              >
-                                <IconServer size={14} />
-                                {svc.status === 'REQUESTED' ? 'Affecter & provisionner' : 'Activer (stub)'}
-                              </Button>
-                            </div>
-                          )}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
-            {services.some((s) => s.server?.id) && (
-              <p className="muted cell-sub mt-sm">
-                Serveurs affectés :{' '}
-                {services
-                  .filter((s) => s.server?.id)
-                  .map((s) => s.server?.name)
-                  .join(', ')}
-              </p>
-            )}
-          </Panel>
-        </div>
       </div>
     </AppShell>
   );

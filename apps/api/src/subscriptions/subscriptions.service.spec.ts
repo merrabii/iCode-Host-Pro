@@ -11,56 +11,25 @@ describe('SubscriptionsService', () => {
     subscription: {
       findFirst: jest.fn(),
       findUnique: jest.fn(),
+      findUniqueOrThrow: jest.fn(),
       create: jest.fn(),
       findMany: jest.fn(),
-      update: jest.fn(),
-    },
-    service: {
-      create: jest.fn(),
-      findMany: jest.fn(),
-      findUnique: jest.fn(),
       update: jest.fn(),
     },
     server: { findUnique: jest.fn() },
   };
   const mockAudit = { record: jest.fn() };
+  const mockProvisioning = { syncAppLimits: jest.fn() };
   const user = { sub: 'u1', email: 'user@example.com' };
   const admin = { sub: 'a1', email: 'admin@example.com' };
 
   beforeEach(() => {
-    service = new SubscriptionsService(mockPrisma as never, mockAudit as never);
     jest.clearAllMocks();
-  });
-
-  describe('createSubscription (client)', () => {
-    it('throws NotFound when the product does not exist', async () => {
-      mockPrisma.product.findUnique.mockResolvedValue(null);
-      await expect(service.createSubscription({ productId: 'p1' }, user)).rejects.toBeInstanceOf(
-        NotFoundException,
-      );
-    });
-
-    it('throws BadRequest for a DRAFT/DISABLED product', async () => {
-      mockPrisma.product.findUnique.mockResolvedValue({ id: 'p1', status: 'DRAFT' });
-      await expect(service.createSubscription({ productId: 'p1' }, user)).rejects.toBeInstanceOf(
-        BadRequestException,
-      );
-    });
-
-    it('creates a PENDING subscription and journals it', async () => {
-      mockPrisma.product.findUnique.mockResolvedValue({ id: 'p1', name: 'Hébergement', status: 'ACTIVE' });
-      mockPrisma.subscription.create.mockResolvedValue({ id: 's1', userId: 'u1', status: 'PENDING' });
-      await expect(service.createSubscription({ productId: 'p1' }, user)).resolves.toMatchObject({
-        id: 's1',
-        status: 'PENDING',
-      });
-      expect(mockPrisma.subscription.create).toHaveBeenCalledWith({
-        data: { userId: 'u1', productId: 'p1' },
-      });
-      expect(mockAudit.record).toHaveBeenCalledWith(
-        expect.objectContaining({ action: 'subscription.create', actorId: 'u1', resourceId: 's1' }),
-      );
-    });
+    service = new SubscriptionsService(
+      mockPrisma as never,
+      mockAudit as never,
+      mockProvisioning as never,
+    );
   });
 
   describe('cancelMySubscription (client)', () => {
@@ -89,27 +58,6 @@ describe('SubscriptionsService', () => {
       });
       expect(mockAudit.record).toHaveBeenCalledWith(
         expect.objectContaining({ action: 'subscription.cancel', actorId: 'u1', resourceId: 's1' }),
-      );
-    });
-  });
-
-  describe('createMyService (client)', () => {
-    it('requires an ACTIVE own subscription', async () => {
-      mockPrisma.subscription.findFirst.mockResolvedValue({ id: 's1', status: 'PENDING' });
-      await expect(
-        service.createMyService({ subscriptionId: 's1', name: 'App' }, user),
-      ).rejects.toBeInstanceOf(BadRequestException);
-      expect(mockPrisma.service.create).not.toHaveBeenCalled();
-    });
-
-    it('creates a REQUESTED service and journals service.request', async () => {
-      mockPrisma.subscription.findFirst.mockResolvedValue({ id: 's1', status: 'ACTIVE' });
-      mockPrisma.service.create.mockResolvedValue({ id: 'sv1', name: 'App', status: 'REQUESTED' });
-      await expect(
-        service.createMyService({ subscriptionId: 's1', name: 'App' }, user),
-      ).resolves.toMatchObject({ id: 'sv1', status: 'REQUESTED' });
-      expect(mockAudit.record).toHaveBeenCalledWith(
-        expect.objectContaining({ action: 'service.request', actorId: 'u1', resourceId: 'sv1' }),
       );
     });
   });
@@ -159,70 +107,31 @@ describe('SubscriptionsService', () => {
     });
   });
 
-  describe('updateService (admin)', () => {
-    const base = { id: 'sv1', name: 'App', status: 'REQUESTED', serverId: null };
-
-    it('throws NotFound for an unknown service', async () => {
-      mockPrisma.service.findUnique.mockResolvedValue(null);
-      await expect(service.updateService('nope', { status: 'ACTIVE' }, admin)).rejects.toBeInstanceOf(
-        NotFoundException,
-      );
-    });
-
-    it('refuses to assign a server that does not exist', async () => {
-      mockPrisma.service.findUnique.mockResolvedValue({ ...base, server: null });
-      mockPrisma.server.findUnique.mockResolvedValue(null);
-      await expect(
-        service.updateService('sv1', { serverId: 'nope' }, admin),
-      ).rejects.toBeInstanceOf(BadRequestException);
-    });
-
-    it('assigns an existing server and journals service.assign', async () => {
-      mockPrisma.service.findUnique.mockResolvedValue({ ...base, server: null });
-      mockPrisma.server.findUnique.mockResolvedValue({ id: 'srv1', name: 'vps', hostname: 'vps.ihp' });
-      mockPrisma.service.update.mockResolvedValue({ ...base, serverId: 'srv1' });
-      await expect(service.updateService('sv1', { serverId: 'srv1' }, admin)).resolves.toMatchObject({
-        serverId: 'srv1',
-      });
-      expect(mockAudit.record).toHaveBeenCalledWith(
-        expect.objectContaining({ action: 'service.assign', resourceId: 'sv1' }),
-      );
-    });
-
-    it('advances REQUESTED → PROVISIONING (then → ACTIVE), stubbed', async () => {
-      mockPrisma.service.findUnique.mockResolvedValue({ ...base, server: null });
-      mockPrisma.service.update.mockResolvedValue({ ...base, status: 'PROVISIONING' });
-      await expect(
-        service.updateService('sv1', { status: 'PROVISIONING' }, admin),
-      ).resolves.toMatchObject({ status: 'PROVISIONING' });
-      expect(mockAudit.record).toHaveBeenCalledWith(
-        expect.objectContaining({ action: 'service.provision' }),
-      );
-    });
-
-    it('rejects an illegal service transition (REQUESTED → ACTIVE)', async () => {
-      mockPrisma.service.findUnique.mockResolvedValue({ ...base, server: null });
-      await expect(
-        service.updateService('sv1', { status: 'ACTIVE' }, admin),
-      ).rejects.toBeInstanceOf(BadRequestException);
-    });
-  });
-
   describe('ownership guards', () => {
-    it('listMyServices scopes to the actor’s subscriptions', async () => {
-      mockPrisma.service.findMany.mockResolvedValue([]);
-      await service.listMyServices(user);
-      expect(mockPrisma.service.findMany).toHaveBeenCalledWith(
-        expect.objectContaining({ where: { subscription: { userId: 'u1' } } }),
-      );
-    });
-
     it('listMySubscriptions scopes to the actor', async () => {
       mockPrisma.subscription.findMany.mockResolvedValue([]);
       await service.listMySubscriptions(user);
       expect(mockPrisma.subscription.findMany).toHaveBeenCalledWith(
         expect.objectContaining({ where: { userId: 'u1' } }),
       );
+    });
+  });
+
+  describe('syncSubscriptionLimits (admin)', () => {
+    it('delegates to ProvisioningService.syncAppLimits (Bloc 2/3 resync)', async () => {
+      mockPrisma.subscription.findUniqueOrThrow.mockResolvedValue({ id: 's1' });
+      mockProvisioning.syncAppLimits.mockResolvedValue({
+        subscriptionId: 's1',
+        checked: 2,
+        applied: 2,
+        failed: 0,
+      });
+      const out = await service.syncSubscriptionLimits('s1');
+      expect(mockPrisma.subscription.findUniqueOrThrow).toHaveBeenCalledWith({
+        where: { id: 's1' },
+      });
+      expect(mockProvisioning.syncAppLimits).toHaveBeenCalledWith('s1');
+      expect(out).toMatchObject({ subscriptionId: 's1', applied: 2 });
     });
   });
 });

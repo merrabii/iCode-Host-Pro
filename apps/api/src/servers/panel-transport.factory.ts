@@ -61,6 +61,19 @@ export interface CoolifyGitAppInput {
   appName?: string; // nom de l'application côté Coolify — défaut serviceName
   projectUuid?: string; // projet Coolify cible (uuid) — défaut "0" (projet par défaut)
   serverUuid?: string; // serveur Coolify cible (uuid) — défaut "0" (serveur par défaut)
+  // Publie un SPA buildé (nixpacks) en statique : `publishDirectory` ("/dist")
+  // + `isStatic` → Coolify sert la sortie de build (ex. via nginx) au lieu de
+  // lancer un serveur node. Sans ça, un repo Vite qui a `express` en dépendance
+  // ferait choisir à nixpacks un serveur node au lieu de la statique.
+  publishDirectory?: string;
+  isStatic?: boolean;
+  // Phase 16 — build « file-based » (codediali.toml) : config de build liée au
+  // dépôt (base directory monorepo, commande de build, commande d'installation)
+  // poussée à Coolify pour un build déterministe. Best-effort côté service : un
+  // champ non supporté n'annule pas la création de l'app.
+  baseDirectory?: string;
+  buildCommand?: string;
+  installCommand?: string;
 }
 
 export interface CoolifyGitAppResult {
@@ -127,6 +140,13 @@ export abstract class PanelTransport {
     target: PanelTarget,
     uuid: string,
     limits: CoolifyAppLimits,
+  ): Promise<void>;
+  /** Applique des variables d'environnement de BUILD à l'app (Phase 16,
+   *  best-effort — un échec n'annule pas le déploiement). */
+  abstract setAppEnvironment(
+    target: PanelTarget,
+    uuid: string,
+    env: Record<string, string>,
   ): Promise<void>;
   abstract deploymentStatus(
     target: PanelTarget,
@@ -411,6 +431,15 @@ class NodePanelTransport extends PanelTransport {
         git_branch: input.branch,
         name: input.appName ?? input.serviceName,
         build_pack: input.buildPack ?? 'nixpacks',
+        // Publie un SPA buildé en statique (nixpacks → dist servi par nginx).
+        // Omis si non fourni pour garder le comportement par défaut du build pack.
+        ...(input.publishDirectory ? { publish_directory: input.publishDirectory } : {}),
+        ...(input.isStatic !== undefined ? { is_static: input.isStatic } : {}),
+        // Phase 16 — build file-based : base directory (monorepo), commandes
+        // de build/install (Coolify 4.x les accepte à la création).
+        ...(input.baseDirectory ? { base_directory: input.baseDirectory } : {}),
+        ...(input.buildCommand ? { build_command: input.buildCommand } : {}),
+        ...(input.installCommand ? { install_command: input.installCommand } : {}),
       }),
     );
     if (status !== 200 && status !== 201) {
@@ -458,6 +487,42 @@ class NodePanelTransport extends PanelTransport {
     if (status !== 200 && status !== 204) {
       throw new Error(
         `Coolify API : application des limites refusée (HTTP ${status})${resp ? ` — ${resp.slice(0, 200)}` : ''}`,
+      );
+    }
+  }
+
+  /**
+   * Applique des variables d'environnement de BUILD à une app (Phase 16).
+   * Endpoint best-effort (`POST /applications/:uuid/env`) : un échec (endpoint
+   * absent sur cette version, 4xx) est remonté mais le service le tape en warn
+   * et ne bloque JAMAIS le déploiement — les env non-essentiels ne doivent pas
+   * empêcher une app de partir.
+   */
+  async setAppEnvironment(
+    target: PanelTarget,
+    uuid: string,
+    env: Record<string, string>,
+  ): Promise<void> {
+    if (!env || Object.keys(env).length === 0) return;
+    this.assertCoolify(target);
+    const base = target.baseUrl.replace(/\/+$/, '');
+    const entries = Object.entries(env).map(([key, value]) => ({
+      key,
+      value,
+      is_build_time: true,
+      is_preview: false,
+    }));
+    const { status, body } = await httpJson(
+      'POST',
+      `${base}/applications/${encodeURIComponent(uuid)}/env`,
+      { Authorization: `Bearer ${target.token}` },
+      target.strictTls,
+      this.timeoutMs,
+      JSON.stringify(entries),
+    );
+    if (status !== 200 && status !== 201 && status !== 204) {
+      throw new Error(
+        `Coolify API : variables d'environnement refusées (HTTP ${status})${body ? ` — ${body.slice(0, 200)}` : ''}`,
       );
     }
   }

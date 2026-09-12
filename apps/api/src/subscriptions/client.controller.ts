@@ -1,10 +1,8 @@
 import {
-  Body,
   Controller,
   Get,
   Param,
   Patch,
-  Post,
   UseGuards,
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
@@ -12,28 +10,20 @@ import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { JwtPayload } from '../auth/types';
 import { SubscriptionsService } from './subscriptions.service';
-import { CreateSubscriptionDto } from './dto/create-subscription.dto';
-import { UpgradeSubscriptionDto } from './dto/upgrade-subscription.dto';
-import { CreateServiceDto } from './dto/create-service.dto';
 
 // Phase 5 (ADR-021): client workspace — any authenticated user, ownership
-// enforced in the service layer (another user's resource id → 404). The client
-// catalog is the existing GET /api/products; /api/servers stays ADMIN-only.
+// enforced in the service layer (another user's resource id → 404).
+//
+// Bloc 2 — Modèle d'abonnement order-driven : la création ET l'upgrade d'un
+// abonnement ne se font PLUS ici. Toute souscription passe par la procédure
+// de commande (POST /api/store/checkout) ; le paiement vaut approbation et le
+// checkout crée/upgrade l'abonnement ACTIVE. La lecture reste ici.
 @ApiTags('client')
 @ApiBearerAuth()
 @UseGuards(JwtAuthGuard)
 @Controller('client')
 export class ClientController {
   constructor(private readonly subscriptions: SubscriptionsService) {}
-
-  @Post('subscriptions')
-  @ApiOperation({ summary: 'Subscribe to a product (USER)' })
-  createSubscription(
-    @Body() dto: CreateSubscriptionDto,
-    @CurrentUser() actor: JwtPayload,
-  ) {
-    return this.subscriptions.createSubscription(dto, actor);
-  }
 
   @Get('subscriptions')
   @ApiOperation({ summary: 'List my subscriptions (USER)' })
@@ -45,27 +35,5 @@ export class ClientController {
   @ApiOperation({ summary: 'Cancel one of my subscriptions (USER)' })
   cancelMySubscription(@Param('id') id: string, @CurrentUser() actor: JwtPayload) {
     return this.subscriptions.cancelMySubscription(id, actor);
-  }
-
-  @Patch('subscriptions/:id/upgrade')
-  @ApiOperation({ summary: 'Upgrade my ACTIVE subscription to another product/pack (USER)' })
-  upgradeMySubscription(
-    @Param('id') id: string,
-    @Body() dto: UpgradeSubscriptionDto,
-    @CurrentUser() actor: JwtPayload,
-  ) {
-    return this.subscriptions.upgradeMySubscription(id, dto, actor);
-  }
-
-  @Post('services')
-  @ApiOperation({ summary: 'Request a service under an ACTIVE subscription (USER)' })
-  createMyService(@Body() dto: CreateServiceDto, @CurrentUser() actor: JwtPayload) {
-    return this.subscriptions.createMyService(dto, actor);
-  }
-
-  @Get('services')
-  @ApiOperation({ summary: 'List my services, no infra details (USER)' })
-  listMyServices(@CurrentUser() actor: JwtPayload) {
-    return this.subscriptions.listMyServices(actor);
   }
 }

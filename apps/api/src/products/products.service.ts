@@ -58,6 +58,18 @@ const PUBLIC_INCLUDE = {
     orderBy: { sortOrder: 'asc' },
     select: { id: true, key: true, label: true, type: true, placeholder: true, required: true },
   },
+  // Présence = le produit exige un sous-domaine choisi au checkout (Plan Gratuit,
+  // « Deploy my GitHub App »…) ; fournit contraintes + domaines autorisés.
+  freeSubdomainRule: {
+    select: {
+      minLength: true,
+      maxLength: true,
+      allowedChars: true,
+      reservedPrefixes: true,
+      rejectPattern: true,
+      allowedDomainIds: true,
+    },
+  },
 } as const;
 
 /** Type produit enrichi (valeur du PUBLIC_INCLUDE) renvoyé par le catalogue/fiche
@@ -164,12 +176,32 @@ export class ProductsService {
       status?: ProductStatus;
       categoryId?: string | null;
       packId?: string | null;
+      provisionModuleId?: string | null;
+      moduleParams?: Prisma.InputJsonValue;
     } = {};
     if (dto.name !== undefined) data.name = dto.name;
     if (dto.kind !== undefined) data.kind = dto.kind;
     if (dto.status !== undefined) data.status = dto.status;
     if (dto.categoryId !== undefined) data.categoryId = dto.categoryId === '' ? null : dto.categoryId;
     if (dto.packId !== undefined) data.packId = dto.packId === '' ? null : dto.packId;
+    // Déploiement par défaut (admin) : on MERGE les clés utiles sur moduleParams
+    // existant (repoUrl/branch/buildPack/appName), on préserve les autres ; '' → null/absent,
+    // et on re-câble une autre method de provisioning si demandé ('' → null).
+    if (dto.moduleParams !== undefined || dto.provisionModuleId !== undefined) {
+      const current = (before.moduleParams as Record<string, unknown> | null) ?? {};
+      if (dto.moduleParams !== undefined) {
+        const patch = dto.moduleParams;
+        const merged: Record<string, unknown> = { ...current };
+        for (const key of ['repoUrl', 'branch', 'buildPack', 'appName'] as const) {
+          const v = patch[key];
+          if (v !== undefined) merged[key] = v === '' ? null : v;
+        }
+        data.moduleParams = merged as Prisma.InputJsonValue;
+      }
+      if (dto.provisionModuleId !== undefined) {
+        data.provisionModuleId = dto.provisionModuleId === '' ? null : dto.provisionModuleId;
+      }
+    }
     const product = await this.prisma.product.update({
       where: { id },
       data,

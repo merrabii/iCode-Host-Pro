@@ -7,7 +7,7 @@ import { StoreShell } from '@/components/store-shell';
 import { useCart } from '@/components/cart-provider';
 import { useToast } from '@/components/toast';
 import { IconChevronLeft, IconChevronRight, IconMail, IconShield } from '@/components/icons';
-import { billingCycleLabel, formatCents } from '@/lib/api';
+import { billingCycleLabel, fetchMe, formatCents, getSessionToken, type Me } from '@/lib/api';
 import { buyerStorage } from '@/lib/cart';
 
 type FieldDef = {
@@ -39,6 +39,27 @@ function CartView() {
   const [values, setValues] = useState<Record<string, string>>({});
   const [errors, setErrors] = useState<Record<string, string>>({});
 
+  // Point 6 — membre connecté : choix du détail de facturation.
+  //   'account' (défaut) = utiliser les coordonnées du compte ;
+  //   'custom'           = autres coordonnées (société / autre personne).
+  const [me, setMe] = useState<Me | null>(null);
+  const [billingMode, setBillingMode] = useState<'account' | 'custom'>('account');
+  const [sessionChecked, setSessionChecked] = useState(false);
+
+  // Détecte la session : si connecté, on propose le choix ; sinon on reste sur
+  // la saisie libre (le serveur ignorera `useAccountDetails` pour un invité).
+  useEffect(() => {
+    (async () => {
+      try {
+        const token = await getSessionToken();
+        if (!token) return;
+        const m = await fetchMe(token);
+        if (m) { setMe(m); setBillingMode('account'); }
+      } catch { /* non connecté */ }
+      finally { setSessionChecked(true); }
+    })();
+  }, []);
+
   // Champs affichés : ceux du produit (enabled) sinon les 3 par défaut.
   const fields = useMemo<FieldDef[]>(() => {
     const cf = item?.product.checkoutFields ?? [];
@@ -52,16 +73,24 @@ function CartView() {
 
   const email = (values.email ?? '').trim();
 
-  // Pré-remplir depuis le buyerStorage (retour /cart) et initialiser les valeurs.
+  // Pré-remplir depuis le buyerStorage (retour /cart) +, si connecté en mode
+  // « coordonnées du compte », depuis le profil (nom/email autoritaires).
   useEffect(() => {
     const c = buyerStorage.read();
     const init: Record<string, string> = {};
     for (const f of fields) {
       if (c && c[f.key as 'name']) init[f.key] = c[f.key as 'name'] as string;
     }
+    if (me && billingMode === 'account') {
+      if (me.name) init.name = me.name;
+      init.email = me.email;
+      for (const f of fields) {
+        if (f.type === 'EMAIL') init[f.key] = me.email;
+      }
+    }
     setValues(init);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [fields.map((f) => f.key).join(','), item?.product.id]);
+  }, [fields.map((f) => f.key).join(','), item?.product.id, me?.id, billingMode]);
 
   const optionsList = useMemo(() => Object.values(item?.options ?? {}), [item]);
   const addonsList = useMemo(() => Object.values(item?.addons ?? {}), [item]);
@@ -101,7 +130,14 @@ function CartView() {
     e.preventDefault();
     if (!item) return;
     if (!validate()) return;
-    const contact = { name: (values.name ?? '').trim(), email, phone: (values.phone ?? '').trim() };
+    const contact = {
+      name: (values.name ?? '').trim(),
+      email,
+      phone: (values.phone ?? '').trim(),
+      // Membres connectés : on transmet le choix de facturation (compte vs autres
+      // coordonnées). Invités : omis → le serveur facture sous les coordonnées saisies.
+      useAccountDetails: me ? billingMode === 'account' : undefined,
+    };
     buyerStorage.write(contact);
     toast.ok('Coordonnées enregistrées.');
     router.push('/checkout/payment');
@@ -138,6 +174,13 @@ function CartView() {
           <div className="store-summary-box">
             <h3>{item.product.name}</h3>
             <p className="muted" style={{ fontSize: 12.5 }}>{billingCycleLabel(item.product.billingCycle)}</p>
+
+            {item.subdomain && (
+              <div className="store-cart-subdomain">
+                <span className="store-recap-label">Adresse de votre application</span>
+                <span className="store-cart-subdomain-val">https://{item.subdomain}.…</span>
+              </div>
+            )}
 
             <ul className="store-totals">
               <li><span>Souscription</span><span>{formatCents(item.product.priceHtCents)}</span></li>
@@ -203,6 +246,46 @@ function CartView() {
           <div className="store-config">
             <h2>Vos coordonnées</h2>
 
+            {/* Point 6 — membre connecté : coordonnées du compte OU autres
+                coordonnées de facturation (société / autre personne). */}
+            {me && (
+              <div className="store-billing-toggle">
+                <div className="store-billing-toggle-label">Coordonnées de facturation</div>
+                <div className="store-billing-toggle-grid">
+                  <label className={`store-billing-opt${billingMode === 'account' ? ' active' : ''}`}>
+                    <input
+                      type="radio"
+                      name="billingMode"
+                      checked={billingMode === 'account'}
+                      onChange={() => setBillingMode('account')}
+                    />
+                    <span>
+                      <b>Utiliser les coordonnées de mon compte</b>
+                      <span className="muted">{me.name || ''} · {me.email}</span>
+                    </span>
+                  </label>
+                  <label className={`store-billing-opt${billingMode === 'custom' ? ' active' : ''}`}>
+                    <input
+                      type="radio"
+                      name="billingMode"
+                      checked={billingMode === 'custom'}
+                      onChange={() => setBillingMode('custom')}
+                    />
+                    <span>
+                      <b>Autres coordonnées de facturation</b>
+                      <span className="muted">Entreprise ou autre personne (nom, email, téléphone).</span>
+                    </span>
+                  </label>
+                </div>
+                {billingMode === 'account' && (
+                  <p className="muted store-billing-note" style={{ fontSize: 12 }}>
+                    La commande et la facture porteront les coordonnées de votre compte. L'accès à votre
+                    espace reste attaché à votre connexion <strong className="store-contact-email">{me.email}</strong>.
+                  </p>
+                )}
+              </div>
+            )}
+
             {fields.map((f) => (
               <div className="field" key={f.id}>
                 <label htmlFor={`cf-${f.id}`}>
@@ -216,6 +299,7 @@ function CartView() {
                   onChange={(e) => setValues((s) => ({ ...s, [f.key]: e.target.value }))}
                   placeholder={f.placeholder ?? undefined}
                   autoComplete={f.type === 'EMAIL' ? 'email' : f.type === 'TEL' ? 'tel' : 'name'}
+                  disabled={!!me && billingMode === 'account' && (f.type === 'EMAIL' || f.key === 'name')}
                 />
                 {errors[f.key] && <span className="store-field-error">{errors[f.key]}</span>}
               </div>

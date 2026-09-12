@@ -233,6 +233,10 @@ model Product {
   slug               String?          @unique
   slogan             String?
   shortDescription   String? // ≤ 50 mots recommandé (vente croisée)
+  // Plan Gratuit : produit à $0 à but d'inscription directe. Marqué ici pour
+  // (a) ouvrir l'inscription sans checkout-intent (signup dédié) et (b) rendre
+  // la fiche produit auth-aware (« Commencez gratuitement » ↦ « Créer un projet »).
+  freePlan           Boolean          @default(false)
   description        String? // HTML basique (br/strong/em) — fiche produit publique
   color              String?          @default("#00b377")
   hidden             Boolean          @default(false) // "Créer en tant que Masqué"
@@ -557,7 +561,6 @@ model Server {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  services          Service[] // services this host is assigned to (Phase 5)
   deployments       Deployment[] // déploiements GitHub → Coolify sur ce serveur (Phase 10bis)
   deploymentModules DeploymentModule[] // modules/méthodes de déploiement de ce serveur (Phase 13)
   clientProjects    ClientProject[] // projets Coolify client hébergés ici (Module B)
@@ -626,15 +629,6 @@ enum SubscriptionStatus {
   CANCELLED
 }
 
-enum ServiceStatus {
-  REQUESTED
-  PROVISIONING // stub transition, set by admin
-  ACTIVE
-  PROBLEM
-  SUSPENDED
-  REMOVED
-}
-
 model Subscription {
   id        String             @id @default(cuid())
   userId    String
@@ -645,26 +639,14 @@ model Subscription {
   createdAt DateTime           @default(now())
   updatedAt DateTime           @updatedAt
 
-  services Service[]
+  // Commande store à l'origine de l'abonnement (création ou upgrade). Tous les
+  // abonnements passent par la procédure de commande ; l'upgrade repointe la MÊME
+  // ligne. 1:1.
+  orderId String? @unique
+  order   Order?   @relation(fields: [orderId], references: [id], onDelete: SetNull)
 
   @@index([userId])
   @@index([status])
-}
-
-model Service {
-  id             String        @id @default(cuid())
-  name           String
-  subscriptionId String
-  subscription   Subscription  @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
-  serverId       String?
-  server         Server?       @relation(fields: [serverId], references: [id], onDelete: SetNull)
-  status         ServiceStatus @default(REQUESTED)
-  createdAt      DateTime      @default(now())
-  updatedAt      DateTime      @updatedAt
-
-  deployments Deployment[] // déploiements GitHub → Coolify de ce service (Phase 10bis)
-
-  @@index([subscriptionId])
 }
 
 // ── Phase 10bis — déploiement GitHub → Coolify (Deployment) ──────────────────
@@ -688,10 +670,8 @@ model Deployment {
   id                 String            @id @default(cuid())
   userId             String
   user               User              @relation(fields: [userId], references: [id], onDelete: Cascade)
-  // Phase 13 : optionnel — le client peut déployer SANS choisir un Service (la
-  // cible est résolue depuis le pack ACTIF → module A/B). Null en mode auto.
-  serviceId          String?
-  service            Service?          @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+  // Phase 13 (Bloc 4) : le client déploie SANS choisir un Service (table retirée) —
+  // la cible est résolue depuis le pack ACTIF → module A/B.
   serverId           String?
   server             Server?           @relation(fields: [serverId], references: [id], onDelete: SetNull)
   repoFullName       String // "owner/repo" tel que détecté sur GitHub (mode GH lié) ou dérivé de l'URL (mode URL)
@@ -710,6 +690,14 @@ model Deployment {
   domain             Domain?           @relation(fields: [domainId], references: [id], onDelete: SetNull)
   fqdn               String?           @unique
   clientSubdomain    ClientSubdomain?
+  // Phase 16 — build « file-based » (codediali.toml / netlify.toml) → config du
+  // build appliquée à Coolify et persistée ici pour re-déploiement déterministe.
+  baseDirectory      String? // monorepo : sous-dossier racine du build
+  buildCommand       String? // commande de build
+  installCommand     String? // commande d'installation de dépendances
+  publishDirectory   String? // dossier de publication (sortie de build / statique)
+  functionsDirectory String? // dossier de fonctions (best-effort, info)
+  environment        Json? // variables d'environnement du BUILD (whitelist)
   // Phase 13 — projet Coolify qui héberge l'app (monitoring + support). Le
   // module (A partagé / B client) et le projet client (Module B) sont tracés.
   coolifyProjectUuid String?
@@ -721,7 +709,6 @@ model Deployment {
   updatedAt          DateTime          @updatedAt
 
   @@index([userId])
-  @@index([serviceId])
   @@index([status])
 }
 
@@ -1096,6 +1083,10 @@ model Order {
   domainType        OrderDomainType   @default(NONE)
   domainValue       String? // domaine saisi / fqdn choisi
   domainStatus      OrderDomainStatus @default(NONE)
+  // Sous-domaine CHOSI par le client au checkout (Plan Gratuit / produits avec
+  // sous-domaine) : passé en `requested` à l'allocation Cloudflare par le
+  // provisioning (actionConfigureDns). Null = sous-domaine auto-généré.
+  requestedSubdomain String?
   paymentMethodId   String?
   paymentMethod     PaymentMethod?    @relation(fields: [paymentMethodId], references: [id], onDelete: SetNull)
   paymentMethodName String? // snapshot
@@ -1111,6 +1102,10 @@ model Order {
   statusHistory OrderStatusHistory[]
   invoice       Invoice?
   provisioningLogs ProvisioningLog[]
+  // Back-relation : l'abonnement créé/upgradé par cette commande (modèle
+  // order-driven). Le FK vit sur Subscription.orderId (1:1, où l'abonnement
+  // référence toujours sa dernière commande).
+  subscription Subscription?
 
   @@index([customerId])
   @@index([status])
