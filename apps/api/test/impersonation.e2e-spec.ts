@@ -118,9 +118,8 @@ describe('Impersonation (e2e)', () => {
 
   it('the impersonation session is READ-ONLY (mutating verb → 403)', async () => {
     await request(app.getHttpServer())
-      .post(`/${GlobalPrefix}/client/subscriptions`)
+      .post(`/${GlobalPrefix}/client/deployments`)
       .set('Authorization', `Bearer ${impToken}`)
-      .send({ productId: 'nope' })
       .expect(403);
   });
 

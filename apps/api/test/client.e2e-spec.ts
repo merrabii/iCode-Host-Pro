@@ -3,15 +3,18 @@ import { Test } from '@nestjs/testing';
 import * as cookieParser from 'cookie-parser';
 import * as bcrypt from 'bcryptjs';
 import request = require('supertest');
-import { Role } from '@prisma/client';
+import { Role, SubscriptionStatus } from '@prisma/client';
 import { AppModule } from './../src/app.module';
 import { PrismaService } from './../src/prisma/prisma.service';
 import { GlobalPrefix } from './../src/config/constants';
 
-// Phase 5 (ADR-021): client workspace. Full loop subscribe → admin approve →
-// client requests service → admin assigns server + (stub) provisions → ACTIVE.
-// Ownership isolation: A's resources are 404/absent for B. The client never
-// reaches /api/admin/* (403) and never sees server details.
+// Phase 5 (ADR-021) + Bloc 1/4 (ADR-035) : espace client — modèle order-driven.
+// Les abonnements sont créés ACTIVE par la procédure de commande (checkout store),
+// jamais via une route de création publique (directive C). Ici la création se
+// reproduit de façon déterministe en base (la ligne ACTIVE que produit le checkout).
+// L'admin garde les transitions : suspendre / réactiver (PENDING→approbation n'existe
+// plus). La table `Service` a disparu — l'isolation porte sur les subscriptions.
+// Le client ne voit jamais /api/admin/* (403) ni de détails serveur.
 describe('Client workspace (e2e)', () => {
   let app: INestApplication;
   let prisma: PrismaService;
@@ -24,10 +27,8 @@ describe('Client workspace (e2e)', () => {
   let aToken = '';
   let bToken = '';
   let productId = '';
-  let serverId = '';
   let subId = '';
   let subBId = '';
-  let serviceId = '';
 
   beforeAll(async () => {
     const moduleRef = await Test.createTestingModule({ imports: [AppModule] }).compile();
@@ -66,7 +67,8 @@ describe('Client workspace (e2e)', () => {
         .expect(201)
     ).body.accessToken as string;
 
-    // Platform fixture: one product + one server (ADMIN-managed).
+    // Plateforme : un produit à pack (ADMIN-managed). Pas de serveur requis ici
+    // — la table `Service` a disparu et ce spec teste le cycle d'abonnement.
     productId = (
       await request(app.getHttpServer())
         .post(`/${GlobalPrefix}/products`)
@@ -74,23 +76,36 @@ describe('Client workspace (e2e)', () => {
         .send({ name: `prod5_${stamp}`, kind: 'deployment' })
         .expect(201)
     ).body.id as string;
-    serverId = (
-      await request(app.getHttpServer())
-        .post(`/${GlobalPrefix}/servers`)
-        .set('Authorization', `Bearer ${adminToken}`)
-        .send({ name: `srv5_${stamp}`, hostname: `srv5_${stamp}.ihp` })
-        .expect(201)
-    ).body.id as string;
+
+    // Les abonnements naissent ACTIVE via checkout (le paiement vaut approbation,
+    // décisions a/e d'ADR-035). Reproduction déterministe en base : la ligne exacte
+    // que produit le checkout, sans réseau.
+    const aRow = await prisma.subscription.create({
+      data: { userId: (await aMeUserId(aToken)), productId, status: SubscriptionStatus.ACTIVE },
+    });
+    subId = aRow.id;
+    const bRow = await prisma.subscription.create({
+      data: { userId: (await aMeUserId(bToken)), productId, status: SubscriptionStatus.ACTIVE },
+    });
+    subBId = bRow.id;
   });
 
+  // Résout l'id de l'utilisateur via /users/me (authentifié) — évite de ré-écrire
+  // le login en Prisma.
+  async function aMeUserId(token: string): Promise<string> {
+    const me = await request(app.getHttpServer())
+      .get(`/${GlobalPrefix}/users/me`)
+      .set('Authorization', `Bearer ${token}`)
+      .expect(200);
+    return me.body.id as string;
+  }
+
   afterAll(async () => {
-    // Deleting users cascades subscriptions then services; product/server
-    // remain free (Restrict/SetNull respected).
+    // Deleting users cascades subscriptions; product remains free (Restrict).
     await prisma.user
       .deleteMany({ where: { email: { in: [userA, userB, adminEmail] } } })
       .catch(() => {});
     if (productId) await prisma.product.deleteMany({ where: { id: productId } }).catch(() => {});
-    if (serverId) await prisma.server.deleteMany({ where: { id: serverId } }).catch(() => {});
     await app.close();
   });
 
@@ -116,127 +131,64 @@ describe('Client workspace (e2e)', () => {
     expect(res.body.some((p: { id: string }) => p.id === productId)).toBe(true);
   });
 
-  it('client subscribes → PENDING, listed in own workspace', async () => {
-    const res = await request(app.getHttpServer())
+  it('no public route creates subscriptions — checkout is the only path (POST → 404)', async () => {
+    await request(app.getHttpServer())
       .post(`/${GlobalPrefix}/client/subscriptions`)
       .set('Authorization', `Bearer ${aToken}`)
       .send({ productId })
-      .expect(201);
-    expect(res.body.status).toBe('PENDING');
-    subId = res.body.id as string;
-    expect(subId).toBeTruthy();
+      .expect(404);
+  });
 
+  it('client lists own ACTIVE subscription, created by checkout, with its product', async () => {
     const list = await request(app.getHttpServer())
       .get(`/${GlobalPrefix}/client/subscriptions`)
       .set('Authorization', `Bearer ${aToken}`)
       .expect(200);
-    expect(list.body.some((s: { id: string }) => s.id === subId)).toBe(true);
-  });
-
-  it('client cannot request a service under a non-ACTIVE subscription (400)', async () => {
-    await request(app.getHttpServer())
-      .post(`/${GlobalPrefix}/client/services`)
-      .set('Authorization', `Bearer ${aToken}`)
-      .send({ subscriptionId: subId, name: 'Trop tôt' })
-      .expect(400);
-  });
-
-  it('ADMIN lists all subscriptions and approves → ACTIVE', async () => {
-    const list = await request(app.getHttpServer())
-      .get(`/${GlobalPrefix}/admin/subscriptions`)
-      .set('Authorization', `Bearer ${adminToken}`)
-      .expect(200);
-    expect(list.body.some((s: { id: string }) => s.id === subId)).toBe(true);
-
-    await request(app.getHttpServer())
-      .patch(`/${GlobalPrefix}/admin/subscriptions/${subId}`)
-      .set('Authorization', `Bearer ${adminToken}`)
-      .send({ status: 'ACTIVE' })
-      .expect(200);
-  });
-
-  it('client requests a service → REQUESTED (no serverId in the DTO path)', async () => {
-    const res = await request(app.getHttpServer())
-      .post(`/${GlobalPrefix}/client/services`)
-      .set('Authorization', `Bearer ${aToken}`)
-      .send({ subscriptionId: subId, name: 'Mon app' })
-      .expect(201);
-    expect(res.body.status).toBe('REQUESTED');
-    expect(res.body.serverId).toBeNull();
-    serviceId = res.body.id as string;
-  });
-
-  it('ADMIN assigns the server + provisions, then activates (stub)', async () => {
-    const provisioned = await request(app.getHttpServer())
-      .patch(`/${GlobalPrefix}/admin/services/${serviceId}`)
-      .set('Authorization', `Bearer ${adminToken}`)
-      .send({ status: 'PROVISIONING', serverId })
-      .expect(200);
-    expect(provisioned.body.status).toBe('PROVISIONING');
-    expect(provisioned.body.serverId).toBe(serverId);
-
-    const active = await request(app.getHttpServer())
-      .patch(`/${GlobalPrefix}/admin/services/${serviceId}`)
-      .set('Authorization', `Bearer ${adminToken}`)
-      .send({ status: 'ACTIVE' })
-      .expect(200);
-    expect(active.body.status).toBe('ACTIVE');
-  });
-
-  it('client sees the service ACTIVE — WITHOUT any server/infra details', async () => {
-    const list = await request(app.getHttpServer())
-      .get(`/${GlobalPrefix}/client/services`)
-      .set('Authorization', `Bearer ${aToken}`)
-      .expect(200);
-    const mine = list.body.find((s: { id: string }) => s.id === serviceId);
+    const mine = list.body.find((s: { id: string }) => s.id === subId);
     expect(mine).toBeTruthy();
     expect(mine.status).toBe('ACTIVE');
+    // Le produit est inclus ; aucune info serveur/infra n'est exposée.
+    expect(mine.product).toMatchObject({ id: productId });
     expect(mine).not.toHaveProperty('server');
     expect(mine).not.toHaveProperty('serverId');
   });
 
-  it('ADMIN cannot skip the provisioning step (REQUESTED → ACTIVE is 400)', async () => {
-    const res = await request(app.getHttpServer())
-      .post(`/${GlobalPrefix}/client/services`)
-      .set('Authorization', `Bearer ${aToken}`)
-      .send({ subscriptionId: subId, name: 'Encore' })
-      .expect(201);
-    await request(app.getHttpServer())
-      .patch(`/${GlobalPrefix}/admin/services/${res.body.id}`)
+  it('ADMIN lists all subscriptions (rapport Bloc 5) incl. product + pack + order', async () => {
+    const list = await request(app.getHttpServer())
+      .get(`/${GlobalPrefix}/admin/subscriptions`)
       .set('Authorization', `Bearer ${adminToken}`)
-      .send({ status: 'ACTIVE' })
-      .expect(400);
+      .expect(200);
+    const row = list.body.find((s: { id: string }) => s.id === subId);
+    expect(row).toBeTruthy();
+    expect(row.product).toBeTruthy();
+    expect(row.user.email).toBe(userA);
+    // `order` (commande liée) et `pack` existent comme colonnes de la refonte.
+    expect(row).toHaveProperty('order');
+    expect(row.product).toHaveProperty('pack');
   });
 
-  it('cross-client isolation: B never sees A’s resources (404 / absent)', async () => {
-    // B's own subscription list does not contain A's subscription.
+  it('cross-client isolation: B never sees A’s subscription (404 on mutate, absent in list)', async () => {
     const bList = await request(app.getHttpServer())
       .get(`/${GlobalPrefix}/client/subscriptions`)
       .set('Authorization', `Bearer ${bToken}`)
       .expect(200);
     expect(bList.body.some((s: { id: string }) => s.id === subId)).toBe(false);
 
-    // B cannot mutate A's subscription (404, no existence leak).
+    // B cannot mutate/cancel A's subscription (404, no existence leak).
     await request(app.getHttpServer())
       .patch(`/${GlobalPrefix}/client/subscriptions/${subId}/cancel`)
       .set('Authorization', `Bearer ${bToken}`)
       .expect(404);
-
-    // B cannot see A's service in their own workspace.
-    const bServices = await request(app.getHttpServer())
-      .get(`/${GlobalPrefix}/client/services`)
-      .set('Authorization', `Bearer ${bToken}`)
-      .expect(200);
-    expect(bServices.body.some((s: { id: string }) => s.id === serviceId)).toBe(false);
   });
 
-  it('client cancels their own ACTIVE subscription → CANCELLED; admin approve then 400', async () => {
+  it('client cancels own ACTIVE subscription → CANCELLED; admin cannot reactivate a CANCELLED one (400)', async () => {
     const cancelled = await request(app.getHttpServer())
       .patch(`/${GlobalPrefix}/client/subscriptions/${subId}/cancel`)
       .set('Authorization', `Bearer ${aToken}`)
       .expect(200);
     expect(cancelled.body.status).toBe('CANCELLED');
 
+    // CANCELLED → ACTIVE n'est pas une transition autorisée.
     await request(app.getHttpServer())
       .patch(`/${GlobalPrefix}/admin/subscriptions/${subId}`)
       .set('Authorization', `Bearer ${adminToken}`)
@@ -244,24 +196,39 @@ describe('Client workspace (e2e)', () => {
       .expect(400);
   });
 
-  it('ADMIN can reject a pending subscription (→ REJECTED), then activate is 400', async () => {
-    const created = await request(app.getHttpServer())
-      .post(`/${GlobalPrefix}/client/subscriptions`)
-      .set('Authorization', `Bearer ${bToken}`)
-      .send({ productId })
-      .expect(201);
-    subBId = created.body.id as string;
-
-    await request(app.getHttpServer())
+  it('ADMIN can suspend an ACTIVE subscription, then reactivate it — client sees the change', async () => {
+    const suspended = await request(app.getHttpServer())
       .patch(`/${GlobalPrefix}/admin/subscriptions/${subBId}`)
       .set('Authorization', `Bearer ${adminToken}`)
-      .send({ status: 'REJECTED' })
+      .send({ status: 'SUSPENDED' })
       .expect(200);
+    expect(suspended.body.status).toBe('SUSPENDED');
 
-    await request(app.getHttpServer())
+    const bList = await request(app.getHttpServer())
+      .get(`/${GlobalPrefix}/client/subscriptions`)
+      .set('Authorization', `Bearer ${bToken}`)
+      .expect(200);
+    expect(bList.body.find((s: { id: string }) => s.id === subBId).status).toBe('SUSPENDED');
+
+    const reactivated = await request(app.getHttpServer())
       .patch(`/${GlobalPrefix}/admin/subscriptions/${subBId}`)
       .set('Authorization', `Bearer ${adminToken}`)
       .send({ status: 'ACTIVE' })
-      .expect(400);
+      .expect(200);
+    expect(reactivated.body.status).toBe('ACTIVE');
+  });
+
+  it('client cancels own SUSPENDED subscription → CANCELLED (allowed)', async () => {
+    await request(app.getHttpServer())
+      .patch(`/${GlobalPrefix}/admin/subscriptions/${subBId}`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ status: 'SUSPENDED' })
+      .expect(200);
+
+    const cancelled = await request(app.getHttpServer())
+      .patch(`/${GlobalPrefix}/client/subscriptions/${subBId}/cancel`)
+      .set('Authorization', `Bearer ${bToken}`)
+      .expect(200);
+    expect(cancelled.body.status).toBe('CANCELLED');
   });
 });

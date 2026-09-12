@@ -166,9 +166,8 @@ describe('Support access codes (e2e)', () => {
 
     // READ-ONLY: a mutating client route is refused (403).
     await request(app.getHttpServer())
-      .post(`/${GlobalPrefix}/client/subscriptions`)
+      .post(`/${GlobalPrefix}/client/deployments`)
       .set('Authorization', `Bearer ${impToken}`)
-      .send({ productId: 'nope' })
       .expect(403);
   });
 
