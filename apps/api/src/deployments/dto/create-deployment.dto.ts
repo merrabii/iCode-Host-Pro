@@ -1,6 +1,7 @@
 import {
   IsIn,
   IsNotEmpty,
+  IsObject,
   IsOptional,
   IsString,
   Matches,
@@ -15,16 +16,9 @@ import { BUILD_PACKS } from '../github.service';
 //  - mode URL collée : `repoUrl` (détection auto, sans liaison GitHub) — le
 //    client peut corriger `buildPack` (suggéré) et `appName`.
 // Exactement un des deux (`repoFullName` | `repoUrl`) est requis.
-// `serviceId` est OPTIONNEL depuis la Phase 13 : la cible est alors résolue
-// automatiquement depuis le pack ACTIF du client (abonnement → produit → pack →
-// module A/B). Un `serviceId` fourni honore le comportement historique.
+// (Bloc 4 : la table `Service` a été supprimée — la cible est TOUJOURS résolue
+// automatiquement depuis le pack ACTIF du client → module A/B.)
 export class CreateDeploymentDto {
-  @IsOptional()
-  @IsString()
-  @IsNotEmpty()
-  @MaxLength(200)
-  serviceId?: string;
-
   @ValidateIf((o) => !o.repoUrl)
   @IsString()
   @IsNotEmpty()
@@ -66,4 +60,37 @@ export class CreateDeploymentDto {
   })
   @MaxLength(63)
   subdomain?: string;
+
+  // ── Phase 16 — build « file-based » (codediali.toml / page de build) ──────
+  // Champs édités par le client sur la page de build professionnelle, pré-remplis
+  // par le serveur depuis codediali.toml/netlify.toml/détection. Serveur re-sane
+  // et re-déduit : jamais reçus du client en autorité sinueuse.
+  @IsOptional()
+  @IsString()
+  @MaxLength(400)
+  baseDirectory?: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(1000)
+  buildCommand?: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(1000)
+  installCommand?: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(400)
+  publishDirectory?: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(400)
+  functionsDirectory?: string;
+
+  @IsOptional()
+  @IsObject()
+  environment?: Record<string, string>;
 }

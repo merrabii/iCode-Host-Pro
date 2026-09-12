@@ -56,6 +56,9 @@ describe('Deployments GitHub → Coolify (e2e, Phase 10bis)', () => {
       listProjects: fakeListProjects,
       deployApp: fakeDeployApp,
       applyAppLimits: jest.fn().mockResolvedValue(undefined),
+      setAppEnvironment: jest.fn().mockResolvedValue(undefined),
+      setAppDomain: jest.fn().mockResolvedValue(undefined),
+      deleteApplication: jest.fn().mockResolvedValue(undefined),
       deploymentStatus: fakeDeploymentStatus,
     }),
   } as unknown as PanelTransportFactory;
@@ -539,7 +542,7 @@ describe('Deployments GitHub → Coolify (e2e, Phase 10bis)', () => {
 
       // La ligne est bien en base avec l'URL brute (audit lisible, infra masquée).
       const row = await prisma.deployment.findFirst({
-        where: { serviceId: bServiceId, repoUrl: 'https://gitlab.com/foo/bar.git' },
+        where: { serverId: bServiceId, repoUrl: 'https://gitlab.com/foo/bar.git' },
       });
       expect(row).toBeTruthy();
       expect(row?.buildPack).toBe('dockerfile');

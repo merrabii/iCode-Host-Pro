@@ -31,6 +31,9 @@ describe('DeploymentsService', () => {
     // Phase 10bis.5 — mode URL collée (détection auto).
     detectRepo: jest.fn(),
     deriveRepoFullName: jest.fn(),
+    // Phase 16 — build « file-based » (codediali.toml/netlify.toml/dépôt vide).
+    readBuildConfig: jest.fn().mockResolvedValue(null),
+    isRepoEmpty: jest.fn().mockResolvedValue(false),
   };
   const mockTransport = {
     createGitApp: jest.fn(),
@@ -89,7 +92,6 @@ describe('DeploymentsService', () => {
   const deploymentRow = (over: Record<string, unknown> = {}) => ({
     id: 'dep1',
     userId: 'u1',
-    serviceId: 'svc1',
     serverId: 'srv-coolify',
     repoFullName: 'owner/repo',
     branch: 'main',
@@ -99,6 +101,51 @@ describe('DeploymentsService', () => {
     createdAt: new Date('2026-09-01T10:00:00Z'),
     updatedAt: new Date('2026-09-01T10:00:00Z'),
     ...over,
+  });
+
+  // Bloc 4 — cible AUTO : la table Service a été supprimée, la cible est un
+  // abonnement ACTIVE → pack ACTIVE → module Coolify connecté (serverRow).
+  const autoModule = (over: Record<string, unknown> = {}) => ({
+    id: 'modA',
+    name: 'Module A',
+    code: 'A',
+    kind: 'SHARED_PROJECT',
+    isActive: true,
+    serverId: 'srv-coolify',
+    sharedProjectUuid: 'proj-shared',
+    sharedProjectName: 'Projet partagé',
+    perClientPrefix: 'client',
+    overrideRamMb: null,
+    overrideCpuCores: null,
+    overrideStorageLimit: null,
+    server: serverRow(),
+    ...over,
+  });
+  const autoTarget = (over: Record<string, unknown> = {}) => ({
+    id: 'sub-act',
+    userId: 'u1',
+    productId: 'prod1',
+    status: 'ACTIVE',
+    createdAt: new Date(),
+    updatedAt: new Date(),
+    product: {
+      id: 'prod1',
+      pack: {
+        id: 'pack1',
+        name: 'Starter 1 Go',
+        status: 'ACTIVE',
+        ramMb: 512,
+        cpuCores: 1,
+        storageLimit: 20,
+        bandwidth: null,
+        maxApps: null,
+        deploymentModuleId: 'modA',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        deploymentModule: autoModule(),
+        ...over,
+      },
+    },
   });
 
   beforeEach(() => {
@@ -130,7 +177,7 @@ describe('DeploymentsService', () => {
       language: 'TypeScript',
       suggestedBuildPack: 'nixpacks',
     });
-    mockPrisma.service.findFirst.mockResolvedValue(serviceRow());
+    mockPrisma.subscription.findFirst.mockResolvedValue(autoTarget());
     mockCrypto.decrypt.mockReturnValue('coolify-token');
   });
 
@@ -138,7 +185,7 @@ describe('DeploymentsService', () => {
     it('403 quand le flag deployEnabled est OFF', async () => {
       mockSettings.isDeployEnabled.mockResolvedValue(false);
       await expect(
-        service.create({ serviceId: 'svc1', repoFullName: 'owner/repo' }, actor),
+        service.create({ repoFullName: 'owner/repo' }, actor),
       ).rejects.toBeInstanceOf(ForbiddenException);
       expect(mockPrisma.deployment.create).not.toHaveBeenCalled();
     });
@@ -146,7 +193,7 @@ describe('DeploymentsService', () => {
     it('400 quand aucun compte GitHub n’est lié', async () => {
       mockPrisma.user.findUnique.mockResolvedValue({ id: 'u1', githubTokenEnc: null });
       await expect(
-        service.create({ serviceId: 'svc1', repoFullName: 'owner/repo' }, actor),
+        service.create({ repoFullName: 'owner/repo' }, actor),
       ).rejects.toBeInstanceOf(BadRequestException);
       expect(mockPrisma.deployment.create).not.toHaveBeenCalled();
     });
@@ -154,39 +201,25 @@ describe('DeploymentsService', () => {
     it('400 quand le dépôt n’est pas possédé', async () => {
       mockGithub.repoExists.mockResolvedValue(false);
       await expect(
-        service.create({ serviceId: 'svc1', repoFullName: 'autrui/repo' }, actor),
+        service.create({ repoFullName: 'autrui/repo' }, actor),
       ).rejects.toBeInstanceOf(BadRequestException);
     });
 
-    it('404 quand le service n’appartient pas au client (ownership)', async () => {
-      mockPrisma.service.findFirst.mockResolvedValue(null);
-      await expect(
-        service.create({ serviceId: 'svc-autrui', repoFullName: 'owner/repo' }, actor),
-      ).rejects.toBeInstanceOf(NotFoundException);
-    });
-
-    it('400 quand le service n’est pas ACTIVE', async () => {
-      mockPrisma.service.findFirst.mockResolvedValue(serviceRow({ status: 'REQUESTED' }));
-      await expect(
-        service.create({ serviceId: 'svc1', repoFullName: 'owner/repo' }, actor),
-      ).rejects.toBeInstanceOf(BadRequestException);
-    });
-
-    it('400 quand le service n’est pas sur un serveur COOLIFY', async () => {
-      mockPrisma.service.findFirst.mockResolvedValue(
-        serviceRow({ server: { ...serverRow(), panelProvider: 'HESTIA' } }),
+    it('400 quand le serveur du module n’est pas sur un panneau COOLIFY', async () => {
+      mockPrisma.subscription.findFirst.mockResolvedValue(
+        autoTarget({ deploymentModule: autoModule({ server: { ...serverRow(), panelProvider: 'HESTIA' } }) }),
       );
       await expect(
-        service.create({ serviceId: 'svc1', repoFullName: 'owner/repo' }, actor),
+        service.create({ repoFullName: 'owner/repo' }, actor),
       ).rejects.toBeInstanceOf(BadRequestException);
     });
 
-    it('400 quand le serveur Coolify n’est pas connecté (panelOk ≠ true)', async () => {
-      mockPrisma.service.findFirst.mockResolvedValue(
-        serviceRow({ server: { ...serverRow(), panelOk: false } }),
+    it('400 quand le serveur Coolify du module n’est pas connecté (panelOk ≠ true)', async () => {
+      mockPrisma.subscription.findFirst.mockResolvedValue(
+        autoTarget({ deploymentModule: autoModule({ server: { ...serverRow(), panelOk: false } }) }),
       );
       await expect(
-        service.create({ serviceId: 'svc1', repoFullName: 'owner/repo' }, actor),
+        service.create({ repoFullName: 'owner/repo' }, actor),
       ).rejects.toBeInstanceOf(BadRequestException);
     });
 
@@ -196,17 +229,16 @@ describe('DeploymentsService', () => {
       mockTransport.deployApp.mockResolvedValue(undefined);
       mockPrisma.deployment.update.mockResolvedValue(deploymentRow());
 
-      const out = await service.create({ serviceId: 'svc1', repoFullName: 'owner/repo' }, actor);
+      const out = await service.create({ repoFullName: 'owner/repo' }, actor);
 
       expect(mockPrisma.deployment.create).toHaveBeenCalledWith({
         data: expect.objectContaining({
           userId: 'u1',
-          serviceId: 'svc1',
           serverId: 'srv-coolify',
           repoFullName: 'owner/repo',
           branch: 'main',
           buildPack: 'nixpacks',
-          appName: 'Site vitrine',
+          appName: 'repo',
           status: 'PENDING',
         }),
       });
@@ -215,9 +247,10 @@ describe('DeploymentsService', () => {
         {
           repoUrl: 'https://github.com/owner/repo.git',
           branch: 'main',
-          serviceName: 'Site vitrine',
+          serviceName: 'repo',
           buildPack: 'nixpacks',
-          appName: 'Site vitrine',
+          appName: 'repo',
+          projectUuid: 'proj-shared',
         },
       );
       expect(mockTransport.deployApp).toHaveBeenCalledWith(
@@ -245,7 +278,7 @@ describe('DeploymentsService', () => {
       mockTransport.deployApp.mockResolvedValue(undefined);
       mockPrisma.deployment.update.mockResolvedValue(deploymentRow({ branch: 'develop' }));
 
-      await service.create({ serviceId: 'svc1', repoFullName: 'owner/repo', branch: ' develop ' }, actor);
+      await service.create({ repoFullName: 'owner/repo', branch: ' develop ' }, actor);
       expect(mockTransport.createGitApp).toHaveBeenCalledWith(
         expect.anything(),
         expect.objectContaining({ branch: 'develop' }),
@@ -254,28 +287,16 @@ describe('DeploymentsService', () => {
 
     it('Phase 12 — pack ACTIVE du produit : limites appliquées AVANT deployApp', async () => {
       // Service dont le produit est abonné à un pack ACTIVE (RAM 1 Go, 1 CPU).
-      const packRow = {
-        id: 'pack1',
-        name: 'Starter 1 Go',
-        status: 'ACTIVE',
-        ramMb: 1024,
-        cpuCores: 1,
-        storageLimit: 20,
-        bandwidth: null,
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      };
-      const serviceRowWithPack = serviceRow({
-        subscription: { product: { id: 'prod1', pack: packRow } },
-      });
-      mockPrisma.service.findFirst.mockResolvedValue(serviceRowWithPack);
+      mockPrisma.subscription.findFirst.mockResolvedValue(
+        autoTarget({ name: 'Starter 1 Go', ramMb: 1024, cpuCores: 1 }),
+      );
       mockPrisma.deployment.create.mockResolvedValue(deploymentRow({ status: 'PENDING', coolifyUuid: null }));
       mockTransport.createGitApp.mockResolvedValue({ uuid: 'app-1' });
       mockTransport.applyAppLimits.mockResolvedValue(undefined);
       mockTransport.deployApp.mockResolvedValue(undefined);
       mockPrisma.deployment.update.mockResolvedValue(deploymentRow());
 
-      const out = await service.create({ serviceId: 'svc1', repoFullName: 'owner/repo' }, actor);
+      const out = await service.create({ repoFullName: 'owner/repo' }, actor);
 
       // Ordre : createGitApp → applyAppLimits → deployApp.
       expect(mockTransport.createGitApp).toHaveBeenCalledTimes(1);
@@ -299,37 +320,32 @@ describe('DeploymentsService', () => {
       expect(out.status).toBe('DEPLOYING');
     });
 
-    it('Phase 12 — best-effort : limites refusées ⇒ ligne DEPLOYING + audit deploy.limits.warn', async () => {
-      const packRow = {
-        id: 'pack1',
-        name: 'Starter 1 Go',
-        status: 'ACTIVE',
-        ramMb: 1024,
-        cpuCores: 1,
-        storageLimit: 20,
-        bandwidth: null,
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      };
-      mockPrisma.service.findFirst.mockResolvedValue(
-        serviceRow({ subscription: { product: { id: 'prod1', pack: packRow } } }),
+    it('Bloc 3 — serveur partagé : limites refusées ⇒ FAILED, app jamais lancée sans plafond', async () => {
+      mockPrisma.subscription.findFirst.mockResolvedValue(
+        autoTarget({ name: 'Starter 1 Go', ramMb: 1024, cpuCores: 1 }),
       );
       mockPrisma.deployment.create.mockResolvedValue(deploymentRow({ status: 'PENDING', coolifyUuid: null }));
       mockTransport.createGitApp.mockResolvedValue({ uuid: 'app-1' });
-      mockTransport.applyAppLimits.mockRejectedValue(new Error('Coolify API : application des limites refusée (HTTP 400)'));
+      mockTransport.applyAppLimits.mockRejectedValueOnce(new Error('Coolify API : application des limites refusée (HTTP 400)'));
       mockTransport.deployApp.mockResolvedValue(undefined);
-      mockPrisma.deployment.update.mockResolvedValue(deploymentRow());
+      mockPrisma.deployment.update.mockResolvedValue(deploymentRow({ status: 'FAILED' }));
 
-      const out = await service.create({ serviceId: 'svc1', repoFullName: 'owner/repo' }, actor);
-
-      expect(out.status).toBe('DEPLOYING');
-      expect(mockTransport.deployApp).toHaveBeenCalled(); // jamais bloqué par l'échec des limites
-      expect(mockAudit.record).toHaveBeenCalledWith(
-        expect.objectContaining({ action: 'deploy.limits.warn' }),
+      // Fail-closed : un échec d'application des limites échoue le déploiement —
+      // on ne lance JAMAIS un build sans plafond sur un serveur partagé.
+      await expect(service.create({ repoFullName: 'owner/repo' }, actor)).rejects.toThrow(
+        BadGatewayException,
       );
-      const created = mockTransport.createGitApp.mock.invocationCallOrder[0];
-      const deployOrder = mockTransport.deployApp.mock.invocationCallOrder[0];
-      expect(created).toBeLessThan(deployOrder);
+
+      expect(mockTransport.deployApp).not.toHaveBeenCalled();
+      expect(mockAudit.record).toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'deploy.limits.failed' }),
+      );
+      expect(mockPrisma.deployment.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 'dep1' },
+          data: expect.objectContaining({ status: 'FAILED' }),
+        }),
+      );
     });
 
     describe('Phase 3 — sous-domaine Cloudflare alloué au déploiement', () => {
@@ -344,15 +360,14 @@ describe('DeploymentsService', () => {
       };
 
       it('racine configurée + sous-domaine saisi ⇒ allocate appelé, update écrit subdomain/fqdn/domainId et detail URL', async () => {
-        mockPrisma.service.findFirst.mockResolvedValue(serviceRow());
-        mockPrisma.deployment.create.mockResolvedValue(deploymentRow({ status: 'PENDING', coolifyUuid: null }));
+                mockPrisma.deployment.create.mockResolvedValue(deploymentRow({ status: 'PENDING', coolifyUuid: null }));
         mockTransport.createGitApp.mockResolvedValue({ uuid: 'app-1' });
         mockTransport.deployApp.mockResolvedValue(undefined);
         mockPrisma.deployment.update.mockResolvedValue(deploymentRow());
         mockCloudflare.findActiveRootDomain.mockResolvedValue(root);
         mockCloudflare.allocateClientSubdomain.mockResolvedValue({ subdomain: 'monapp', fqdn: 'monapp.arumdigital.com' });
 
-        await service.create({ serviceId: 'svc1', repoFullName: 'owner/repo', subdomain: 'monapp' }, actor);
+        await service.create({ repoFullName: 'owner/repo', subdomain: 'monapp' }, actor);
 
         expect(mockCloudflare.allocateClientSubdomain).toHaveBeenCalledWith(
           expect.objectContaining({ root, requested: 'monapp', fallbackHost: 'portal.exemple.com' }),
@@ -375,42 +390,31 @@ describe('DeploymentsService', () => {
       });
 
       it('racine NON configurée ⇒ aucun appel allocation, déploiement normal', async () => {
-        mockPrisma.service.findFirst.mockResolvedValue(serviceRow());
-        mockPrisma.deployment.create.mockResolvedValue(deploymentRow({ status: 'PENDING', coolifyUuid: null }));
+                mockPrisma.deployment.create.mockResolvedValue(deploymentRow({ status: 'PENDING', coolifyUuid: null }));
         mockTransport.createGitApp.mockResolvedValue({ uuid: 'app-1' });
         mockTransport.deployApp.mockResolvedValue(undefined);
         mockPrisma.deployment.update.mockResolvedValue(deploymentRow());
         mockCloudflare.findActiveRootDomain.mockResolvedValue(null);
 
-        await service.create({ serviceId: 'svc1', repoFullName: 'owner/repo' }, actor);
+        await service.create({ repoFullName: 'owner/repo' }, actor);
 
         expect(mockCloudflare.allocateClientSubdomain).not.toHaveBeenCalled();
       });
 
       it('échec d’allocation ⇒ best-effort : ligne DEPLOYING quand même + audit deploy.domain.warn', async () => {
-        mockPrisma.service.findFirst.mockResolvedValue(serviceRow());
-        mockPrisma.deployment.create.mockResolvedValue(deploymentRow({ status: 'PENDING', coolifyUuid: null }));
+                mockPrisma.deployment.create.mockResolvedValue(deploymentRow({ status: 'PENDING', coolifyUuid: null }));
         mockTransport.createGitApp.mockResolvedValue({ uuid: 'app-1' });
         mockTransport.deployApp.mockResolvedValue(undefined);
         mockPrisma.deployment.update.mockResolvedValue(deploymentRow());
         mockCloudflare.findActiveRootDomain.mockResolvedValue(root);
         mockCloudflare.allocateClientSubdomain.mockRejectedValue(new Error('Sous-domaine déjà pris : monapp.arumdigital.com'));
 
-        const out = await service.create({ serviceId: 'svc1', repoFullName: 'owner/repo', subdomain: 'monapp' }, actor);
+        const out = await service.create({ repoFullName: 'owner/repo', subdomain: 'monapp' }, actor);
 
         expect(out.status).toBe('DEPLOYING');
         expect(mockTransport.deployApp).toHaveBeenCalled(); // jamais bloqué par le DNS
         expect(mockAudit.record).toHaveBeenCalledWith(expect.objectContaining({ action: 'deploy.domain.warn' }));
       });
-    });
-
-    it('Phase 12 — aucun pack ⇒ applyAppLimits jamais appelé', async () => {
-      mockPrisma.deployment.create.mockResolvedValue(deploymentRow({ status: 'PENDING', coolifyUuid: null }));
-      mockTransport.createGitApp.mockResolvedValue({ uuid: 'app-1' });
-      mockTransport.deployApp.mockResolvedValue(undefined);
-      mockPrisma.deployment.update.mockResolvedValue(deploymentRow());
-      await service.create({ serviceId: 'svc1', repoFullName: 'owner/repo' }, actor);
-      expect(mockTransport.applyAppLimits).not.toHaveBeenCalled();
     });
 
     it('échec Coolify : ligne FAILED + audit deploy.failed + 502', async () => {
@@ -419,7 +423,7 @@ describe('DeploymentsService', () => {
       mockPrisma.deployment.update.mockResolvedValue(deploymentRow({ status: 'FAILED', detail: 'Coolify API : création refusée (HTTP 401)' }));
 
       await expect(
-        service.create({ serviceId: 'svc1', repoFullName: 'owner/repo' }, actor),
+        service.create({ repoFullName: 'owner/repo' }, actor),
       ).rejects.toBeInstanceOf(BadGatewayException);
 
       expect(mockPrisma.deployment.update).toHaveBeenCalledWith({
@@ -451,7 +455,7 @@ describe('DeploymentsService', () => {
       mockPrisma.deployment.update.mockResolvedValue(deploymentRow());
 
       const out = await service.create(
-        { serviceId: 'svc1', repoUrl: 'https://github.com/owner/repo.git' },
+        { repoUrl: 'https://github.com/owner/repo.git' },
         actor,
       );
 
@@ -464,7 +468,7 @@ describe('DeploymentsService', () => {
           repoFullName: 'owner/repo',
           branch: 'develop', // branche détectée, pas « main »
           buildPack: 'nixpacks',
-          appName: 'Site vitrine',
+          appName: 'repo',
         }),
       });
       expect(mockTransport.createGitApp).toHaveBeenCalledWith(
@@ -473,7 +477,7 @@ describe('DeploymentsService', () => {
           repoUrl: 'https://github.com/owner/repo.git',
           branch: 'develop',
           buildPack: 'nixpacks',
-          appName: 'Site vitrine',
+          appName: 'repo',
         }),
       );
       expect(out).not.toHaveProperty('coolifyUuid');
@@ -498,7 +502,6 @@ describe('DeploymentsService', () => {
 
       await service.create(
         {
-          serviceId: 'svc1',
           repoUrl: 'https://gitlab.com/foo/bar.git',
           buildPack: 'dockerfile',
           appName: 'mon-app',
@@ -520,7 +523,7 @@ describe('DeploymentsService', () => {
         throw new BadRequestException('URL de dépôt invalide');
       });
       await expect(
-        service.create({ serviceId: 'svc1', repoUrl: 'ftp://x/y' }, actor),
+        service.create({ repoUrl: 'ftp://x/y' }, actor),
       ).rejects.toBeInstanceOf(BadRequestException);
       expect(mockPrisma.deployment.create).not.toHaveBeenCalled();
     });
@@ -528,7 +531,7 @@ describe('DeploymentsService', () => {
     it('400 quand les deux modes sont fournis (repoFullName ET repoUrl)', async () => {
       await expect(
         service.create(
-          { serviceId: 'svc1', repoFullName: 'owner/repo', repoUrl: 'https://github.com/owner/repo.git' },
+          { repoFullName: 'owner/repo', repoUrl: 'https://github.com/owner/repo.git' },
           actor,
         ),
       ).rejects.toBeInstanceOf(BadRequestException);
@@ -558,6 +561,69 @@ describe('DeploymentsService', () => {
       expect(mockGithub.detectRepo).toHaveBeenCalledWith('https://github.com/o/r.git');
       expect(out.suggestedBuildPack).toBe('nixpacks');
       expect(mockGithub.decryptToken).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("create() — détection SPA Vite (fix 503 « no available server »)", () => {
+    const happyMocks = () => {
+      mockPrisma.deployment.create.mockResolvedValue(deploymentRow({ status: 'PENDING', coolifyUuid: null }));
+      mockTransport.createGitApp.mockResolvedValue({ uuid: 'app-1' });
+      mockTransport.deployApp.mockResolvedValue(undefined);
+      mockPrisma.deployment.update.mockResolvedValue(deploymentRow());
+    };
+
+    it('SPA Vite détecté ⇒ buildPack garde nixpacks (la voie store build+got statique), publishDirectory "/dist", isStatic:true envoyé à Coolify', async () => {
+      mockGithub.readBuildConfig.mockResolvedValue({ environment: {}, source: 'none', publishDirectory: '/dist', isStatic: true });
+      happyMocks();
+
+      await service.create({ repoFullName: 'owner/spa' }, actor);
+
+      // Ne PAS forcer build_pack "static" (le pack static ne build pas → page
+      // vide). On garde nixpacks (build → dist) + isStatic + /dist (servi statique).
+      expect(mockTransport.createGitApp).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          buildPack: 'nixpacks',
+          publishDirectory: '/dist',
+          isStatic: true,
+        }),
+      );
+      expect(mockPrisma.deployment.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          buildPack: 'nixpacks',
+          publishDirectory: '/dist',
+        }),
+      });
+    });
+
+    it('repo backend (sans vite) ⇒ aucun isStatic, buildPack nixpacks non statique', async () => {
+      mockGithub.readBuildConfig.mockResolvedValue({ environment: {}, source: 'none' });
+      happyMocks();
+
+      await service.create({ repoFullName: 'owner/api' }, actor);
+
+      expect(mockTransport.createGitApp).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ buildPack: 'nixpacks' }),
+      );
+      const [, input] = mockTransport.createGitApp.mock.calls[0] as [unknown, Record<string, unknown>];
+      expect(input.publishDirectory).toBeUndefined();
+      expect(input.isStatic).toBeUndefined();
+      expect(mockPrisma.deployment.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({ buildPack: 'nixpacks' }),
+      });
+    });
+
+    it('SPA Vite : un buildPack/client explicite est honoré (pas écrasé), isStatic:/dist transmis quand même', async () => {
+      mockGithub.readBuildConfig.mockResolvedValue({ environment: {}, source: 'none', publishDirectory: '/dist', isStatic: true });
+      happyMocks();
+
+      await service.create({ repoFullName: 'owner/spa', buildPack: 'nixpacks' }, actor);
+
+      expect(mockTransport.createGitApp).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ buildPack: 'nixpacks', publishDirectory: '/dist', isStatic: true }),
+      );
     });
   });
 
@@ -748,8 +814,7 @@ describe('DeploymentsService', () => {
       expect(mockPrisma.deployment.create).toHaveBeenCalledWith({
         data: expect.objectContaining({
           userId: 'u1',
-          serviceId: null,
-          serverId: 'srv-coolify',
+                    serverId: 'srv-coolify',
           moduleId: 'modA',
           coolifyProjectUuid: 'proj-shared',
           clientProjectId: null,
@@ -826,8 +891,7 @@ describe('DeploymentsService', () => {
       });
       expect(mockPrisma.deployment.create).toHaveBeenCalledWith({
         data: expect.objectContaining({
-          serviceId: null,
-          moduleId: 'modB',
+                    moduleId: 'modB',
           coolifyProjectUuid: 'proj-client',
           clientProjectId: 'cp1',
         }),
@@ -916,25 +980,18 @@ describe('DeploymentsService', () => {
       );
     });
 
-    it('serviceId fourni : pack avec module → le projet du module est utilisé (comportement historique + module)', async () => {
-      const serviceWithPack = serviceRow({
-        subscription: {
-          id: 'sub1',
-          product: { id: 'prod1', pack: packWithModule({ deploymentModule: moduleRow() }) },
-        },
-      });
-      mockPrisma.service.findFirst.mockResolvedValue(serviceWithPack);
+    it('mode auto : pack ACTIF avec module → le projet du module (A partagé) est utilisé', async () => {
       happyMocks();
 
-      await service.create({ serviceId: 'svc1', repoFullName: 'owner/repo' }, actor);
+      await service.create({ repoFullName: 'owner/repo' }, actor);
 
-      expect(mockPrisma.subscription.findFirst).not.toHaveBeenCalled();
+      expect(mockPrisma.subscription.findFirst).toHaveBeenCalled();
       expect(mockTransport.createGitApp).toHaveBeenCalledWith(
         expect.anything(),
         expect.objectContaining({ projectUuid: 'proj-shared' }),
       );
       expect(mockPrisma.deployment.create).toHaveBeenCalledWith({
-        data: expect.objectContaining({ serviceId: 'svc1', moduleId: 'modA' }),
+        data: expect.objectContaining({ moduleId: 'modA' }),
       });
     });
   });

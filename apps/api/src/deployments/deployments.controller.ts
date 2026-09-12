@@ -6,6 +6,7 @@ import { JwtPayload } from '../auth/types';
 import { DeploymentsService } from './deployments.service';
 import { CreateDeploymentDto } from './dto/create-deployment.dto';
 import { DetectRepoDto } from './dto/detect-repo.dto';
+import { BuildConfigPreviewDto } from './dto/build-config.dto';
 
 // Phase 10bis (M+N) — espace client : repos GitHub autodétectés + déploiement
 // sur le serveur Coolify connecté. Même contrat que ClientController (Phase 5) :
@@ -42,6 +43,20 @@ export class DeploymentsController {
   @ApiOperation({ summary: 'Deploy a GitHub repo to my connected Coolify server (Phase 10bis)' })
   create(@Body() dto: CreateDeploymentDto, @CurrentUser() actor: JwtPayload) {
     return this.deployments.create(dto, actor);
+  }
+
+  @Post('deployments/preview')
+  @ApiOperation({
+    summary: 'Pre-fill build config from codediali.toml/netlify.toml/detection (Phase 16)',
+  })
+  preview(@Body() dto: BuildConfigPreviewDto, @CurrentUser() actor: JwtPayload) {
+    return this.deployments.previewBuildConfig(dto.repoFullName, dto.branch, actor);
+  }
+
+  @Post('deployments/check-empty')
+  @ApiOperation({ summary: 'Detect an empty repository before deploy (Phase 16)' })
+  checkEmpty(@Body() dto: BuildConfigPreviewDto, @CurrentUser() actor: JwtPayload) {
+    return this.deployments.checkRepoEmpty(dto.repoFullName, dto.branch, actor);
   }
 
   @Get('deployments')

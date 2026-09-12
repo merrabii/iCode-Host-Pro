@@ -30,6 +30,21 @@ export interface DetectResult {
 /** Build packs que Coolify 4.x sait utiliser pour une app Git (menu web). */
 export const BUILD_PACKS = ['nixpacks', 'dockerfile', 'dockercompose', 'static'] as const;
 
+/** Config de build normalisée lue d'un fichier `codediali.toml` / `netlify.toml`
+ *  (Phase 16). Pré-remplit la page de build du client et est appliquée à Coolify.
+ *  `source` = fichier qui a servi (ou 'none' → la détection auto s'applique). */
+export interface BuildConfig {
+  pack?: string; // force un build pack (nixpacks|static|dockerfile|dockercompose)
+  baseDirectory?: string; // monorepo : sous-dossier racine du build
+  buildCommand?: string; // commande de build
+  installCommand?: string; // commande d'installation de dépendances
+  publishDirectory?: string; // dossier de publication (sortie / statique)
+  functionsDirectory?: string; // dossier de fonctions (best-effort, info)
+  isStatic?: boolean; // SPA/frontend Vite détecté → servir le build en statique (fix 503)
+  environment: Record<string, string>; // variables d'environnement du BUILD
+  source: 'codediali.toml' | 'netlify.toml' | 'none';
+}
+
 // Plages d'adresses privées/réservées à REFUSER dans une URL git (SSRF léger) :
 // un clone d'app ne doit jamais viser l'infrastructure interne (127.x, RFC1918…).
 function isPrivateOrReservedHost(host: string): boolean {
@@ -283,6 +298,184 @@ export class GithubService {
       return segs.length >= 2 ? segs.slice(-2).join('/') : segs[0];
     } catch {
       return null;
+    }
+  }
+
+  // ── Phase 16 — build « file-based » (codediali.toml / netlify.toml) ────────
+
+  /**
+   * Config de build normalisée lue d'un fichier de config (Ranking :
+   * `codediali.toml` > `netlify.toml` > aucun). Pré-remplit la page de build
+   * du client ET est appliquée à Coolify au déploiement pour un build fiable,
+   * sans deviner le build pack. Valeurs sanitized (whitelist, bornées) — un
+   * fichier n'exécute jamais de code côté serveur.
+   */
+  async readBuildConfig(
+    fullName: string,
+    branch: string,
+    token?: string | null,
+  ): Promise<BuildConfig> {
+    const [owner, repo] = fullName.split('/');
+    const codediali = await this.fetchRepoFile(owner, repo, 'codediali.toml', branch, token);
+    if (codediali !== null) {
+      return { ...this.parseBuildContent('codediali.toml', codediali), source: 'codediali.toml' };
+    }
+    const netlify = await this.fetchRepoFile(owner, repo, 'netlify.toml', branch, token);
+    if (netlify !== null) {
+      return { ...this.parseBuildContent('netlify.toml', netlify), source: 'netlify.toml' };
+    }
+    // Fix 503 « no available server » — repo sans fichier de config : détection
+    // best-effort d'un SPA Vite (vite.config.* présent, aucun serveur applicatif
+    // de production). Le build sort en `dist/` servi statiquement par Coolify
+    // (Coolify exige `/dist` avec slash de tête — 422 sinon, cf. voie store).
+    if (await this.detectViteSpa(owner, repo, branch, token)) {
+      return { environment: {}, source: 'none', publishDirectory: '/dist', isStatic: true };
+    }
+    return { environment: {}, source: 'none' };
+  }
+
+  /**
+   * Best-effort : le repo est-il un SPA Vite (frontend statique → `dist/`) ?
+   * `true` si un `vite.config.ts|js|mts` existe à la racine ET que le BUILD est
+   * un compile statique (`vite build`) sans runtime serveur Node comme point
+   * d'entrée. On juge le SERVEUR RÉEL, pas la seule présence d'une dep :
+   * un `express:^4` résiduel en `dependencies` (ex. dep d'un ancien server.js
+   * supprimé, build = vite build) ne fait PAS un back-end ; en revanche un dépôt
+   * au build applicatif (nest build / tsc + un `start` node/tsx) reste non-statique.
+   * Ne lit que package.json + fichiers à la racine — aucun code exécuté
+   * (JSON.parse d'un package.json, valeurs lues uniquement).
+   */
+  private async detectViteSpa(
+    owner: string,
+    repo: string,
+    branch: string,
+    token?: string | null,
+  ): Promise<boolean> {
+    const hasViteConfig =
+      (await this.fetchRepoFile(owner, repo, 'vite.config.ts', branch, token)) !== null ||
+      (await this.fetchRepoFile(owner, repo, 'vite.config.js', branch, token)) !== null ||
+      (await this.fetchRepoFile(owner, repo, 'vite.config.mts', branch, token)) !== null;
+    if (!hasViteConfig) return false;
+    const pkg = await this.fetchRepoFile(owner, repo, 'package.json', branch, token);
+    if (pkg === null) return false;
+    try {
+      const json = JSON.parse(pkg) as {
+        dependencies?: Record<string, string>;
+        scripts?: Record<string, string>;
+      };
+      // Un runtime serveur Node comme point d'entrée ⇒ repo applicatif, PAS statique.
+      const runScript = [
+        json.scripts?.start ?? '',
+        json.scripts?.serve ?? '',
+        json.scripts?.server ?? '',
+        json.scripts?.prod ?? '',
+      ]
+        .join(' ')
+        .trim();
+      if (/(^|\s)(node|tsx|ts-node|nodemon|pm2|next|nest)\s/.test(runScript)) return false;
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Récupère un fichier à la racine du repo (auth si token, sinon public) et
+   *  le décode depuis base64. `null` si absent/inaccessible (best-effort). */
+  private async fetchRepoFile(
+    owner: string,
+    repo: string,
+    file: string,
+    branch: string,
+    token?: string | null,
+  ): Promise<string | null> {
+    const path = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(
+      repo,
+    )}/contents/${encodeURIComponent(file)}?ref=${encodeURIComponent(branch)}`;
+    try {
+      const data = token
+        ? ((await this.get(path, token)) as { content?: unknown })
+        : ((await this.getPublic<{ content?: unknown }>(path)) ?? {});
+      if (typeof data.content === 'string') {
+        return Buffer.from(data.content.replace(/\n/g, ''), 'base64').toString('utf8');
+      }
+      return null;
+    } catch {
+      return null; // absent, privé sans token, réseau — best-effort
+    }
+  }
+
+  /** Parse un TOML minimal (sections + clés `key = "value"`) et extrait la
+   *  config de build. Jamais de code exécuté — uniquement des chaînes texte. */
+  private parseBuildContent(source: string, content: string): Omit<BuildConfig, 'source'> {
+    const out: Omit<BuildConfig, 'source'> = { environment: {} };
+    let section = '';
+    for (const line of content.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      const sectionMatch = /^\[([^\]]+)\]$/.exec(trimmed);
+      if (sectionMatch) {
+        section = sectionMatch[1].trim();
+        continue;
+      }
+      const kv = /^([A-Za-z0-9_][\w.-]*)\s*=\s*"(.*)"\s*$/.exec(trimmed);
+      if (!kv) continue;
+      const key = kv[1];
+      const value = kv[2].slice(0, 500); // borné
+      if (section === 'build') this.applyBuildKey(out, key, value);
+      else if (section === 'build.environment') out.environment![key] = value;
+      else if (source === 'netlify.toml' && section === 'functions' && key === 'directory')
+        out.functionsDirectory = value;
+    }
+    return out;
+  }
+
+  private applyBuildKey(
+    out: Omit<BuildConfig, 'source'>,
+    key: string,
+    value: string,
+  ): void {
+    switch (key) {
+      case 'pack':
+        out.pack = value;
+        break;
+      case 'base':
+        out.baseDirectory = value.replace(/\/+$/, '') || undefined;
+        break;
+      case 'command':
+        out.buildCommand = value;
+        break;
+      case 'install':
+        out.installCommand = value;
+        break;
+      case 'publish':
+        out.publishDirectory = value;
+        break;
+      case 'functions':
+        out.functionsDirectory = value;
+        break;
+      default:
+        break;
+    }
+  }
+
+  /**
+   * Détection « dépôt vide » (Phase 16) : aucune entrée dans `contents/` à la
+   * branche (ou réponse « Git Repository is empty »). Best-effort — un repo
+   * inaccessible ou une erreur réseau renvoie `false` (on ne bloque pas à tort).
+   */
+  async isRepoEmpty(token: string, fullName: string, branch: string): Promise<boolean> {
+    const [owner, repo] = fullName.split('/');
+    try {
+      const data = (await this.get(
+        `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(
+          repo,
+        )}/contents?ref=${encodeURIComponent(branch)}`,
+        token,
+      )) as Array<unknown> | { message?: unknown };
+      return Array.isArray(data) && data.length === 0;
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (/Git Repository is empty|404/i.test(msg)) return true;
+      return false;
     }
   }
 

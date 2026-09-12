@@ -219,6 +219,104 @@ describe('GithubService', () => {
     });
   });
 
+  // ── Phase 16 fix 503 — détection SPA Vite (readBuildConfig) ───────────────
+  describe('readBuildConfig() — détection SPA Vite (fix 503)', () => {
+    const b64 = (s: string) => Buffer.from(s, 'utf8').toString('base64');
+    const okContent = (path: string, content: string) => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ content: b64(content) }),
+    });
+    const empty = () => ({ ok: false, status: 404, text: async () => 'not found' });
+    // Injecte les fichiers racine ; tout fichier absent répond 404 (absent).
+    const setFiles = (map: Record<string, string>) => {
+      fetchMock.mockImplementation(async (path: unknown) => {
+        for (const [k, v] of Object.entries(map)) {
+          if (String(path).includes(`/contents/${k}?ref=`)) return okContent(String(path), v);
+        }
+        return empty();
+      });
+    };
+
+    it('SPA Vite (vite.config.ts + vite, SANS serveur prod) ⇒ isStatic:true + publishDirectory "dist"', async () => {
+      setFiles({
+        'vite.config.ts': 'export default {}',
+        'package.json': JSON.stringify({
+          dependencies: { react: '^18' },
+          devDependencies: { vite: '^5', '@vitejs/plugin-react': '^4' },
+        }),
+      });
+      const out = await service.readBuildConfig('owner/spa', 'main', 'gh-token');
+      expect(out).toEqual({
+        environment: {},
+        source: 'none',
+        publishDirectory: '/dist',
+        isStatic: true,
+      });
+    });
+
+    it('SPA Vite avec vite.config.js ⇒ isStatic:true', async () => {
+      setFiles({
+        'vite.config.js': 'export default {}',
+        'package.json': JSON.stringify({ devDependencies: { vite: '^5' } }),
+      });
+      const out = await service.readBuildConfig('owner/spa', 'main', 'gh-token');
+      expect(out.isStatic).toBe(true);
+      expect(out.publishDirectory).toBe('/dist');
+    });
+
+    it('repo backend Express (vite.config présent MAIS runtime serveur node via start) ⇒ PAS static', async () => {
+      setFiles({
+        'vite.config.ts': 'export default {}',
+        'package.json': JSON.stringify({
+          scripts: { start: 'node server.js', build: 'tsc && vite build' },
+          dependencies: { express: '^4' },
+          devDependencies: { vite: '^5' },
+        }),
+      });
+      const out = await service.readBuildConfig('owner/api', 'main', 'gh-token');
+      expect(out).toEqual({ environment: {}, source: 'none' });
+    });
+
+    it('express résiduel en deps (ancien server.js supprimé, build vite, AUCUN start) ⇒ SPA statique', async () => {
+      // Ex. repo « Code-Diali-Guide-de-Demarrage » : dépendance express vestigiale
+      // mais build = `vite build` (dist statique) et aucun serveur réel.
+      setFiles({
+        'vite.config.ts': 'export default {}',
+        'package.json': JSON.stringify({
+          scripts: { build: 'vite build', preview: 'vite preview' },
+          dependencies: { express: '^4.21.2', react: '^19', vite: '^6', dotenv: '^17' },
+        }),
+      });
+      const out = await service.readBuildConfig('owner/spa', 'main', 'gh-token');
+      expect(out.isStatic).toBe(true);
+      expect(out.publishDirectory).toBe('/dist');
+    });
+
+    it('backend sans vite.config ⇒ PAS static (comportement historique inchangé)', async () => {
+      setFiles({ 'package.json': JSON.stringify({ dependencies: { express: '^4' } }) });
+      const out = await service.readBuildConfig('owner/api', 'main', 'gh-token');
+      expect(out).toEqual({ environment: {}, source: 'none' });
+    });
+
+    it('SPA sans package.json lisible ⇒ PAS static (best-effort, jamais bloquant)', async () => {
+      setFiles({ 'vite.config.ts': 'export default {}' }); // package.json absent
+      const out = await service.readBuildConfig('owner/spa', 'main', 'gh-token');
+      expect(out).toEqual({ environment: {}, source: 'none' });
+    });
+
+    it('un codediali.toml prime sur la détection (pas de isStatic dérivé)', async () => {
+      setFiles({
+        'codediali.toml': '[build]\ncommand = "npm run build"',
+        'vite.config.ts': 'export default {}',
+        'package.json': JSON.stringify({ devDependencies: { vite: '^5' } }),
+      });
+      const out = await service.readBuildConfig('owner/app', 'main', 'gh-token');
+      expect(out.source).toBe('codediali.toml');
+      expect(out.isStatic).toBeUndefined();
+    });
+  });
+
   describe('suggestBuildPack()', () => {
     it('dockerfile pour Dockerfile, nixpacks pour les langages et null', () => {
       expect(suggestBuildPack('Dockerfile')).toBe('dockerfile');

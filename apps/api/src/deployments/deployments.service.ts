@@ -12,10 +12,9 @@ import {
   DeploymentStatus,
   HostingPack,
   PackStatus,
+  Prisma,
   Server,
   ServerPanelProvider,
-  Service,
-  ServiceStatus,
   SubscriptionStatus,
 } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
@@ -33,12 +32,11 @@ import {
 } from '../servers/panel-transport.factory';
 import { CloudflareService } from '../cloudflare/cloudflare.service';
 import { CreateDeploymentDto } from './dto/create-deployment.dto';
-import { DetectResult, GithubRepo, GithubService } from './github.service';
+import { BuildConfig, DetectResult, GithubRepo, GithubService } from './github.service';
 
 /** Vue masquée d'un déploiement : jamais `coolifyUuid` (infra Coolify, ADR-021 —
  *  le client ne reçoit ni l'UUID d'application ni l'adresse du serveur). */
 export type DeploymentView = Omit<Deployment, 'coolifyUuid'> & {
-  service?: { id: string; name: string } | null;
   server?: { id: string; name: string } | null;
 };
 
@@ -63,7 +61,6 @@ export interface ClientDeploymentsPayload {
 }
 
 type DeploymentWithRefs = Deployment & {
-  service?: { id: string; name: string } | null;
   server?: { id: string; name: string } | null;
 };
 
@@ -116,6 +113,73 @@ export class DeploymentsService {
   private async requireGithubToken(actor: Actor): Promise<string> {
     const user = await this.prisma.user.findUnique({ where: { id: actor.sub } });
     return this.github.decryptToken(user?.githubTokenEnc ?? null);
+  }
+
+  /** Token GitHub du compte, ou null (mode URL / compte non lié) — pour la
+   *  lecture de codediali.toml et la détection repo vide. Best-effort. */
+  private async tryGithubToken(actor: Actor): Promise<string | null> {
+    try {
+      return await this.requireGithubToken(actor);
+    } catch {
+      return null;
+    }
+  }
+
+  /** Fusionne la config de build : les valeurs explicites du client (page de
+   *  build) PRIMENT sur celles lues du fichier codediali.toml/netlify.toml. */
+  private resolveBuildConnection(
+    dto: CreateDeploymentDto,
+    fromFile: BuildConfig | null,
+  ): {
+    baseDirectory?: string;
+    buildCommand?: string;
+    installCommand?: string;
+    publishDirectory?: string;
+    functionsDirectory?: string;
+    isStatic?: boolean;
+    environment: Record<string, string>;
+  } {
+    const t = (v: string | undefined): string | undefined =>
+      v && v.trim() ? v.trim().slice(0, 1000) : undefined;
+    const env: Record<string, string> = {};
+    if (dto.environment) {
+      for (const [k, v] of Object.entries(dto.environment)) {
+        const key = k.trim().slice(0, 200);
+        if (key && /^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) env[key] = String(v).slice(0, 4000);
+      }
+    } else if (fromFile) {
+      Object.assign(env, fromFile.environment);
+    }
+    // Fix 503 « no available server » — SPA Vite détecté : on sert le build en
+    // `dist/` statique (forcé, quel que soit le dossier demandé).
+    const isStatic = fromFile?.isStatic === true;
+    return {
+      baseDirectory: t(dto.baseDirectory ?? fromFile?.baseDirectory),
+      buildCommand: t(dto.buildCommand ?? fromFile?.buildCommand),
+      installCommand: t(dto.installCommand ?? fromFile?.installCommand),
+      publishDirectory: isStatic ? '/dist' : t(dto.publishDirectory ?? fromFile?.publishDirectory),
+      functionsDirectory: t(dto.functionsDirectory ?? fromFile?.functionsDirectory),
+      environment: env,
+      isStatic: isStatic || undefined,
+    };
+  }
+
+  /**
+   * Phase 16 — prévisualisation de la config de build d'un dépôt GitHub (page
+   * « Créer un nouveau Projet » du client) : lit codediali.toml/netlify.toml
+   * (ou détection) et renvoie la config pré-remplie — jamais le contenu brut.
+   */
+  async previewBuildConfig(fullName: string, branch: string | undefined, actor: Actor): Promise<BuildConfig> {
+    await this.requireDeployEnabled();
+    const token = await this.tryGithubToken(actor);
+    return this.github.readBuildConfig(fullName, branch ?? 'main', token);
+  }
+
+  /** Détection « dépôt vide » (message Netlify-style au client). */
+  async checkRepoEmpty(fullName: string, branch: string | undefined, actor: Actor): Promise<{ empty: boolean }> {
+    await this.requireDeployEnabled();
+    const token = await this.requireGithubToken(actor);
+    return { empty: await this.github.isRepoEmpty(token, fullName, branch ?? 'main') };
   }
 
   private toView(d: DeploymentWithRefs): DeploymentView {
@@ -197,8 +261,8 @@ export class DeploymentsService {
     // Phase 13 — cible résolue depuis le pack ACTIF → module A/B quand aucun
     // Service n'est choisi ; un `serviceId` fourni honore le comportement
     // historique (serveur du Service + pack de son abonnement).
-    const { server, pack, module, projectUuid, clientProjectId, service } =
-      await this.resolveDeployTarget(actor.sub, dto.serviceId);
+    const { server, pack, module, projectUuid, clientProjectId } =
+      await this.resolveDeployTarget(actor.sub);
     // Quota d'apps du pack (Phase 13) : count des apps du client hors FAILED.
     // Appliqué AVANT toute création côté Coolify.
     if (pack?.maxApps != null && pack.maxApps > 0) {
@@ -213,24 +277,44 @@ export class DeploymentsService {
     }
 
     const branch = dto.branch?.trim() ? dto.branch.trim() : (detectedBranch ?? 'main');
-    const buildPack = dto.buildPack ?? suggestedBuildPack ?? 'nixpacks';
+
+    // Phase 16 — build « file-based » : on PRÉFÈRE les valeurs explicites du
+    // client (page de build), sinon les valeurs lues de codediali.toml /
+    // netlify.toml (best-effort), sinon la détection auto existante. Le serveur
+    // re-sane et borne : un fichier malformé ne casse jamais le déploiement.
+    const buildFromFile = await this.github
+      .readBuildConfig(repoFullName, branch, dto.repoUrl ? null : await this.tryGithubToken(actor))
+      .catch(() => null);
+    const conn = this.resolveBuildConnection(dto, buildFromFile);
+    // Fix 503 « no available server » — SPA Vite. On NE force PAS build_pack
+    // "static" : le pack static de Coolify NE BUILDE pas (clone frais ⇒ dist
+    // absent ⇒ sert la racine source ⇒ page vide). Recette validée voie store :
+    // garder le build stack (nixpacks → produit dist/) et poser isStatic + /dist
+    // pour que Coolify serve la sortie de build statiquement (port 80).
+    const packed = dto.buildPack ?? buildFromFile?.pack ?? suggestedBuildPack ?? 'nixpacks';
     const appName = dto.appName?.trim()
       ? dto.appName.trim()
-      : (service?.name ?? repoFullName.split('/')[1] ?? 'mon-app');
+      : (repoFullName.split('/')[1] ?? 'mon-app');
     const target = this.buildTarget(server);
     const transport = this.panelFactory.create();
 
     const row = await this.prisma.deployment.create({
       data: {
         userId: actor.sub,
-        serviceId: service?.id ?? null,
         serverId: server.id,
         repoFullName,
         repoUrl: dto.repoUrl ? repoUrl : null,
-        buildPack,
+        buildPack: packed,
         appName,
         branch,
         status: DeploymentStatus.PENDING,
+        // Phase 16 — build file-based persisté pour un re-déploiement déterministe.
+        baseDirectory: conn.baseDirectory,
+        buildCommand: conn.buildCommand,
+        installCommand: conn.installCommand,
+        publishDirectory: conn.publishDirectory,
+        functionsDirectory: conn.functionsDirectory,
+        environment: Object.keys(conn.environment).length ? conn.environment : Prisma.JsonNull,
         // Phase 13 — traçabilité du projet/module qui héberge l'app.
         coolifyProjectUuid: projectUuid,
         moduleId: module?.id ?? null,
@@ -242,12 +326,36 @@ export class DeploymentsService {
       const app = await transport.createGitApp(target, {
         repoUrl,
         branch,
-        serviceName: service?.name ?? appName,
-        buildPack,
+        serviceName: appName,
+        buildPack: packed,
         appName,
         projectUuid: projectUuid ?? server.coolifyProjectUuid ?? undefined,
         serverUuid: server.coolifyServerUuid ?? undefined,
+        // Phase 16 — build file-based (base directory, commandes).
+        publishDirectory: conn.publishDirectory,
+        baseDirectory: conn.baseDirectory,
+        buildCommand: conn.buildCommand,
+        installCommand: conn.installCommand,
+        // Fix 503 — SPA Vite : transmet is_static:true à Coolify.
+        isStatic: conn.isStatic,
       });
+      // Phase 16 — variables d'environnement de BUILD (best-effort : un échec
+      // est tracé en warn et n'annule jamais le déploiement).
+      if (Object.keys(conn.environment).length) {
+        try {
+          await transport.setAppEnvironment(target, app.uuid, conn.environment);
+        } catch (err) {
+          const m = err instanceof Error ? err.message : String(err);
+          await this.audit.record({
+            actorId: actor.sub,
+            actorEmail: actor.email,
+            action: 'deploy.env.warn',
+            resourceType: 'deployment',
+            resourceId: row.id,
+            details: { coolifyUuid: app.uuid, message: m },
+          });
+        }
+      }
       // Phase 12/13 — applique les limites RAM/CPU du pack (overrides du module
       // prioritaires) AVANT de lancer le déploiement. Best-effort : un échec
       // n'interrompt pas l'app. Le quota disque reste enregistré, non appliqué.
@@ -266,16 +374,23 @@ export class DeploymentsService {
             details: { coolifyUuid: app.uuid, ...limits, packName: pack?.name },
           });
         } catch (err) {
+          // Sécurité serveur partagé (Bloc 3) — fail-closed : une app ne reste
+          // JAMAIS sans plafond sur un box partagé. Si les limites du pack ne
+          // peuvent pas être appliquées, on échoue la deployment (FAILED) au lieu
+          // de lancer le build. On lève ici ; le catch externe marque FAILED et
+          // lève BadGateway avec le message.
           const m = err instanceof Error ? err.message : String(err);
-          deployDetail = `App créée — limites non appliquées (${m}). Déploiement lancé.`;
           await this.audit.record({
             actorId: actor.sub,
             actorEmail: actor.email,
-            action: 'deploy.limits.warn',
+            action: 'deploy.limits.failed',
             resourceType: 'deployment',
             resourceId: row.id,
             details: { coolifyUuid: app.uuid, ...limits, packName: pack?.name, message: m },
           });
+          throw new Error(
+            `Limites pack non appliquées — app non laissée sans plafond sur serveur partagé (${m}).`,
+          );
         }
       }
       // Phase 3 — sous-domaine gratuit (CNAME → hostname Coolify) via Cloudflare,
@@ -288,7 +403,7 @@ export class DeploymentsService {
           const alloc = await this.cloudflare.allocateClientSubdomain({
             root,
             requested: dto.subdomain,
-            seed: appName || service?.name || 'app',
+            seed: appName || 'app',
             fallbackHost: server.hostname,
             deploymentId: row.id,
           });
@@ -315,6 +430,26 @@ export class DeploymentsService {
           });
         }
       }
+      // Phase 16 (validé en réel) — pose le fqdn alloué comme domaine de l'app
+      // Coolify. Sans cela l'app ne répond que sur son sslip.io par défaut et le
+      // sous-domaine public (CNAME Cloudflare) renvoie 503 « no available server ».
+      // Best-effort, comme dans la voie store (provisioning.actionCreateApp).
+      if (dns.fqdn) {
+        try {
+          await transport.setAppDomain(target, app.uuid, dns.fqdn);
+        } catch (err) {
+          const m = err instanceof Error ? err.message : String(err);
+          deployDetail += ` (domaine app : ${m})`;
+          await this.audit.record({
+            actorId: actor.sub,
+            actorEmail: actor.email,
+            action: 'deploy.domain.app.warn',
+            resourceType: 'deployment',
+            resourceId: row.id,
+            details: { coolifyUuid: app.uuid, fqdn: dns.fqdn, message: m },
+          });
+        }
+      }
       await transport.deployApp(target, app.uuid);
       const updated = await this.prisma.deployment.update({
         where: { id: row.id },
@@ -325,7 +460,6 @@ export class DeploymentsService {
           ...dns,
         },
         include: {
-          service: { select: { id: true, name: true } },
           server: { select: { id: true, name: true } },
         },
       });
@@ -338,10 +472,9 @@ export class DeploymentsService {
         details: {
           repoFullName,
           branch,
-          buildPack,
+          buildPack: packed,
           appName,
           mode: dto.repoUrl ? 'url' : 'github',
-          serviceId: service?.id ?? null,
           serverId: server.id,
           coolifyUuid: app.uuid,
           moduleId: module?.id ?? null,
@@ -361,7 +494,7 @@ export class DeploymentsService {
         action: 'deploy.failed',
         resourceType: 'deployment',
         resourceId: row.id,
-        details: { repoFullName, branch, buildPack, appName, message },
+        details: { repoFullName, branch, buildPack: packed, appName, message },
       });
       throw new BadGatewayException(`Échec du déploiement : ${message}`);
     }
@@ -373,7 +506,6 @@ export class DeploymentsService {
     const rows = await this.prisma.deployment.findMany({
       where: { userId: actor.sub },
       include: {
-        service: { select: { id: true, name: true } },
         server: { select: { id: true, name: true } },
       },
       orderBy: { createdAt: 'desc' },
@@ -418,7 +550,6 @@ export class DeploymentsService {
     const row = await this.prisma.deployment.findFirst({
       where: { id, userId: actor.sub },
       include: {
-        service: { select: { id: true, name: true } },
         server: { select: { id: true, name: true } },
       },
     });
@@ -526,50 +657,21 @@ export class DeploymentsService {
   // ── Internes ───────────────────────────────────────────────────────────────
 
   /**
-   * Phase 13 — cible de déploiement. Deux chemins :
-   *  1. `serviceId` fourni (et appartenant au client) → comportement historique :
-   *     serveur = celui du Service ACTIVE, pack = pack de son abonnement.
-   *  2. `serviceId` absent → résolution automatique depuis le pack ACTIF du
-   *     client (abonnement ACTIVE → produit → pack) → module de déploiement.
+   * Phase 13 (Bloc 4) — cible de déploiement : la table `Service` a été
+   * supprimée, la cible est TOUJOURS résolue depuis le pack ACTIF du client
+   * (abonnement ACTIVE → produit → pack) → module de déploiement A/B.
    * Le projet Coolify est ensuite déduit du module (A = projet partagé configuré ;
    * B = projet dédié du client, créé paresseusement à la première app).
    */
   private async resolveDeployTarget(
     userId: string,
-    serviceId?: string,
   ): Promise<{
     server: Server;
     pack: HostingPack | null;
     module: DeploymentModule | null;
     projectUuid?: string;
     clientProjectId?: string;
-    service: Service | null;
   }> {
-    // ── 1. Mode historique : un Service du client est fourni ────────────────
-    if (serviceId) {
-      const service = await this.prisma.service.findFirst({
-        where: { id: serviceId, subscription: { userId } },
-        include: {
-          server: true,
-          subscription: {
-            include: { product: { include: { pack: { include: { deploymentModule: true } } } } },
-          },
-        },
-      });
-      if (!service) {
-        throw new NotFoundException('Service introuvable.');
-      }
-      if (service.status !== ServiceStatus.ACTIVE) {
-        throw new BadRequestException('Service non actif : impossible de déployer.');
-      }
-      const server = this.requireCoolifyServer(service.server);
-      const pack = service.subscription?.product?.pack ?? null;
-      const module = pack?.deploymentModule ?? null;
-      const project = await this.resolveProject(module, server, userId);
-      return { server, pack, module, ...project, service };
-    }
-
-    // ── 2. Mode auto : pack ACTIF du client → module A/B ────────────────────
     const subscription = await this.prisma.subscription.findFirst({
       where: { userId, status: SubscriptionStatus.ACTIVE },
       include: {
@@ -598,7 +700,7 @@ export class DeploymentsService {
     }
     const server = this.requireCoolifyServer(module.server);
     const project = await this.resolveProject(module, server, userId);
-    return { server, pack, module, ...project, service: null };
+    return { server, pack, module, ...project };
   }
 
   /** Vérifie que le serveur est Coolify + connecté (panelOk + credentials). */
@@ -758,7 +860,6 @@ export class DeploymentsService {
       where: { id: row.id },
       data: { status: mapped, detail: detail ?? `Statut Coolify : ${rawStatus}` },
       include: {
-        service: { select: { id: true, name: true } },
         server: { select: { id: true, name: true } },
       },
     });

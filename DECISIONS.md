@@ -647,5 +647,75 @@ Decision: la marque n'est plus codée en dur — tout détail éditable depuis `
 - **Application sans flash** : `generateMetadata()` + `<style :root>` injecté (`--brand-*` `!important` → recolor badges/glows/globe/touches) ; `BrandProvider`/`BrandLogo` ; `globals.css` dérive les verts via `color-mix(var(--brand-primary))`. `config/brand.ts` = source des défauts. Article « Configurer la marque » seedé.
 - Invariants : rebrand Code Diali **différé à la fin du projet** (règle owner) ; SVG/interdit + ≤ 2 Mo.
 
+## ADR-035 — Abonnements par commande (order-driven), suppression Service, limites strictes (Blocs 1–7)
+**Status: IMPLEMENTED** (2026-09-11, commits en cours — Blocs 1–7 des 5 directives propriétaire).
+Decision (5 directives owner + 3 décisions entérinées AskUserQuestion) :
+1. **Sécurité des ressources sur serveur partagé** (directive A, la plus critique) — un build client
+   lourd doit **échouer l'app seule**, jamais planter le serveur. Toutes les apps d'un serveur
+   **partagent** les ressources (rien n'est réservé), chacune **plafonnée** par les limites de son
+   pack (`limits_cpus`/`limits_memory`, `applyAppLimits`). **Fail-closed** : les limites sont
+   **OBLIGATOIRES** aux deux chemins de création (`DeploymentsService.create` et
+   `ProvisioningService.actionCreateApp`) — un échec d'application → l'app passe **FAILED** / la
+   step `create_app` échoue, message « Limites pack non appliquées sur serveur partagé ». Toujours
+   re-plafonner les apps déjà déployées après un upgrade via **`syncAppLimits`**.
+2. **Refonte page admin « Souscriptions & services » → « Abonnements »** (directive B) — une table
+   unique : client, produit, **pack** (RAM/CPU/maxApps), **commande liée** (order store, montant),
+   statut, **apps déployées**, quota. Actions Suspendre/Réactiver/Annuler + **« Ré-synchroniser les
+   ressources »** (`POST /api/admin/subscriptions/:id/resync-limits` → `syncAppLimits`).
+3. **Tous les abonnements/services passent par la procédure de commande** (directive C) — le seul
+   chemin public est `POST /store/checkout`. L'espace client « Souscrire »/« Commander » redirige
+   vers `/shop/<slug>`. Aucune création manuelle de subscription ; `PATCH
+   /api/client/subscriptions/:id/upgrade` retiré (helper interne conservé).
+4. **Produit gratuit + upgrade e2e sans perte** (directive D) — produit « **Plan Gratuit** »
+   (`/shop/plan-gratuit`, `priceHtCents:0`, MONTHLY) + pack **« Starter »** minimal (256 Mo / 0.5 CPU /
+   maxApps 1) dans `prisma/seed-store.ts`. Décision (b) **upgrade order-driven** : un client qui
+   rachète un produit à pack **repoint la MÊME souscription ACTIVE** (data/apps/sous-domaines
+   préservés, `createdAt` intact) puis `syncAppLimits` ré-applique les nouvelles limites.
+5. **Décision (c)** : la table **`Service`** est **supprimée entièrement** (migration
+   `20260911150000_drop_service`) + code (services controllers/DTO/spec, `Deployment.serviceId`,
+   `SERVICE_*`), web (`Service` type + helpers, panneaux « services demandés »).
+6. **Décisions (a) + (e)** : abonnements **ACTIFS immédiatement** au checkout (le paiement vaut
+   approbation ; l'admin garde suspendre/réactiver/ré-synchroniser). Upgrade = repointe la MÊME
+   ligne, pas de recréation.
+- Modèles (migration `20260911140000_order_subscription_relation`) : `Order.subscriptionId?` +
+   `Subscription.orderId? @unique` (1:1, `onDelete:SetNull`), relation `order`.
+- **Module** : `SubscriptionsModule` importe `StoreModule` (exporte `ProvisioningService`) pour
+   l'injection de `syncAppLimits` (pas de circularité).
+- Bloc 7 : KB `docs/kb-creation-apps-github.md` §6 « Sécurité des ressources sur serveur partagé ».
+- Vérifié : API/web tsc nets + jest verts (`subscriptions` 10, `deployments` 40, `provisioning` 4) +
+   `prisma migrate deploy` OK + seed store OK (pack Starter + Plan Gratuit créés).
+
+## ADR-036 — Build config fichier (codediali.toml) + détection SPA Vite statique (Phase 16b)
+**Status: IMPLEMENTED + verified live** (2026-09-12, correction du 503 « no available server » sur
+la voie client, suite à la validation live d'un SPA Vite sur Coolify). Étend ADR-030/ADR-032/ADR-035.
+Decision (deux volets, enroulés dans le même slice auto-contenu `deployments/*`) :
+- **Build config fichier (Phase 16 build-file)** : un repo peut porter un `codediali.toml`
+  (prioritaire) ou `netlify.toml` qui **pré-remplit la page de build du client ET est appliqué à
+  Coolify au déploiement** (build pack, dossier base, commandes build/install, dossier de
+  publication, fonctions, variables d'env). Lecture **sanitized** (`GithubService.readBuildConfig` +
+  `parseBuildContent`, whitelist + bornes) : un fichier n'exécute JAMAIS de code côté serveur.
+  Endpoint `previewBuildConfig` (`GET /api/client/deployments/build-config`) pour pré-remplir le
+  formulaire client. Sources : `codediali.toml` > `netlify.toml` > détection auto (`none`).
+- **Fix 503 SPA Vite (le motif réel)** : sans fichier de config, la voie client sur un repo SPA Vite
+  renvoyait HTTP 503 « no available server » (Coolify ne savait pas comment servir). Une détection
+  **best-effort** `detectViteSpa` marque `isStatic:true` + `publishDirectory:'/dist'` ; `DeploymentsService`
+  transmet `is_static:true` + `publish_directory:/dist` (transport `createGitApp` déjà compatible).
+  **Recette validée live — on NE force PAS `build_pack:'static'`** : le pack `static` de Coolify ne
+  BUILD PAS (clone frais ⇒ `dist/` absent ⇒ sert l'`index.html` SOURCE ⇒ page vide en HTTP 200, bug
+  « rien ne s'affiche » constaté et corrigé). La recette qui marche (voie store plan-gratuit,
+  `provisioning.service.ts:394` défaut `nixpacks`) = **nixpacks + `is_static:true` + `publish_directory:/dist`** :
+  nixpacks build `dist/`, Coolify sert la sortie statiquement (port 80). Exigence Coolify : `publish_directory`
+  AVEC slash de tête (`/dist`, sinon HTTP 422 « The publish directory field format is invalid »).
+  Un `publish_directory` saisit reste surchargé vers `/dist` quand `isStatic:true`.
+- **Détection du SPA** : `vite.config.ts|js|mts` présent à la racine ET build = compile statique
+  (`vite build` ⇒ `dist/`) SANS runtime serveur Node comme point d'entrée. On juge le **serveur réel**
+  (scripts `start/serve/server/prod` exécutant `node|tsx|ts-node|nodemon|pm2|next|nest`), PAS la seule
+  présence d'une dep : un `express:^4` résiduel (ancien server.js supprimé) ne fait pas un back-end ;
+  un dépôt applicatif (`nest build`/tsc + `start`) reste non-statique. `source:'none'` = auto.
+- **Périmètre NON retenu** : rien d'autre. Le slice ne touche pas auth free-signup / store /
+  subscriptions (WIP Phase 16 séparé, non commité). Vérifié live : `https://gfix74485355.arumdigital.com`
+  → HTTP 200, HTML sert `dist/index.html` buildé, `/assets/index-*.js`/`.css` chargés 200.
+  Tests unit (7 détection github.service + 3 propagation deployments) verts.
+
 # REJECTED
 None recorded in this clean baseline.
