@@ -246,7 +246,10 @@ export default function ClientProjectPage() {
       if (k) environment[k] = row.value;
     }
     const r = await createDeployment(token, {
-      repoFullName,
+      // Un lien collé (mode URL) : envoyer `repoUrl` pour que le serveur reste en
+      // mode URL (aucun compte GitHub requis) — `repoFullName` forcerait le mode
+      // GitHub lié (decryptToken → « Aucun compte GitHub lié »).
+      ...(detected?.repoUrl ? { repoUrl: detected.repoUrl } : { repoFullName }),
       branch: branch.trim() || 'main',
       buildPack: (buildPack || undefined) as BuildPack | undefined,
       appName: appName.trim() || undefined,
