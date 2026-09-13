@@ -1,6 +1,7 @@
 import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import {
   DeploymentStatus,
+  LimitsStatus,
   OrderStatus,
   ProvisioningStepStatus,
   ProvisionAction,
@@ -10,6 +11,7 @@ import { AuditService } from '../audit/audit.service';
 import { CryptoService } from '../crypto/crypto.service';
 import { MailSettingsService } from '../mail/mail-settings.service';
 import { CloudflareService } from '../cloudflare/cloudflare.service';
+import { resolveEffectiveLimits } from '../deployments/limits.util';
 import { clientAreaUrl } from './web-links';
 import {
   PanelKind,
@@ -494,6 +496,14 @@ export class ProvisioningService {
         details: { orderId: ctx.order.id, coolifyUuid: created.uuid, fqdn: ctx.fqdn ?? undefined, source: 'store' },
       });
     } else if (userId) {
+      // Phase 17 (3c/3d) — cohérence quota/tracking per-pack : on trace le pack et les
+      // limites effectives (overrides module) sur l'app store aussi. Ici l'échec
+      // d'application des limites est FATAL (policy serveur partagé) : si on arrive à
+      // la création, les limites ont été appliquées → APPLIED (ou null si pas de pack).
+      const effStore = resolveEffectiveLimits(
+        fullOrder?.product.pack as { ramMb: number; cpuCores: number; storageLimit: number | null } | null | undefined,
+        mod,
+      );
       const createdRow = await this.prisma.deployment.create({
         data: {
           userId,
@@ -509,6 +519,10 @@ export class ProvisioningService {
           publishDirectory,
           coolifyProjectUuid: projectUuid ?? null,
           moduleId: mod?.id ?? null,
+          packId: fullOrder?.product.pack?.id ?? null,
+          limitsStatus: effStore ? LimitsStatus.APPLIED : null,
+          limitsRamMb: effStore?.ramMb ?? null,
+          limitsCpu: effStore?.cpuCores ?? null,
           ...(ctx.fqdn ? { fqdn: ctx.fqdn } : {}),
         },
       });

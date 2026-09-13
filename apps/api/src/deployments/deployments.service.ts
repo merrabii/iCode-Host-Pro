@@ -11,6 +11,7 @@ import {
   DeploymentModuleKind,
   DeploymentStatus,
   HostingPack,
+  LimitsStatus,
   PackStatus,
   Prisma,
   Server,
@@ -24,12 +25,13 @@ import { SecuritySettingsService } from '../auth/security/security-settings.serv
 import { Actor } from '../users/users.service';
 import {
   CoolifyAppLimits,
-  cpusFromCores,
-  memoryFromMb,
   PanelKind,
   PanelTarget,
   PanelTransportFactory,
+  cpusFromCores,
+  memoryFromMb,
 } from '../servers/panel-transport.factory';
+import { resolveEffectiveLimits } from './limits.util';
 import { CloudflareService } from '../cloudflare/cloudflare.service';
 import { CreateDeploymentDto } from './dto/create-deployment.dto';
 import { BuildConfig, DetectResult, GithubRepo, GithubService } from './github.service';
@@ -263,18 +265,12 @@ export class DeploymentsService {
     // historique (serveur du Service + pack de son abonnement).
     const { server, pack, module, projectUuid, clientProjectId } =
       await this.resolveDeployTarget(actor.sub);
-    // Quota d'apps du pack (Phase 13) : count des apps du client hors FAILED.
-    // Appliqué AVANT toute création côté Coolify.
-    if (pack?.maxApps != null && pack.maxApps > 0) {
-      const used = await this.prisma.deployment.count({
-        where: { userId: actor.sub, status: { not: DeploymentStatus.FAILED } },
-      });
-      if (used >= pack.maxApps) {
-        throw new ForbiddenException(
-          `Quota d'applications atteint (${used}/${pack.maxApps}). Supprimez une application ou passez à un plan supérieur.`,
-        );
-      }
-    }
+    // Phase 17 (3d) — quota PAR PACK (jamais fusionné entre packs d'un même
+    // client). Compte et somme les ressources des apps du client rattachées à CE
+    // pack précis, compare au budget dérivé du pack (limite par app × maxApps),
+    // et refuse la création si elle dépasserait. Appliqué AVANT toute création
+    // côté Coolify.
+    await this.assertUnderPackQuota(actor.sub, pack, module);
 
     const branch = dto.branch?.trim() ? dto.branch.trim() : (detectedBranch ?? 'main');
 
@@ -319,6 +315,8 @@ export class DeploymentsService {
         coolifyProjectUuid: projectUuid,
         moduleId: module?.id ?? null,
         clientProjectId: clientProjectId ?? null,
+        // Phase 17 (3c/3d) — pack à l'origine de la création (quota per-pack + tracking).
+        packId: pack?.id ?? null,
       },
     });
 
@@ -357,11 +355,17 @@ export class DeploymentsService {
         }
       }
       // Phase 12/13 — applique les limites RAM/CPU du pack (overrides du module
-      // prioritaires) AVANT de lancer le déploiement. Best-effort : un échec
-      // n'interrompt pas l'app. Le quota disque reste enregistré, non appliqué.
-      const limits = this.packLimits(pack, module);
+      // prioritaires) AVANT de lancer le déploiement. Phase 17 (décision #2, 3c) :
+      // BEST-EFFORT — un échec d'applyAppLimits ne bloque JAMAIS le déploiement de
+      // l'app cliente (l'app est déployée quand même), mais il n'est plus silencieux :
+      // on trace limitsStatus=FAILED + message, visible au monitoring admin, et
+      // re-applicable manuellement. Le quota disque reste enregistré, non appliqué.
+      const eff = resolveEffectiveLimits(pack, module);
       let deployDetail = 'Déploiement déclenché sur Coolify.';
-      if (limits) {
+      if (eff) {
+        const limits = eff.limits;
+        let limitsStatus: LimitsStatus = LimitsStatus.APPLIED;
+        let limitsLastError: string | null = null;
         try {
           await transport.applyAppLimits(target, app.uuid, limits);
           deployDetail = `Déploiement déclenché — limites appliquées (${limits.memory ?? ''} RAM${limits.cpus ? `, ${limits.cpus} CPU` : ''}).`;
@@ -374,12 +378,10 @@ export class DeploymentsService {
             details: { coolifyUuid: app.uuid, ...limits, packName: pack?.name },
           });
         } catch (err) {
-          // Sécurité serveur partagé (Bloc 3) — fail-closed : une app ne reste
-          // JAMAIS sans plafond sur un box partagé. Si les limites du pack ne
-          // peuvent pas être appliquées, on échoue la deployment (FAILED) au lieu
-          // de lancer le build. On lève ici ; le catch externe marque FAILED et
-          // lève BadGateway avec le message.
           const m = err instanceof Error ? err.message : String(err);
+          limitsStatus = LimitsStatus.FAILED;
+          limitsLastError = m;
+          deployDetail = `Déploiement déclenché — AVERTISSEMENT : limites non appliquées (${m}).`;
           await this.audit.record({
             actorId: actor.sub,
             actorEmail: actor.email,
@@ -388,10 +390,17 @@ export class DeploymentsService {
             resourceId: row.id,
             details: { coolifyUuid: app.uuid, ...limits, packName: pack?.name, message: m },
           });
-          throw new Error(
-            `Limites pack non appliquées — app non laissée sans plafond sur serveur partagé (${m}).`,
-          );
         }
+        // Suivi persistant (3c) — statut + valeurs effectives pour la re-application.
+        await this.prisma.deployment.update({
+          where: { id: row.id },
+          data: {
+            limitsStatus,
+            limitsRamMb: eff.ramMb,
+            limitsCpu: eff.cpuCores,
+            limitsLastError,
+          },
+        });
       }
       // Phase 3 — sous-domaine gratuit (CNAME → hostname Coolify) via Cloudflare,
       // APRÈS les limites et AVANT le run. Best-effort comme les limites : un
@@ -800,12 +809,139 @@ export class DeploymentsService {
    *  quota prévu après la mise en prod. */
   private packLimits(pack: HostingPack | null, module?: DeploymentModule | null): CoolifyAppLimits | null {
     if (!pack || pack.status !== PackStatus.ACTIVE) return null;
-    const ramMb = module?.overrideRamMb ?? pack.ramMb;
-    const cpuCores = module?.overrideCpuCores ?? pack.cpuCores;
+    return resolveEffectiveLimits(pack, module)?.limits ?? null;
+  }
+
+  /**
+   * Phase 17 (3d) — QUOTA PAR PACK, jamais fusionné entre packs d'un même client.
+   * Compte et somme les ressources des apps du client rattachées à CE pack précis
+   * (packId), compare au budget DÉRIVÉ du pack (limite effective par app × maxApps),
+   * et refuse la création si elle dépasserait le quota d'apps OU les ressources
+   * du pack. Appelé AVANT toute création côté Coolify.
+   */
+  private async assertUnderPackQuota(
+    userId: string,
+    pack: HostingPack | null,
+    module?: DeploymentModule | null,
+  ): Promise<void> {
+    if (!pack) return;
+    const eff = resolveEffectiveLimits(pack, module);
+    // Apps du client qui appartiennent à CE pack précis (jamais d'autres packs).
+    const deps = await this.prisma.deployment.findMany({
+      where: { userId, packId: pack.id, status: { not: DeploymentStatus.FAILED } },
+      select: { limitsRamMb: true, limitsCpu: true },
+    });
+    const count = deps.length;
+    const maxApps = pack.maxApps ?? null;
+    if (maxApps != null && count >= maxApps) {
+      throw new ForbiddenException(
+        `Quota d'applications du pack « ${pack.name} » atteint (${count}/${maxApps}). Supprimez une application ou passez à un plan supérieur.`,
+      );
+    }
+    // Budget dérivé : limite effective par app × maxApps. Chaque pack a SON budget,
+    // indépendant des autres packs du client.
+    if (maxApps != null && eff) {
+      const sumRam = deps.reduce((acc, d) => acc + (d.limitsRamMb ?? eff.ramMb), 0);
+      const sumCpu = deps.reduce((acc, d) => acc + (d.limitsCpu ?? eff.cpuCores), 0);
+      const budgetRam = eff.ramMb * maxApps;
+      const budgetCpu = eff.cpuCores * maxApps;
+      if (sumRam + eff.ramMb > budgetRam || sumCpu + eff.cpuCores > budgetCpu) {
+        throw new ForbiddenException(
+          `Limites de ressources du pack « ${pack.name} » dépassées (RAM ${sumRam + eff.ramMb}/${budgetRam} Mo, CPU ${sumCpu + eff.cpuCores}/${budgetCpu}). Supprimez une application ou passez à un plan supérieur.`,
+        );
+      }
+    }
+  }
+
+  /** Phase 17 (3c) — apps dont l'application des limites a échoué (suivi visible admin). */
+  async listLimitsIssues(limit = 200): Promise<
+    Array<{
+      id: string;
+      appName: string | null;
+      fqdn: string | null;
+      clientEmail: string;
+      clientName: string | null;
+      status: DeploymentStatus;
+      limitsStatus: LimitsStatus;
+      limitsRamMb: number | null;
+      limitsCpu: number | null;
+      limitsLastError: string | null;
+      limitsRetryCount: number;
+    }>
+  > {
+    const rows = await this.prisma.deployment.findMany({
+      where: { limitsStatus: { in: [LimitsStatus.FAILED, LimitsStatus.PENDING_RETRY] } },
+      take: limit,
+      orderBy: { updatedAt: 'desc' },
+      include: { user: { select: { name: true, email: true } } },
+    });
+    return rows.map((r) => ({
+      id: r.id,
+      appName: r.appName,
+      fqdn: r.fqdn,
+      clientEmail: r.user.email,
+      clientName: r.user.name,
+      status: r.status,
+      limitsStatus: r.limitsStatus as LimitsStatus,
+      limitsRamMb: r.limitsRamMb,
+      limitsCpu: r.limitsCpu,
+      limitsLastError: r.limitsLastError,
+      limitsRetryCount: r.limitsRetryCount,
+    }));
+  }
+
+  /**
+   * Phase 17 (3c) — re-application MANUELLE des limites (bouton admin). Réutilise
+   * les limites effectives ENREGISTRÉES à la création (pas de recalcul dépendant du
+   * pack actuel). Lève en cas d'échec (l'admin voit le message). Ne redéploie jamais
+   * l'app ni ne redémarre le conteneur : uniquement un PATCH des champs Coolify, donc
+   * aucune interruption du service client. Un cooldown anti-spam évite une boucle
+   * qui frapperait l'API Coolify (pas d'auto-retry).
+   */
+  async reapplyLimits(id: string): Promise<{ status: LimitsStatus; message: string }> {
+    const dep = await this.prisma.deployment.findUnique({
+      where: { id },
+      include: { server: true },
+    });
+    if (!dep) throw new NotFoundException('Déploiement introuvable.');
+    if (!dep.coolifyUuid || !dep.server || dep.server.panelOk !== true || !dep.server.apiBaseUrl || !dep.server.apiTokenEnc) {
+      throw new BadRequestException(
+        'Ré-application impossible : app Coolify ou serveur connecté non tracé pour cette app.',
+      );
+    }
+    if (dep.limitsRamMb == null && dep.limitsCpu == null) {
+      throw new BadRequestException("Aucune limite enregistrée pour cette app (pas de pack ACTIVE à la création).");
+    }
+    const cooldownMs = 60_000;
+    if (
+      dep.limitsStatus === LimitsStatus.PENDING_RETRY &&
+      Date.now() - (dep.updatedAt?.getTime() ?? 0) < cooldownMs
+    ) {
+      throw new BadRequestException('Ré-application trop récente. Attendez quelques instants.');
+    }
     const limits: CoolifyAppLimits = {};
-    if (cpuCores && cpuCores > 0) limits.cpus = cpusFromCores(cpuCores);
-    if (ramMb && ramMb > 0) limits.memory = memoryFromMb(ramMb);
-    return limits.cpus || limits.memory ? limits : null;
+    if (dep.limitsRamMb != null && dep.limitsRamMb > 0) limits.memory = memoryFromMb(dep.limitsRamMb);
+    if (dep.limitsCpu != null && dep.limitsCpu > 0) limits.cpus = cpusFromCores(dep.limitsCpu);
+    const target = this.buildTarget(dep.server);
+    const transport = this.panelFactory.create();
+    try {
+      await transport.applyAppLimits(target, dep.coolifyUuid, limits);
+    } catch (err) {
+      const m = err instanceof Error ? err.message : String(err);
+      await this.prisma.deployment.update({
+        where: { id },
+        data: { limitsStatus: LimitsStatus.FAILED, limitsLastError: m, limitsRetryCount: { increment: 1 } },
+      });
+      throw new BadRequestException(`Échec de la ré-application des limites : ${m}`);
+    }
+    await this.prisma.deployment.update({
+      where: { id },
+      data: { limitsStatus: LimitsStatus.APPLIED, limitsLastError: null, limitsRetryCount: { increment: 1 } },
+    });
+    return {
+      status: LimitsStatus.APPLIED,
+      message: `Limites ré-appliquées (${limits.memory ?? ''} RAM${limits.cpus ? `, ${limits.cpus} CPU` : ''}).`,
+    };
   }
 
   /** Construit la cible du transport : jeton API panneau déchiffré à la volée. */

@@ -228,6 +228,8 @@ describe('DeploymentsService', () => {
       mockTransport.createGitApp.mockResolvedValue({ uuid: 'app-1' });
       mockTransport.deployApp.mockResolvedValue(undefined);
       mockPrisma.deployment.update.mockResolvedValue(deploymentRow());
+      // Phase 17 (3d) — quota par pack : comptage findMany (apps du pack du client).
+      mockPrisma.deployment.findMany.mockResolvedValue([]);
 
       const out = await service.create({ repoFullName: 'owner/repo' }, actor);
 
@@ -277,6 +279,8 @@ describe('DeploymentsService', () => {
       mockTransport.createGitApp.mockResolvedValue({ uuid: 'app-1' });
       mockTransport.deployApp.mockResolvedValue(undefined);
       mockPrisma.deployment.update.mockResolvedValue(deploymentRow({ branch: 'develop' }));
+      // Phase 17 (3d) — quota par pack : comptage findMany (apps du pack du client).
+      mockPrisma.deployment.findMany.mockResolvedValue([]);
 
       await service.create({ repoFullName: 'owner/repo', branch: ' develop ' }, actor);
       expect(mockTransport.createGitApp).toHaveBeenCalledWith(
@@ -295,6 +299,8 @@ describe('DeploymentsService', () => {
       mockTransport.applyAppLimits.mockResolvedValue(undefined);
       mockTransport.deployApp.mockResolvedValue(undefined);
       mockPrisma.deployment.update.mockResolvedValue(deploymentRow());
+      // Phase 17 (3d) — quota par pack : comptage findMany (apps du pack du client).
+      mockPrisma.deployment.findMany.mockResolvedValue([]);
 
       const out = await service.create({ repoFullName: 'owner/repo' }, actor);
 
@@ -320,7 +326,7 @@ describe('DeploymentsService', () => {
       expect(out.status).toBe('DEPLOYING');
     });
 
-    it('Bloc 3 — serveur partagé : limites refusées ⇒ FAILED, app jamais lancée sans plafond', async () => {
+    it('Bloc 3 — limites refusées ⇒ bottom-effort (Phase 17 décision #2) : app lancée quand même, limitsStatus=FAILED tracé', async () => {
       mockPrisma.subscription.findFirst.mockResolvedValue(
         autoTarget({ name: 'Starter 1 Go', ramMb: 1024, cpuCores: 1 }),
       );
@@ -328,22 +334,29 @@ describe('DeploymentsService', () => {
       mockTransport.createGitApp.mockResolvedValue({ uuid: 'app-1' });
       mockTransport.applyAppLimits.mockRejectedValueOnce(new Error('Coolify API : application des limites refusée (HTTP 400)'));
       mockTransport.deployApp.mockResolvedValue(undefined);
-      mockPrisma.deployment.update.mockResolvedValue(deploymentRow({ status: 'FAILED' }));
+      mockPrisma.deployment.update.mockResolvedValue(deploymentRow({ status: 'DEPLOYING' }));
+      mockPrisma.deployment.findMany.mockResolvedValue([]);
 
-      // Fail-closed : un échec d'application des limites échoue le déploiement —
-      // on ne lance JAMAIS un build sans plafond sur un serveur partagé.
-      await expect(service.create({ repoFullName: 'owner/repo' }, actor)).rejects.toThrow(
-        BadGatewayException,
-      );
+      // Best-effort : un échec d'application des limites N'EMPÊCHE PLUS le
+      // déploiement de l'app cliente (décision #2). L'échec n'est plus silencieux :
+      // on trace limitsStatus=FAILED + message (visible monitoring admin), et
+      // l'app est lance quand même sur Coolify (sans plafond, à re-poser manuellement).
+      const out = await service.create({ repoFullName: 'owner/repo' }, actor);
 
-      expect(mockTransport.deployApp).not.toHaveBeenCalled();
+      expect(out.status).toBe('DEPLOYING');
+      expect(mockTransport.deployApp).toHaveBeenCalled();
       expect(mockAudit.record).toHaveBeenCalledWith(
         expect.objectContaining({ action: 'deploy.limits.failed' }),
       );
       expect(mockPrisma.deployment.update).toHaveBeenCalledWith(
         expect.objectContaining({
           where: { id: 'dep1' },
-          data: expect.objectContaining({ status: 'FAILED' }),
+          data: expect.objectContaining({
+            limitsStatus: 'FAILED',
+            limitsLastError: expect.any(String),
+            limitsRamMb: 1024,
+            limitsCpu: 1,
+          }),
         }),
       );
     });
@@ -570,6 +583,8 @@ describe('DeploymentsService', () => {
       mockTransport.createGitApp.mockResolvedValue({ uuid: 'app-1' });
       mockTransport.deployApp.mockResolvedValue(undefined);
       mockPrisma.deployment.update.mockResolvedValue(deploymentRow());
+      // Phase 17 (3d) — la vérification de quota (par pack) passe par findMany.
+      mockPrisma.deployment.findMany.mockResolvedValue([]);
     };
 
     it('SPA Vite détecté ⇒ buildPack garde nixpacks (la voie store build+got statique), publishDirectory "/dist", isStatic:true envoyé à Coolify', async () => {
@@ -796,6 +811,8 @@ describe('DeploymentsService', () => {
       mockTransport.createGitApp.mockResolvedValue({ uuid: 'app-1' });
       mockTransport.deployApp.mockResolvedValue(undefined);
       mockPrisma.deployment.update.mockResolvedValue(deploymentRow());
+      // Phase 17 (3d) — quota par pack vérifié via findMany (apps du pack du client).
+      mockPrisma.deployment.findMany.mockResolvedValue([]);
     };
 
     it('mode auto (sans serviceId) : pack ACTIF → module A → app dans le projet partagé, serviceId null', async () => {
@@ -929,38 +946,47 @@ describe('DeploymentsService', () => {
       );
     });
 
-    it("quota d'apps : atteint (2/2) → 403 avec le compteur, rien n'est créé", async () => {
+    it("quota d'apps du pack : atteint (2/2) → 403 avec le compteur, rien n'est créé", async () => {
       mockPrisma.subscription.findFirst.mockResolvedValue(
         activeSubscription(packWithModule({ maxApps: 2 })),
       );
-      mockPrisma.deployment.count.mockResolvedValue(2);
+      // 2 apps existantes dans CE pack (Phase 17 3d) — le quota est compté PAR PACK.
+      mockPrisma.deployment.findMany.mockResolvedValue([
+        { limitsRamMb: 512, limitsCpu: 1 },
+        { limitsRamMb: 512, limitsCpu: 1 },
+      ]);
 
       await expect(service.create({ repoFullName: 'owner/repo' }, actor)).rejects.toBeInstanceOf(
         ForbiddenException,
       );
-      expect(mockPrisma.deployment.count).toHaveBeenCalledWith({
-        where: { userId: 'u1', status: { not: 'FAILED' } },
+      expect(mockPrisma.deployment.findMany).toHaveBeenCalledWith({
+        where: { userId: 'u1', packId: 'pack1', status: { not: 'FAILED' } },
+        select: { limitsRamMb: true, limitsCpu: true },
       });
       expect(mockPrisma.deployment.create).not.toHaveBeenCalled();
       expect(mockTransport.createGitApp).not.toHaveBeenCalled();
     });
 
-    it("quota d'apps : sous la limite (1/2) → déploiement autorisé", async () => {
+    it("quota d'apps du pack : sous la limite (1/2) → déploiement autorisé", async () => {
       mockPrisma.subscription.findFirst.mockResolvedValue(
         activeSubscription(packWithModule({ maxApps: 2 })),
       );
-      mockPrisma.deployment.count.mockResolvedValue(1);
       happyMocks();
+      mockPrisma.deployment.findMany.mockResolvedValue([{ limitsRamMb: 512, limitsCpu: 1 }]);
 
       const out = await service.create({ repoFullName: 'owner/repo' }, actor);
       expect(out.status).toBe('DEPLOYING');
     });
 
-    it("quota illimité (maxApps null) → count jamais appelé", async () => {
+    it("quota illimité (maxApps null) → comptage par pack appelé mais jamais bloquant", async () => {
       mockPrisma.subscription.findFirst.mockResolvedValue(activeSubscription(packWithModule()));
       happyMocks();
-      await service.create({ repoFullName: 'owner/repo' }, actor);
-      expect(mockPrisma.deployment.count).not.toHaveBeenCalled();
+      const out = await service.create({ repoFullName: 'owner/repo' }, actor);
+      expect(mockPrisma.deployment.findMany).toHaveBeenCalledWith({
+        where: { userId: 'u1', packId: 'pack1', status: { not: 'FAILED' } },
+        select: { limitsRamMb: true, limitsCpu: true },
+      });
+      expect(out.status).toBe('DEPLOYING');
     });
 
     it('overrides du module (RAM/CPU) priment sur le pack dans applyAppLimits', async () => {

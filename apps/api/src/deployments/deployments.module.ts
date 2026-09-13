@@ -3,6 +3,7 @@ import { AuthModule } from '../auth/auth.module';
 import { CloudflareModule } from '../cloudflare/cloudflare.module';
 import { CryptoModule } from '../crypto/crypto.module';
 import { PanelTransportFactory } from '../servers/panel-transport.factory';
+import { AdminDeploymentsController } from './admin-deployments.controller';
 import { DeploymentModulesController } from './deployment-modules.controller';
 import { DeploymentModulesService } from './deployment-modules.service';
 import { DeploymentsController } from './deployments.controller';
@@ -17,7 +18,7 @@ import { GithubService } from './github.service';
 // (A/B) + projets Coolify live.
 @Module({
   imports: [AuthModule, CryptoModule, CloudflareModule],
-  controllers: [DeploymentsController, DeploymentModulesController],
+  controllers: [DeploymentsController, DeploymentModulesController, AdminDeploymentsController],
   providers: [DeploymentsService, GithubService, PanelTransportFactory, DeploymentModulesService],
   exports: [DeploymentsService, DeploymentModulesService],
 })

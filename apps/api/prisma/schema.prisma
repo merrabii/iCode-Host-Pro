@@ -434,6 +434,7 @@ model HostingPack {
 
   products   Product[] // packs référencés par des produits (Restrict)
   categories ProductCategory[] // catégories dont ce pack est le recommandé
+  deployments Deployment[] // apps créées sous ce pack (Phase 17 — quota par pack)
 }
 
 // ── Phase 13 — modules/méthodes de déploiement (A/B) ─────────────────────────
@@ -666,6 +667,15 @@ enum DeploymentStatus {
   FAILED
 }
 
+// Phase 17 (3c) — suivi du statut d'application des limites RAM/CPU sur une app.
+// null = pas de limites applicables (pas de pack ACTIVE) ou non tenté. PENDING_RETRY
+// = échec précédent, en attente d'une re-application (bouton admin, jamais automatique).
+enum LimitsStatus {
+  APPLIED // limites posées sur Coolify avec succès
+  FAILED // échec best-effort (l'app tourne sans cap — signalé au monitoring admin)
+  PENDING_RETRY // marqué pour ré-essai manuel
+}
+
 model Deployment {
   id                 String            @id @default(cuid())
   userId             String
@@ -705,8 +715,20 @@ model Deployment {
   module             DeploymentModule? @relation(fields: [moduleId], references: [id], onDelete: SetNull)
   clientProjectId    String?
   clientProject      ClientProject?    @relation(fields: [clientProjectId], references: [id], onDelete: SetNull)
-  createdAt          DateTime          @default(now())
-  updatedAt          DateTime          @updatedAt
+  // Phase 17 (3c/3d) — suivi des limites appliquées + quota PAR PACK (jamais
+  // fusionné entre packs). `packId` = pack (produit) à l'origine de la création ;
+  // `limitsRamMb`/`limitsCpu` = limites EFFECTIVES appliquées à cette app (override
+  // du module primant sur le pack, cf. limits.util). `limitsStatus` trace un échec
+  // d'application (best-effort côté client) pour un suivi/une re-application visible.
+  packId           String?
+  pack             HostingPack?   @relation(fields: [packId], references: [id], onDelete: SetNull)
+  limitsStatus     LimitsStatus?
+  limitsRamMb      Int?
+  limitsCpu        Float?
+  limitsRetryCount Int            @default(0)
+  limitsLastError  String?
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
 
   @@index([userId])
   @@index([status])

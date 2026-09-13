@@ -3,171 +3,180 @@ import { PrismaService } from '../prisma/prisma.service';
 import { DeploymentModuleKind, DeploymentStatus, PackStatus } from '@prisma/client';
 
 export interface ProjectConsumption {
-  projectUuid: string;
+  /** Clé de ligne composite (un client avec plusieurs packs → plusieurs lignes). */
+  id: string;
   clientName: string | null;
   clientEmail: string;
+  projectUuid: string;
+  packId: string | null;
+  packName: string | null;
   moduleKind: DeploymentModuleKind | null;
   appsCount: number;
   totalRamMb: number;
   totalCpuCores: number;
-  totalStorageGb: number;
-  packRamMb: number | null;
-  packCpuCores: number | null;
-  packStorageGb: number | null;
+  totalStorageGb: number | null;
+  /** Budget du pack (quota dérivé) : limite effective par app × maxApps. null = illimité. */
+  budgetRamMb: number | null;
+  budgetCpuCores: number | null;
+  budgetStorageGb: number | null;
   overRam: boolean;
   overCpu: boolean;
   overDisk: boolean;
   totalConsumption: number; // score pour tri desc : RAM(1) + CPU(1024) + Disk(1024*1024) approx
 }
 
+type PackAgg = {
+  id: string;
+  name: string;
+  status: PackStatus;
+  maxApps: number | null;
+  ramMb: number;
+  cpuCores: number;
+  storageLimit: number | null;
+  deploymentModule: {
+    overrideRamMb: number | null;
+    overrideCpuCores: number | null;
+    overrideStorageLimit: number | null;
+  } | null;
+};
+
 /**
- * Service de monitoring des projets client (Phase 13).
- * Agrégation OFFLINE des déploiements par projet Coolify (coolifyProjectUuid).
- * Compare les limites Σ des apps aux limites du pack → flags overRam/overCpu/overDisk.
- * Trie par consommation totale descendante.
+ * Service de monitoring (Phase 13/17).
+ * Agrégation OFFLINE des déploiements ACTIVE, groupée PAR (client, pack) — un client
+ * avec plusieurs packs a donc plusieurs lignes/quotas SÉPARÉS, jamais fusionnés entre
+ * packs (décision 3d). Les ressources allouées viennent des limites EFFECTIVES
+ * enregistrées sur la Deployment (`limitsRamMb`/`limitsCpu`, override du module incluse),
+ * avec repli sur le pack quand absente (lignes legacy). Le « budget » affiché = quota
+ * dérivé du pack : limite effective par app × maxApps.
  */
 @Injectable()
 export class MonitoringService {
   constructor(private readonly prisma: PrismaService) {}
 
   async getProjectsConsumption(): Promise<ProjectConsumption[]> {
-    // 1. Récupérer tous les déploiements ACTIVE avec leurs infos pack/module
     const deployments = await this.prisma.deployment.findMany({
-      where: {
-        status: DeploymentStatus.ACTIVE,
-        coolifyProjectUuid: { not: null },
-      },
+      where: { status: DeploymentStatus.ACTIVE, coolifyProjectUuid: { not: null } },
       include: {
         user: { select: { id: true, name: true, email: true } },
-        server: { select: { id: true, name: true } },
-        // Le module peut venir de Deployment.moduleId OU de Deployment.clientProject.module
-        module: {
-          include: { server: true },
-        },
-        clientProject: {
-          include: { module: { include: { server: true } } },
-        },
+        module: { include: { server: true } },
+        clientProject: { include: { module: { include: { server: true } } } },
       },
     });
 
-    // 2. Pour chaque déploiement, déterminer le pack actif du client
-    // On doit charger l'abonnement ACTIVE → produit → pack
-    const userIds = [...new Set(deployments.map((d) => d.userId))];
-    const userPacks = await this.getUserActivePacks(userIds);
+    // Packs référencés par les déploiements, avec les overrides de leur module
+    // (pour le budget per-app). `select` limite la forme, indépendante du type
+    // de relation complet du modèle (évite un couplage au type généré).
+    const packIds = [...new Set(deployments.map((d) => d.packId).filter(Boolean))] as string[];
+    const packs = await this.prisma.hostingPack.findMany({
+      where: { id: { in: packIds } },
+      select: {
+        id: true,
+        name: true,
+        status: true,
+        maxApps: true,
+        ramMb: true,
+        cpuCores: true,
+        storageLimit: true,
+        deploymentModule: {
+          select: { overrideRamMb: true, overrideCpuCores: true, overrideStorageLimit: true },
+        },
+      },
+    });
+    const packById = new Map<string, PackAgg>(packs.map((p) => [p.id, p as unknown as PackAgg]));
 
-    // 3. Grouper par coolifyProjectUuid
-    const byProject = new Map<string, {
-      projectUuid: string;
+    // Limite effective par app d'un pack (override du module du pack primant).
+    const perApp = (p: PackAgg | undefined): { ramMb: number; cpuCores: number; storageGb: number | null } => {
+      if (!p || p.status !== PackStatus.ACTIVE) return { ramMb: 0, cpuCores: 0, storageGb: null };
+      return {
+        ramMb: p.deploymentModule?.overrideRamMb ?? p.ramMb,
+        cpuCores: p.deploymentModule?.overrideCpuCores ?? p.cpuCores,
+        storageGb: p.deploymentModule?.overrideStorageLimit ?? p.storageLimit ?? null,
+      };
+    };
+
+    // Groupe par (userId, packId) : jamais de fusion entre packs d'un même client.
+    type Group = {
+      userId: string;
       clientName: string | null;
       clientEmail: string;
+      projectUuid: string;
+      packId: string | null;
+      packName: string | null;
       moduleKind: DeploymentModuleKind | null;
-      deployments: typeof deployments;
-      pack: { ramMb: number; cpuCores: number; storageLimit: number | null } | null;
-    }>();
+      appsCount: number;
+      totalRamMb: number;
+      totalCpuCores: number;
+      totalStorageGb: number;
+    };
+    const groups = new Map<string, Group>();
 
     for (const d of deployments) {
-      const projectUuid = d.coolifyProjectUuid!;
-      const pack = userPacks.get(d.userId) ?? null;
-      const moduleKind = d.module?.kind ?? d.clientProject?.module?.kind ?? null;
+      const pack = d.packId ? packById.get(d.packId) : undefined;
+      const effPerApp = perApp(pack);
+      // Ressource allouée réelle = limite effective enregistrée (override incluse), sinon repli pack.
+      const ramMb = d.limitsRamMb ?? effPerApp.ramMb;
+      const cpuCores = d.limitsCpu ?? effPerApp.cpuCores;
+      const storageGb = effPerApp.storageGb ?? 0;
 
-      if (!byProject.has(projectUuid)) {
-        byProject.set(projectUuid, {
-          projectUuid,
+      const key = `${d.userId}:${d.packId ?? 'no-pack'}`;
+      let g = groups.get(key);
+      if (!g) {
+        g = {
+          userId: d.userId,
           clientName: d.user.name,
           clientEmail: d.user.email,
-          moduleKind,
-          deployments: [],
-          pack,
-        });
+          projectUuid: d.coolifyProjectUuid!,
+          packId: d.packId ?? null,
+          packName: pack?.name ?? (d.packId ? null : null),
+          moduleKind: d.module?.kind ?? d.clientProject?.module?.kind ?? null,
+          appsCount: 0,
+          totalRamMb: 0,
+          totalCpuCores: 0,
+          totalStorageGb: 0,
+        };
+        groups.set(key, g);
       }
-      byProject.get(projectUuid)!.deployments.push(d);
+      g.appsCount += 1;
+      g.totalRamMb += ramMb;
+      g.totalCpuCores += cpuCores;
+      g.totalStorageGb += storageGb;
     }
 
-    // 4. Calculer les totaux par projet
     const results: ProjectConsumption[] = [];
-    for (const [projectUuid, data] of byProject) {
-      const { deployments: deps, pack, clientName, clientEmail, moduleKind } = data;
-
-      let totalRamMb = 0;
-      let totalCpuCores = 0;
-      let totalStorageGb = 0;
-
-      for (const dep of deps) {
-        // RAM/CPU appliqués côté Coolify via applyAppLimits → on lit les limites du pack (avec overrides module)
-        // Note: les overrides du module priment sur le pack (voir deployments.service.packLimits)
-        // Pour le monitoring offline, on approxime avec les limites du pack (sans overrides pour simplifier)
-        if (pack) {
-          totalRamMb += pack.ramMb;
-          totalCpuCores += pack.cpuCores;
-          totalStorageGb += pack.storageLimit ?? 0;
-        }
-      }
-
-      const packRamMb = pack?.ramMb ?? null;
-      const packCpuCores = pack?.cpuCores ?? null;
-      const packStorageGb = pack?.storageLimit ?? null;
-
-      const overRam = packRamMb !== null && totalRamMb > packRamMb;
-      const overCpu = packCpuCores !== null && totalCpuCores > packCpuCores;
-      const overDisk = packStorageGb !== null && totalStorageGb > packStorageGb;
-
-      // Score de tri : RAM en Mo + CPU*1000 + Disk*1000000 (pour ordre de grandeur)
-      const totalConsumption = totalRamMb + totalCpuCores * 1000 + totalStorageGb * 1_000_000;
+    for (const g of groups.values()) {
+      const pack = g.packId ? packById.get(g.packId) : undefined;
+      const effPerApp = perApp(pack);
+      const maxApps = pack?.maxApps ?? null;
+      // Budget = limite effective par app × maxApps (quota dérivé, par pack).
+      const budgetRamMb = maxApps != null && effPerApp.ramMb > 0 ? effPerApp.ramMb * maxApps : null;
+      const budgetCpuCores = maxApps != null && effPerApp.cpuCores > 0 ? effPerApp.cpuCores * maxApps : null;
+      // Quota disque : inactif (valeur enregistrée seulement) — on affiche « illimité ».
+      const budgetStorageGb = null;
 
       results.push({
-        projectUuid,
-        clientName,
-        clientEmail,
-        moduleKind,
-        appsCount: deps.length,
-        totalRamMb,
-        totalCpuCores,
-        totalStorageGb,
-        packRamMb,
-        packCpuCores,
-        packStorageGb,
-        overRam,
-        overCpu,
-        overDisk,
-        totalConsumption,
+        id: `${g.projectUuid}:${g.packId ?? 'no-pack'}`,
+        clientName: g.clientName,
+        clientEmail: g.clientEmail,
+        projectUuid: g.projectUuid,
+        packId: g.packId,
+        packName: g.packName ?? (pack ? pack.name : null),
+        moduleKind: g.moduleKind,
+        appsCount: g.appsCount,
+        totalRamMb: g.totalRamMb,
+        totalCpuCores: g.totalCpuCores,
+        totalStorageGb: g.totalStorageGb,
+        budgetRamMb,
+        budgetCpuCores,
+        budgetStorageGb,
+        overRam: budgetRamMb != null && g.totalRamMb > budgetRamMb,
+        overCpu: budgetCpuCores != null && g.totalCpuCores > budgetCpuCores,
+        overDisk: false,
+        totalConsumption:
+          g.totalRamMb + g.totalCpuCores * 1000 + (g.totalStorageGb ?? 0) * 1_000_000,
       });
     }
 
-    // 5. Trier par consommation totale descendante
     results.sort((a, b) => b.totalConsumption - a.totalConsumption);
-
     return results;
-  }
-
-  /**
-   * Récupère le pack ACTIF de chaque utilisateur (via subscription ACTIVE → product → pack).
-   * Retourne un Map userId -> { ramMb, cpuCores, storageLimit }.
-   */
-  private async getUserActivePacks(userIds: string[]): Promise<Map<string, { ramMb: number; cpuCores: number; storageLimit: number | null }>> {
-    const subs = await this.prisma.subscription.findMany({
-      where: {
-        userId: { in: userIds },
-        status: 'ACTIVE',
-      },
-      include: {
-        product: {
-          include: {
-            pack: true,
-          },
-        },
-      },
-    });
-
-    const map = new Map<string, { ramMb: number; cpuCores: number; storageLimit: number | null }>();
-    for (const sub of subs) {
-      if (sub.product?.pack && sub.product.pack.status === PackStatus.ACTIVE) {
-        map.set(sub.userId, {
-          ramMb: sub.product.pack.ramMb,
-          cpuCores: sub.product.pack.cpuCores,
-          storageLimit: sub.product.pack.storageLimit,
-        });
-      }
-    }
-    return map;
   }
 }

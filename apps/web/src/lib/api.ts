@@ -1457,17 +1457,22 @@ export const listDeploymentModuleProjects = (t: string, id: string) =>
 
 // ═══ Phase 13 — Monitoring projets ══════════════════════════════════════════════
 export interface ProjectConsumption {
+  /** Clé de ligne composite (un client avec plusieurs packs → plusieurs lignes). */
+  id: string;
   projectUuid: string;
+  packId: string | null;
+  packName: string | null;
   clientName: string | null;
   clientEmail: string;
   moduleKind: DeploymentModuleKind | null;
   appsCount: number;
   totalRamMb: number;
   totalCpuCores: number;
-  totalStorageGb: number;
-  packRamMb: number | null;
-  packCpuCores: number | null;
-  packStorageGb: number | null;
+  totalStorageGb: number | null;
+  /** Budget du pack (quota dérivé) : limite effective par app × maxApps. null = illimité. */
+  budgetRamMb: number | null;
+  budgetCpuCores: number | null;
+  budgetStorageGb: number | null;
   overRam: boolean;
   overCpu: boolean;
   overDisk: boolean;
@@ -1475,6 +1480,26 @@ export interface ProjectConsumption {
 }
 export const listProjectsConsumption = (t: string) =>
   apiJson('/api/admin/monitoring/projects', t);
+
+// ═══ Phase 17 (3c) — Suivi / re-application des limites (admin) ════════════════
+export type LimitsStatus = 'APPLIED' | 'FAILED' | 'PENDING_RETRY';
+export interface LimitsIssue {
+  id: string;
+  appName: string | null;
+  fqdn: string | null;
+  clientEmail: string;
+  clientName: string | null;
+  status: string;
+  limitsStatus: LimitsStatus;
+  limitsRamMb: number | null;
+  limitsCpu: number | null;
+  limitsLastError: string | null;
+  limitsRetryCount: number;
+}
+export const listLimitsIssues = (t: string, limit = 200) =>
+  apiJson(`/api/admin/deployments/limits-issues?limit=${limit}`, t);
+export const reapplyDeploymentLimits = (t: string, id: string) =>
+  apiJson(`/api/admin/deployments/${id}/reapply-limits`, t, { method: 'POST' });
 
 // ═══ Phase 14 — Branding white-label (admin) ═══════════════════════════════════
 export type BrandLogoType = 'DEFAULT' | 'TEXT' | 'IMAGE';
