@@ -1,5 +1,28 @@
 # CHANGELOG
 
+## 2026-09-13 — Phase 16 validée réel (déploiement dépôt public, mode URL) + fix web URL-mode — commits poussés
+Lancement réel de bout en bout confirmé **en autonomie** : un compte gratuit colle `https://github.com/merrabii/Code-Diali-Guide-de-Demarrage` →
+`POST /api/client/deployments {repoUrl,…}` → **module B** (projet client dédié créé sur Coolify) → `createGitApp` **nixpacks** `is_static` `publish_directory:/dist` →
+limites pack Starter appliquées (256 m / 0.5 CPU) → build ~107 s → **`ACTIVE`** → `https://code-diali-guide-de-demarrage.arumdigital.com` **HTTP 200** (SPA « Code Diali Cloud - Guide de Démarrage »).
+App de test ensuite supprimée par le chemin de code (`DELETE /api/client/deployments/:id`) → **quota libéré**.
+### Cause racine importante (à relire par toute session/AI future)
+Le `403 "You are not allowed to access the API"` (jeté sur `createProject` Module B **et** `createGitApp` Module A) n'était **PAS** un jeton non-ROOT :
+le jeton est **ROOT et valide** ; c'était la **liste blanche d'IP de l'API Coolify** (`portal.arumdigital.com:8000`). Une fois l'IP autorisée, les deux endpoints passent.
+Il faut donc **tester l'IP autorisée côté Coolify AVANT de conclure à un scope de token** (leçon analogue à Brevo, dérivable Phase 6 : IP publique dynamique à ré-auto­toriser).
+### Fix code (web)
+`apps/web/src/app/client/project/page.tsx` `deploy()` : envoyer **`repoUrl`** quand `detected.repoUrl` (lien collé), jamais un `repoFullName` figé —
+sinon le serveur bascule en mode GitHub lié → `decryptToken` → « Aucun compte GitHub lié ». Un client peut désormais déployer un **dépôt public sans compte GitHub lié**.
+
+## Phase 16 — STORE ORDER-DRIVEN + PLAN GRATUIT + BUILD CONFIG FICHIER — IMPLEMENTED (ADR-035/036, commits `539cacd`→`4705366`→`11d3592`→`2ed6a76`)
+### Added (ADR-035, Blocs 1–7)
+- **Abonnements par commande** : table **`Service` supprimée** (migrations `20260911150000_drop_service` + `20260911140000_order_subscription_relation` + `20260911085322_order_requested_subdomain`) ; une souscription est liée à **produit+pack+commande**, créée **`ACTIVE` par la commande** (le paiement vaut approbation) ; l'admin garde suspendre/réactiver, le client annule.
+- **Plan gratuit sans checkout** : produit `$0` + pack **Starter** (`maxApps:1`, 256 Mo/0.5 CPU, module B) ; `POST /api/auth/free-signup` (`FreeSignupDto` + `planSlug?`) + OAuth **`mode=free`** ; quota d'apps N/M.
+- **Store→Deployment unifié** `20260911160000_free_signup_file_build` + `probe-container.js`.
+### Added (ADR-036, Phase 16b `539cacd`)
+- **Build config fichier** : `codediali.toml` (prioritaire) > `netlify.toml` > détection (`previewBuildConfig`). **Détection SPA Vite** : `isStatic:true` + `publishDirectory:'/dist'` ; création **nixpacks + `is_static:true` + `publish_directory:/dist`** (NE PAS forcer `build_pack:'static'` — page vide HTTP 200).
+### Verified
+- Unit + e2e verts au commit (19 suites / 146 e2e). Validation réelle de bout en bout le **2026-09-13** (ci-dessus).
+
 ## Décision quota disque (2026-09-06) — Plan.storage_limit enregistré mais INACTIF
 La limitation disque (machinerie `--storage-opt`/`custom_docker_run_options` + `mergeStorageOpt`/`storageOptFromGb` + injection `diskGb` au déploiement + tests associés) a été **supprimée**. Le champ du pack est renommé `diskGb` → **`storageLimit`** (migration `20260906010000_rename_pack_disk_to_storage_limit`, valeur préservée) et aligné sur l'architecture `Plan { cpu_limit, memory_limit, storage_limit }`. **Seuls RAM/CPU sont appliqués** à la création de l'app Coolify ; `storageLimit` est affiché/enregistré (admin + offres) mais **le système de quota disque sera branché après la mise en prod** (toujours 320 tests verts, API :3001 prête).
 
