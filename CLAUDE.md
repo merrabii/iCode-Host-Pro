@@ -5,6 +5,9 @@ de ce repo : Code Diali / iCode Host Pro) — distinctes de la gestion/du déplo
 clients**. À relire à chaque session avant de raisonner sur « la prod », les redéploiements et
 l'installation.
 
+> **Statut Phase 17 —** Limites RAM/CPU par pack + quota par pack : **terminée** (code + tests 43/43).
+> Détail ligne par ligne : voir `memory/architecture.md` → section « Phase 17 (3a→3d) ».
+
 ## 1. Ce repo = la plateforme, pas une app client
 Le code de ce repo est la plateforme (backend API NestJS + frontend) qui permet à des **clients**
 de créer des comptes et d'héberger **leurs propres apps**. Les apps déployées/appartenant aux
