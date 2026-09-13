@@ -6,11 +6,13 @@ import {
   createProduct,
   deleteProduct,
   listCategories,
+  listDeploymentModules,
   listPacks,
   listProducts,
   PackAdmin,
   ProductAdmin,
   ProductCategory,
+  type DeploymentModule,
   updateProduct,
 } from '@/lib/api';
 import { useAdminSession } from '@/lib/session';
@@ -30,6 +32,7 @@ import {
   Select,
 } from '@/components/ui';
 import { StoreSettingsDrawer } from '@/components/admin/product-store-settings';
+import { ProductEditPanel } from '@/components/admin/product-edit-panel';
 import { IconBox, IconBoxes, IconPlus, IconTrash, IconX } from '@/components/icons';
 
 const PRODUCT_STATUSES = ['DRAFT', 'ACTIVE', 'SUSPENDED', 'DISABLED'];
@@ -48,6 +51,8 @@ export default function ManagerProduitsPage() {
   const [packId, setPackId] = useState('');
   const [busy, setBusy] = useState<string | null>(null); // 'create' | product id
   const [storeProductId, setStoreProductId] = useState<string | null>(null); // drawer « Réglages boutique » ouvert
+  const [editId, setEditId] = useState<string | null>(null); // panneau d'édition produit ouvert
+  const [modules, setModules] = useState<DeploymentModule[]>([]); // modules de déploiement (visualisation de la méthode)
 
   useEffect(() => {
     if (phase === 'ready' && token) void load(token);
@@ -55,11 +60,17 @@ export default function ManagerProduitsPage() {
   }, [phase, token]);
 
   async function load(t: string) {
-    const [p, c, k] = await Promise.all([listProducts(t), listCategories(t), listPacks(t)]);
+    const [p, c, k, m] = await Promise.all([
+      listProducts(t),
+      listCategories(t),
+      listPacks(t),
+      listDeploymentModules(t),
+    ]);
     if (p.ok) setProducts((p.data as ProductAdmin[]) ?? []);
     else toast.error(apiError(p, 'Impossible de charger le catalogue.'));
     if (c.ok) setCategories((c.data as ProductCategory[]) ?? []);
     if (k.ok) setPacks((k.data as PackAdmin[]) ?? []);
+    if (m.ok) setModules((m.data as DeploymentModule[]) ?? []);
   }
 
   async function handleCreate() {
@@ -258,6 +269,14 @@ export default function ManagerProduitsPage() {
                       <div className="row ta-right">
                         <Button
                           size="sm"
+                          variant={editId === p.id ? 'primary' : 'secondary'}
+                          onClick={() => setEditId((v) => (v === p.id ? null : p.id))}
+                          title="Modifier le produit (champs + méthode de déploiement)"
+                        >
+                          ✎ Modifier
+                        </Button>
+                        <Button
+                          size="sm"
                           variant={storeProductId === p.id ? 'primary' : 'secondary'}
                           onClick={() => setStoreProductId((v) => (v === p.id ? null : p.id))}
                           title="Réglages boutique (récap /cart, champs de facturation)"
@@ -280,6 +299,18 @@ export default function ManagerProduitsPage() {
           <StoreSettingsDrawer
             product={products.find((p) => p.id === storeProductId)!}
             token={token}
+            onUpdated={() => void load(token)}
+          />
+        )}
+
+        {editId && products.some((p) => p.id === editId) && (
+          <ProductEditPanel
+            key={editId}
+            product={products.find((p) => p.id === editId)!}
+            token={token}
+            categories={categories}
+            packs={packs}
+            modules={modules}
             onUpdated={() => void load(token)}
           />
         )}
