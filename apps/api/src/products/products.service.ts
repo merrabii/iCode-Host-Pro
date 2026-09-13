@@ -5,7 +5,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
-import { Prisma, Product, ProductStatus, CheckoutFieldType } from '@prisma/client';
+import { BillingCycle, Prisma, Product, ProductStatus, CheckoutFieldType } from '@prisma/client';
 import { AuditService } from '../audit/audit.service';
 import { CreateProductDto } from './dto/create-product.dto';
 import { UpdateProductDto } from './dto/update-product.dto';
@@ -14,9 +14,21 @@ import {
   CreateCheckoutFieldDto,
   UpdateCheckoutFieldDto,
 } from './dto/checkout-field.dto';
+import {
+  SetCategoriesDto,
+  UpsertFreeSubdomainRuleDto,
+  CreateOptionDto,
+  UpdateOptionDto,
+  CreateOptionChoiceDto,
+  UpdateOptionChoiceDto,
+  CreateAddonDto,
+  UpdateAddonDto,
+} from './dto/product-nested.dto';
 import { Actor } from '../users/users.service';
 
-/** Références embarquées dans la vue produit : catégorie + pack (limites). */
+/** Références embarquées dans la vue produit admin : catégorie + pack (limites)+
+ *  store-front (onglets 1/2), options/addons/cat-links/règle domaine (onglets
+ *  4/5/6/7/8). Additif : enrichit create/findAll/findOne/update sans casser le client. */
 const PRODUCT_INCLUDE = {
   category: { select: { id: true, name: true } },
   pack: {
@@ -28,9 +40,29 @@ const PRODUCT_INCLUDE = {
       storageLimit: true,
       bandwidth: true,
       status: true,
+      maxApps: true,
+      freeSubdomainsIncluded: true,
+      // Onglet 3/5 — module de déploiement hérité du pack (A/B + serveur).
+      deploymentModule: {
+        select: { id: true, code: true, name: true, kind: true, server: { select: { id: true, hostname: true } } },
+      },
     },
   },
-};
+  taxRate: { select: { id: true, name: true, ratePercent: true } },
+  // Onglet 4 — catégories liées (multi), en plus de `category` (principale).
+  categoryLinks: {
+    select: { categoryId: true, category: { select: { id: true, name: true } } },
+  },
+  // Onglet 6 — options configurables + leurs choix.
+  options: {
+    orderBy: { sortOrder: 'asc' },
+    include: { choices: { orderBy: { sortOrder: 'asc' } } },
+  },
+  // Onglet 7 — suppléments/add-ons.
+  addons: { orderBy: { sortOrder: 'asc' } },
+  // Onglet 8 — règle des sous-domaines gratuits du produit.
+  freeSubdomainRule: true,
+} as const;
 
 /** Vue publique (catalogue) : pack sans le statut interne + configuration
  *  vendable (options à choix + add-ons) pour la fiche produit (Étape 2, ADR-07). */
@@ -96,16 +128,55 @@ export class ProductsService {
     }
   }
 
+  /** Le slug est @unique : refuse une collision (hors soi-même en édition). */
+  private async assertSlugUnique(slug: string | null | undefined, exceptId?: string): Promise<void> {
+    if (!slug) return;
+    const found = await this.prisma.product.findFirst({
+      where: { slug, ...(exceptId ? { id: { not: exceptId } } : {}) },
+      select: { id: true },
+    });
+    if (found) throw new ConflictException(`Le slug « ${slug} » est déjà utilisé par un autre produit.`);
+  }
+
+  /** Normalise un champ texte nullable : null ou '' → null ; sinon trim. */
+  private static nullable(v: string | null | undefined): string | null | undefined {
+    if (v === undefined) return undefined; // non transmis = inchangé
+    const t = typeof v === 'string' ? v.trim() : v;
+    return t === '' ? null : t;
+  }
+
   async create(dto: CreateProductDto, actor: Actor): Promise<Product> {
     await this.assertRefs(dto.categoryId, dto.packId);
+    await this.assertSlugUnique(dto.slug);
+    const data: Prisma.ProductUncheckedCreateInput = {
+      name: dto.name,
+      kind: dto.kind ?? 'generic',
+      // Seulement les clés fournies : l'API de création produit est partielle
+      // (les défauts du schéma — status/freePlan/hidden/displayOrder/crossSell… —
+      // s'appliquent via Prisma quand absentes). Cohérent avec `update`.
+      ...(dto.status !== undefined ? { status: dto.status } : {}),
+      categoryId: dto.categoryId ?? null,
+      packId: dto.packId ?? null,
+      ...(dto.slug !== undefined ? { slug: ProductsService.nullable(dto.slug) } : {}),
+      ...(dto.slogan !== undefined ? { slogan: ProductsService.nullable(dto.slogan) } : {}),
+      ...(dto.shortDescription !== undefined ? { shortDescription: ProductsService.nullable(dto.shortDescription) } : {}),
+      ...(dto.freePlan !== undefined ? { freePlan: dto.freePlan } : {}),
+      ...(dto.description !== undefined ? { description: ProductsService.nullable(dto.description) } : {}),
+      ...(dto.color !== undefined ? { color: ProductsService.nullable(dto.color) } : {}),
+      ...(dto.hidden !== undefined ? { hidden: dto.hidden } : {}),
+      ...(dto.displayOrder !== undefined ? { displayOrder: dto.displayOrder } : {}),
+      ...(dto.priceHtCents !== undefined ? { priceHtCents: dto.priceHtCents } : {}),
+      ...(dto.promoPriceHtCents !== undefined ? { promoPriceHtCents: dto.promoPriceHtCents } : {}),
+      ...(dto.billingCycle !== undefined ? { billingCycle: dto.billingCycle } : {}),
+      ...(dto.taxRateId !== undefined ? { taxRateId: ProductsService.nullable(dto.taxRateId) } : {}),
+      ...(dto.domainRequired !== undefined ? { domainRequired: dto.domainRequired } : {}),
+      ...(dto.welcomeEmailTemplate !== undefined ? { welcomeEmailTemplate: ProductsService.nullable(dto.welcomeEmailTemplate) } : {}),
+      ...(dto.stockEnabled !== undefined ? { stockEnabled: dto.stockEnabled } : {}),
+      ...(dto.stockQty !== undefined ? { stockQty: dto.stockQty } : {}),
+      ...(dto.crossSell !== undefined ? { crossSell: dto.crossSell } : {}),
+    };
     const product = await this.prisma.product.create({
-      data: {
-        name: dto.name,
-        kind: dto.kind ?? 'generic',
-        status: dto.status,
-        categoryId: dto.categoryId ?? null,
-        packId: dto.packId ?? null,
-      },
+      data,
       include: PRODUCT_INCLUDE,
     });
     await this.audit.record({
@@ -170,6 +241,7 @@ export class ProductsService {
   async update(id: string, dto: UpdateProductDto, actor: Actor): Promise<Product> {
     const before = await this.findOne(id);
     await this.assertRefs(dto.categoryId, dto.packId);
+    await this.assertSlugUnique(dto.slug, id);
     const data: {
       name?: string;
       kind?: string;
@@ -178,12 +250,48 @@ export class ProductsService {
       packId?: string | null;
       provisionModuleId?: string | null;
       moduleParams?: Prisma.InputJsonValue;
+      // Bloc A — store-front (onglets 1 & 2), optionnels/rétro-compatibles.
+      slug?: string | null;
+      slogan?: string | null;
+      shortDescription?: string | null;
+      freePlan?: boolean;
+      description?: string | null;
+      color?: string | null;
+      hidden?: boolean;
+      displayOrder?: number;
+      priceHtCents?: number | null;
+      promoPriceHtCents?: number | null;
+      billingCycle?: BillingCycle;
+      taxRateId?: string | null;
+      domainRequired?: boolean;
+      welcomeEmailTemplate?: string | null;
+      stockEnabled?: boolean;
+      stockQty?: number | null;
+      crossSell?: boolean;
     } = {};
     if (dto.name !== undefined) data.name = dto.name;
     if (dto.kind !== undefined) data.kind = dto.kind;
     if (dto.status !== undefined) data.status = dto.status;
     if (dto.categoryId !== undefined) data.categoryId = dto.categoryId === '' ? null : dto.categoryId;
     if (dto.packId !== undefined) data.packId = dto.packId === '' ? null : dto.packId;
+    // Bloc A — store-front : null/'' = effacer ; undefined = inchangé.
+    if (dto.slug !== undefined) data.slug = ProductsService.nullable(dto.slug);
+    if (dto.slogan !== undefined) data.slogan = ProductsService.nullable(dto.slogan);
+    if (dto.shortDescription !== undefined) data.shortDescription = ProductsService.nullable(dto.shortDescription);
+    if (dto.freePlan !== undefined) data.freePlan = dto.freePlan;
+    if (dto.description !== undefined) data.description = ProductsService.nullable(dto.description);
+    if (dto.color !== undefined) data.color = ProductsService.nullable(dto.color);
+    if (dto.hidden !== undefined) data.hidden = dto.hidden;
+    if (dto.displayOrder !== undefined) data.displayOrder = dto.displayOrder;
+    if (dto.priceHtCents !== undefined) data.priceHtCents = dto.priceHtCents ?? null;
+    if (dto.promoPriceHtCents !== undefined) data.promoPriceHtCents = dto.promoPriceHtCents ?? null;
+    if (dto.billingCycle !== undefined) data.billingCycle = dto.billingCycle;
+    if (dto.taxRateId !== undefined) data.taxRateId = ProductsService.nullable(dto.taxRateId);
+    if (dto.domainRequired !== undefined) data.domainRequired = dto.domainRequired;
+    if (dto.welcomeEmailTemplate !== undefined) data.welcomeEmailTemplate = ProductsService.nullable(dto.welcomeEmailTemplate);
+    if (dto.stockEnabled !== undefined) data.stockEnabled = dto.stockEnabled;
+    if (dto.stockQty !== undefined) data.stockQty = dto.stockQty ?? null;
+    if (dto.crossSell !== undefined) data.crossSell = dto.crossSell;
     // Déploiement par défaut (admin) : on MERGE les clés utiles sur moduleParams
     // existant (repoUrl/branch/buildPack/appName), on préserve les autres ; '' → null/absent,
     // et on re-câble une autre method de provisioning si demandé ('' → null).
@@ -354,5 +462,426 @@ export class ProductsService {
       details: { ids },
     });
     return this.listCheckoutFields(productId);
+  }
+
+  // ── Onglet 4 — catégories liées (multi, ProductCategoryLink) ────────────
+  /** Liste les catégories liées (en plus de la catégorie principale). */
+  async listCategoryLinks(id: string) {
+    await this.findOne(id);
+    return this.prisma.productCategoryLink.findMany({
+      where: { productId: id },
+      orderBy: { category: { name: 'asc' } },
+      include: { category: { select: { id: true, name: true } } },
+    });
+  }
+
+  /** Remplace l'ensemble des catégories liées du produit (transaction). */
+  async setCategories(id: string, categoryIds: string[], actor: Actor) {
+    await this.findOne(id);
+    for (const cid of categoryIds) {
+      const cat = await this.prisma.productCategory.findUnique({ where: { id: cid }, select: { id: true } });
+      if (!cat) throw new BadRequestException('Catégorie introuvable.');
+    }
+    await this.prisma.$transaction([
+      this.prisma.productCategoryLink.deleteMany({ where: { productId: id } }),
+      this.prisma.productCategoryLink.createMany({
+        data: categoryIds.map((categoryId) => ({ productId: id, categoryId })),
+        skipDuplicates: true,
+      }),
+    ]);
+    await this.audit.record({
+      actorId: actor.sub,
+      actorEmail: actor.email,
+      action: 'store.categories.set',
+      resourceType: 'product',
+      resourceId: id,
+      details: { categoryIds },
+    });
+    return this.listCategoryLinks(id);
+  }
+
+  /** Retire une catégorie liée. */
+  async unlinkCategory(id: string, categoryId: string, actor: Actor) {
+    await this.findOne(id);
+    const where = { productId_categoryId: { productId: id, categoryId } };
+    const link = await this.prisma.productCategoryLink.findUnique({ where });
+    if (!link) throw new NotFoundException('Catégorie liée introuvable.');
+    await this.prisma.productCategoryLink.delete({ where });
+    await this.audit.record({
+      actorId: actor.sub,
+      actorEmail: actor.email,
+      action: 'store.category.unlink',
+      resourceType: 'product',
+      resourceId: id,
+      details: { categoryId },
+    });
+    return { ok: true };
+  }
+
+  // ── Onglet 5/8 — règle des sous-domaines gratuits (1:1, upsert) ─────────
+  async getFreeSubdomainRule(id: string) {
+    await this.findOne(id);
+    return this.prisma.freeSubdomainRule.findUnique({ where: { productId: id } });
+  }
+
+  async upsertFreeSubdomainRule(id: string, dto: UpsertFreeSubdomainRuleDto, actor: Actor) {
+    await this.findOne(id);
+    const data = {
+      ...(dto.allowedDomainIds !== undefined ? { allowedDomainIds: dto.allowedDomainIds } : {}),
+      ...(dto.reservedPrefixes !== undefined ? { reservedPrefixes: dto.reservedPrefixes } : {}),
+      ...(dto.minLength !== undefined ? { minLength: dto.minLength } : {}),
+      ...(dto.maxLength !== undefined ? { maxLength: dto.maxLength } : {}),
+      ...(dto.allowedChars !== undefined ? { allowedChars: dto.allowedChars } : {}),
+      ...(dto.rejectPattern !== undefined ? { rejectPattern: dto.rejectPattern ?? null } : {}),
+    };
+    const rule = await this.prisma.freeSubdomainRule.upsert({
+      where: { productId: id },
+      create: { productId: id, ...data },
+      update: data,
+    });
+    await this.audit.record({
+      actorId: actor.sub,
+      actorEmail: actor.email,
+      action: 'store.subdomain.rule.upsert',
+      resourceType: 'product',
+      resourceId: id,
+      details: { allowedDomainIds: rule.allowedDomainIds, reservedPrefixes: rule.reservedPrefixes },
+    });
+    return rule;
+  }
+
+  async deleteFreeSubdomainRule(id: string, actor: Actor) {
+    await this.findOne(id);
+    const rule = await this.prisma.freeSubdomainRule.findUnique({ where: { productId: id } });
+    if (!rule) throw new NotFoundException('Règle de sous-domaines absente pour ce produit.');
+    await this.prisma.freeSubdomainRule.delete({ where: { productId: id } });
+    await this.audit.record({
+      actorId: actor.sub,
+      actorEmail: actor.email,
+      action: 'store.subdomain.rule.delete',
+      resourceType: 'product',
+      resourceId: id,
+      details: { cleared: true },
+    });
+    return { ok: true };
+  }
+
+  // ── Onglet 6 — options configurables + choix ───────────────────────────
+  async listOptions(id: string) {
+    await this.findOne(id);
+    return this.prisma.productOption.findMany({
+      where: { productId: id },
+      orderBy: { sortOrder: 'asc' },
+      include: { choices: { orderBy: { sortOrder: 'asc' } } },
+    });
+  }
+
+  async createOption(id: string, dto: CreateOptionDto, actor: Actor) {
+    await this.findOne(id);
+    const option = await this.prisma.productOption.create({
+      data: {
+        productId: id,
+        name: dto.name,
+        required: dto.required ?? false,
+        sortOrder: dto.sortOrder ?? 0,
+      },
+    });
+    await this.audit.record({
+      actorId: actor.sub,
+      actorEmail: actor.email,
+      action: 'store.option.create',
+      resourceType: 'product',
+      resourceId: id,
+      details: { name: option.name },
+    });
+    return option;
+  }
+
+  async updateOption(optionId: string, dto: UpdateOptionDto, actor: Actor) {
+    const option = await this.prisma.productOption.findUnique({ where: { id: optionId } });
+    if (!option) throw new NotFoundException('Option introuvable.');
+    const data: { name?: string; required?: boolean; sortOrder?: number } = {};
+    if (dto.name !== undefined) data.name = dto.name;
+    if (dto.required !== undefined) data.required = dto.required;
+    if (dto.sortOrder !== undefined) data.sortOrder = dto.sortOrder;
+    const updated = await this.prisma.productOption.update({ where: { id: optionId }, data });
+    await this.audit.record({
+      actorId: actor.sub,
+      actorEmail: actor.email,
+      action: 'store.option.update',
+      resourceType: 'product',
+      resourceId: option.productId,
+      details: { name: updated.name },
+    });
+    return updated;
+  }
+
+  async deleteOption(optionId: string, actor: Actor) {
+    const option = await this.prisma.productOption.findUnique({ where: { id: optionId } });
+    if (!option) throw new NotFoundException('Option introuvable.');
+    await this.prisma.productOption.delete({ where: { id: optionId } });
+    await this.audit.record({
+      actorId: actor.sub,
+      actorEmail: actor.email,
+      action: 'store.option.delete',
+      resourceType: 'product',
+      resourceId: option.productId,
+      details: { name: option.name },
+    });
+    return { ok: true };
+  }
+
+  async reorderOptions(id: string, ids: string[], actor: Actor) {
+    await this.findOne(id);
+    const found = await this.prisma.productOption.findMany({
+      where: { id: { in: ids }, productId: id },
+      select: { id: true },
+    });
+    if (found.length !== ids.length) {
+      throw new BadRequestException('Certaines options n’appartiennent pas à ce produit.');
+    }
+    await this.prisma.$transaction(
+      ids.map((optionId, index) =>
+        this.prisma.productOption.update({ where: { id: optionId }, data: { sortOrder: index } }),
+      ),
+    );
+    await this.audit.record({
+      actorId: actor.sub,
+      actorEmail: actor.email,
+      action: 'store.option.reorder',
+      resourceType: 'product',
+      resourceId: id,
+      details: { ids },
+    });
+    return this.listOptions(id);
+  }
+
+  async createChoice(optionId: string, dto: CreateOptionChoiceDto, actor: Actor) {
+    const option = await this.prisma.productOption.findUnique({ where: { id: optionId } });
+    if (!option) throw new NotFoundException('Option introuvable.');
+    const choice = await this.prisma.productOptionChoice.create({
+      data: {
+        optionId,
+        label: dto.label,
+        priceDeltaHtCents: dto.priceDeltaHtCents,
+        sortOrder: dto.sortOrder ?? 0,
+      },
+    });
+    await this.audit.record({
+      actorId: actor.sub,
+      actorEmail: actor.email,
+      action: 'store.choice.create',
+      resourceType: 'product',
+      resourceId: option.productId,
+      details: { optionId, label: choice.label },
+    });
+    return choice;
+  }
+
+  async updateChoice(choiceId: string, dto: UpdateOptionChoiceDto, actor: Actor) {
+    const choice = await this.prisma.productOptionChoice.findUnique({
+      where: { id: choiceId },
+      include: { option: { select: { productId: true } } },
+    });
+    if (!choice) throw new NotFoundException('Choix introuvable.');
+    const data: { label?: string; priceDeltaHtCents?: number; sortOrder?: number } = {};
+    if (dto.label !== undefined) data.label = dto.label;
+    if (dto.priceDeltaHtCents !== undefined) data.priceDeltaHtCents = dto.priceDeltaHtCents;
+    if (dto.sortOrder !== undefined) data.sortOrder = dto.sortOrder;
+    const updated = await this.prisma.productOptionChoice.update({ where: { id: choiceId }, data });
+    await this.audit.record({
+      actorId: actor.sub,
+      actorEmail: actor.email,
+      action: 'store.choice.update',
+      resourceType: 'product',
+      resourceId: choice.option.productId,
+      details: { choiceId, label: updated.label },
+    });
+    return updated;
+  }
+
+  async deleteChoice(choiceId: string, actor: Actor) {
+    const choice = await this.prisma.productOptionChoice.findUnique({
+      where: { id: choiceId },
+      include: { option: { select: { productId: true } } },
+    });
+    if (!choice) throw new NotFoundException('Choix introuvable.');
+    await this.prisma.productOptionChoice.delete({ where: { id: choiceId } });
+    await this.audit.record({
+      actorId: actor.sub,
+      actorEmail: actor.email,
+      action: 'store.choice.delete',
+      resourceType: 'product',
+      resourceId: choice.option.productId,
+      details: { choiceId, label: choice.label },
+    });
+    return { ok: true };
+  }
+
+  async reorderChoices(optionId: string, ids: string[], actor: Actor) {
+    const option = await this.prisma.productOption.findUnique({
+      where: { id: optionId },
+      select: { id: true, productId: true },
+    });
+    if (!option) throw new NotFoundException('Option introuvable.');
+    const found = await this.prisma.productOptionChoice.findMany({
+      where: { id: { in: ids }, optionId },
+      select: { id: true },
+    });
+    if (found.length !== ids.length) {
+      throw new BadRequestException('Certains choix n’appartiennent pas à cette option.');
+    }
+    await this.prisma.$transaction(
+      ids.map((choiceId, index) =>
+        this.prisma.productOptionChoice.update({ where: { id: choiceId }, data: { sortOrder: index } }),
+      ),
+    );
+    await this.audit.record({
+      actorId: actor.sub,
+      actorEmail: actor.email,
+      action: 'store.choice.reorder',
+      resourceType: 'product',
+      resourceId: option.productId,
+      details: { optionId, ids },
+    });
+    return this.prisma.productOptionChoice.findMany({
+      where: { optionId },
+      orderBy: { sortOrder: 'asc' },
+    });
+  }
+
+  // ── Onglet 7 — suppléments / add-ons ────────────────────────────────────
+  async listAddons(id: string) {
+    await this.findOne(id);
+    return this.prisma.productAddon.findMany({
+      where: { productId: id },
+      orderBy: { sortOrder: 'asc' },
+    });
+  }
+
+  async createAddon(id: string, dto: CreateAddonDto, actor: Actor) {
+    await this.findOne(id);
+    const addon = await this.prisma.productAddon.create({
+      data: {
+        productId: id,
+        name: dto.name,
+        description: dto.description ?? null,
+        priceHtCents: dto.priceHtCents,
+        sortOrder: dto.sortOrder ?? 0,
+      },
+    });
+    await this.audit.record({
+      actorId: actor.sub,
+      actorEmail: actor.email,
+      action: 'store.addon.create',
+      resourceType: 'product',
+      resourceId: id,
+      details: { name: addon.name, priceHtCents: addon.priceHtCents },
+    });
+    return addon;
+  }
+
+  async updateAddon(addonId: string, dto: UpdateAddonDto, actor: Actor) {
+    const addon = await this.prisma.productAddon.findUnique({ where: { id: addonId } });
+    if (!addon) throw new NotFoundException('Add-on introuvable.');
+    const data: {
+      name?: string;
+      description?: string | null;
+      priceHtCents?: number;
+      sortOrder?: number;
+    } = {};
+    if (dto.name !== undefined) data.name = dto.name;
+    if (dto.description !== undefined) data.description = dto.description;
+    if (dto.priceHtCents !== undefined) data.priceHtCents = dto.priceHtCents;
+    if (dto.sortOrder !== undefined) data.sortOrder = dto.sortOrder;
+    const updated = await this.prisma.productAddon.update({ where: { id: addonId }, data });
+    await this.audit.record({
+      actorId: actor.sub,
+      actorEmail: actor.email,
+      action: 'store.addon.update',
+      resourceType: 'product',
+      resourceId: addon.productId,
+      details: { name: updated.name },
+    });
+    return updated;
+  }
+
+  async deleteAddon(addonId: string, actor: Actor) {
+    const addon = await this.prisma.productAddon.findUnique({ where: { id: addonId } });
+    if (!addon) throw new NotFoundException('Add-on introuvable.');
+    await this.prisma.productAddon.delete({ where: { id: addonId } });
+    await this.audit.record({
+      actorId: actor.sub,
+      actorEmail: actor.email,
+      action: 'store.addon.delete',
+      resourceType: 'product',
+      resourceId: addon.productId,
+      details: { name: addon.name },
+    });
+    return { ok: true };
+  }
+
+  async reorderAddons(id: string, ids: string[], actor: Actor) {
+    await this.findOne(id);
+    const found = await this.prisma.productAddon.findMany({
+      where: { id: { in: ids }, productId: id },
+      select: { id: true },
+    });
+    if (found.length !== ids.length) {
+      throw new BadRequestException('Certains add-ons n’appartiennent pas à ce produit.');
+    }
+    await this.prisma.$transaction(
+      ids.map((addonId, index) =>
+        this.prisma.productAddon.update({ where: { id: addonId }, data: { sortOrder: index } }),
+      ),
+    );
+    await this.audit.record({
+      actorId: actor.sub,
+      actorEmail: actor.email,
+      action: 'store.addon.reorder',
+      resourceType: 'product',
+      resourceId: id,
+      details: { ids },
+    });
+    return this.listAddons(id);
+  }
+
+  // ── Onglet 3 — résumé provisioning + méthodes disponibles ───────────────
+  /** Vue admin du provisioning d'un produit : module de déploiement A/B hérité
+   *  du pack (lecture seule) + méthode de provisioning + paramètres. */
+  async getProvisioning(id: string) {
+    const product = await this.prisma.product.findUnique({
+      where: { id },
+      select: {
+        id: true,
+        moduleParams: true,
+        provisionModule: {
+          select: { id: true, name: true, code: true, description: true, endpoint: true, actions: true, isSystem: true },
+        },
+        pack: {
+          select: {
+            id: true,
+            name: true,
+            deploymentModule: {
+              select: { id: true, code: true, name: true, kind: true, server: { select: { id: true, hostname: true } } },
+            },
+          },
+        },
+      },
+    });
+    if (!product) throw new NotFoundException('Product not found');
+    return {
+      deploymentModule: product.pack?.deploymentModule ?? null,
+      provisionMethod: product.provisionModule,
+      moduleParams: (product.moduleParams as Record<string, unknown> | null) ?? {},
+    };
+  }
+
+  /** Méthodes de provisioning actives (registre, pour choisir à l’onglet 3). */
+  async listActiveProvisionMethods() {
+    return this.prisma.provisionMethod.findMany({
+      where: { isActive: true },
+      orderBy: { name: 'asc' },
+    });
   }
 }
