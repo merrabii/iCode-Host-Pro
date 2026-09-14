@@ -455,6 +455,25 @@ export interface ProductAdmin {
     publishDirectory?: string | null;
     isStatic?: boolean | null;
   } | null;
+  // ── Bloc A (page produit 10 onglets) — champs store-front (onglets 1 & 2) ──
+  slug?: string | null;
+  slogan?: string | null;
+  shortDescription?: string | null;
+  freePlan?: boolean;
+  description?: string | null;
+  color?: string | null;
+  hidden?: boolean;
+  displayOrder?: number;
+  priceHtCents?: number | null;
+  promoPriceHtCents?: number | null;
+  billingCycle?: string;
+  taxRateId?: string | null;
+  taxRate?: { id: string; name: string; ratePercent: string } | null;
+  domainRequired?: boolean;
+  welcomeEmailTemplate?: string | null;
+  stockEnabled?: boolean;
+  stockQty?: number | null;
+  crossSell?: boolean;
 }
 /** Référence pack (limites présentées à l'admin + client). storageLimit = quota
  *  disque ENREGISTRÉ mais NON actif encore (système de quota après la mise en prod). */
@@ -470,6 +489,8 @@ export interface PackMin {
   maxApps?: number | null;
   deploymentModuleId?: string | null;
   deploymentModule?: { id: string; code: string; name: string } | null;
+  // Bloc A — nb de sous-domaines gratuits inclus (informatif).
+  freeSubdomainsIncluded?: number | null;
 }
 /** Vue admin d'un pack d'hébergement. */
 export interface PackAdmin {
@@ -483,6 +504,7 @@ export interface PackAdmin {
   status: string;
   maxApps?: number | null;
   deploymentModule?: { id: string; code: string; name: string } | null;
+  freeSubdomainsIncluded?: number | null;
   createdAt: string;
   updatedAt: string;
   _count?: { products: number; categories: number };
@@ -510,6 +532,8 @@ export type PackInput = {
   // Phase 13 — quota d'apps (null = illimité) + module de déploiement lié.
   maxApps?: number | null;
   deploymentModuleId?: string | null;
+  // Bloc A — nb de sous-domaines gratuits inclus (informatif).
+  freeSubdomainsIncluded?: number | null;
 };
 export type CategoryInput = {
   name?: string;
@@ -639,26 +663,26 @@ export const checkSubdomainAvailability = (t: string, subdomain: string, domainI
     body: JSON.stringify({ subdomain, domainId }),
   });
 export const listProducts = (t: string) => apiJson('/api/products', t);
-export const createProduct = (
-  t: string,
-  dto: { name: string; kind?: string; status?: string; categoryId?: string; packId?: string },
-) => apiJson('/api/products', t, { method: 'POST', body: JSON.stringify(dto) });
-export const updateProduct = (
-  t: string,
-  id: string,
-  patch: {
-    name?: string; kind?: string; status?: string; categoryId?: string | null; packId?: string | null;
-    provisionModuleId?: string | null;
-    moduleParams?: {
-      repoUrl?: string;
-      branch?: string;
-      buildPack?: string;
-      appName?: string;
-      publishDirectory?: string;
-      isStatic?: boolean;
-    };
-  },
-) => apiJson(`/api/products/${id}`, t, { method: 'PATCH', body: JSON.stringify(patch) });
+export type ProductPatchInput = {
+  name?: string; kind?: string; status?: string;
+  categoryId?: string | null; packId?: string | null;
+  provisionModuleId?: string | null;
+  moduleParams?: {
+    repoUrl?: string; branch?: string; buildPack?: string; appName?: string;
+    publishDirectory?: string; isStatic?: boolean;
+  };
+  // Bloc A — store-front (onglets 1 & 2) : null = effacer.
+  slug?: string | null; slogan?: string | null; shortDescription?: string | null;
+  freePlan?: boolean; description?: string | null; color?: string | null;
+  hidden?: boolean; displayOrder?: number;
+  priceHtCents?: number | null; promoPriceHtCents?: number | null; billingCycle?: string;
+  taxRateId?: string | null; domainRequired?: boolean; welcomeEmailTemplate?: string | null;
+  stockEnabled?: boolean; stockQty?: number | null; crossSell?: boolean;
+};
+export const createProduct = (t: string, dto: ProductPatchInput) =>
+  apiJson('/api/products', t, { method: 'POST', body: JSON.stringify(dto) });
+export const updateProduct = (t: string, id: string, patch: ProductPatchInput) =>
+  apiJson(`/api/products/${id}`, t, { method: 'PATCH', body: JSON.stringify(patch) });
 export const deleteProduct = (t: string, id: string) =>
   apiJson(`/api/products/${id}`, t, { method: 'DELETE' });
 
@@ -684,6 +708,118 @@ export const deleteCheckoutField = (t: string, fieldId: string) =>
   apiJson(`/api/products/checkout-fields/${fieldId}`, t, { method: 'DELETE' });
 export const reorderCheckoutFields = (t: string, id: string, ids: string[]) =>
   apiJson(`/api/products/${id}/checkout-fields/reorder`, t, { method: 'POST', body: JSON.stringify({ ids }) });
+
+// ── Bloc B — onglets fiche produit : catégories liées, options/choix, add-ons,
+//    règle sous-domaines gratuits, provisioning (miroir des routes admin) ─────
+export interface CategoryLinkView {
+  id: string;
+  category: { id: string; name: string };
+}
+export interface ChoiceRow {
+  id: string;
+  label: string;
+  priceDeltaHtCents: number;
+  sortOrder: number;
+}
+export interface ProductOptionRow {
+  id: string;
+  name: string;
+  required: boolean;
+  sortOrder: number;
+  choices: ChoiceRow[];
+}
+export interface ProductAddonRow {
+  id: string;
+  name: string;
+  description?: string | null;
+  priceHtCents: number;
+  sortOrder: number;
+}
+/** Règle sous-domaines gratuits côté admin (inclut les contraintes d'édition). */
+export interface FreeSubdomainRuleAdmin {
+  id?: string;
+  minLength: number;
+  maxLength: number;
+  allowedChars?: string | null;
+  reservedPrefixes: string[];
+  rejectPattern?: string | null;
+  allowedDomainIds: string[];
+}
+export interface ProvisionMethod {
+  id: string;
+  name: string;
+  code: string;
+  description?: string | null;
+  endpoint?: string | null;
+  actions?: string[] | null;
+  isSystem: boolean;
+}
+export const listProductCategories = (t: string, id: string) =>
+  apiJson(`/api/products/${id}/categories`, t);
+export const setProductCategories = (t: string, id: string, categoryIds: string[]) =>
+  apiJson(`/api/products/${id}/categories`, t, { method: 'PUT', body: JSON.stringify({ categoryIds }) });
+export const unlinkProductCategory = (t: string, id: string, categoryId: string) =>
+  apiJson(`/api/products/${id}/categories/${categoryId}`, t, { method: 'DELETE' });
+
+export const getFreeSubdomainRule = (t: string, id: string) =>
+  apiJson(`/api/products/${id}/free-subdomain-rule`, t);
+export const upsertFreeSubdomainRule = (t: string, id: string, dto: Omit<FreeSubdomainRuleAdmin, 'id'>) =>
+  apiJson(`/api/products/${id}/free-subdomain-rule`, t, { method: 'PUT', body: JSON.stringify(dto) });
+export const deleteFreeSubdomainRule = (t: string, id: string) =>
+  apiJson(`/api/products/${id}/free-subdomain-rule`, t, { method: 'DELETE' });
+
+export const listProductOptions = (t: string, id: string) =>
+  apiJson(`/api/products/${id}/options`, t);
+export const createProductOption = (
+  t: string,
+  id: string,
+  dto: { name: string; required?: boolean; sortOrder?: number },
+) => apiJson(`/api/products/${id}/options`, t, { method: 'POST', body: JSON.stringify(dto) });
+export const updateProductOption = (
+  t: string,
+  optionId: string,
+  dto: { name?: string; required?: boolean; sortOrder?: number },
+) => apiJson(`/api/products/options/${optionId}`, t, { method: 'PATCH', body: JSON.stringify(dto) });
+export const deleteProductOption = (t: string, optionId: string) =>
+  apiJson(`/api/products/options/${optionId}`, t, { method: 'DELETE' });
+export const reorderProductOptions = (t: string, id: string, ids: string[]) =>
+  apiJson(`/api/products/${id}/options/reorder`, t, { method: 'POST', body: JSON.stringify({ ids }) });
+
+export const createOptionChoice = (
+  t: string,
+  optionId: string,
+  dto: { label: string; priceDeltaHtCents: number; sortOrder?: number },
+) => apiJson(`/api/products/options/${optionId}/choices`, t, { method: 'POST', body: JSON.stringify(dto) });
+export const updateOptionChoice = (
+  t: string,
+  choiceId: string,
+  dto: { label?: string; priceDeltaHtCents?: number; sortOrder?: number },
+) => apiJson(`/api/products/choices/${choiceId}`, t, { method: 'PATCH', body: JSON.stringify(dto) });
+export const deleteOptionChoice = (t: string, choiceId: string) =>
+  apiJson(`/api/products/choices/${choiceId}`, t, { method: 'DELETE' });
+export const reorderOptionChoices = (t: string, optionId: string, ids: string[]) =>
+  apiJson(`/api/products/options/${optionId}/choices/reorder`, t, { method: 'POST', body: JSON.stringify({ ids }) });
+
+export const listProductAddons = (t: string, id: string) =>
+  apiJson(`/api/products/${id}/addons`, t);
+export const createProductAddon = (
+  t: string,
+  id: string,
+  dto: { name: string; description?: string; priceHtCents: number; sortOrder?: number },
+) => apiJson(`/api/products/${id}/addons`, t, { method: 'POST', body: JSON.stringify(dto) });
+export const updateProductAddon = (
+  t: string,
+  addonId: string,
+  dto: { name?: string; description?: string | null; priceHtCents?: number; sortOrder?: number },
+) => apiJson(`/api/products/addons/${addonId}`, t, { method: 'PATCH', body: JSON.stringify(dto) });
+export const deleteProductAddon = (t: string, addonId: string) =>
+  apiJson(`/api/products/addons/${addonId}`, t, { method: 'DELETE' });
+export const reorderProductAddons = (t: string, id: string, ids: string[]) =>
+  apiJson(`/api/products/${id}/addons/reorder`, t, { method: 'POST', body: JSON.stringify({ ids }) });
+
+export const getProductProvisioning = (t: string, id: string) =>
+  apiJson(`/api/products/${id}/provisioning`, t);
+export const listProvisionMethods = (t: string) => apiJson('/api/products/provision-methods', t);
 
 // ── Phase 12 (Catalog) — catégories & packs d'hébergement ───────────────────
 export const listCategories = (t: string) => apiJson('/api/categories', t);

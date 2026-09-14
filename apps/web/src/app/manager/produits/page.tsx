@@ -31,9 +31,8 @@ import {
   Panel,
   Select,
 } from '@/components/ui';
-import { StoreSettingsDrawer } from '@/components/admin/product-store-settings';
-import { ProductEditPanel } from '@/components/admin/product-edit-panel';
-import { IconBox, IconBoxes, IconPlus, IconTrash, IconX } from '@/components/icons';
+import { ProductEditor } from '@/components/admin/product-editor';
+import { IconBox, IconPlus, IconTrash, IconX } from '@/components/icons';
 
 const PRODUCT_STATUSES = ['DRAFT', 'ACTIVE', 'SUSPENDED', 'DISABLED'];
 
@@ -50,8 +49,7 @@ export default function ManagerProduitsPage() {
   const [catId, setCatId] = useState('');
   const [packId, setPackId] = useState('');
   const [busy, setBusy] = useState<string | null>(null); // 'create' | product id
-  const [storeProductId, setStoreProductId] = useState<string | null>(null); // drawer « Réglages boutique » ouvert
-  const [editId, setEditId] = useState<string | null>(null); // panneau d'édition produit ouvert
+  const [editId, setEditId] = useState<string | null>(null); // éditeur produit à onglets ouvert
   const [modules, setModules] = useState<DeploymentModule[]>([]); // modules de déploiement (visualisation de la méthode)
 
   useEffect(() => {
@@ -271,17 +269,9 @@ export default function ManagerProduitsPage() {
                           size="sm"
                           variant={editId === p.id ? 'primary' : 'secondary'}
                           onClick={() => setEditId((v) => (v === p.id ? null : p.id))}
-                          title="Modifier le produit (champs + méthode de déploiement)"
+                          title="Modifier le produit (tous les onglets)"
                         >
                           ✎ Modifier
-                        </Button>
-                        <Button
-                          size="sm"
-                          variant={storeProductId === p.id ? 'primary' : 'secondary'}
-                          onClick={() => setStoreProductId((v) => (v === p.id ? null : p.id))}
-                          title="Réglages boutique (récap /cart, champs de facturation)"
-                        >
-                          <IconBoxes size={14} /> Boutique
                         </Button>
                         <Button size="sm" variant="danger" disabled={busy === p.id} onClick={() => handleDelete(p)} title="Supprimer le produit">
                           <IconTrash size={14} />
@@ -295,16 +285,8 @@ export default function ManagerProduitsPage() {
           </div>
         )}
 
-        {storeProductId && products.some((p) => p.id === storeProductId) && (
-          <StoreSettingsDrawer
-            product={products.find((p) => p.id === storeProductId)!}
-            token={token}
-            onUpdated={() => void load(token)}
-          />
-        )}
-
         {editId && products.some((p) => p.id === editId) && (
-          <ProductEditPanel
+          <ProductEditor
             key={editId}
             product={products.find((p) => p.id === editId)!}
             token={token}
