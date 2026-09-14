@@ -423,6 +423,11 @@ model HostingPack {
   // Quota d'applications du plan (Phase 13) : 1 / 5 / 10… null = illimité. Le
   // nombre d'apps du client sous l'abonnement ACTIF lié à ce pack est plafonné.
   maxApps            Int?
+  // Nombre de sous-domaines gratuits inclus dans le pack (onglet Packs de la
+  // fiche produit). INFORMATIF pour l'instant (affiché à l'admin) : la logique
+  // métier d'enforcement (quota de sous-domaines utilisables par commande/client)
+  // n'est pas encore décidée — voir point ouvert dans le plan (Bloc A).
+  freeSubdomainsIncluded Int?
   // Méthode de déploiement du plan (Phase 13) : le module (A projet partagé /
   // B projet client) qui héberge les apps de ce pack. null = déploiement non
   // configuré pour ce pack (le module par défaut actif fait office de fallback).

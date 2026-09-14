@@ -52,6 +52,13 @@ export class CreatePackDto {
   @Min(1)
   maxApps?: number;
 
+  // Bloc A (page produit 10 onglets) — sous-domaines gratuits inclus.
+  // INFORMATIF pour l'instant (aucune logique d'enforcement décidée — point ouvert).
+  @IsOptional()
+  @IsInt()
+  @Min(0)
+  freeSubdomainsIncluded?: number;
+
   // Phase 13 — module/méthode de déploiement lié à ce pack (A/B/C…).
   @IsOptional()
   @IsString()
