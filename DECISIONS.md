@@ -804,4 +804,9 @@ Unit **398/398**, e2e **146/146** verts. Fichiers : `runtime-port-contract.ts` (
 `provisioning.service.ts/.spec.ts` (`resolveBackendExposedPort`, plus de `NODE_CANONICAL_PORT`),
 2 specs e2e (mock `resolveExposedPort`). Pas de push GitHub (attente validation propriétaire).
 
+### ADR-038 ADDENDUM — 2026-09-15 — produit backend + flux produit réel (état)
+- Produit `api-node-starter` (`cmu1tljf8000bpelc1k2ltft3`) audit : repo = `Product.moduleParams.repoUrl` ; runtime = `{isStatic,publishDirectory,buildPack}` ⇒ `isServerRuntime = !(isStatic || publishDirectory)` ; flux = Order → `actionCreateApp` (lit `order.product.moduleParams`) → `createGitApp` → si serveur runtime `resolveBackendExposedPort` → `applyNodePort`. Base live = `heroku/nodejs-getting-started.git`, `isStatic:false`, `buildPack:nixpacks` (déjà backend).
+- **COMMIT 1** `7490de1` (provisioning ADR-038) ; **COMMIT 2** `528d1b9` (`fix(catalog)` : `seed-catalog.ts` expose `repoUrl=heroku` pour `api-node-starter`, source de vérité reproductible ; URL config produit uniquement, jamais dans le moteur). Local seulement, pas de push.
+- **Flux produit réel (tentative) BLOQUÉ à la frange provider** : commande propre `ord-node-product-20260915` → config_dns **SUCCESS** (CNAME `node-product-e2e`), **create_app FAILED +403 Coolify « You are not allowed to access the API »** = **allowlist IP Coolify** (egress `105.190.173.126` non autorisé ; IP publique dynamique, cf. mémoire). Aucun orphelin ; order **PROVISIONING** (gate correct, pas de faux ACTIVE). Non contourné par principe. Le moteur est déjà prouvé sur 2 E2E directs (provider/buildpack, HTTP 200 public). Reste à valider opérateur (autoriser IP) puis relancer le MÊME force-provision (idempotent).
+
 # REJECTED

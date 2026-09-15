@@ -1,5 +1,14 @@
 # CHANGELOG
 
+## 2026-09-15 — Phase 17 (ADR-038 suite) : produit api-node-starter = vrai backend (déclaré + source de vérité) — flux produit réel bloqué à la frange Coolify (allowlist IP)
+### Fait et validé
+- **Audit produit `api-node-starter`** (`cmu1tljf8000bpelc1k2ltft3`) : repo dans `Product.moduleParams.repoUrl` ; runtime déterminé par `{isStatic, publishDirectory, buildPack}` → `isServerRuntime = !(isStatic || publishDirectory)` ; flux = Order→`actionCreateApp`→`createGitApp(repoUrl,buildPack,isStatic,…)` → si serveur runtime `resolveBackendExposedPort`→`applyNodePort`. La base live porte déjà `heroku/nodejs-getting-started.git`, `isStatic:false`, `buildPack:nixpacks` (repointée en E2E).
+- **COMMIT 1** `7490de1` (dessous) + **COMMIT 2** `528d1b9` : `seed-catalog.ts` donne à `api-node-starter` le repo backend `heroku` **explicitement** (au lieu du fallback statique), source de vérité reproductible. URL = config produit uniquement, **jamais dans le moteur** (commentaire explicite).
+### Bloqué (externe, NON contourné)
+- Commande propre `ord-node-product-20260915` (PAID) provisionnée via le chemin réel admin : configure_dns **SUCCESS** (CNAME `node-product-e2e.arumdigital.com`) ; **create_app FAILED — HTTP 403 Coolify « You are not allowed to access the API »** = **allowlist IP Coolify** (egress actuel `105.190.173.126` non autorisé ; IP publique dynamique — cf. mémoire). **Aucun orphelin** (create échoué avant création), order **PROVISIONING** (proof-gate correct, jamais de faux ACTIVE). Le moteur ADR-038 est déjà prouvé sur 2 E2E directs (provider + buildpack, HTTP 200 public) ; la preuve du **flux produit réel** attend que l'opérateur ré-autorise l'IP puis relance le MÊME force-provision (idempotent).
+### Tests
+Unit **398/398** · e2e **146/146** verts. **Aucun push GitHub (attente GO).**
+
 ## 2026-09-15 — Phase 17 (ADR-038) : résolution générique du port exposé des backends Node — IMPLEMENTED + vérifié live (2 preuves HTTP 200 publiques)
 ### Problème résolu
 Le GAP architectural du PORT (Phase 17/Node) : un backend Node qui s'auto-lie sur `process.env.PORT` écoute ailleurs que le port routé par le proxy → 503/502 ; un « port canonique » global fixé en dur cassait la généricité. Constat empirique **Coolify 4.1.2** : `ports_exposes` reste `null` à la création ET après un build fini ; le front seulement l'image **EXPOSE** (nixpacks Node → **8080**), pas les autres. Forcer `ports_exposes=3000` → **502 persistant** même au redémarrage.
