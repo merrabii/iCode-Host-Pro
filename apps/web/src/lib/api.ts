@@ -685,6 +685,7 @@ export const updateProduct = (t: string, id: string, patch: ProductPatchInput) =
   apiJson(`/api/products/${id}`, t, { method: 'PATCH', body: JSON.stringify(patch) });
 export const deleteProduct = (t: string, id: string) =>
   apiJson(`/api/products/${id}`, t, { method: 'DELETE' });
+export const getProduct = (t: string, id: string) => apiJson(`/api/products/${id}`, t);
 
 // ── Réglages store par produit (admin) ───────────────────────────────────────
 export const updateStoreSettings = (
@@ -1499,6 +1500,8 @@ export const createDeployment = (
     appName?: string;
     /** Phase 3 — sous-domaine gratuit choisi (vide/absent = slug auto). */
     subdomain?: string;
+    /** Choix du domaine racine gratuit (id d'un Domain ACTIVE) ; vide = défaut. */
+    domainId?: string;
     // Phase 16 — build « file-based » (page de build professionnelle).
     baseDirectory?: string;
     buildCommand?: string;
@@ -1508,6 +1511,9 @@ export const createDeployment = (
     environment?: Record<string, string>;
   },
 ) => apiJson('/api/client/deployments', t, { method: 'POST', body: JSON.stringify(dto) });
+
+/** Racines gratuites proposées au client pour un sous-domaine (choix affiché). */
+export const listFreeDomains = (t: string) => apiJson('/api/client/domains', t);
 
 // ── Phase 16 — config de build « file-based » (Netlify-style) ────────────────
 /** Source qui a produit la config de build (préremplissage, jamais autoritaire). */

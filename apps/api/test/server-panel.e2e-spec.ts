@@ -39,6 +39,7 @@ describe('Server panel verify (e2e, Phase 9)', () => {
       createGitApp: jest.fn(),
       createProject: jest.fn(),
       listProjects: jest.fn(),
+      listServers: jest.fn().mockResolvedValue([]),
       deployApp: jest.fn(),
       applyAppLimits: jest.fn(),
       setAppEnvironment: jest.fn(),

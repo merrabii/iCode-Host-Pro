@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import Link from 'next/link';
 import {
   apiError,
@@ -77,6 +77,7 @@ export function ProductEditPanel({
   packs,
   modules,
   onUpdated,
+  onDirtyChange,
 }: {
   product: ProductAdmin;
   token: string;
@@ -84,6 +85,7 @@ export function ProductEditPanel({
   packs: PackAdmin[];
   modules: DeploymentModule[];
   onUpdated?: () => void;
+  onDirtyChange?: (key: string, dirty: boolean) => void;
 }) {
   const toast = useToast();
   const [name, setName] = useState(product.name);
@@ -92,6 +94,18 @@ export function ProductEditPanel({
   const [catId, setCatId] = useState(product.categoryId ?? '');
   const [packId, setPackId] = useState(product.packId ?? '');
   const [busy, setBusy] = useState(false);
+
+  // Détection de modifications non enregistrées (remontée au ProductEditor).
+  const dirty =
+    name.trim() !== product.name ||
+    (kind.trim() || 'generic') !== (product.kind || 'generic') ||
+    status !== product.status ||
+    (catId || '') !== (product.categoryId || '') ||
+    (packId || '') !== (product.packId || '');
+  useEffect(() => {
+    onDirtyChange?.('general', dirty);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dirty]);
 
   // Pack sélectionné pour la prévisualisation (PackAdmin, plus riche que product.pack).
   const chosenPack = packs.find((p) => p.id === packId) ?? product.pack ?? null;
@@ -156,6 +170,7 @@ export function ProductEditPanel({
             <Button type="submit" disabled={busy}>
               {busy ? 'Enregistrement…' : 'Enregistrer le produit'}
             </Button>
+            {dirty && <span className="muted" style={{ fontSize: 12 }}>⚠ modifications non enregistrées</span>}
           </div>
         </form>
       </div>
@@ -210,14 +225,22 @@ export function ProductEditPanel({
       </p>
 
       <div style={{ marginTop: 12 }}>
-        <Field label="Pack (change la méthode)">
+        <Field label="Pack (choisir le pack = choisir le serveur + le module A/B)">
           <Select value={packId} onChange={(e) => setPackId(e.target.value)}>
             <option value="">Aucun</option>
-            {packs.map((pk) => (
-              <option key={pk.id} value={pk.id}>
-                {pk.name} — {pk.ramMb} Mo · {pk.cpuCores} CPU
-              </option>
-            ))}
+            {packs.map((pk) => {
+              const pkMod = resolveModule(pk, modules);
+              const kind = pkMod ? moduleKindLabel(pkMod.kind) : null;
+              const svr = pkMod?.server?.hostname || null;
+              const broken = pk && !pkMod;
+              return (
+                <option key={pk.id} value={pk.id}>
+                  {broken
+                    ? `${pk.name} — ⚠ aucun module/serveur`
+                    : `${pk.name} · ${pk.ramMb} Mo · ${pk.cpuCores} CPU · ${kind ?? '—'}${svr ? ` · ${svr}` : ''}`}
+                </option>
+              );
+            })}
           </Select>
         </Field>
         <div className="muted" style={{ fontSize: 12, marginTop: 8 }}>

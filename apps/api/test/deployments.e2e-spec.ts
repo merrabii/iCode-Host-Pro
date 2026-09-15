@@ -65,6 +65,7 @@ describe('Deployments GitHub → Coolify (e2e, Phase 10bis)', () => {
       createGitApp: fakeCreateGitApp,
       createProject: fakeCreateProject,
       listProjects: fakeListProjects,
+      listServers: jest.fn().mockResolvedValue([]),
       deployApp: fakeDeployApp,
       applyAppLimits: jest.fn().mockResolvedValue(undefined),
       setAppEnvironment: jest.fn().mockResolvedValue(undefined),

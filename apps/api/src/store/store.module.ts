@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { AuthModule } from '../auth/auth.module';
 import { CloudflareModule } from '../cloudflare/cloudflare.module';
 import { CryptoModule } from '../crypto/crypto.module';
+import { DeploymentsModule } from '../deployments/deployments.module';
 import { MailModule } from '../mail/mail.module';
 import { ProductsModule } from '../products/products.module';
 import { PanelTransportFactory } from '../servers/panel-transport.factory';
@@ -19,7 +20,7 @@ import { StoreSubdomainController } from './store-subdomain.controller';
  * et PanelTransportFactory (pose du domaine Coolify).
  */
 @Module({
-  imports: [AuthModule, CloudflareModule, CryptoModule, MailModule, ProductsModule],
+  imports: [AuthModule, CloudflareModule, CryptoModule, DeploymentsModule, MailModule, ProductsModule],
   controllers: [
     PaymentMethodsController,
     BillingPaymentAdminController,

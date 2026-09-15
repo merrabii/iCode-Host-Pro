@@ -61,6 +61,16 @@ export class CreateDeploymentDto {
   @MaxLength(63)
   subdomain?: string;
 
+  // Choix du domaine racine GRATUIT du sous-domaine (ex "codediali.com" ou
+  // "arumdigital.com"), parmi ceux que l'admin propose. Vide/absent = racine
+  // configurée par défaut (`findActiveRootDomain`). Appliqué au déploiement :
+  // le CNAME est créé dans la zone Cloudflare du domaine choisi et posé sur
+  // l'app (`sous-domaine.racine-choisie`).
+  @IsOptional()
+  @IsString()
+  @MaxLength(100)
+  domainId?: string;
+
   // ── Phase 16 — build « file-based » (codediali.toml / page de build) ──────
   // Champs édités par le client sur la page de build professionnelle, pré-remplis
   // par le serveur depuis codediali.toml/netlify.toml/détection. Serveur re-sane

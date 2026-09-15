@@ -29,6 +29,7 @@ import {
   type Me,
   type PublicProduct,
 } from '@/lib/api';
+import { cartStorage, type CartItem } from '@/lib/cart';
 
 /** Pattern d'un sous-domaine libre (comme le DTO API). */
 const SUBDOMAIN_PATTERN = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
@@ -43,6 +44,8 @@ const SUBDOMAIN_PATTERN = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
 export default function ShopProductPage() {
   const params = useParams(); // sync dans un composant client (Next 15)
   const slug = Array.isArray(params.slug) ? params.slug[0] : params.slug;
+  const router = useRouter();
+  const actionRef = useRef<string | null>(null); // ?action=panier|checkout (lien « Liens Public »)
 
   const [product, setProduct] = useState<PublicProduct | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -109,6 +112,57 @@ export default function ShopProductPage() {
   }, [subdomain, needsSubdomain]);
 
   useEffect(() => () => { if (checkTimer.current) clearTimeout(checkTimer.current); }, []);
+
+  // Lien « Liens Public » direct : ?action=panier|checkout pré-remplit le panier
+  // (config par défaut) puis redirige. Plan Gratuit → inscription ; produit à
+  // sous-domaine exigé → on laisse la fiche pour le choix du sous-domaine.
+  useEffect(() => {
+    actionRef.current = new URLSearchParams(window.location.search).get('action');
+  }, []);
+
+  useEffect(() => {
+    const a = actionRef.current;
+    if (a !== 'panier' && a !== 'checkout') return;
+    if (!product) return;
+    const ready = (product.options ?? []).every((o) => !o.required || selected[o.id]);
+    if (!ready) return;
+
+    if (product.freePlan === true) {
+      router.replace(`/auth?plan=${encodeURIComponent(product.slug ?? '')}`);
+      return;
+    }
+    if (product.freeSubdomainRule) {
+      // Sous-domaine requis : pas d'ajout automatique — la fiche guide le choix.
+      return;
+    }
+
+    const optionsMap: Record<string, { id: string; label: string; priceDeltaHtCents: number }> = {};
+    for (const o of product.options ?? []) {
+      const c = o.choices.find((c) => c.id === selected[o.id]);
+      if (c) optionsMap[o.id] = { id: c.id, label: c.label, priceDeltaHtCents: c.priceDeltaHtCents };
+    }
+    const item: CartItem = {
+      product: {
+        id: product.id,
+        name: product.name,
+        slug: product.slug,
+        priceHtCents: product.priceHtCents,
+        promoPriceHtCents: product.promoPriceHtCents,
+        billingCycle: product.billingCycle,
+        color: product.color,
+        allowEditConfig: product.allowEditConfig ?? true,
+        installationFeeCents: product.installationFeeCents ?? 0,
+        taxRatePercent: product.taxRate != null ? Number(product.taxRate.ratePercent) : 0,
+        checkoutFields: product.checkoutFields ?? [],
+      },
+      options: optionsMap,
+      addons: {},
+      subdomain: product.freeSubdomainRule ? undefined : undefined,
+    };
+    cartStorage.write(item);
+    router.replace(a === 'checkout' ? '/checkout/payment' : '/cart');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [product, selected]);
 
   if (notFound) {
     return (

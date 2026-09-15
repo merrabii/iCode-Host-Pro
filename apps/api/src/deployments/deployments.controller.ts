@@ -59,6 +59,12 @@ export class DeploymentsController {
     return this.deployments.checkRepoEmpty(dto.repoFullName, dto.branch, actor);
   }
 
+  @Get('domains')
+  @ApiOperation({ summary: 'Free root domains available to this client for a subdomain (Phase 16)' })
+  listFreeDomains(@CurrentUser() actor: JwtPayload) {
+    return this.deployments.listFreeDomains(actor);
+  }
+
   @Get('deployments')
   @ApiOperation({ summary: 'List my deployments (Phase 10bis)' })
   listMine(@CurrentUser() actor: JwtPayload) {

@@ -11,12 +11,14 @@ import { AuditService } from '../audit/audit.service';
 import { CryptoService } from '../crypto/crypto.service';
 import { MailSettingsService } from '../mail/mail-settings.service';
 import { CloudflareService } from '../cloudflare/cloudflare.service';
+import { DeploymentsService, mapCoolifyStatus } from '../deployments/deployments.service';
 import { resolveEffectiveLimits } from '../deployments/limits.util';
 import { clientAreaUrl } from './web-links';
 import {
   PanelKind,
   PanelTarget,
   PanelTransportFactory,
+  PanelTransport,
 } from '../servers/panel-transport.factory';
 
 /**
@@ -43,6 +45,7 @@ export class ProvisioningService {
     private readonly mail: MailSettingsService,
     private readonly cloudflare: CloudflareService,
     private readonly panelFactory: PanelTransportFactory,
+    private readonly deployments: DeploymentsService,
   ) {}
 
   /**
@@ -144,44 +147,160 @@ export class ProvisioningService {
       });
     }
 
-    // Si un fqdn a été livré ou qu'aucune step critique n'a échoué, on passe ACTIVE.
+    // Règle PRODUCTION (2026-09-15) — « ne jamais confirmer tant que ce n'est pas réellement OK ».
+    // Le statut ACTIVE (et l'email de livraison « en ligne ») ne peut être accordé que sur
+    // PREUVE réelle : une app Coolify créée pour CETTE commande (coolifyUuid) ET un build
+    // Coolify ACTIVE/servi (ou un HTTP 2xx/3xx sur le sous-domaine).
     const logs = await this.prisma.provisioningLog.findMany({
       where: { orderId },
       orderBy: { createdAt: 'asc' },
     });
-    const hasFailedCreateApp = logs.some(
-      (l) => l.step === 'create_app' && l.status === ProvisioningStepStatus.FAILED,
-    );
-    const nextStatus = hasFailedCreateApp && !fqdn ? OrderStatus.PROVISIONING : OrderStatus.ACTIVE;
-    await this.setOrderStatus(
-      orderId,
-      nextStatus,
-      nextStatus === OrderStatus.ACTIVE ? 'Provisioning terminé.' : 'Provisioning partiel — relance requise.',
-    );
+    const createAppLog = logs.find((l) => l.step === 'create_app');
+    const createFailed = createAppLog?.status === ProvisioningStepStatus.FAILED;
+    const hasCreateAction = actions.includes(ProvisionAction.CREATE_APP);
+    // L'app a été réellement créée si actionCreateApp a retourné un appUuid (l'uuid
+    // Coolify est threadé sur l'ensemble des steps). Robustesse : pas de re-query.
+    const appCreated = !!appUuid;
 
-    // Email de livraison du sous-domaine (best-effort, jamais bloquant).
-    if (fqdn && nextStatus === OrderStatus.ACTIVE) {
-      await this.sendDeliveryEmail(order.customerEmail, order.customerName, fqdn, orderId).catch((e) => {
-        this.log.warn(`delivery email order=${orderId} failed: ${String(e)}`);
-        this.audit.record({
-          action: 'provision.delivery_email',
-          resourceType: 'order',
-          resourceId: orderId,
-          details: { ok: false, error: String(e) },
-        });
+    // 1) Produit censé créer une app mais AUCUNE app créée (create_app FAILED ou ignoré) →
+    //    JAMAIS ACTIVE. L'Order reste PROVISIONING pour relance admin. Aucun email.
+    //    (Avant : `hasFailedCreateApp && !fqdn ? PROVISIONING : ACTIVE` faisait passer ACTIVE
+    //    dès qu'un fqdn DNS existait même si la création d'app avait échoué — le « faux
+    //    succès » qui confirmait une commande sans app ni build.)
+    if (hasCreateAction && !appCreated) {
+      const reason = createFailed
+        ? 'La création de l’application a échoué — relance requise.'
+        : 'Aucune application créée (prérequis serveur/repo manquants ?) — relance requise.';
+      await this.setOrderStatus(orderId, OrderStatus.PROVISIONING, reason);
+      await this.audit.record({
+        action: 'provision.app_not_created',
+        resourceType: 'order',
+        resourceId: orderId,
+        details: { fqdn, ok: false, reason },
       });
+      return this.finalResult(orderId, OrderStatus.PROVISIONING, fqdn);
     }
 
+    // 2) App créée → on vérifie la mise en ligne RÉELLE avant de confirmer/emmailler.
+    if (hasCreateAction && appCreated) {
+      const serverId = (order.product.pack?.deploymentModule?.server as { id?: string } | null | undefined)?.id ?? null;
+      const ready = await this.awaitAppReady({ coolifyUuid: appUuid!, serverId }, fqdn);
+      if (ready) {
+        await this.setOrderStatus(orderId, OrderStatus.ACTIVE, 'Application en ligne — mise en place confirmée.');
+        if (fqdn) await this.deliverEmail(order.customerEmail, order.customerName, fqdn, orderId);
+        return this.finalResult(orderId, OrderStatus.ACTIVE, fqdn);
+      }
+      // Build encore en cours (légitime, plusieurs minutes) : PROVISIONING, SANS email
+      // « en ligne ». Le dashboard client re-sonde et reflète le vrai état (DEPLOYING).
+      // Une relance admin (endpoint provision, idempotent) finalise à la mise en ligne.
+      await this.setOrderStatus(
+        orderId,
+        OrderStatus.PROVISIONING,
+        'Build en cours — confirmation différée jusqu’à la mise en ligne effective.',
+      );
+      return this.finalResult(orderId, OrderStatus.PROVISIONING, fqdn);
+    }
+
+    // 3) Produit SANS CREATE_APP (ex. DNS/SSL seuls) : comportement historique, mais
+    //    jamais ACTIVE si une step critique a échoué et qu'aucun fqdn n'est livré.
+    const hasFailedCritical = logs.some((l) => l.status === ProvisioningStepStatus.FAILED);
+    const simpleNext = hasFailedCritical && !fqdn ? OrderStatus.PROVISIONING : OrderStatus.ACTIVE;
+    await this.setOrderStatus(
+      orderId,
+      simpleNext,
+      simpleNext === OrderStatus.ACTIVE ? 'Provisioning terminé.' : 'Provisioning partiel — relance requise.',
+    );
+    if (fqdn && simpleNext === OrderStatus.ACTIVE) {
+      await this.deliverEmail(order.customerEmail, order.customerName, fqdn, orderId);
+    }
+    return this.finalResult(orderId, simpleNext, fqdn);
+  }
+
+  /** Recharge les provisioning logs et renvoie le résultat final d'une run. */
+  private async finalResult(
+    orderId: string,
+    status: OrderStatus,
+    fqdn: string | null,
+  ): Promise<{ orderId: string; status: string; fqdn: string | null; steps: { step: string; status: string; message: string | null }[] }> {
     const finalLogs = await this.prisma.provisioningLog.findMany({
       where: { orderId },
       orderBy: { createdAt: 'asc' },
     });
     return {
       orderId,
-      status: nextStatus,
+      status,
       fqdn,
       steps: finalLogs.map((l) => ({ step: l.step, status: l.status, message: l.message })),
     };
+  }
+
+  /** Email de livraison doté de la gestion d'échec commune (best-effort, audité). */
+  private async deliverEmail(to: string, name: string, fqdn: string, orderId: string): Promise<void> {
+    await this.sendDeliveryEmail(to, name, fqdn, orderId).catch((e) => {
+      this.log.warn(`delivery email order=${orderId} failed: ${String(e)}`);
+      this.audit.record({
+        action: 'provision.delivery_email',
+        resourceType: 'order',
+        resourceId: orderId,
+        details: { ok: false, error: String(e) },
+      });
+    });
+  }
+
+  /**
+   * PREUVE de mise en ligne avant confirmation : poll borné du statut Coolify de l'app
+   * (jusqu'à ~2 min) + raid HTTP 2xx/3xx sur le sous-domaine (best-effort). Renvoie true
+   * dès que l'app est servie (status ACTIVE OU HTTP OK). Renvoie false si échec ferme ou
+   * timeout → l'Order reste PROVISIONING (jamais de faux ACTIVE).
+   */
+  private async awaitAppReady(
+    dep: { coolifyUuid: string | null; serverId: string | null },
+    fqdn: string | null,
+  ): Promise<boolean> {
+    if (!dep.coolifyUuid) return false;
+    let server: { panelProvider?: string; apiBaseUrl?: string | null; apiTokenEnc?: string | null } | null = null;
+    if (dep.serverId) {
+      try {
+        server = (await this.prisma.server.findUnique({ where: { id: dep.serverId } })) ?? null;
+      } catch {
+        server = null; // prisma.server indisponible → repli HTTP only
+      }
+    }
+    const deadline = Date.now() + 120_000;
+    // Aucun canal de preuve (ni statut Coolify ni HTTP) → pas ready, sans attendre.
+    if (!server && !fqdn) return false;
+    while (Date.now() < deadline) {
+      // Preuve 1 : statut build Coolify.
+      if (server && server.panelProvider === 'COOLIFY' && server.apiBaseUrl && server.apiTokenEnc) {
+        try {
+          const target = this.buildTarget(server as Parameters<ProvisioningService['buildTarget']>[0]);
+          const res = await this.panelFactory.create().deploymentStatus(target, dep.coolifyUuid);
+          const mapped = mapCoolifyStatus(res.rawStatus);
+          if (mapped === DeploymentStatus.ACTIVE) return true;
+          if (mapped === DeploymentStatus.FAILED) return false; // échec ferme → relance admin
+        } catch {
+          // Coolify injoignable → on tente la preuve HTTP avant de relancer.
+        }
+      }
+      // Preuve 2 : le sous-domaine répond (best-effort).
+      if (fqdn && (await this.isServed(fqdn))) return true;
+      await this.sleep(5000);
+    }
+    return false;
+  }
+
+  /** HEAD/GET best-effort sur le sous-domaine : 2xx/3xx = l'app est servie. */
+  private async isServed(fqdn: string): Promise<boolean> {
+    try {
+      const res = await fetch(`https://${fqdn}`, { method: 'HEAD', redirect: 'follow', signal: AbortSignal.timeout(8000) });
+      return res.status >= 200 && res.status < 400;
+    } catch {
+      return false;
+    }
+  }
+
+  private sleep(ms: number): Promise<void> {
+    return new Promise((r) => setTimeout(r, ms));
   }
 
   private stepName(a: ProvisionAction): string {
@@ -335,6 +454,31 @@ export class ProvisioningService {
     return s;
   }
 
+  /**
+   * AUTO-DÉTECTION du serveur Coolify cible (demande utilisateur : « si le champ
+   * Serveur Coolify cible (uuid) est vide → utiliser le uuid détecté »). Quand
+   * `server.coolifyServerUuid` est vide, on interroge `GET /servers` et on
+   * choisit celui qui correspond au `hostname`/`ip` du serveur saisi, sinon le
+   * premier. Best-effort : tout échec renvoie undefined → le transport se replie
+   * sur le défaut, on ne bloque JAMAIS le déploiement pour une détection.
+   */
+  private async resolveCoolifyServerUuid(
+    server: NonNullable<NonNullable<Awaited<ReturnType<ProvisioningService['resolveServer']>>>>,
+    transport: PanelTransport,
+  ): Promise<string | undefined> {
+    if (server.coolifyServerUuid) return server.coolifyServerUuid;
+    try {
+      const target = this.buildTarget(server);
+      const servers = await transport.listServers(target);
+      if (servers.length === 0) return undefined;
+      const byHost = servers.find((s) => s.ip && server.hostname && s.ip.includes(server.hostname));
+      // Pas de correspondance hôte → premier serveur (détection déterministe).
+      return byHost?.uuid ?? servers[0]?.uuid;
+    } catch {
+      return undefined;
+    }
+  }
+
   private async runAction(
     action: ProvisionAction,
     ctx: {
@@ -408,18 +552,36 @@ export class ProvisioningService {
     const target = this.buildTarget(server as Parameters<ProvisioningService['buildTarget']>[0]);
     const transport = this.panelFactory.create();
     const mod = fullOrder?.product.pack?.deploymentModule ?? null;
-    const projectUuid =
-      mod && mod.kind === 'SHARED_PROJECT' && mod.sharedProjectUuid
-        ? mod.sharedProjectUuid
-        : (server.coolifyProjectUuid ?? undefined);
     const userId = ctx.order.customer?.userId ?? null;
+    // Choix du projet Coolify selon le type de module (A/B) :
+    //  • SHARED_PROJECT (A) → projet partagé configuré sur le module ;
+    //  • PER_CLIENT_PROJECT (B) → projet Coolify DÉDIÉ du client, créé à la
+    //    première commande (`getOrCreateClientProject`) — même logique que le
+    //    widget « Créer un nouveau projet » (deployments.service) ;
+    //  • aucun module → comportement historique : projet du serveur.
+    // On capture aussi `clientProjectId` pour traçabilité sur la row Deployment.
+    let projectUuid: string | undefined;
+    let clientProjectId: string | null = null;
+    if (mod && mod.kind === 'SHARED_PROJECT' && mod.sharedProjectUuid) {
+      projectUuid = mod.sharedProjectUuid;
+    } else if (mod && mod.kind === 'PER_CLIENT_PROJECT' && userId) {
+      const cp = await this.deployments.getOrCreateClientProject(userId, server, mod);
+      projectUuid = cp.projectUuid;
+      clientProjectId = cp.id;
+    } else {
+      projectUuid = server.coolifyProjectUuid ?? undefined;
+    }
     const repoFullName = this.deriveRepoFullName(repoUrl);
 
     // Phase 16 (Décision C) — l'app du store devient une row **Deployment** liée
     // au user (via order.customer.userId), visible + supprimable dans « Mes
-    // applications », comptée par le quota du pack. Idempotent : si on redéploie
-    // (retry/relance), on réutilise la row existante (`{ userId, repoFullName }`)
-    // plutôt que d'en créer une doublon.
+    // applications », comptée par le quota du pack. Fix critique prod (2026-09-14) :
+    // la row est liée à SA commande (`orderId` @unique), PAS réutilisée par
+    // `{ userId, repoFullName }`. Réutiliser par repo effondrait plusieurs commandes
+    // du même produit en UNE row et ÉCRASAIT l'app précédente (coolifyUuid/fqdn)
+    // → la commande précédente disparaissait de l'espace client, sous-domaine perdu.
+    // Désormais : une commande = une app = une row ; retry/relance idempotent par
+    // `orderId` (et par `coolifyUuid` pour une relance au sein de la MÊME exécution).
     let row:
       | { id: string; coolifyUuid: string | null; detail: string | null; status: string }
       | null = null;
@@ -429,24 +591,36 @@ export class ProvisioningService {
         select: { id: true, coolifyUuid: true, detail: true, status: true },
       });
     }
-    if (!row && userId && repoFullName) {
+    if (!row && ctx.order?.id) {
       row = await this.prisma.deployment.findFirst({
-        where: { userId, repoFullName },
+        where: { orderId: ctx.order.id },
         select: { id: true, coolifyUuid: true, detail: true, status: true },
       });
     }
 
-    const created = await transport.createGitApp(target, {
-      repoUrl,
-      branch,
-      serviceName: appName,
-      buildPack,
-      appName,
-      projectUuid,
-      serverUuid: server.coolifyServerUuid ?? undefined,
-      publishDirectory,
-      isStatic,
-    });
+    // Ré-utilisation idempotente (fix 2026-09-15) : si une app Coolify existe déjà
+    // pour CETTE commande (row.coolifyUuid), on la RE-déploie au lieu d'en créer une
+    // nouvelle. Sans ça, chaque relance admin (`force`) créait une app orpheline
+    // supplémentaire sur le même sous-domaine (conflit traefik + apps fantômes).
+    const existingUuid = row?.coolifyUuid ?? null;
+    let appUuid: string;
+    if (existingUuid) {
+      appUuid = existingUuid;
+      this.log.log(`provision order=${ctx.order.id}: réutilisation de l'app existante ${appUuid}`);
+    } else {
+      const created = await transport.createGitApp(target, {
+        repoUrl,
+        branch,
+        serviceName: appName,
+        buildPack,
+        appName,
+        projectUuid,
+        serverUuid: await this.resolveCoolifyServerUuid(server, transport),
+        publishDirectory,
+        isStatic,
+      });
+      appUuid = created.uuid;
+    }
     // Sécurité serveur partagé (Bloc 3) — l'application des limites du pack est
     // OBLIGATOIRE : jamais une app sans plafond sur un box partagé. Si le pack
     // porte des limites et qu'on ne peut pas les appliquer, on échoue la step
@@ -456,7 +630,7 @@ export class ProvisioningService {
     );
     if (limits) {
       try {
-        await transport.applyAppLimits(target, created.uuid, limits);
+        await transport.applyAppLimits(target, appUuid, limits);
       } catch (err) {
         const m = err instanceof Error ? err.message : String(err);
         throw new Error(`Limites pack non appliquées sur serveur partagé — app NON créée (${m}).`);
@@ -468,12 +642,12 @@ export class ProvisioningService {
     // sous-domaine est réellement servi publiquement — vérifié live 4.1.2).
     if (ctx.fqdn) {
       try {
-        await transport.setAppDomain(target, created.uuid, ctx.fqdn);
+        await transport.setAppDomain(target, appUuid, ctx.fqdn);
       } catch {
         // best-effort — le domaine sera posable en retry
       }
     }
-    await transport.deployApp(target, created.uuid);
+    await transport.deployApp(target, appUuid);
 
     // Row Deployment : création (nouvelle app) ou mise à jour du déploiement.
     const deployDetail = ctx.fqdn ? `App : https://${ctx.fqdn}` : 'Déploiement déclenché sur Coolify.';
@@ -483,7 +657,14 @@ export class ProvisioningService {
         data: {
           status: DeploymentStatus.DEPLOYING,
           detail: deployDetail,
-          coolifyUuid: created.uuid,
+          coolifyUuid: appUuid,
+          orderId: ctx.order?.id ?? null,
+          // Rafraîchit la traçabilité du projet/module (une row réutilisée par
+          // idempotence pouvait conserver l'ancien projet — ex. projet serveur).
+          coolifyProjectUuid: projectUuid ?? null,
+          clientProjectId,
+          moduleId: mod?.id ?? null,
+          packId: fullOrder?.product.pack?.id ?? null,
           ...(ctx.fqdn ? { fqdn: ctx.fqdn } : {}),
         },
       });
@@ -493,7 +674,7 @@ export class ProvisioningService {
         action: 'deploy.redeploy.store',
         resourceType: 'deployment',
         resourceId: row.id,
-        details: { orderId: ctx.order.id, coolifyUuid: created.uuid, fqdn: ctx.fqdn ?? undefined, source: 'store' },
+        details: { orderId: ctx.order.id, coolifyUuid: appUuid, fqdn: ctx.fqdn ?? undefined, source: 'store' },
       });
     } else if (userId) {
       // Phase 17 (3c/3d) — cohérence quota/tracking per-pack : on trace le pack et les
@@ -513,11 +694,13 @@ export class ProvisioningService {
           buildPack,
           appName,
           branch,
-          coolifyUuid: created.uuid,
+          coolifyUuid: appUuid,
+          orderId: ctx.order?.id ?? null,
           status: DeploymentStatus.DEPLOYING,
           detail: deployDetail,
           publishDirectory,
           coolifyProjectUuid: projectUuid ?? null,
+          clientProjectId,
           moduleId: mod?.id ?? null,
           packId: fullOrder?.product.pack?.id ?? null,
           limitsStatus: effStore ? LimitsStatus.APPLIED : null,
@@ -536,10 +719,12 @@ export class ProvisioningService {
       });
     }
     return {
-      appUuid: created.uuid,
+      appUuid: appUuid,
       message: userId
-        ? `App créée et ajoutée à « Mes applications » (${created.uuid}).`
-        : `App Coolify créée (${created.uuid}) — non liée à un compte client.`,
+        ? existingUuid
+          ? `App réutilisée et redéployée — « Mes applications » (${appUuid}).`
+          : `App créée et ajoutée à « Mes applications » (${appUuid}).`
+        : `App Coolify ${existingUuid ? 'réutilisée' : 'créée'} (${appUuid}) — non liée à un compte client.`,
     };
   }
 

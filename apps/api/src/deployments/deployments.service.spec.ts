@@ -946,6 +946,41 @@ describe('DeploymentsService', () => {
       );
     });
 
+    it('module B : DEUX modules différents, MÊME client/serveur → un seul projet réutilisé', async () => {
+      // Le client installe une 2ème app via un AUTRE module B (modB2, même serveur) :
+      // il doit retomber sur SON projet existant, jamais en créer un nouveau.
+      const existing = {
+        id: 'cp1',
+        userId: 'u1',
+        serverId: 'srv-coolify',
+        moduleId: 'modB2',
+        name: 'client-u1',
+        projectUuid: 'proj-client',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+      mockPrisma.subscription.findFirst.mockResolvedValue(
+        activeSubscription(
+          packWithModule({ deploymentModule: moduleB({ id: 'modB2', code: 'B2' }) }),
+        ),
+      );
+      mockPrisma.clientProject.findUnique.mockResolvedValue(existing);
+      happyMocks();
+
+      await service.create({ repoFullName: 'owner/repo2' }, actor);
+
+      // Aucun nouveau projet créé ; la 2ème app va dans le projet du client.
+      expect(mockTransport.createProject).not.toHaveBeenCalled();
+      expect(mockPrisma.clientProject.create).not.toHaveBeenCalled();
+      expect(mockTransport.createGitApp).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ projectUuid: 'proj-client' }),
+      );
+      expect(mockPrisma.deployment.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({ clientProjectId: 'cp1', coolifyProjectUuid: 'proj-client' }),
+      });
+    });
+
     it("quota d'apps du pack : atteint (2/2) → 403 avec le compteur, rien n'est créé", async () => {
       mockPrisma.subscription.findFirst.mockResolvedValue(
         activeSubscription(packWithModule({ maxApps: 2 })),

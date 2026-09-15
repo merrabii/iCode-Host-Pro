@@ -34,21 +34,28 @@ function dollars(v?: number): string {
   return ((v ?? 0) / 100).toFixed(2);
 }
 
-/** Réglages « boutique » d'un produit (récap /cart + champs de facturation). */
+/**
+ * Réglages « boutique » d'un produit (récap /cart + champs de facturation) +
+ * l'application par défaut déployée à la première commande. Un SEUL bouton
+ * « Enregistrer tout » persiste l'ensemble : un changement non enregistré est
+ * signalé (⚠) et remonté au <ProductEditor> pour bloquer le changement d'onglet
+ * tant que la sauvegarde n'est pas faite ou confirmée.
+ */
 export function StoreSettingsDrawer({
   product,
   token,
   onUpdated,
+  onDirtyChange,
 }: {
   product: ProductAdmin;
   token: string;
   onUpdated?: () => void;
+  onDirtyChange?: (key: string, dirty: boolean) => void;
 }) {
   const toast = useToast();
   const [fields, setFields] = useState<CheckoutFieldRow[]>([]);
   const [allowEdit, setAllowEdit] = useState(product.allowEditConfig ?? true);
   const [installDollars, setInstallDollars] = useState(dollars(product.installationFeeCents));
-  const [busy, setBusy] = useState(false);
 
   // ── Déploiement par défaut (app servie à la première commande) ────────────
   const [repoUrl, setRepoUrl] = useState(product.moduleParams?.repoUrl ?? '');
@@ -57,7 +64,33 @@ export function StoreSettingsDrawer({
   const [publishDirectory, setPublishDirectory] = useState(product.moduleParams?.publishDirectory ?? '');
   const [isStatic, setIsStatic] = useState(!!product.moduleParams?.isStatic);
   const [provisionModuleId, setProvisionModuleId] = useState(product.provisionModuleId ?? '');
-  const [depBusy, setDepBusy] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  // ── Base de référence (pour détecter les modifs non enregistrées) ─────────
+  const baseAllow = product.allowEditConfig ?? true;
+  const baseInstall = dollars(product.installationFeeCents);
+  const baseRepo = product.moduleParams?.repoUrl ?? '';
+  const baseBranch = product.moduleParams?.branch ?? '';
+  const baseBuild = product.moduleParams?.buildPack ?? '';
+  const basePub = product.moduleParams?.publishDirectory ?? '';
+  const baseStatic = !!product.moduleParams?.isStatic;
+  const baseProv = product.provisionModuleId ?? '';
+
+  const dirty =
+    allowEdit !== baseAllow ||
+    installDollars !== baseInstall ||
+    repoUrl !== baseRepo ||
+    branch !== baseBranch ||
+    buildPack !== baseBuild ||
+    publishDirectory !== basePub ||
+    isStatic !== baseStatic ||
+    provisionModuleId !== baseProv;
+
+  // Informe le parent (bloqueur de changement d'onglet) de l'état non enregistré.
+  useEffect(() => {
+    onDirtyChange?.('boutique', dirty);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dirty]);
 
   const [adding, setAdding] = useState(false);
   const [nl, setNl] = useState('');
@@ -78,35 +111,32 @@ export function StoreSettingsDrawer({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [product.id]);
 
-  async function saveSettings() {
+  /** Bouton unique « Enregistrer tout » : persiste réglages boutique + app par défaut. */
+  async function saveAll() {
     setBusy(true);
-    const cents = Math.round(parseFloat(installDollars || '0') * 100);
-    const r = await updateStoreSettings(token, product.id, {
-      allowEditConfig: allowEdit,
-      installationFeeCents: Number.isFinite(cents) && cents >= 0 ? cents : 0,
-    });
-    setBusy(false);
-    if (!r.ok) return toast.error(apiError(r, 'Échec de l’enregistrement des réglages.'));
-    toast.ok('Réglages boutique enregistrés.');
-    onUpdated?.();
-  }
-
-  async function saveDeployment() {
-    setDepBusy(true);
-    const r = await updateProduct(token, product.id, {
-      moduleParams: {
-        repoUrl: repoUrl.trim() || '',
-        branch: branch.trim() || '',
-        buildPack: buildPack.trim() || '',
-        publishDirectory: publishDirectory.trim() || '',
-        isStatic,
-      },
-      provisionModuleId: provisionModuleId.trim() || '',
-    });
-    setDepBusy(false);
-    if (!r.ok) return toast.error(apiError(r, 'Échec de l’enregistrement du déploiement.'));
-    toast.ok('Application par défaut enregistrée.');
-    onUpdated?.();
+    try {
+      const cents = Math.round(parseFloat(installDollars || '0') * 100);
+      const r1 = await updateStoreSettings(token, product.id, {
+        allowEditConfig: allowEdit,
+        installationFeeCents: Number.isFinite(cents) && cents >= 0 ? cents : 0,
+      });
+      if (!r1.ok) return toast.error(apiError(r1, 'Échec de l’enregistrement des réglages.'));
+      const r2 = await updateProduct(token, product.id, {
+        moduleParams: {
+          repoUrl: repoUrl.trim() || '',
+          branch: branch.trim() || '',
+          buildPack: buildPack.trim() || '',
+          publishDirectory: publishDirectory.trim() || '',
+          isStatic,
+        },
+        provisionModuleId: provisionModuleId.trim() || '',
+      });
+      if (!r2.ok) return toast.error(apiError(r2, 'Échec de l’enregistrement de l’application par défaut.'));
+      toast.ok('Tout a été enregistré.');
+      onUpdated?.();
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function toggleEnabled(f: CheckoutFieldRow, enabled: boolean) {
@@ -173,7 +203,13 @@ export function StoreSettingsDrawer({
   }
 
   return (
-    <Panel title={`Boutique — ${product.name}`} sub="Contrôles du récap /cart et champs de facturation.">
+    <Panel title={`Boutique — ${product.name}`} sub="Contrôles du récap /cart, champs de facturation et app par défaut déployée à la commande.">
+      {dirty && (
+        <div className="alert warn" style={{ marginBottom: 14 }}>
+          <b>Modifications non enregistrées.</b> Cliquez sur « Enregistrer tout » avant de
+          changer d&apos;onglet, sinon elles seront perdues.
+        </div>
+      )}
       {/* Réglages généraux */}
       <div className="stack" style={{ gap: 14 }}>
         <div className="row" style={{ alignItems: 'center', justifyContent: 'space-between' }}>
@@ -200,12 +236,7 @@ export function StoreSettingsDrawer({
           />
         </Field>
 
-        <div>
-          <Button onClick={() => void saveSettings()} disabled={busy}>
-            {busy ? 'Enregistrement…' : 'Enregistrer les réglages'}
-          </Button>
-        </div>
-      </div>
+              </div>
 
       {/* Déploiement par défaut (l'app servie à la première commande) */}
       <div className="section-title" style={{ marginTop: 22 }}>
@@ -229,12 +260,17 @@ export function StoreSettingsDrawer({
           <Field label="Build pack">
             <Input value={buildPack} onChange={(e) => setBuildPack(e.target.value)} placeholder="nixpacks" />
           </Field>
-          <Field label="Dossier de publication (SPA)">
+          <Field label="Dossier de publication (doit commencer par / — ex. /dist)" required={isStatic}>
             <Input
               value={publishDirectory}
               onChange={(e) => setPublishDirectory(e.target.value)}
-              placeholder="/dist (vite build)"
+              placeholder="/dist (SPA vite build)"
             />
+            {isStatic && (
+              <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>
+                Pour un build static, Coolify exige le slash de tête : <b>/dist</b>, pas « dist » (sinon erreur 422).
+              </div>
+            )}
           </Field>
           <div className="row" style={{ gap: 8, alignItems: 'center' }}>
             <label className="switch">
@@ -251,10 +287,11 @@ export function StoreSettingsDrawer({
             />
           </Field>
         </div>
-        <div>
-          <Button onClick={() => void saveDeployment()} disabled={depBusy}>
-            {depBusy ? 'Enregistrement…' : 'Enregistrer l’application par défaut'}
+        <div className="row" style={{ gap: 10, alignItems: 'center', marginTop: 6 }}>
+          <Button onClick={() => void saveAll()} disabled={busy || !dirty}>
+            {busy ? 'Enregistrement…' : dirty ? 'Enregistrer tout' : 'Tout est enregistré ✓'}
           </Button>
+          {dirty && <span className="muted" style={{ fontSize: 12 }}>⚠ des changements ne sont pas encore sauvegardés.</span>}
         </div>
       </div>
 

@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
   apiError,
   updateProduct,
@@ -33,10 +33,12 @@ export function ProductVitrineTab({
   product,
   token,
   onUpdated,
+  onDirtyChange,
 }: {
   product: ProductAdmin;
   token: string;
   onUpdated?: () => void;
+  onDirtyChange?: (key: string, dirty: boolean) => void;
 }) {
   const toast = useToast();
   const [slug, setSlug] = useState(product.slug ?? '');
@@ -56,6 +58,29 @@ export function ProductVitrineTab({
   const [crossSell, setCrossSell] = useState(!!product.crossSell);
   const [freePlan, setFreePlan] = useState(!!product.freePlan);
   const [busy, setBusy] = useState(false);
+
+  // Détection de modifications non enregistrées (remontée au ProductEditor).
+  const dirty =
+    (slug.trim() || null) !== (product.slug || null) ||
+    (slogan.trim() || null) !== (product.slogan || null) ||
+    (shortDesc.trim() || null) !== (product.shortDescription || null) ||
+    (description.trim() || null) !== (product.description || null) ||
+    (color.trim() || null) !== (product.color || null) ||
+    hidden !== !!product.hidden ||
+    displayOrder !== (product.displayOrder ?? 0) ||
+    (price.trim() || '0') !== dollars(product.priceHtCents) ||
+    (promo.trim() || '0') !== dollars(product.promoPriceHtCents) ||
+    cycle !== (product.billingCycle ?? 'MONTHLY') ||
+    domainRequired !== !!product.domainRequired ||
+    (welcomeTemplate.trim() || null) !== (product.welcomeEmailTemplate || null) ||
+    stockEnabled !== !!product.stockEnabled ||
+    stockQty !== (product.stockQty ?? 0) ||
+    crossSell !== !!product.crossSell ||
+    freePlan !== !!product.freePlan;
+  useEffect(() => {
+    onDirtyChange?.('vitrine', dirty);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dirty]);
 
   async function save() {
     setBusy(true);
@@ -144,6 +169,7 @@ export function ProductVitrineTab({
           <Button type="submit" disabled={busy}>
             {busy ? 'Enregistrement…' : 'Enregistrer la vitrine'}
           </Button>
+          {dirty && <span className="muted" style={{ fontSize: 12 }}>⚠ modifications non enregistrées</span>}
         </div>
       </form>
 

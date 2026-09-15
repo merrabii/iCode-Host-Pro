@@ -125,7 +125,7 @@ export class UsersService {
     return this.toPublic(updated);
   }
 
-  private toPublic(user: User & { clientProjects?: Array<{ id: string; name: string; projectUuid: string; module: { kind: string } }> }): PublicUser {
+  private toPublic(user: User & { clientProjects?: Array<{ id: string; name: string; projectUuid: string; module: { kind: string } | null }> }): PublicUser {
     const {
       passwordHash: _passwordHash,
       mfaSecretEnc: _mfaSecretEnc,
@@ -134,7 +134,9 @@ export class UsersService {
       ...rest
     } = user;
     // Phase 13: inclure le premier clientProject de type PER_CLIENT_PROJECT
-    const cp = user.clientProjects?.find((p) => p.module.kind === 'PER_CLIENT_PROJECT');
+    // (module nullable depuis 2026-09-14 : le projet client est unique par
+    // client/serveur, il peut avoir été créé par un autre module).
+    const cp = user.clientProjects?.find((p) => p.module?.kind === 'PER_CLIENT_PROJECT');
     const clientProject = cp ? { id: cp.id, name: cp.name, projectUuid: cp.projectUuid } : null;
     return { ...rest, clientProject };
   }

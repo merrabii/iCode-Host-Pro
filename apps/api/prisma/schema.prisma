@@ -488,21 +488,26 @@ model DeploymentModule {
 // Créé paresseusement à la première app (POST /projects Coolify, idempotent) ou
 // via l'action admin « Créer le projet maintenant » (page Utilisateurs).
 model ClientProject {
-  id          String           @id @default(cuid())
+  id          String            @id @default(cuid())
   userId      String
-  user        User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user        User              @relation(fields: [userId], references: [id], onDelete: Cascade)
   serverId    String
-  server      Server           @relation(fields: [serverId], references: [id], onDelete: Cascade)
-  moduleId    String
-  module      DeploymentModule @relation(fields: [moduleId], references: [id], onDelete: Cascade)
+  server      Server            @relation(fields: [serverId], references: [id], onDelete: Cascade)
+  // Lien indicatif vers le module qui a créé le projet (trace) — nul après un
+  // autre module : le projet client est UNIQUE par (client, serveur), toutes
+  // ses apps y vivent quel que soit le module B utilisé.
+  moduleId    String?
+  module      DeploymentModule? @relation(fields: [moduleId], references: [id], onDelete: SetNull)
   name        String // ex « client-<uid> »
   projectUuid String // uuid du projet Coolify
-  createdAt   DateTime         @default(now())
-  updatedAt   DateTime         @updatedAt
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
 
   deployments Deployment[] // apps déployées dans ce projet (tracabilité)
 
-  @@unique([userId, serverId, moduleId])
+  // Un SEUL projet Coolify par client par serveur — l'app suivante réutilise,
+  // elle ne recrée jamais un projet.
+  @@unique([userId, serverId])
   @@index([userId])
 }
 
@@ -732,6 +737,14 @@ model Deployment {
   limitsCpu        Float?
   limitsRetryCount Int            @default(0)
   limitsLastError  String?
+  // Fix critique prod (2026-09-14) — chaque app STORE est une row **distincte**
+  // liée à SA commande. Avant, le chemin store réutilisait la row par
+  // `{ userId, repoFullName }` et l'ÉCRASAIT au nouvel app (coolifyUuid/fqdn) :
+  // plusieurs commandes du même produit s'effondraient en UNE seule row, la
+  // commande précédente disparaissait de l'espace client et son sous-domaine
+  // était perdu. `orderId` (unique) = une app par commande, retry idempotent.
+  orderId          String?          @unique
+  order            Order?           @relation(fields: [orderId], references: [id], onDelete: SetNull)
   createdAt        DateTime       @default(now())
   updatedAt        DateTime       @updatedAt
 
@@ -1133,6 +1146,10 @@ model Order {
   // order-driven). Le FK vit sur Subscription.orderId (1:1, où l'abonnement
   // référence toujours sa dernière commande).
   subscription Subscription?
+  // Fix critique prod (2026-09-14) — une commande store livre sa propre app
+  // (row Deployment `orderId` @unique) : plusieurs commandes du même produit
+  // = plusieurs apps visibles, sans écrasement de la commande précédente.
+  deployments   Deployment[]
 
   @@index([customerId])
   @@index([status])

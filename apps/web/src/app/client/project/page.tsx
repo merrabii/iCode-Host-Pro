@@ -12,6 +12,7 @@ import {
   fetchMe,
   getSessionToken,
   githubLinkStatus,
+  listFreeDomains,
   listGithubRepos,
   previewBuildConfig,
   type BuildConfig,
@@ -93,6 +94,8 @@ export default function ClientProjectPage() {
   const [functionsDirectory, setFunctionsDirectory] = useState('');
   const [envRows, setEnvRows] = useState<EnvRow[]>([]);
   const [subdomain, setSubdomain] = useState('');
+  const [freeDomains, setFreeDomains] = useState<{ id: string; name: string }[]>([]);
+  const [domainId, setDomainId] = useState('');
   const [deploying, setDeploying] = useState(false);
 
   useEffect(() => {
@@ -130,6 +133,9 @@ export default function ClientProjectPage() {
         }
       }
       if (deps && !Array.isArray(deps) && deps.quota) setQuota(deps.quota);
+      // Racines gratuites proposées (choix du domaine du sous-domaine).
+      const dms = await listFreeDomains(t);
+      if (dms.ok) setFreeDomains((dms.data as { id: string; name: string }[]) ?? []);
     })();
   }, [router]);
 
@@ -260,6 +266,7 @@ export default function ClientProjectPage() {
       functionsDirectory: functionsDirectory.trim() || undefined,
       environment: Object.keys(environment).length ? environment : undefined,
       subdomain: subdomain.trim() || undefined,
+      domainId: domainId || undefined,
     });
     setDeploying(false);
     if (!r.ok) {
@@ -476,8 +483,30 @@ export default function ClientProjectPage() {
                     </Field>
                   </div>
 
+                  <Field label="Domaine (optionnel)" hint="Choisissez la racine du sous-domaine ; Par défaut = la racine configurée par la plateforme.">
+                    <Select value={domainId} onChange={(e) => setDomainId(e.target.value)}>
+                      <option value="">Par défaut (auto)</option>
+                      {freeDomains.map((d) => (
+                        <option key={d.id} value={d.id}>{d.name}</option>
+                      ))}
+                    </Select>
+                  </Field>
+
                   <Field label="Sous-domaine (optionnel)" hint="Libre ; vide = slug auto. Vous obtenez une URL en https://.">
                     <Input className="input-sm" placeholder="mon-app" value={subdomain} onChange={(e) => setSubdomain(e.target.value)} />
+                    {(() => {
+                      const root =
+                        freeDomains.find((d) => d.id === domainId)?.name ??
+                        freeDomains[0]?.name ??
+                        null;
+                      const slug = subdomain.trim() || appName.trim() || 'mon-app';
+                      if (!root) return null;
+                      return (
+                        <span className="muted" style={{ display: 'block', fontSize: 12, marginTop: 4 }}>
+                          <IconCopy size={12} /> Aperçu : <code>https://{slug.toLowerCase()}.{root}</code>
+                        </span>
+                      );
+                    })()}
                   </Field>
 
                   {/* Variables d'environnement de build */}

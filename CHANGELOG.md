@@ -1,5 +1,20 @@
 # CHANGELOG
 
+## 2026-09-15 — Phase 17 (ADR-037) : provisioning store à preuve réelle + sous-domaines gratuits par produit — IMPLEMENTED + vérifié live — COMMIT CHECKPOINT (avant correction backend Node)
+### Problème résolu
+3 commandes payées de `ermocrypt` restaient à **PAID sans app** malgré les messages « Commande confirmée ». Deux causes racines corrigées : routing « upgrade » erroné (membre ACTIVE re-commandant) et **confirmation prématurée** (l'ancien `finalize` passait ACTIVE si DNS alloué, même sans app). Exigence durable appliquée : **ne jamais confirmer une commande avant que ce soit réellement OK**.
+### Added
+- **`FreeSubdomainRule` par produit** (migration `20260915120000_attach_free_subdomain_rules`) attaché à `deploy-github-app`, `site-statique-premium`, `api-node-starter` ; `allowedDomainIds` vide = toutes les racines ACTIVES (codediali.com + arumdigital.com). Exposé par `GET /api/public/products/:slug` → le `/shop` propose un **sous-domaine gratuit** (`product.freeSubdomainRule`).
+- **Proof-gate** (`provisioning.service.finalize`) : Order **ACTIVE + email de livraison UNIQUEMENT sur preuve réelle** — create_app succès + poll `deploymentStatus` ACTIVE **ou** HTTP 2xx/3xx sur le fqdn (`awaitAppReady`, 120 s). Échec create_app → branche `app_not_created`, **jamais ACTIVE** (reste PROVISIONING pour relance admin).
+- **Fix réutilisation d'app (doublons)** : `actionCreateApp` réutilise `row.coolifyUuid` existant (re-déploie) au lieu de `createGitApp` à chaque relance `force` — empêché l'app orpheline créée par relance (bug observé live : 2ᵉ app `bwgy96…` sur github-app-deploy).
+### Verified (live 2026-09-15)
+- **GitHub App `q52…` ACTIVE — HTTP 200** · **Site Statique `xah8nn…` ACTIVE — HTTP 200 (email livré)** · **API Node `bc68…` PROVISIONING (`exited:unhealthy`)** — correctement **maintenu non-ACTIVE** par le gate.
+- Unit **71/71** + tsc API + web tsc verts ; re-provision `force` → « App réutilisée et redéployée » (pas de nouveau doublon).
+### Pending / prochaine phase (NON résolu — à CORRIGER, pas présenté comme fait)
+- Le backend Node ne se déploie **pas** réellement : `api-node-starter` pointe sur le repo **statique** `merrabii/Code-Diali-Guide-de-Demarrage.git` (static=false, pas de serveur). Prochaine phase : tester un **vrai dépôt backend Node (`https://github.com/Ryadel/NodeJS-Express-CRUD-API-Sample`)**, vérifier HTTP 200 réel, **ne jamais utiliser de faux ACTIVE**.
+- **Nettoyer l'app orpheline** `bwgy96194kmgo3v3t6psqokp` (github-app-deploy, domaine sslip) **après** récupération des preuves — accord propriétaire requis.
+- Ce commit est un **checkpoint de sauvegarde** : la correction Node.js n'a pas commencé, l'app orpheline n'est pas supprimée.
+
 ## 2026-09-13 — Phase 16 validée réel (déploiement dépôt public, mode URL) + fix web URL-mode — commits poussés
 Lancement réel de bout en bout confirmé **en autonomie** : un compte gratuit colle `https://github.com/merrabii/Code-Diali-Guide-de-Demarrage` →
 `POST /api/client/deployments {repoUrl,…}` → **module B** (projet client dédié créé sur Coolify) → `createGitApp` **nixpacks** `is_static` `publish_directory:/dist` →

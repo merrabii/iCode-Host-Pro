@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useState } from 'react';
+import Link from 'next/link';
 import {
   apiError,
   createProduct,
@@ -31,7 +32,6 @@ import {
   Panel,
   Select,
 } from '@/components/ui';
-import { ProductEditor } from '@/components/admin/product-editor';
 import { IconBox, IconPlus, IconTrash, IconX } from '@/components/icons';
 
 const PRODUCT_STATUSES = ['DRAFT', 'ACTIVE', 'SUSPENDED', 'DISABLED'];
@@ -49,7 +49,6 @@ export default function ManagerProduitsPage() {
   const [catId, setCatId] = useState('');
   const [packId, setPackId] = useState('');
   const [busy, setBusy] = useState<string | null>(null); // 'create' | product id
-  const [editId, setEditId] = useState<string | null>(null); // éditeur produit à onglets ouvert
   const [modules, setModules] = useState<DeploymentModule[]>([]); // modules de déploiement (visualisation de la méthode)
 
   useEffect(() => {
@@ -265,14 +264,13 @@ export default function ManagerProduitsPage() {
                     </td>
                     <td>
                       <div className="row ta-right">
-                        <Button
-                          size="sm"
-                          variant={editId === p.id ? 'primary' : 'secondary'}
-                          onClick={() => setEditId((v) => (v === p.id ? null : p.id))}
+                        <Link
+                          href={`/manager/produits/${p.id}`}
+                          className="btn btn-sm btn-secondary"
                           title="Modifier le produit (tous les onglets)"
                         >
                           ✎ Modifier
-                        </Button>
+                        </Link>
                         <Button size="sm" variant="danger" disabled={busy === p.id} onClick={() => handleDelete(p)} title="Supprimer le produit">
                           <IconTrash size={14} />
                         </Button>
@@ -285,18 +283,7 @@ export default function ManagerProduitsPage() {
           </div>
         )}
 
-        {editId && products.some((p) => p.id === editId) && (
-          <ProductEditor
-            key={editId}
-            product={products.find((p) => p.id === editId)!}
-            token={token}
-            categories={categories}
-            packs={packs}
-            modules={modules}
-            onUpdated={() => void load(token)}
-          />
-        )}
-      </div>
+        </div>
     </AppShell>
   );
 }

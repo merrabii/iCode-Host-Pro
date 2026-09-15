@@ -126,6 +126,13 @@ export interface CoolifyCreateProjectInput {
   serverUuid?: string;
 }
 
+/** Info minimale d'un serveur Coolify pour auto-détection du serveur cible. */
+export interface CoolifyServerInfo {
+  uuid: string;
+  name: string;
+  ip?: string | null;
+}
+
 export abstract class PanelTransport {
   abstract verify(target: PanelTarget): Promise<PanelVerifyResult>;
 
@@ -159,6 +166,12 @@ export abstract class PanelTransport {
 
   // Phase 13 — projets Coolify (COOLIFY uniquement).
   abstract listProjects(target: PanelTarget): Promise<CoolifyProject[]>;
+  /** Liste les serveurs Coolify (uuid + nom). Utilisée pour AUTO-DÉTECTER le
+   *  serveur cible quand `server.coolifyServerUuid` est vide — au lieu du
+   *  fallback « 0 » (serveur localhost par défaut) qui provoquait un 404
+   *  « Server not found » sur le panneau réel. Best-effort : un panneau sans
+   *  endpoint /servers fiable ou un échec ne bloque jamais le déploiement. */
+  abstract listServers(target: PanelTarget): Promise<CoolifyServerInfo[]>;
   abstract createProject(
     target: PanelTarget,
     input: CoolifyCreateProjectInput,
@@ -656,6 +669,54 @@ class NodePanelTransport extends PanelTransport {
         };
       })
       .filter((p) => p.uuid && p.name);
+  }
+
+  /**
+   * Liste les serveurs Coolify (`GET /servers`) pour AUTO-DÉTECTER le serveur
+   * cible. Chaque item expose `uuid` (l'id du serveur), `name`, `ip` (hôtes,
+   * vite). Une enveloppe objet `{ data: [...] }` est acceptée comme un tableau
+   * nu. Difficile en best-effort : l'appelant (provisioning) se replie sur le
+   * défaut « 0 » si la détection échoue — jamais bloquant.
+   */
+  async listServers(target: PanelTarget): Promise<CoolifyServerInfo[]> {
+    this.assertCoolify(target);
+    const base = target.baseUrl.replace(/\/+$/, '');
+    const { status, body } = await httpGet(
+      `${base}/servers`,
+      { Authorization: `Bearer ${target.token}` },
+      target.strictTls,
+      this.timeoutMs,
+    );
+    if (status !== 200) {
+      throw new Error(
+        `Coolify API : liste des serveurs refusée (HTTP ${status})${body ? ` — ${body.slice(0, 200)}` : ''}`,
+      );
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(body) as unknown;
+    } catch {
+      throw new Error('Coolify API : réponse sans liste de serveurs.');
+    }
+    let raw = parsed;
+    if (parsed && !Array.isArray(parsed) && typeof parsed === 'object') {
+      const obj = parsed as Record<string, unknown>;
+      if (Array.isArray(obj.data)) raw = obj.data;
+      else if (Array.isArray(obj.servers)) raw = obj.servers;
+    }
+    if (!Array.isArray(raw)) {
+      throw new Error('Coolify API : réponse sans liste de serveurs.');
+    }
+    return (raw as unknown[])
+      .map((item) => {
+        const s = item as { uuid?: unknown; name?: unknown; ip?: unknown };
+        return {
+          uuid: typeof s.uuid === 'string' ? s.uuid : '',
+          name: typeof s.name === 'string' ? s.name : '',
+          ip: typeof s.ip === 'string' ? s.ip : null,
+        };
+      })
+      .filter((s) => s.uuid && s.name);
   }
 
   /**

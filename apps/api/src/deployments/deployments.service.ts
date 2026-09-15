@@ -27,6 +27,7 @@ import {
   CoolifyAppLimits,
   PanelKind,
   PanelTarget,
+  PanelTransport,
   PanelTransportFactory,
   cpusFromCores,
   memoryFromMb,
@@ -66,8 +67,10 @@ type DeploymentWithRefs = Deployment & {
   server?: { id: string; name: string } | null;
 };
 
-/** Mapping best-effort du statut brut Coolify vers notre DeploymentStatus. */
-function mapCoolifyStatus(raw: string): DeploymentStatus | null {
+/** Mapping best-effort du statut brut Coolify vers notre DeploymentStatus.
+ *  Exporté pour réutilisation par ProvisioningService (preuve de mise en ligne
+ *  avant confirmation d'une commande store). */
+export function mapCoolifyStatus(raw: string): DeploymentStatus | null {
   const s = raw.toLowerCase();
   // Coolify rend l'état d'une app sous la forme « <état>:<santé> » (ex
   // « running:healthy », « running:unknown », « exited:unhealthy »). Toute
@@ -182,6 +185,34 @@ export class DeploymentsService {
     await this.requireDeployEnabled();
     const token = await this.requireGithubToken(actor);
     return { empty: await this.github.isRepoEmpty(token, fullName, branch ?? 'main') };
+  }
+
+  // ── Domaine gratuit au choix (racine des sous-domaines) ────────────────────
+
+  /** Racines gratuites proposables au client : celles autorisées par la règle
+   *  FreeSubdomainRule de son pack/produit ACTIF, sinon toutes les réactives. */
+  async listFreeDomains(actor: Actor): Promise<Array<{ id: string; name: string }>> {
+    const allowed = await this.memberFreeDomainIds(actor.sub);
+    const domains = await this.cloudflare.findMemberFreeDomains(allowed);
+    return domains.map((d) => ({ id: d.id, name: d.name }));
+  }
+
+  /** `allowedDomainIds` de la règle gratuite du produit ACTIF du membre, ou null. */
+  private async memberFreeDomainIds(userId: string): Promise<string[] | null> {
+    const subscription = await this.prisma.subscription.findFirst({
+      where: { userId, status: SubscriptionStatus.ACTIVE },
+      select: { product: { select: { freeSubdomainRule: { select: { allowedDomainIds: true } } } } },
+    });
+    return subscription?.product?.freeSubdomainRule?.allowedDomainIds ?? null;
+  }
+
+  /** Un domaine choisi est-il offert au membre ? Vrai si aucune liste blanche
+   *  n'est posée, sinon si la liste contient `chosen.id`. Best-effort : un
+   *  domaine non éligible est ignoré et on revient à la racine par défaut. */
+  private async allowClientDomain(userId: string, chosen: { id: string }): Promise<boolean> {
+    const allowed = await this.memberFreeDomainIds(userId);
+    if (!allowed || allowed.length === 0) return true;
+    return allowed.includes(chosen.id);
   }
 
   private toView(d: DeploymentWithRefs): DeploymentView {
@@ -328,7 +359,7 @@ export class DeploymentsService {
         buildPack: packed,
         appName,
         projectUuid: projectUuid ?? server.coolifyProjectUuid ?? undefined,
-        serverUuid: server.coolifyServerUuid ?? undefined,
+        serverUuid: await this.resolveCoolifyServerUuid(server, transport),
         // Phase 16 — build file-based (base directory, commandes).
         publishDirectory: conn.publishDirectory,
         baseDirectory: conn.baseDirectory,
@@ -406,7 +437,13 @@ export class DeploymentsService {
       // APRÈS les limites et AVANT le run. Best-effort comme les limites : un
       // échec (sous-domaine pris, DNS indisponible…) n'interrompt pas le déploiement.
       let dns: { subdomain?: string; fqdn?: string; domainId?: string } = {};
-      const root = await this.cloudflare.findActiveRootDomain();
+      // Racine gratuite du sous-domaine : par défaut celle configurée ; sinon le
+      // domaine choisi par le client (s'il est ACTIVE et offert à son pack).
+      let root = await this.cloudflare.findActiveRootDomain();
+      if (dto.domainId) {
+        const chosen = await this.cloudflare.findActiveRootById(dto.domainId);
+        if (chosen && (await this.allowClientDomain(actor.sub, chosen))) root = chosen;
+      }
       if (root) {
         try {
           const alloc = await this.cloudflare.allocateClientSubdomain({
@@ -519,8 +556,21 @@ export class DeploymentsService {
       },
       orderBy: { createdAt: 'desc' },
     });
+    // Réconcilie LIVE les apps encore « en cours » : une app créée via la voie
+    // STORE reste posée en DEPLOYING dans la BD jusqu'à ce qu'on interroge
+    // Coolify (le build prend plusieurs minutes). Même comportement que
+    // findMine : on re-sonde l'état réel et on bascule ACTIVE/FAILED, pour que
+    // la liste du dashboard reflète la réalité sans qu'il faille ouvrir chaque
+    // app. Best-effort — Coolify injoignable ⇒ état courant conservé.
+    const latest = await Promise.all(
+      rows.map((r) =>
+        r.status === DeploymentStatus.DEPLOYING && r.coolifyUuid && r.serverId
+          ? this.refreshStatus(r, actor)
+          : Promise.resolve(r),
+      ),
+    );
     const quota = await this.resolveQuota(actor.sub);
-    return { deployments: rows.map((r) => this.toView(r)), quota };
+    return { deployments: latest.map((r) => this.toView(r)), quota };
   }
 
   /** Quota d'apps du pack ACTIF du compte : `{ pack, used }`, ou null si aucun
@@ -760,23 +810,27 @@ export class DeploymentsService {
   }
 
   /**
-   * Projet Coolify dédié du client (Module B) : existe → renvoyé ; sinon créé
+   * Projet Coolify dédié du client (Module B) : UN SEUL par (client, serveur),
+   * quel que soit le module de déploiement B. Existant → renvoyé tel quel (la
+   * 2ème app du client réutilise, elle ne recrée jamais un projet) ; sinon créé
    * paresseusement sur Coolify (`POST /projects`, idempotent via @@unique) puis
    * persisté. Nom = `<perClientPrefix>-<id client>` — retrouvable par le support.
+   * Le module est passé pour le préfixe du nom + trace, mais la clé de dédup
+   * ignore `moduleId` (projet dédié client, pas par module).
    * Exposed for admin create-client-project endpoint (UsersService).
    */
   async getOrCreateClientProject(
     userId: string,
     server: Server,
-    module: DeploymentModule,
+    module: DeploymentModule | null,
   ): Promise<{ id: string; projectUuid: string }> {
-    const key = { userId, serverId: server.id, moduleId: module.id };
+    const key = { userId, serverId: server.id };
     const existing = await this.prisma.clientProject.findUnique({
-      where: { userId_serverId_moduleId: key },
+      where: { userId_serverId: key },
     });
     if (existing) return { id: existing.id, projectUuid: existing.projectUuid };
 
-    const name = `${module.perClientPrefix}-${userId}`;
+    const name = module ? `${module.perClientPrefix}-${userId}` : `client-${userId}`;
     const created = await this.panelFactory
       .create()
       .createProject(this.buildTarget(server), {
@@ -786,7 +840,7 @@ export class DeploymentsService {
       });
     try {
       const row = await this.prisma.clientProject.create({
-        data: { ...key, name, projectUuid: created.uuid },
+        data: { ...key, moduleId: module?.id ?? null, name, projectUuid: created.uuid },
       });
       return { id: row.id, projectUuid: row.projectUuid };
     } catch (err) {
@@ -794,7 +848,7 @@ export class DeploymentsService {
       // la ligne existante (P2002 = violation de la contrainte unique).
       if ((err as { code?: string }).code === 'P2002') {
         const row = await this.prisma.clientProject.findUnique({
-          where: { userId_serverId_moduleId: key },
+          where: { userId_serverId: key },
         });
         if (row) return { id: row.id, projectUuid: row.projectUuid };
       }
@@ -961,6 +1015,28 @@ export class DeploymentsService {
       user: null,
       strictTls: server.strictTls,
     };
+  }
+
+  /**
+   * AUTO-DÉTECTION du serveur Coolify cible quand `server.coolifyServerUuid` est
+   * vide (demande utilisateur : « si le champ Serveur Coolify cible (uuid) est
+   * vide → utiliser le uuid détecté »). Interroge `GET /servers` et choisit celui
+   * qui correspond au `hostname`, sinon le premier. Best-effort : tout échec
+   * renvoie undefined → le transport se replie sur le défaut, jamais bloquant.
+   */
+  private async resolveCoolifyServerUuid(
+    server: Server,
+    transport: PanelTransport,
+  ): Promise<string | undefined> {
+    if (server.coolifyServerUuid) return server.coolifyServerUuid;
+    try {
+      const servers = await transport.listServers(this.buildTarget(server));
+      if (servers.length === 0) return undefined;
+      const byHost = servers.find((s) => s.ip && server.hostname && s.ip.includes(server.hostname));
+      return byHost?.uuid ?? servers[0]?.uuid;
+    } catch {
+      return undefined;
+    }
   }
 
   /** Re-sonde Coolify et met à jour la ligne si l'état a changé (audit). */

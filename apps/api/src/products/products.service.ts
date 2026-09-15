@@ -293,14 +293,16 @@ export class ProductsService {
     if (dto.stockQty !== undefined) data.stockQty = dto.stockQty ?? null;
     if (dto.crossSell !== undefined) data.crossSell = dto.crossSell;
     // Déploiement par défaut (admin) : on MERGE les clés utiles sur moduleParams
-    // existant (repoUrl/branch/buildPack/appName), on préserve les autres ; '' → null/absent,
-    // et on re-câble une autre method de provisioning si demandé ('' → null).
+    // existant (repoUrl/branch/buildPack/appName/publishDirectory/isStatic), on préserve
+    // les autres ; '' → null/absent, et on re-câble une autre method de provisioning si
+    // demandé ('' → null). NB : `isStatic` + `publishDirectory` étaient ABSENTS du merge
+    // (bug : l'app static enregistrée par l'admin se « décochait » après re-fetch).
     if (dto.moduleParams !== undefined || dto.provisionModuleId !== undefined) {
       const current = (before.moduleParams as Record<string, unknown> | null) ?? {};
       if (dto.moduleParams !== undefined) {
         const patch = dto.moduleParams;
         const merged: Record<string, unknown> = { ...current };
-        for (const key of ['repoUrl', 'branch', 'buildPack', 'appName'] as const) {
+        for (const key of ['repoUrl', 'branch', 'buildPack', 'appName', 'publishDirectory', 'isStatic'] as const) {
           const v = patch[key];
           if (v !== undefined) merged[key] = v === '' ? null : v;
         }

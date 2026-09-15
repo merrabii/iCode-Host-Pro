@@ -835,20 +835,22 @@ export default function ManagerServeursPage() {
                             <Input
                               value={draft.coolifyProjectUuid}
                               onChange={(e) => set('coolifyProjectUuid', e.target.value)}
-                              placeholder="dnke41uj6jfu8qvnj7oq1g1a — vide = projet par défaut"
+                              placeholder={draft.coolifyProjectUuid || 'vide = projet partagé du module A (défaut : projet dédié client, module B)'}
                             />
                           </Field>
                           <Field label="Serveur Coolify cible (uuid)">
                             <Input
                               value={draft.coolifyServerUuid}
                               onChange={(e) => set('coolifyServerUuid', e.target.value)}
-                              placeholder="gcpn2wk4cqwtecqmbo0ey6ej — vide = serveur par défaut"
+                              placeholder={draft.coolifyServerUuid || 'vide = serveur détecté automatiquement'}
                             />
                           </Field>
                           <div className="srv-field-full">
                             <span className="muted cell-sub" style={{ lineHeight: 1.6 }}>
-                              Applications déployées en <b>partage</b> sur ce projet/serveur Coolify, plafonnées
-                              par le pack du client. UUID vides ⇒ cibles Coolify par défaut.
+                              <b>Serveur (uuid) :</b> laissez vide pour que le serveur soit <b>détecté
+                              automatiquement</b> au déploiement. <b>Projet (uuid) :</b> vide = projet
+                              partagé du module A ; le module B (projet dédié par client) reste le
+                              défaut — un projet vide ne bloque jamais la mise en service.
                             </span>
                           </div>
                         </>

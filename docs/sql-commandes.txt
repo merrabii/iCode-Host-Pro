@@ -1025,3 +1025,56 @@ REMARKS FOR FUTURE AI:
   - Phase 10bis : githubTokenEnc alimentera l'appel GET /api/client/github/repos
     + le déploiement Coolify (Deployment + extension PanelTransport).
 ================================================================
+================================================================
+PHASE 17 (2026-09-15) — PROVISIONING STORE À PREUVE RÉELLE + SOUS-DOMAINES GRATUITS PAR PRODUIT (ADR-037)
+================================================================
+Fix « aucune proposition de domaine au checkout ».
+Cause racine : aucun produit n'avait de FreeSubdomainRule -> le shop ne rendait
+pas le sélecteur de sous-domaine et le checkout ne capturait jamais requestedSubdomain.
+On attache une règle aux 3 produits payants « GitHub Deploy » (Go App, Static, Node API).
+allowedDomainIds = {} -> tous les Domain ACTIVE (racine par défaut = first ACTIVE = codediali.com).
+reservedPrefixes : bannir les sous-domaines system/vitrine courants.
+Idempotente : ON CONFLICT (productId) DO NOTHING.
+
+MIGRATION 34 — attach_free_subdomain_rules (File: apps/api/prisma/migrations/20260915120000_attach_free_subdomain_rules/migration.sql):
+  INSERT INTO "FreeSubdomainRule"
+    ("id", "productId", "allowedDomainIds", "reservedPrefixes", "minLength", "maxLength",
+     "allowedChars", "rejectPattern", "createdAt", "updatedAt")
+  SELECT
+    gen_random_uuid()::text,
+    p."id",
+    '{}',                                        -- toutes les racines Domain ACTIVE
+    '{admin,www,api,mail,smtp,status,files,test,dev,staging,prod}',
+    3,                                           -- minLength sous-domaine
+    40,                                          -- maxLength sous-domaine
+    'a-z0-9-',                                   -- allowedChars
+    NULL,                                        -- rejectPattern (aucun)
+    now(),
+    now()
+  FROM "Product" p
+  WHERE p."slug" IN ('deploy-github-app', 'site-statique-premium', 'api-node-starter')
+  ON CONFLICT ("productId") DO NOTHING;          -- idempotente
+
+CHECK:
+  - SELECT p."slug", r."allowedDomainIds", r."minLength", r."maxLength", r."reservedPrefixes"
+    FROM "FreeSubdomainRule" r
+    JOIN "Product" p ON p."id" = r."productId";
+    -> 3 lignes (deploy-github-app, site-statique-premium, api-node-starter),
+       allowedDomainIds = '{}' (vide = toutes les racines ACTIVE codediali.com + arumdigital.com).
+  - GET /api/public/products/:slug (ex. /api/public/products/deploy-github-app)
+    -> le payload expose freeSubdomainRule (le /shop consomme product.freeSubdomainRule).
+  - Commandes ermocrypt (cmu1vlz6h…, cmu1vnrbq…, cmu1vqilq…) : re-provision force
+    -> app créée/réutilisée + proof-gate. State final : 2 ACTIVE (HTTP 200),
+    1 PROVISIONING (api-node-starter pointe sur un repo statique — à corriger phase suivante).
+
+REMARKS FOR FUTURE AI:
+  - FreeSubdomainRule est 1:1 par produit ; `allowedDomainIds` VIDE = autoriser TOUTES les
+    racines Domain ACTIVE (pas zéro racine). Modèle d'idempotence : ON CONFLICT (productId).
+  - Le proof-gate finalize (ACTIVE/email seulement sur preuve réelle Coolify ACTIVE OU HTTP 2xx/3xx)
+    est UNE RÈGLE MÉTIER, pas un état DB : re-provision admin via
+    POST /api/store/admin/orders/:id/provision?force=1 pour corriger une commande bloquée.
+  - Le produit api-node-starter POINTE sur un repo STATIQUE (Code-Diali-Guide-de-Demarrage.git,
+    static=false, sans serveur) -> son app ne peut pas monter : c'est un manque de DONNÉES
+    produit, PAS un bug de code. Prochaine phase : basculer sur un vrai dépôt backend Node
+    (ex. https://github.com/Ryadel/NodeJS-Express-CRUD-API-Sample) et revérifier HTTP 200 réel.
+================================================================

@@ -959,6 +959,18 @@ Réponse au retour propriétaire : port Coolify non mentionné, IP non auto-dét
 - Constat : `origin/main` à jour (ahead 0) ; 25 migrations in sync ; `git status` propre (seul `.claude/settings.json` modifié, hors gouvernance).
 - **Ne rien pousser pour ce rattrapage sans ok explicite du propriétaire** (règle conservée).
 
+# PHASE 17 — PROVISIONING STORE À PREUVE RÉELLE + SOUS-DOMAINES GRATUITS PAR PRODUIT (ADR-037) — 2026-09-15
+
+## 2026-09-15 — Résolution « 3 commandes sans app » + proof-gate + sous-domaines gratuits (code + tests + live)
+- **Contexte** : 3 commandes payées de `ermocrypt` bloquées à PAID sans app (`cmu1vlz6h…` GitHub App, `cmu1vnrbq…` Site Statique, `cmu1vqilq…` API Node). Exigence durable réaffirmée : **ne jamais confirmer une commande avant que ce soit réellement OK** (pas de faux ACTIVE).
+- **Files created** : migration `apps/api/prisma/migrations/20260915120000_attach_free_subdomain_rules` ; `apps/api/src/store/provisioning.service.spec.ts` (+tests preuve/create-app-error/proof-gate).
+- **Files modified** : `apps/api/src/store/provisioning.service.ts` (proof-gate dans `finalize` : ACTIVE + email UNIQUEMENT sur preuve réelle — poll `deploymentStatus` ACTIVE ou HTTP 2xx/3xx `awaitAppReady` 120 s ; échec create_app → `app_not_created`, jamais ACTIVE ; **fix réutilisation d'app** idempotente `appUuid = row.coolifyUuid` au lieu de re-`createGitApp` — rendu par commit live d'un doublon `bwgy96…`), `apps/api/prisma/schema.prisma` (FreeSubdomainRule 1:1), provisioning/service + products (exposition `freeSubdomainRule`), web `/shop/[slug]`.
+- **Database changes** : migration `20260915120000_attach_free_subdomain_rules` appliquée — FreeSubdomainRule attaché à `deploy-github-app`, `site-statique-premium`, `api-node-starter` (vide `allowedDomainIds` = toutes racines ACTIVES codediali.com + arumdigital.com). **34 migrations in sync.**
+- **Résultat live (propre, aucune invention)** : GitHub App `q52…` ACTIVE HTTP 200 · Site Statique `xah8nn…` ACTIVE HTTP 200 (email livré) · **API Node `bc68…` PROVISIONING (`exited:unhealthy`)** — `api-node-starter` pointe sur le repo STATIQUE `merrabii/Code-Diali-Guide-de-Demarrage.git` (static=false, pas de serveur) ⇒ l'app ne peut pas monter ; le gate l'a correctement **maintenu PROVISIONING (jamais de faux ACTIVE)**.
+- **Tests/validation** : unit **71/71** + `tsc` API + web tsc PASS ; proof-gate éprouvé live.
+- **À corriger en PROCHAINE PHASE (non résolu — NE PAS présenter comme résolu)** : tester le provisioning réel d'un **vrai backend Node** via **`https://github.com/Ryadel/NodeJS-Express-CRUD-API-Sample`**, vérifier HTTP 200 réel, **ne jamais utiliser de faux statut ACTIVE** ; puis **nettoyer l'app orpheline** `bwgy96194kmgo3v3t6psqokp` (accord propriétaire requis).
+- **Follow-up** : app orpheline NON supprimée (accord requis) ; correction Node.js PAS commencée — commit **checkpoint** uniquement.
+
 # COMPLETED HISTORY
 - Clean baseline (Pre-Phase 0): documentation pack + first AI orientation.
 - Phase 0: source tree and config files authored; runtime execution (install, generate, migrate, tests) pending toolchain availability.

@@ -3,6 +3,7 @@ import {
   BadRequestException,
   ConflictException,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
 import {
@@ -63,6 +64,7 @@ interface InvoiceLineInput {
  */
 @Injectable()
 export class CheckoutService {
+  private readonly log = new Logger(CheckoutService.name);
   constructor(
     private readonly prisma: PrismaService,
     private readonly products: ProductsService,
@@ -173,7 +175,7 @@ export class CheckoutService {
     // 5. Clé d'idempotence : hash déterministe de la configuration + montant.
     //    Basée sur les coordonnées de FACTURATION (billingEmail) : un changement
     //    de mode (compte/autres coordonnées) produit bien une commande distincte.
-    const key = this.idempotencyKey(dto, method.id, amountTtcCents, billingEmail);
+    const key = this.idempotencyKey(dto, method.id, amountTtcCents, billingEmail, requestedSubdomain);
 
     // 6. Replay (double-clic / retry identique) : on renvoie la commande déjà
     //    créée, SANS recréer de compte ni de commande (§7 idempotence).
@@ -352,15 +354,24 @@ export class CheckoutService {
         created.subscriptionAction,
       ).catch((e) => this.traceAudit(product.id, created.order.id, amountTtcCents, method.id, false, String(e)));
 
-      // 8. Provisioning réel, fire-and-forget, jamais bloquant (§10).
-      //    - upgrade : on NE crée PAS de nouvelle app — on ré-applique les
-      //      limites du nouveau pack aux apps déjà déployées (data préservée).
-      //    - création ou produit sans pack (ex. Installation Fees) : provisionOrder,
-      //      qui passe ACTIVE immédiatement s'il n'y a aucune action à exécuter.
+      // 8. Provisioning réel, fire-and-forget, jamais bloquant (§10). Les échecs de
+      //    lancement ne sont JAMAIS avalés silencieusement : la commande reste alors
+      //    PAID (jamais faussement confirmée) et est tracée pour une relance admin.
       if (created.subscriptionAction === 'upgraded') {
-        this.provisioning.syncAppLimits(created.subscription!.id).catch(() => {});
-      } else {
-        this.provisioning.provisionOrder(created.order.id).catch(() => {});
+        this.provisioning.syncAppLimits(created.subscription!.id).catch((e) => {
+          this.log.warn(`checkout order=${created.order.id}: syncAppLimits launch failed: ${String(e)}`);
+        });
+      }
+      if (requestedSubdomain || created.subscriptionAction !== 'upgraded') {
+        this.provisioning.provisionOrder(created.order.id).catch((e) => {
+          this.log.warn(`checkout order=${created.order.id}: provisionOrder launch failed: ${String(e)}`);
+          this.audit.record({
+            action: 'provision.launch_failed',
+            resourceType: 'order',
+            resourceId: created.order.id,
+            details: { error: String(e) },
+          }).catch(() => {});
+        });
       }
 
       return {
@@ -531,19 +542,25 @@ export class CheckoutService {
     });
   }
 
-  /** Hash déterministe : adresse de facturation + slug + options + addons + moyen + montant TTC. */
+  /** Hash déterministe : adresse de facturation + slug + options + addons + moyen +
+   *  montant TTC + SOUS-DOMAINE demandé (normalisé).
+   *  Le sous-domaine fait partie de la configuration livrée : l'omettre faisait que
+   *  re-commander le MÊME produit avec un sous-domaine DIFFÉRENT (même montant/options)
+   *  produisait la MÊME clé → replay de l'ancienne commande, sans jamais provisionner la
+   *  nouvelle app. Deux sous-domaines = deux commandes distinctes. */
   private idempotencyKey(
     dto: CheckoutDto,
     methodId: string,
     amountTtcCents: number,
     billingEmail: string,
+    subdomain: string | null,
   ): string {
     const options = [...(dto.options ?? [])]
       .map((o) => `${o.optionId}:${o.choiceId}`)
       .sort()
       .join(',');
     const addons = [...(dto.addonIds ?? [])].sort().join(',');
-    const payload = [billingEmail, dto.productSlug, options, addons, methodId, amountTtcCents].join('|');
+    const payload = [billingEmail, dto.productSlug, options, addons, methodId, amountTtcCents, subdomain ?? ''].join('|');
     return createHash('sha256').update(payload).digest('hex');
   }
 

@@ -523,4 +523,22 @@ export class CloudflareService {
     });
     return domain ?? null;
   }
+
+  /** Une racine ACTIVE précise par id, ou null (pour le choix « domaine gratuit »). */
+  async findActiveRootById(id: string): Promise<Domain | null> {
+    return this.prisma.domain.findFirst({
+      where: { id, status: DomainStatus.ACTIVE },
+    });
+  }
+
+  /** Racines ACTIVES proposables au client pour un sous-domaine gratuit.
+   *  `allowedDomainIds` = autorisations de la règle FreeSubdomainRule du produit
+   *  du client (admin). Vide/null ⇒ toutes les racines ACTIVES. */
+  async findMemberFreeDomains(allowedDomainIds: string[] | null): Promise<Domain[]> {
+    const where: Prisma.DomainWhereInput = { status: DomainStatus.ACTIVE };
+    if (allowedDomainIds && allowedDomainIds.length > 0) {
+      where.id = { in: allowedDomainIds };
+    }
+    return this.prisma.domain.findMany({ where, orderBy: [{ name: 'asc' }] });
+  }
 }

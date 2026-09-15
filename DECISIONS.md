@@ -717,5 +717,36 @@ Decision (deux volets, enroulés dans le même slice auto-contenu `deployments/*
   → HTTP 200, HTML sert `dist/index.html` buildé, `/assets/index-*.js`/`.css` chargés 200.
   Tests unit (7 détection github.service + 3 propagation deployments) verts.
 
+## ADR-037 — Provisioning store à preuve réelle + sous-domaines gratuits par produit (2026-09-15)
+**Status: IMPLEMENTED + verified live**. Décision en trois volets pour corriger des commandes payées
+bloquées « confirmées sans app ni build » (exigence propriétaire expresse : « ne jamais confirmer une
+commande avant de s'assurer que réellement tout est ok »).
+- **FreeSubdomainRule par produit** (migration `20260915120000_attach_free_subdomain_rules`) : les
+  produits pouvant héberger une app (déjà câblés `freeSubdomainsIncluded` sur le pack, Bloc A admin)
+  reçoivent une règle `FreeSubdomainRule` (empty `allowedDomainIds` = toutes les racines ACTIVES,
+  `codediali.com` + `arumdigital.com`). Conséquence : `GET /api/public/products/:slug` expose
+  `freeSubdomainRule`, et le front `/shop` propose un **choix de sous-domaine** (impossible avant, car
+  aucun produit n'avait de règle ⇒ le checkout ne capturait pas `requestedSubdomain`).
+  Idempotente : `INSERT … ON CONFLICT("productId") DO NOTHING`.
+- **Confirmation à preuve réelle** (`ProvisioningService.finalize` réécrit) : une Order ne passe
+  **ACTIVE** (et n'envoie l'email de livraison) **que** sur preuve : `create_app` **succès** (appUuid
+  threadé) **ET** `awaitAppReady` vrai — statut Coolify `running*`/`queued`→ACTIVE via `mapCoolifyStatus`
+  **OU** HTTP 2xx/3xx sur le fqdn. Échec `create_app` → branche `app_not_created`, jamais ACTIVE.
+  Build encore en cours / non prouvé → **PROVISIONING** (jamais de faux ACTIVE). `awaitAppReady` =
+  poll borné (120 s). L'ancien `nextStatus = hasFailedCreateApp && !fqdn ? PROVISIONING : ACTIVE`
+  passait ACTIVE dès qu'un sous-domaine DNS existait même si l'app n'avait jamais été créée.
+- **Réutilisation d'app sur relance** (fix `actionCreateApp`) : une relance admin `force` **réutilise**
+  `row.coolifyUuid` existant (re-déploie) au lieu de `createGitApp` — sinon chaque relance créait une
+  app **orpheline** sur le MÊME sous-domaine (conflit traefik + apps fantômes ; bug observé : 2ᵉ app
+  `bwgy96…` sur github-app-deploy pendant le diagnostic).
+- **État réel au commit** : GitHub App `q52…` ACTIVE 200 ; Site Statique `xah8nn…` ACTIVE 200 (emails
+  livrés) ; API Node `bc68…` PROVISIONING `exited:unhealthy` — produit `api-node-starter` pointe sur le
+  repo **statique** `merrabii/Code-Diali-Guide-de-Demarrage.git` (`static=false`, sans serveur) ⇒ son app
+  ne peut pas monter ; le gate l'a correctement maintenu PROVISIONING. **ÉTAPE PROCHAINE (Phase 17/Node)** :
+  pointer ce produit vers un vrai backend Node (repo de test : `https://github.com/Ryadel/NodeJS-Express-CRUD-API-Sample`),
+  re-provisionner, vérifier un **HTTP réel** (jamais de faux ACTIVE), puis nettoyer l'app orpheline
+  `bwgy96194kmgo3v3t6psqokp` (accord requis). Tests : unit/e2e **71** verts (4 suites provisioning/
+  deployments/checkout/cloudflare) + `tsc` API et web verts.
+
 # REJECTED
 None recorded in this clean baseline.
