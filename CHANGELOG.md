@@ -1,6 +1,17 @@
 # CHANGELOG
 
-## 2026-09-15 — Phase 17 (ADR-038) : **FLUX PRODUIT RÉEL PROUVÉ → ACTIVE** (IP Coolify ré-autorisée)
+## 2026-09-15 — Phase 17 (ADR-038) : **réconciliation Deployment↔Order après preuve réelle** (divergence ACTIVE/DEPLOYING corrigée)
+### Problème résolu
+À l'issue de la preuve produit réelle, on a observé **Order ACTIVE + row Deployment DEPLOYING**. Audit de la machine d'état (SOURCE DE VÉRITÉ) : le proof-gate store (`awaitAppReady` vrai = Coolify ACTIVE ou HTTP 2xx/3xx public) confirme réellement la mise en ligne, mais la voie store posait la row Deployment en **DEPLOYING** (`actionCreateApp`) **sans jamais la passer ACTIVE** ; la seule bascule Deployment→ACTIVE était la **réconciliation lazy du dashboard client** (`refreshStatus`), déclenchée uniquement si le client ouvre la page. ⇒ divergence **réelle à l'arrêt** : la preuve la plus forte était obtenue à l'activation de l'Order mais pas persistée sur le Deployment.
+### Corrigé (ciblé, en respectant ADR-037/038, port, build-pack, proof-gate inchangés)
+- **`reconcileDeploymentActive(orderId)`** dans `provisioning.service.ts`, appelé dans la branche `ready===true` du proof-gate juste après `setOrderStatus(Order.ACTIVE)` : `deployment.updateMany({ where: { orderId, status: DEPLOYING }, data: { status: ACTIVE } })` + audit `provision.deployment_active`.
+- Ciblage **précis** (jamais « Order ACTIVE ⇒ toutes ses Deployments ») : `orderId @unique` ⇒ UNE row, bornée à `DEPLOYING`. **Idempotent** (ACTIVE déjà posé → no-op, `count=0` → aucun audit) ; **jamais FAILED→ACTIVE** sans nouvelle preuve ; **jamais de création** de Deployment ; **conditionnel (`updateMany`)** donc sûr en concurrence avec `refreshStatus`. Best-effort : un échec de sync trace un audit et ne casse pas l'activation déjà prouvée de l'Order.
+### Tests ajoutés (TEST1–TEST7, `provisioning.service.spec.ts`)
+TEST1 DEPLOYING+preuve+Order ACTIVE→ACTIVE · TEST2 déjà ACTIVE→aucune Écriture · TEST3 preuve absente→NOT ACTIVE · TEST4 preuve invalide→NOT ACTIVE · TEST5 Order déjà ACTIVE→pas de nouveau Deployment · TEST6 double activation→1 seule row, cohérent · TEST7 FAILED jamais basculé.
+### Tests
+Unit **405/405** (398 + 7) · 34/34 suites · tsc API **vert**. E2E non rejouées (rien de changé sur le chemin E2E, la correction est couverte à l'unité ; baseline e2e 146/146 conservée).
+### Commit state
+**4ᵉ commit de correction** (`fix(provisioning): reconcile deployment status after proof`) — local, non poussé. **Aucun push GitHub (attente GO).** Aucun statut forcé en base, aucun werkaround Node.
 ### Résolu
 L'opérateur ayant ré-autorisé l'IP egress Coolify (egress ADSL `105.190.173.126`), la relance idempotente de la commande propre `ord-node-product-20260915` (produit `api-node-starter` = vrai backend Express) a abouti : `create_app` SUCCESS (app `iv7agk1rhijid5dth830nxni`), **public HTTPS 200** sur `node-product-e2e.arumdigital.com` (provenance `x-powered-by: Express` + `<title>Node.js Getting Started on Heroku</title>`, `Server: cloudflare` = edge), **Order ACTIVE** (proof-gate). Provider : `running:unknown`, `build_pack:nixpacks`, `ports_exposes:"8080"`, `PORT=8080 is_runtime:true`, `is_static:null`. **Idempotence** : 2ᵉ force-run = « App réutilisée et redéployée » (même UUID), 1 seule row Deployment. Les preuves du moteur ADR-038 sont désormais validées **à la fois** sur 2 E2E directs ET sur le **chemin produit réel** (le 403 initial avait correctement gardé la commande PROVISIONING, jamais de faux ACTIVE, aucun port forcé).
 ### Observation (non modifiée)

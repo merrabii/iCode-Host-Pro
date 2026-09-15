@@ -153,7 +153,7 @@ describe('ProvisioningService — actionCreateApp (choix du projet A/B voie stor
   const panelFactory = { create: jest.fn(() => transport) };
   const prisma = {
     order: { findUnique: jest.fn(), update: jest.fn() },
-    deployment: { findFirst: jest.fn(), create: jest.fn(), update: jest.fn() },
+    deployment: { findFirst: jest.fn(), create: jest.fn(), update: jest.fn(), updateMany: jest.fn() },
     provisioningLog: { create: jest.fn(), update: jest.fn(), findMany: jest.fn() },
     orderStatusHistory: { create: jest.fn() },
   };
@@ -213,6 +213,16 @@ describe('ProvisioningService — actionCreateApp (choix du projet A/B voie stor
     };
   }
 
+  // Serveur COOLIFY opérationnel → canal de preuve par statut de build (pas de HTTP).
+  function coolifyProofServer() {
+    return {
+      findUnique: jest.fn().mockResolvedValue({
+        id: 'srv-coolify', panelProvider: 'COOLIFY', apiBaseUrl: 'http://portal.exemple.com:8000/api/v1',
+        apiTokenEnc: 'enc:coolify', strictTls: true, hostname: 'p.exemple.com', coolifyProjectUuid: 'p1', coolifyServerUuid: 's1',
+      }),
+    };
+  }
+
   beforeEach(() => {
     service = new ProvisioningService(
       prisma as never,
@@ -230,6 +240,7 @@ describe('ProvisioningService — actionCreateApp (choix du projet A/B voie stor
     prisma.deployment.findFirst.mockResolvedValue(null);
     prisma.deployment.create.mockResolvedValue({ id: 'd1' });
     prisma.deployment.update.mockResolvedValue({ id: 'd1' });
+    prisma.deployment.updateMany.mockResolvedValue({ count: 1 });
     transport.createGitApp.mockResolvedValue({ uuid: 'app9' });
     transport.deployApp.mockResolvedValue(undefined);
   });
@@ -416,5 +427,131 @@ describe('ProvisioningService — actionCreateApp (choix du projet A/B voie stor
 
     expect(out.status).toBe('PROVISIONING');
     expect(transport.deployApp).not.toHaveBeenCalled();
+  });
+
+  // =========================================================================
+  // RÉCONCILIATION DÉPLOIEMENT ↔ ORDER (2026-09-15) — la preuve de mise en
+  // ligne (Order ACTIVE) doit se refléter sur LA row Deployment de la commande.
+  // Testé unitairement via le mock Prisma `deployment.updateMany` (aucun réseau).
+  // =========================================================================
+
+  it('TEST1 — preuve réelle (Coolify ACTIVE) + Order ACTIVE ⇒ la row Deployment de la commande passe DEPLOYING→ACTIVE', async () => {
+    prisma.order.findUnique.mockResolvedValue(orderFor('PER_CLIENT_PROJECT'));
+    deployments.getOrCreateClientProject.mockResolvedValue({ id: 'cp1', projectUuid: 'proj-dedie-client' });
+    (prisma as Record<string, any>).server = coolifyProofServer();
+    (transport as Record<string, any>).deploymentStatus = jest.fn().mockResolvedValue({ rawStatus: 'running:healthy', detail: 'running' });
+
+    const out = await service.provisionOrder('ord1');
+
+    expect(out.status).toBe('ACTIVE');
+    // La reconciliation vise PRÉCISÉMENT LA row de cette commande, bornée à DEPLOYING.
+    expect(prisma.deployment.updateMany).toHaveBeenCalledWith({
+      where: { orderId: 'ord1', status: 'DEPLOYING' },
+      data: { status: 'ACTIVE' },
+    });
+    expect(audit.record).toHaveBeenCalledWith(
+      expect.objectContaining({ action: 'provision.deployment_active', resourceId: 'ord1', details: expect.objectContaining({ ok: true }) }),
+    );
+  });
+
+  it('TEST2 — Deployment déjà ACTIVE ⇒ aucune réconciliation inutile (idempotent côté row)', async () => {
+    prisma.order.findUnique.mockResolvedValue(orderFor('PER_CLIENT_PROJECT'));
+    deployments.getOrCreateClientProject.mockResolvedValue({ id: 'cp1', projectUuid: 'proj-dedie-client' });
+    (prisma as Record<string, any>).server = coolifyProofServer();
+    (transport as Record<string, any>).deploymentStatus = jest.fn().mockResolvedValue({ rawStatus: 'running:healthy', detail: 'running' });
+    // La row est DÉJÀ ACTIVE : le `updateMany` borné à DEPLOYING ne matche rien.
+    prisma.deployment.updateMany.mockResolvedValue({ count: 0 });
+
+    const out = await service.provisionOrder('ord1');
+
+    expect(out.status).toBe('ACTIVE');
+    // Aucun audit « réconcilié » émis quand rien n'a changé (pas de double écriture).
+    expect(audit.record).not.toHaveBeenCalledWith(
+      expect.objectContaining({ action: 'provision.deployment_active', details: expect.objectContaining({ ok: true }) }),
+    );
+  });
+
+  it('TEST3 — preuve ABSENTE (build Coolify FAILED) ⇒ jamais ACTIVE, reconcile non appelé, Order reste PROVISIONING', async () => {
+    prisma.order.findUnique.mockResolvedValue(orderFor('PER_CLIENT_PROJECT'));
+    deployments.getOrCreateClientProject.mockResolvedValue({ id: 'cp1', projectUuid: 'proj-dedie-client' });
+    (prisma as Record<string, any>).server = coolifyProofServer();
+    // rawStatus mappé FAILED → cerré : awaitAppReady renvoie false immédiatement.
+    (transport as Record<string, any>).deploymentStatus = jest.fn().mockResolvedValue({ rawStatus: 'crash', detail: 'crash' });
+
+    const out = await service.provisionOrder('ord1');
+
+    expect(out.status).toBe('PROVISIONING');
+    // Pas de preuve de mise en ligne ⇒ la réconciliation Deployment→ACTIVE n'a PAS lieu.
+    expect(prisma.deployment.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('TEST4 — preuve INVALIDE (create_app échoue) ⇒ jamais ACTIVE, reconcile non appelé, Order reste PROVISIONING', async () => {
+    prisma.order.findUnique.mockResolvedValue(orderFor('PER_CLIENT_PROJECT'));
+    // La création d'app échoue réellement : aucune preuve de mise en ligne.
+    (transport.createGitApp as jest.Mock).mockRejectedValueOnce(new Error('Coolify 400'));
+
+    const out = await service.provisionOrder('ord1');
+
+    expect(out.status).toBe('PROVISIONING');
+    expect(prisma.deployment.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('TEST5 — Order déjà ACTIVE ⇒ pas de nouveau Deployment (ni création, ni reconcile)', async () => {
+    const order = orderFor('PER_CLIENT_PROJECT');
+    order.status = 'ACTIVE'; // déjà activée → provisionOrder renvoie l'état sans refaire le travail.
+    prisma.order.findUnique.mockResolvedValue(order as never);
+
+    const out = await service.provisionOrder('ord1');
+
+    expect(out.status).toBe('ACTIVE');
+    expect(prisma.deployment.create).not.toHaveBeenCalled();
+    expect(prisma.deployment.updateMany).not.toHaveBeenCalled();
+    expect(transport.createGitApp).not.toHaveBeenCalled();
+  });
+
+  it('TEST6 — double activation (relance force idempotente) ⇒ 1 seule row Deployment, état cohérent', async () => {
+    (prisma as Record<string, any>).server = coolifyProofServer();
+    (transport as Record<string, any>).deploymentStatus = jest.fn().mockResolvedValue({ rawStatus: 'running:healthy', detail: 'running' });
+    deployments.getOrCreateClientProject.mockResolvedValue({ id: 'cp1', projectUuid: 'proj-dedie-client' });
+    // 1ère activation : aucune row → création (+ reconcile). 2ème activation (relance
+    // force) : row existante réutilisée (DÉJÀ ACTIVE) → reconcile borné DEPLOYING = 0.
+    prisma.order.findUnique.mockResolvedValueOnce(orderFor('PER_CLIENT_PROJECT')).mockResolvedValueOnce(orderFor('PER_CLIENT_PROJECT'));
+    prisma.deployment.findFirst.mockResolvedValueOnce(null).mockResolvedValueOnce({ id: 'd1', coolifyUuid: 'app9', status: 'ACTIVE' });
+    prisma.deployment.updateMany.mockResolvedValueOnce({ count: 1 }).mockResolvedValueOnce({ count: 0 });
+
+    const first = await service.provisionOrder('ord1', { force: true });
+    const second = await service.provisionOrder('ord1', { force: true });
+
+    expect(first.status).toBe('ACTIVE');
+    expect(second.status).toBe('ACTIVE');
+    // Une seule row Deployment créée au total (pas de doublon).
+    expect(prisma.deployment.create).toHaveBeenCalledTimes(1);
+    // L'app Coolify n'est créée qu'UNE fois (1ère activation) ; la relance la RÉUTILISE.
+    expect(transport.createGitApp).toHaveBeenCalledTimes(1);
+  });
+
+  it('TEST7 — Deployment FAILED n’est jamais basculé ACTIVE arbitrairement (reconcile borné à DEPLOYING)', async () => {
+    prisma.order.findUnique.mockResolvedValue(orderFor('PER_CLIENT_PROJECT'));
+    deployments.getOrCreateClientProject.mockResolvedValue({ id: 'cp1', projectUuid: 'proj-dedie-client' });
+    (prisma as Record<string, any>).server = coolifyProofServer();
+    (transport as Record<string, any>).deploymentStatus = jest.fn().mockResolvedValue({ rawStatus: 'running:healthy', detail: 'running' });
+    // Row existante FAILED : le filtre `status: DEPLOYING` l'exclut → jamais basculée.
+    prisma.deployment.findFirst.mockResolvedValue({ id: 'd1', coolifyUuid: 'app9', status: 'FAILED' });
+    // Une row FAILED ne matche pas `status: DEPLOYING` ⇒ `updateMany` ne change rien.
+    prisma.deployment.updateMany.mockResolvedValue({ count: 0 });
+
+    const out = await service.provisionOrder('ord1');
+
+    // Order ACTIVE (preuve réelle obtenue) …
+    expect(out.status).toBe('ACTIVE');
+    // … mais la réconciliation est BORNÉE à DEPLOYING : la condition n'atteint pas FAILED,
+    // donc aucune écriture ni audit « réconcilié ».
+    expect(prisma.deployment.updateMany).toHaveBeenCalledWith({
+      where: { orderId: 'ord1', status: 'DEPLOYING' },
+      data: { status: 'ACTIVE' },
+    });
+    expect(audit.record).not.toHaveBeenCalledWith(
+      expect.objectContaining({ action: 'provision.deployment_active', details: expect.objectContaining({ ok: true }) }),
+    );
   });
 });

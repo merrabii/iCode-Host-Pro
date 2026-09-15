@@ -189,6 +189,13 @@ export class ProvisioningService {
       const ready = await this.awaitAppReady({ coolifyUuid: appUuid!, serverId }, fqdn);
       if (ready) {
         await this.setOrderStatus(orderId, OrderStatus.ACTIVE, 'Application en ligne — mise en place confirmée.');
+        // La preuve de mise en ligne (prod réelle : Coolify ACTIVE ou HTTP 2xx/3xx
+        // public) est atteinte : la row Deployment DE cette commande doit refléter
+        // ACTIVE au même instant, sinon elle démeure DEPLOYING à l'arrêt (seule la
+        // consultation du dashboard client la réconcilie sinon). Ciblé sur LA row de
+        // la commande (orderId @unique), idempotent, jamais FAILED→ACTIVE, jamais de
+        // création, conditionnel donc sûr en concurrence avec `refreshStatus`.
+        await this.reconcileDeploymentActive(orderId);
         if (fqdn) await this.deliverEmail(order.customerEmail, order.customerName, fqdn, orderId);
         return this.finalResult(orderId, OrderStatus.ACTIVE, fqdn);
       }
@@ -334,6 +341,45 @@ export class ProvisioningService {
   private async setOrderStatus(orderId: string, status: OrderStatus, note: string): Promise<void> {
     await this.prisma.order.update({ where: { id: orderId }, data: { status } });
     await this.prisma.orderStatusHistory.create({ data: { orderId, status, note } });
+  }
+
+  /**
+   * Réconcilie l'état de la row Deployment de la commande après une preuve de
+   * mise en ligne réelle (Order passé ACTIVE). Seule la row de CELLE-ci est
+   * visée — jamais « Order ACTIVE ⇒ toutes ses Deployments ACTIVE » :
+   * `updateMany` est borné par `orderId` (+ `orderId @unique` ⇒ une seule row)
+   * ET par `status: DEPLOYING`, donc :
+   *  - idempotent : un ACTIVE déjà posé (double activation) reste ACTIVE, apiSafe ;
+   *  - jamais FAILED→ACTIVE arbitrairement sans nouvelle preuve ;
+   *  - jamais de création de Deployment ;
+   *  - conditionnel : sûr en concurrence avec la réconciliation lazy du dashboard
+   *    (`refreshStatus`), l'un des deux arrivant le premier ne produit pas de conflit.
+   * Best-effort et audité : un échec de sync ne doit pas casser l'activation dejà
+   * PROUVÉE de l'Order (source de vérité métier), il est tracé pour relance.
+   */
+  private async reconcileDeploymentActive(orderId: string): Promise<void> {
+    try {
+      const res = await this.prisma.deployment.updateMany({
+        where: { orderId, status: DeploymentStatus.DEPLOYING },
+        data: { status: DeploymentStatus.ACTIVE },
+      });
+      if (res.count > 0) {
+        await this.audit.record({
+          action: 'provision.deployment_active',
+          resourceType: 'deployment',
+          resourceId: orderId,
+          details: { orderId, ok: true, reconciled: res.count, from: DeploymentStatus.DEPLOYING, to: DeploymentStatus.ACTIVE },
+        });
+      }
+    } catch (e) {
+      this.log.warn(`reconcile deployment order=${orderId} failed: ${String(e)}`);
+      await this.audit.record({
+        action: 'provision.deployment_active',
+        resourceType: 'deployment',
+        resourceId: orderId,
+        details: { orderId, ok: false, error: String(e) },
+      });
+    }
   }
 
   /**
