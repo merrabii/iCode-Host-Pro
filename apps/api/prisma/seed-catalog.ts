@@ -177,6 +177,11 @@ async function main(): Promise<number> {
     billingCycle: BillingCycle.MONTHLY,
     slogan: 'Une API Node.js déployée et servie en HTTPS.',
     shortDescription: 'Backend Node.js/Express déployé sur notre infrastructure, sous-domaine gratuit inclus.',
+    // Produit BACKEND Node (isStatic:false, pas de publishDirectory) → repo de
+    // validation Express réel. La logique générique (résolution de port ADR-038)
+    // s'applique ; cette URL est UNIQUEMENT la config produit (jamais codée dans
+    // le moteur de provisioning).
+    repoUrl: 'https://github.com/heroku/nodejs-getting-started.git',
     isStatic: false,
     appName: 'api-node-starter',
   });
