@@ -1,5 +1,13 @@
 # CHANGELOG
 
+## 2026-09-15 — Phase 17 (ADR-038) : **FLUX PRODUIT RÉEL PROUVÉ → ACTIVE** (IP Coolify ré-autorisée)
+### Résolu
+L'opérateur ayant ré-autorisé l'IP egress Coolify (egress ADSL `105.190.173.126`), la relance idempotente de la commande propre `ord-node-product-20260915` (produit `api-node-starter` = vrai backend Express) a abouti : `create_app` SUCCESS (app `iv7agk1rhijid5dth830nxni`), **public HTTPS 200** sur `node-product-e2e.arumdigital.com` (provenance `x-powered-by: Express` + `<title>Node.js Getting Started on Heroku</title>`, `Server: cloudflare` = edge), **Order ACTIVE** (proof-gate). Provider : `running:unknown`, `build_pack:nixpacks`, `ports_exposes:"8080"`, `PORT=8080 is_runtime:true`, `is_static:null`. **Idempotence** : 2ᵉ force-run = « App réutilisée et redéployée » (même UUID), 1 seule row Deployment. Les preuves du moteur ADR-038 sont désormais validées **à la fois** sur 2 E2E directs ET sur le **chemin produit réel** (le 403 initial avait correctement gardé la commande PROVISIONING, jamais de faux ACTIVE, aucun port forcé).
+### Observation (non modifiée)
+La row `Deployment` (`cmu37y5t30037peecq5a78lq3`) reste `DEPLOYING` quand l'Order est `ACTIVE` (le proof-gate finalise l'Order) — divergence d'alignement à trancher si souhaité.
+### Commit state
+3 commits locaux non poussés : `7490de1` · `528d1b9` · `555b808`. Tests 398/398 unit + 146/146 e2e. **Aucun push GitHub (attente GO).**
+
 ## 2026-09-15 — Phase 17 (ADR-038 suite) : produit api-node-starter = vrai backend (déclaré + source de vérité) — flux produit réel bloqué à la frange Coolify (allowlist IP)
 ### Fait et validé
 - **Audit produit `api-node-starter`** (`cmu1tljf8000bpelc1k2ltft3`) : repo dans `Product.moduleParams.repoUrl` ; runtime déterminé par `{isStatic, publishDirectory, buildPack}` → `isServerRuntime = !(isStatic || publishDirectory)` ; flux = Order→`actionCreateApp`→`createGitApp(repoUrl,buildPack,isStatic,…)` → si serveur runtime `resolveBackendExposedPort`→`applyNodePort`. La base live porte déjà `heroku/nodejs-getting-started.git`, `isStatic:false`, `buildPack:nixpacks` (repointée en E2E).
