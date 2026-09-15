@@ -455,6 +455,194 @@ describe('PanelTransportFactory / NodePanelTransport', () => {
       }
     });
 
+    // Fix GAP PORT (2026-09-15) : `applyNodePort` rend runtime ↔ provider cohérents
+    // sur un port RÉSOLU en amont (ici 8080, valeur quelconque fournie par le service),
+    // en dédupliquant toute variable PORT existante (idempotence).
+    it('applyNodePort PATCHes ports_exposes puis déduplique et POSTe la variable runtime PORT', async () => {
+      const calls: { method: string; path: string; body: string }[] = [];
+      let authHeader: string | undefined;
+      const srv = await serve((req, res) => {
+        authHeader = req.headers.authorization;
+        let body = '';
+        req.on('data', (c: Buffer) => (body += c.toString()));
+        req.on('end', () => {
+          calls.push({ method: req.method ?? '', path: req.url ?? '', body });
+          if (req.method === 'GET') {
+            // aucun PORT existant -> pas de DELETE
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end('[]');
+            return;
+          }
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true }));
+        });
+      });
+      try {
+        await expect(
+          factory.create(timeoutMs).applyNodePort(base(srv.url), 'app-123', 8080),
+        ).resolves.toBeUndefined();
+        expect(authHeader).toBe('Bearer tok-deploy');
+        // Séquence : 1) PATCH ports_exposes, 2) GET envs (dédup), 3) POST runtime PORT.
+        expect(calls.length).toBe(3);
+        expect(calls[0].method).toBe('PATCH');
+        expect(calls[0].path).toBe('/api/v1/applications/app-123');
+        expect(JSON.parse(calls[0].body).ports_exposes).toBe('8080');
+        expect(calls[1].method).toBe('GET');
+        expect(calls[1].path).toBe('/api/v1/applications/app-123/envs');
+        expect(calls[2].method).toBe('POST');
+        expect(calls[2].path).toBe('/api/v1/applications/app-123/envs');
+        const env = JSON.parse(calls[2].body) as { key: string; value: string; is_runtime: boolean; is_buildtime: boolean };
+        expect(env.key).toBe('PORT');
+        expect(env.value).toBe('8080');
+        expect(env.is_runtime).toBe(true);
+        expect(env.is_buildtime).toBe(false);
+      } finally {
+        await srv.close();
+      }
+    });
+
+    it('applyNodePort supprime les PORT existants avant d’en poser un seul (idempotence)', async () => {
+      const del: string[] = [];
+      const srv = await serve((req, res) => {
+        let body = '';
+        req.on('data', (c: Buffer) => (body += c.toString()));
+        req.on('end', () => {
+          if (req.method === 'GET') {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify([
+              { uuid: 'env-old-1', key: 'PORT', value: '5006' },
+              { uuid: 'env-old-2', key: 'OTHER', value: 'x' },
+              { uuid: 'env-old-3', key: 'port', value: '9999' },
+            ]));
+            return;
+          }
+          if (req.method === 'DELETE') {
+            del.push(req.url ?? '');
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end('{}');
+            return;
+          }
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true }));
+        });
+      });
+      try {
+        await factory.create(timeoutMs).applyNodePort(base(srv.url), 'app-123', 8080);
+        // Les DEUX PORT (case-insensitive) existants sont supprimés, pas OTHER.
+        expect(del).toEqual([
+          '/api/v1/applications/app-123/envs/env-old-1',
+          '/api/v1/applications/app-123/envs/env-old-3',
+        ]);
+      } finally {
+        await srv.close();
+      }
+    });
+
+    it('applyNodePort rejects when the port exposure PATCH returns a non-2xx', async () => {
+      const srv = await serve((_req, res) => {
+        res.writeHead(422);
+        res.end('invalid');
+      });
+      try {
+        await expect(
+          factory.create(timeoutMs).applyNodePort(base(srv.url), 'app-123', 8080),
+        ).rejects.toThrow(/422/);
+      } finally {
+        await srv.close();
+      }
+    });
+
+    it('applyNodePort is Coolify-only (Hestia lève une erreur claire)', async () => {
+      await expect(
+        factory.create(timeoutMs).applyNodePort({ provider: 'HESTIA', baseUrl: 'http://x', token: 't', strictTls: true }, 'app-123', 8080),
+      ).rejects.toThrow(/Coolify uniquement/);
+    });
+
+    // Résolution du port exposé (Approche B) — le provider/transport est l'autorité
+    // de sa config, retourne `null` plutôt qu'une valeur inventée (Coolify 4.1.2).
+    describe('resolveExposedPort', () => {
+      it('retourne le port exposé quand un seul entier valide', async () => {
+        const srv = await serve((_req, res) => {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ports_exposes: '8080' }));
+        });
+        try {
+          await expect(
+            factory.create(timeoutMs).resolveExposedPort(base(srv.url), 'app-123'),
+          ).resolves.toBe(8080);
+        } finally {
+          await srv.close();
+        }
+      });
+
+      it('retourne null si ports_exposes absent/null/vide — jamais de valeur inventée', async () => {
+        for (const value of [undefined, null, '', '   ']) {
+          const body = value === undefined ? {} : { ports_exposes: value };
+          const srv = await serve((_req, res) => {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify(body));
+          });
+          try {
+            await expect(
+              factory.create(timeoutMs).resolveExposedPort(base(srv.url), 'app-123'),
+            ).resolves.toBeNull();
+          } finally {
+            await srv.close();
+          }
+        }
+      });
+
+      it('retourne null sur multi-port — pas de choix muet d’un port HTTP principal', async () => {
+        const srv = await serve((_req, res) => {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ports_exposes: '8080,3000' }));
+        });
+        try {
+          await expect(
+            factory.create(timeoutMs).resolveExposedPort(base(srv.url), 'app-123'),
+          ).resolves.toBeNull();
+        } finally {
+          await srv.close();
+        }
+      });
+
+      it('retourne null si la valeur est invalide (non-entier, hors plage)', async () => {
+        for (const raw of ['abc', '-1', '0', '70000', '8080.5']) {
+          const srv = await serve((_req, res) => {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ports_exposes: raw }));
+          });
+          try {
+            await expect(
+              factory.create(timeoutMs).resolveExposedPort(base(srv.url), 'app-123'),
+            ).resolves.toBeNull();
+          } finally {
+            await srv.close();
+          }
+        }
+      });
+
+      it('retourne null si la requête échoue (non-2xx)', async () => {
+        const srv = await serve((_req, res) => {
+          res.writeHead(500);
+          res.end('boom');
+        });
+        try {
+          await expect(
+            factory.create(timeoutMs).resolveExposedPort(base(srv.url), 'app-123'),
+          ).resolves.toBeNull();
+        } finally {
+          await srv.close();
+        }
+      });
+
+      it('est Coolify-only (Hestia lève une erreur claire)', async () => {
+        await expect(
+          factory.create(timeoutMs).resolveExposedPort({ provider: 'HESTIA', baseUrl: 'http://x', token: 't', strictTls: true }, 'app-123'),
+        ).rejects.toThrow(/Coolify uniquement/);
+      });
+    });
+
     it('listProjects GETs /projects and maps the success-envelope data array', async () => {
       let path = '';
       let authHeader: string | undefined;

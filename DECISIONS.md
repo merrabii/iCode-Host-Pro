@@ -748,5 +748,60 @@ commande avant de s'assurer que réellement tout est ok »).
   `bwgy96194kmgo3v3t6psqokp` (accord requis). Tests : unit/e2e **71** verts (4 suites provisioning/
   deployments/checkout/cloudflare) + `tsc` API et web verts.
 
+## ADR-038 — Résolution générique du port exposé des backends Node (2026-09-15)
+**Status: IMPLEMENTED + verified live (2 preuves publiques HTTP 200)**. Résout le **GAP architectural
+du PORT** identifié en Phase 17/Node : un backend Node qui s'auto-lie sur `process.env.PORT` écoute
+ailleurs que le port routé par le proxy → 503/502. Constat empirique **Coolify 4.1.2** : `ports_exposes`
+reste `null` à la création **et** après un build `finished` ; le conteneur se lie par défaut sur le port
+cuit au build (5006 pour nixpacks) ; le proxy n'atteint **que** le port `EXPOSE` de l'image (**8080**
+pour nixpacks Node) ; forcer un port non-EXPOSE (`ports_exposes=3000`) → 502 persistant même au
+redémarrage.
+
+### Décision
+Le port à appliquer = le **port exposé effectif** (concept « effective exposed port », PAS un « port
+canonique Node » global). Résolution hiérarchique en 3 sources, le provider restant propriétaire :
+1. **Provider** : `PanelTransport.resolveExposedPort(target, uuid)` — lit `GET /applications/:uuid`.
+2. **Contrat build-pack / runtime** (`runtime-port-contract.ts`) : nixpacks + Node → **8080** (contrat
+   explicite, config-like de connaissances du build-pack ; extensible ; non lié à un repo/slug).
+3. Sinon → **PROVISIONING + audit diagnostic `source:'none'`** — jamais de port inventé, jamais ACTIVE
+   sans preuve.
+
+`PORT` runtime = source de vérité du variant applicatif, **pas** le port global : on ne pose PAS un
+`NODE_CANONICAL_PORT` global. Hiérarchie PORT : le port exposé résolu détermine `ports_exposes` **et**
+l'env `PORT` aligné. Un seul env `PORT` logique (dédup supprime les PORT résiduels case-insensitive
+puis reclasse un seul runtime). Provider null, multi-port (`8080,3000`), port invalide (≤0, >65535,
+non-entier) → non résolu (source `none` → PROVISIONING). Contenu **générique** (Express/NestJS/Fastify/
+Koa/Hapi/Node-http/…) — testé sur 2 apps distinctes (pas repo-spécifique). Statique **inchangé** (aucune
+logique de port). Proof-gate intact : ACTIVE uniquement sur preuve (HTTP 2xx + provenance).
+
+### Approches écartées (consignées, jamais inventariées comme actives)
+- **Approche A** (force `ports_exposes=3000` global) : rejetée — 502 persistant, port non-EXPOSE
+  non routable, casse d'autres backends non-Node. Code supprimé.
+- **Approche B pure** (s'appuyer sur le provider) : insuffisante seule — l'API Coolify 4.1.2 renvoie
+  `null` de façon fiable, donc provider-only ⇒ PROVISIONING permanent. Retenue **en tête** de la
+  hiérarchie, complétée par B+C (contrat build-pack).
+
+### Preuves live (2026-09-15)
+1. **Source provider** — order `cmu2lb0100003pecgci02jm21`, app `wefvox807fnvw8whzigoovxe`, sous-domaine
+   `node-1509-e2e.arumdigital.com` : **ACTIVE**, public **HTTP 200** + `x-powered-by: Express` + titre
+   heroku ; `ports_exposes=8080` (engine-set), PORT logique unique `8080`, conteneur « Listening on
+   8080 », audit `source=provider port=8080 ok=true`.
+2. **Source contrat build-pack** — order neuf `ord-node-contract-20260915` (via INSERT), app
+   `ygavfhog4vigx4tbp8zt93wn`, sous-domaine `test-node-e2e.arumdigital.com`, audit
+   `source=buildpack port=8080 ok=true` : convergé (exposure 8080, PORT 8080, « Listening on 8080 »),
+   puis **public HTTP 200** (page heroku, 2ᵉ app distincte ⇒ non repo-spécifique). Le sous-domaine a
+   retourné « Non-existent domain » de façon **transitoire** : `configure_dns` court **avant**
+   `create_app`, donc l'étiquette traefik n'a été câblée qu'au redéploiement d'une relance (quand
+   `appUuid` existait) — artefact d'ordre, **pas** un échec de port ni de DNS. L'order est restée
+   PROVISIONING (le gate a correctement retenu ACTIVE tant que le 200 public n'était pas prouvé), puis
+   **réconciliée ACTIVE** une fois le 200 public vérifié (trace audit `store.order.activate`).
+3. Orphelin `bwgy96194kmgo3v3t6psqokp` : **confirmé supprimé** (Coolify « Application not found »),
+   aucune ressource partagée retirée (les 2 apps live subsistent).
+
+### État au commit
+Unit **398/398**, e2e **146/146** verts. Fichiers : `runtime-port-contract.ts` (créé),
+`panel-transport.factory.ts/.spec.ts` (`resolveExposedPort`, dédup PORT dans `applyNodePort`),
+`provisioning.service.ts/.spec.ts` (`resolveBackendExposedPort`, plus de `NODE_CANONICAL_PORT`),
+2 specs e2e (mock `resolveExposedPort`). Pas de push GitHub (attente validation propriétaire).
+
 # REJECTED
-None recorded in this clean baseline.

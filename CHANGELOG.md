@@ -1,5 +1,21 @@
 # CHANGELOG
 
+## 2026-09-15 — Phase 17 (ADR-038) : résolution générique du port exposé des backends Node — IMPLEMENTED + vérifié live (2 preuves HTTP 200 publiques)
+### Problème résolu
+Le GAP architectural du PORT (Phase 17/Node) : un backend Node qui s'auto-lie sur `process.env.PORT` écoute ailleurs que le port routé par le proxy → 503/502 ; un « port canonique » global fixé en dur cassait la généricité. Constat empirique **Coolify 4.1.2** : `ports_exposes` reste `null` à la création ET après un build fini ; le front seulement l'image **EXPOSE** (nixpacks Node → **8080**), pas les autres. Forcer `ports_exposes=3000` → **502 persistant** même au redémarrage.
+### Added
+- **`runtime-port-contract.ts`** (créé) : contrat explicite build-pack/runtime — `{ buildPack:'nixpacks', runtime:'node', defaultExposedPort:8080, source:'buildpack-contract' }`, extensible, **non lié à un repo/slug**.
+- **`resolveExposedPort`** (abstrait + impl Coolify dans `NodePanelTransport`) : lit `GET /applications/:uuid` ; non-résolu sur null/vide/multi-port/invalide.
+- **Dédup PORT** dans `applyNodePort` : après PATCH `ports_exposes`, supprime les env `PORT` résiduels (case-insensitive), reclasse **un seul** env runtime.
+- **`resolveBackendExposedPort`** dans `provisioning.service` : hiérarchie **provider → contrat build-pack → source `none`**. Plus de `NODE_CANONICAL_PORT`. `PORT` n'est pas un port global : il est aligné sur le port exposé résolu. **source `none` → PROVISIONING + audit diagnostic, jamais de port inventé, jamais ACTIVE sans preuve.**
+- Statique **inchangé** (aucune logique de port) ; proof-gate intact.
+### Verified (live 2026-09-15)
+- **Source provider** : app `wefvox807fnvw8whzigoovxe`, `node-1509-e2e.arumdigital.com` → **ACTIVE**, **HTTP 200** + `x-powered-by: Express` + titre heroku ; exposure 8080, PORT unique 8080, « Listening on 8080 », audit `source=provider port=8080 ok=true`.
+- **Source contrat build-pack** : order neuf `ord-node-contract-20260915`, app `ygavfhog4vigx4tbp8zt93wn`, `test-node-e2e.arumdigital.com` → convergé 8080, **public HTTP 200** (page heroku ; 2ᵉ app distincte ⇒ non repo-spécifique). Le « Non-existent domain » était **transitoire** (configure_dns avant create_app ⇒ étiquette traefik câblée à la relance) — réconcilié ACTIVE une fois le 200 vérifié (trace audit).
+- Orphelin `bwgy96194kmgo3v3t6psqokp` : confirmé supprimé (Coolify « Application not found »), ressources partagées intactes.
+### Tests
+Unit **398/398** · e2e **146/146** verts. **Pas de push GitHub (attente validation propriétaire).**
+
 ## 2026-09-15 — Phase 17 (ADR-037) : provisioning store à preuve réelle + sous-domaines gratuits par produit — IMPLEMENTED + vérifié live — COMMIT CHECKPOINT (avant correction backend Node)
 ### Problème résolu
 3 commandes payées de `ermocrypt` restaient à **PAID sans app** malgré les messages « Commande confirmée ». Deux causes racines corrigées : routing « upgrade » erroné (membre ACTIVE re-commandant) et **confirmation prématurée** (l'ancien `finalize` passait ACTIVE si DNS alloué, même sans app). Exigence durable appliquée : **ne jamais confirmer une commande avant que ce soit réellement OK**.

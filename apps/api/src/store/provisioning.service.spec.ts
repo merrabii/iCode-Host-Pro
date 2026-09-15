@@ -149,7 +149,7 @@ describe('ProvisioningService — actionCreateApp (choix du projet A/B voie stor
     coolifyProjectUuid: 'proj-partage-serveur',
     coolifyServerUuid: 'srv-1',
   };
-  const transport = { createGitApp: jest.fn(), deployApp: jest.fn(), applyAppLimits: jest.fn(), setAppDomain: jest.fn() };
+  const transport = { createGitApp: jest.fn(), deployApp: jest.fn(), applyAppLimits: jest.fn(), setAppDomain: jest.fn(), applyNodePort: jest.fn(), resolveExposedPort: jest.fn().mockResolvedValue(null) };
   const panelFactory = { create: jest.fn(() => transport) };
   const prisma = {
     order: { findUnique: jest.fn(), update: jest.fn() },
@@ -180,6 +180,33 @@ describe('ProvisioningService — actionCreateApp (choix du projet A/B voie stor
                   sharedProjectUuid: 'proj-partage-module',
                   server: coolifyServer,
                 },
+        },
+        provisionModule: { name: 'coolify-store', actions: ['CREATE_APP'] },
+      },
+    };
+  }
+
+  // Produit backend Servé (non statique) : aucun isStatic ni publishDirectory →
+  // est un serveur d'applications → la logique de port runtime s'y applique.
+  function serverRuntimeOrder(opts?: { buildPack?: string; repoUrl?: string }) {
+    return {
+      id: 'ord1',
+      status: 'PAID',
+      domainValue: null,
+      customer: { userId: 'u1' },
+      product: {
+        name: 'Trend',
+        moduleParams: {
+          repoUrl: opts?.repoUrl ?? 'https://github.com/exemple/un-backend-node.git',
+          buildPack: opts?.buildPack ?? 'nixpacks',
+        },
+        pack: {
+          deploymentModule: {
+            kind: 'PER_CLIENT_PROJECT',
+            perClientPrefix: 'client',
+            sharedProjectUuid: 'proj-partage-module',
+            server: coolifyServer,
+          },
         },
         provisionModule: { name: 'coolify-store', actions: ['CREATE_APP'] },
       },
@@ -302,6 +329,50 @@ describe('ProvisioningService — actionCreateApp (choix du projet A/B voie stor
     });
     expect(transport.deployApp).toHaveBeenCalledWith(expect.anything(), 'app-OLD');
     // App réutilisée mais non prouvée en ligne → PROVISIONING.
+    expect(out.status).toBe('PROVISIONING');
+  });
+
+  // Fix GAP PORT (2026-09-15) — Approche B + contrat build-pack : le port d'un
+  // backend Servé est RÉSOLU (source de vérité provider puis contrat build-pack),
+  // jamais un chiffre canonique arbitraire ; un SPA n'y est jamais soumis.
+  it('fix port — backend Node non statique ⇒ port résolu (provider OU contrat build-pack) avant deploy, pas pour un SPA', async () => {
+    // (a) Produit SPA (isStatic+publishDirectory) → aucune logique de port.
+    prisma.order.findUnique.mockResolvedValue(orderFor('PER_CLIENT_PROJECT'));
+    await service.provisionOrder('ord1');
+    expect(transport.applyNodePort).not.toHaveBeenCalled();
+    expect(transport.resolveExposedPort).not.toHaveBeenCalled();
+
+    // (b) Backend servé + provider EXPOSE un port (source = provider).
+    jest.clearAllMocks();
+    deployments.getOrCreateClientProject.mockResolvedValue({ id: 'cp1', projectUuid: 'proj-dedie-client' });
+    (transport.resolveExposedPort as jest.Mock).mockResolvedValue(4000);
+    prisma.order.findUnique.mockResolvedValue(serverRuntimeOrder());
+    await service.provisionOrder('ord1');
+    expect(transport.resolveExposedPort).toHaveBeenCalled();
+    expect(transport.applyNodePort).toHaveBeenCalledWith(expect.anything(), 'app9', 4000);
+
+    // (c) Backend servé + provider NULL ⇒ fallback contrat build-pack (nixpacks → 8080).
+    jest.clearAllMocks();
+    deployments.getOrCreateClientProject.mockResolvedValue({ id: 'cp1', projectUuid: 'proj-dedie-client' });
+    (transport.resolveExposedPort as jest.Mock).mockResolvedValue(null);
+    prisma.order.findUnique.mockResolvedValue(serverRuntimeOrder());
+    await service.provisionOrder('ord1');
+    expect(transport.applyNodePort).toHaveBeenCalledWith(expect.anything(), 'app9', 8080);
+
+    // (d) Backend servé + provider NULL + AUCUN contrat ⇒ aucun port injecté,
+    //     diagnostic explicite enregistré, jamais ACTIVE (order reste PROVISIONING).
+    jest.clearAllMocks();
+    deployments.getOrCreateClientProject.mockResolvedValue({ id: 'cp1', projectUuid: 'proj-dedie-client' });
+    (transport.resolveExposedPort as jest.Mock).mockResolvedValue(null);
+    prisma.order.findUnique.mockResolvedValue(serverRuntimeOrder({ buildPack: 'dockerfile' }));
+    const out = await service.provisionOrder('ord1');
+    expect(transport.applyNodePort).not.toHaveBeenCalled();
+    expect(audit.record).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: 'provision.node_port',
+        details: expect.objectContaining({ ok: false, source: 'none' }),
+      }),
+    );
     expect(out.status).toBe('PROVISIONING');
   });
 

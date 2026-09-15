@@ -43,6 +43,8 @@ describe('Server panel verify (e2e, Phase 9)', () => {
       deployApp: jest.fn(),
       applyAppLimits: jest.fn(),
       setAppEnvironment: jest.fn(),
+      applyNodePort: jest.fn().mockResolvedValue(undefined),
+      resolveExposedPort: jest.fn().mockResolvedValue(null),
       setAppDomain: jest.fn(),
       deleteApplication: jest.fn(),
       deploymentStatus: jest.fn(),

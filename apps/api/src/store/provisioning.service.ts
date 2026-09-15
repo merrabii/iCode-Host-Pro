@@ -20,6 +20,7 @@ import {
   PanelTransportFactory,
   PanelTransport,
 } from '../servers/panel-transport.factory';
+import { resolveBuildPackPortContract } from '../servers/runtime-port-contract';
 
 /**
  * Bloc D — provision réel d'une commande store.
@@ -34,6 +35,7 @@ import {
  * Best-effort par étape : un échec met la step en FAILED mais ne coupe pas
  * les suivantes ; le statut final dépend du succès des steps critiques.
  */
+
 @Injectable()
 export class ProvisioningService {
   private readonly log = new Logger(ProvisioningService.name);
@@ -546,6 +548,11 @@ export class ProvisioningService {
         ? String(params.publishDirectory).trim()
         : undefined;
     const isStatic = typeof params.isStatic === 'boolean' ? params.isStatic : undefined;
+    // Backend servé (Node/autre runtime) vs SPA statique : un SPA (isStatic OU
+    // publishDirectory de build) est servi en statique — on NE lui applique PAS
+    // la logique de port runtime Node (STATIC reste STATIC). Un produit sans
+    // isStatic ni publishDirectory est un serveur d'applications → port réconcilié.
+    const isServerRuntime = !(isStatic === true || String(publishDirectory ?? '').trim().length > 0);
     const appName = typeof params.appName === 'string' && String(params.appName).trim()
       ? String(params.appName).trim()
       : fullOrder?.product.name ?? 'app';
@@ -647,6 +654,55 @@ export class ProvisioningService {
         // best-effort — le domaine sera posable en retry
       }
     }
+    // Réconciliation du port (fix GAP PORT, 2026-09-15, Approche B + contrat
+    // build-pack) : pour un backend Servé (non statique), on résout le port
+    // EFFECTIVEMENT exposé/routé par le provider et on rend le runtime cohérent
+    // AVANT le déploiement. Source de vérité : ① `resolveExposedPort()` (provider)
+    // → ② contrat build-pack/runtime si le provider ne le révèle pas (cas réel
+    // Coolify 4.1.2 : `ports_exposes` = null) → ③ aucun : diagnostic, AUCUN port
+    // injecté, et le proof-gate garde l'ordre non-ACTIVE (jamais de faux port, jamais
+    // de faux ACTIVE). Générique : la valeur ne dépend JAMAIS du dépôt/slug/framework.
+    if (isServerRuntime) {
+      const resolved = await this.resolveBackendExposedPort(transport, target, appUuid, buildPack);
+      if (resolved.port !== null) {
+        try {
+          await transport.applyNodePort(target, appUuid, resolved.port);
+          this.log.log(
+            `provision order=${ctx.order.id}: port backend résolu=${resolved.port} (source=${resolved.source})`,
+          );
+          await this.audit.record({
+            action: 'provision.node_port',
+            resourceType: 'order',
+            resourceId: ctx.order.id,
+            details: { ok: true, port: resolved.port, source: resolved.source },
+          });
+        } catch (err) {
+          const m = err instanceof Error ? err.message : String(err);
+          this.log.warn(`provision order=${ctx.order.id}: port runtime non appliqué (${m})`);
+          await this.audit.record({
+            action: 'provision.node_port',
+            resourceType: 'order',
+            resourceId: ctx.order.id,
+            details: { ok: false, error: m, port: resolved.port },
+          });
+          // On ne bloque pas : le proof-gate (awaitAppReady) gardera l'ordre
+          // non-ACTIVE si le runtime ne sert pas réellement.
+        }
+      } else {
+        // Aucune source fiable (provider null + aucun contrat build-pack) :
+        // on n'injecte PAS de port fantaisiste. Diagnostic explicite. Le proof-gate
+        // garde l'order PROVISIONING (jamais ACTIVE sans preuve de service réel).
+        const msg =
+          'Aucun port exposé fiable pour ce backend (provider null, aucun contrat build-pack/runtime). PROVISIONING, jamais ACTIVE.';
+        this.log.warn(`provision order=${ctx.order.id}: ${msg}`);
+        await this.audit.record({
+          action: 'provision.node_port',
+          resourceType: 'order',
+          resourceId: ctx.order.id,
+          details: { ok: false, error: msg, source: 'none' },
+        });
+      }
+    }
     await transport.deployApp(target, appUuid);
 
     // Row Deployment : création (nouvelle app) ou mise à jour du déploiement.
@@ -738,6 +794,38 @@ export class ProvisioningService {
       .replace(/\/+$/, '');
     const parts = cleaned.split('/').filter(Boolean);
     return parts.length >= 2 ? `${parts[0]}/${parts[1]}` : null;
+  }
+
+  /**
+   * Résout le port EFFECTIVEMENT exposé/routé pour un backend servé, avec sa
+   * source de vérité. Ordonnancement (Approche B + contrat build-pack, validé) :
+   *   1. `resolveExposedPort()` du provider/transport — la responsabilité de
+   *      connaître sa propre config reste au provider (Coolify 4.1.2 renvoie
+   *      souvent `null`, l'image n'ayant pas encore été analysée) ;
+   *   2. contrat build-pack/runtime explicite (`resolveBuildPackPortContract`) si
+   *      le provider ne révèle rien — connaissance du runtime, jamais du dépôt ;
+   *   3. aucun ⇒ `{ port: null, source: 'none' }` → le moteur N'INJECTE AUCUN port
+   *      fantaisiste et laisse le proof-gate garder l'ordre non-ACTIVE.
+   * Le résultat est déterministe et indépendant du repository/framework.
+   */
+  private async resolveBackendExposedPort(
+    transport: PanelTransport,
+    target: PanelTarget,
+    appUuid: string,
+    buildPack: string,
+  ): Promise<{ port: number | null; source: 'provider' | 'buildpack' | 'none' }> {
+    let providerPort: number | null = null;
+    try {
+      providerPort = await transport.resolveExposedPort(target, appUuid);
+    } catch {
+      providerPort = null;
+    }
+    if (providerPort !== null) return { port: providerPort, source: 'provider' };
+    const contract = resolveBuildPackPortContract(buildPack);
+    if (contract?.defaultExposedPort != null) {
+      return { port: contract.defaultExposedPort, source: 'buildpack' };
+    }
+    return { port: null, source: 'none' };
   }
 
   private async actionConfigureDns(ctx: {

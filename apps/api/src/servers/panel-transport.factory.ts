@@ -155,6 +155,24 @@ export abstract class PanelTransport {
     uuid: string,
     env: Record<string, string>,
   ): Promise<void>;
+  /** Réconciliation du port runtime d'un backend servé (COOLIFY) : pose le port
+   *  RÉSOLU exposé/routé par le provider (Traefik/Coolify) ET la variable runtime
+   *  `PORT` à la MÊME valeur, pour que le process écoute exactement là où le proxy
+   *  route. Générique — s'applique à tout backend Node, indépendant du dépôt/build
+   *  pack. La valeur `port` DOIT être résolue en amont (source de vérité provider
+   *  puis contrat build-pack) : cette méthode ne devine jamais un port. */
+  abstract applyNodePort(
+    target: PanelTarget,
+    uuid: string,
+    port: number,
+  ): Promise<void>;
+  /** Résolution du port EFFECTIVEMENT exposé/routé par le provider pour une app.
+   *  Retourne un entier positif si le provider peut le déterminer, sinon `null` —
+   *  JAMAIS une valeur inventée. La connaissance de sa propre config reste au
+   *  provider/transport : les futurs providers implémentent leur mécanisme.
+   *  Coolify 4.1.2 : lit `ports_exposes` (souvent `null` tant que l'image n'a pas
+   *  été analysée) ; un multi-port non identifiable → `null` (pas de choix muet). */
+  abstract resolveExposedPort(target: PanelTarget, uuid: string): Promise<number | null>;
   abstract deploymentStatus(
     target: PanelTarget,
     uuid: string,
@@ -538,6 +556,135 @@ class NodePanelTransport extends PanelTransport {
         `Coolify API : variables d'environnement refusées (HTTP ${status})${body ? ` — ${body.slice(0, 200)}` : ''}`,
       );
     }
+  }
+
+  /**
+   * Réconciliation du port runtime (fix GAP PORT, générique — Phase 2026-09-15).
+   * Rend un backend servé cohérent sur TOUTE la chaîne en posant la MÊME valeur
+   * (le port `port` RÉSOLU — source provider ou contrat build-pack) :
+   *   1. le port exposé/routé par le provider (`ports_exposes`, PATCH app) ;
+   *   2. la variable RUNTIME `PORT` (convention universelle Node/12-factor).
+   * Ainsi le process écoute là où Traefik route — là où Nixpacks pouvait choisir
+   * un port « libre » (ex. 5006) divergent de l'exposition réellement servie (8080),
+   * causant un 503 « no available server » sur container pourtant running.
+   * Endpoints vérifiés contre le serveur réel (Coolify 4.1.2) : PATCH
+   * `/applications/:uuid` (ports_exposes) et POST `/applications/:uuid/envs`
+   * (is_runtime). IMPORTANT : `port` est TOUJOURS un port résolu en amont — JAMAIS
+   * une constante arbitraire (l'Approche A « canonique 3000 » a été rejetée après
+   * preuve réelle : ports_exposes=3000 + process 3000 + restart ⇒ 502, car seul le
+   * port EXPOSÉ par l'image est routable). Aucun dépôt particulier n'est référencé.
+   */
+  async applyNodePort(
+    target: PanelTarget,
+    uuid: string,
+    port: number,
+  ): Promise<void> {
+    this.assertCoolify(target);
+    const base = target.baseUrl.replace(/\/+$/, '');
+    const p = String(port);
+    // 1) Port exposé/routé par le provider.
+    const patch = await httpJson(
+      'PATCH',
+      `${base}/applications/${encodeURIComponent(uuid)}`,
+      { Authorization: `Bearer ${target.token}` },
+      target.strictTls,
+      this.timeoutMs,
+      JSON.stringify({ ports_exposes: p }),
+    );
+    if (patch.status !== 200 && patch.status !== 204) {
+      throw new Error(
+        `Coolify API : port exposé refusé (HTTP ${patch.status})${patch.body ? ` — ${patch.body.slice(0, 200)}` : ''}`,
+      );
+    }
+    // 1bis) Déduplication (idempotence) : supprimer TOUTE variable PORT existante
+    //       avant d'en poser UNE seule — jamais de doublon, résultat déterministe.
+    const listRes = await httpJson(
+      'GET',
+      `${base}/applications/${encodeURIComponent(uuid)}/envs`,
+      { Authorization: `Bearer ${target.token}` },
+      target.strictTls,
+      this.timeoutMs,
+    );
+    if (listRes.status === 200) {
+      let envs: { key?: unknown; uuid?: unknown }[] = [];
+      try {
+        envs = JSON.parse(listRes.body) as { key?: unknown; uuid?: unknown }[];
+      } catch {
+        envs = [];
+      }
+      for (const e of Array.isArray(envs) ? envs : []) {
+        if (e && /^PORT$/i.test(String(e.key ?? '')) && typeof e.uuid === 'string') {
+          await httpJson(
+            'DELETE',
+            `${base}/applications/${encodeURIComponent(uuid)}/envs/${encodeURIComponent(e.uuid)}`,
+            { Authorization: `Bearer ${target.token}` },
+            target.strictTls,
+            this.timeoutMs,
+          );
+        }
+      }
+    }
+    // 2) Variable d'environnement RUNTIME `PORT` (pas build-time) — c'est celle
+    //    que lit réellement `process.env.PORT` dans le container.
+    const env = await httpJson(
+      'POST',
+      `${base}/applications/${encodeURIComponent(uuid)}/envs`,
+      { Authorization: `Bearer ${target.token}` },
+      target.strictTls,
+      this.timeoutMs,
+      JSON.stringify({
+        key: 'PORT',
+        value: p,
+        is_preview: false,
+        is_buildtime: false,
+        is_runtime: true,
+        is_literal: true,
+      }),
+    );
+    if (env.status !== 200 && env.status !== 201 && env.status !== 204) {
+      throw new Error(
+        `Coolify API : variable runtime PORT refusée (HTTP ${env.status})${env.body ? ` — ${env.body.slice(0, 200)}` : ''}`,
+      );
+    }
+  }
+
+  /**
+   * Résolution du port exposé/routé par le provider (Coolify 4.1.2).
+   * Lit `GET /applications/:uuid → ports_exposes`. Retourne `null` (jamais une
+   * invention) si : non-2xx, champ absent/vide/null, invalide, ou multi-port non
+   * identifiable (on ne choisit pas silencieusement le premier sans connaître le
+   * port HTTP principal). Sur cette version, `ports_exposes` reste souvent `null`
+   * tant que l'image n'a pas été analysée → le moteur retombe alors sur le contrat
+   * build-pack. La connaissance du port reste la responsabilité du provider.
+   */
+  async resolveExposedPort(target: PanelTarget, uuid: string): Promise<number | null> {
+    this.assertCoolify(target);
+    const base = target.baseUrl.replace(/\/+$/, '');
+    const { status, body } = await httpJson(
+      'GET',
+      `${base}/applications/${encodeURIComponent(uuid)}`,
+      { Authorization: `Bearer ${target.token}` },
+      target.strictTls,
+      this.timeoutMs,
+    );
+    if (status !== 200) return null;
+    let parsed: { ports_exposes?: unknown };
+    try {
+      parsed = JSON.parse(body) as { ports_exposes?: unknown };
+    } catch {
+      return null;
+    }
+    const raw = parsed?.ports_exposes;
+    if (typeof raw !== 'string' || !raw.trim()) return null;
+    const parts = raw
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    // Multi-port : sans port HTTP principal identifiable, pas de choix muet → null.
+    if (parts.length !== 1) return null;
+    const n = Number(parts[0]);
+    if (!Number.isInteger(n) || n <= 0 || n > 65535) return null;
+    return n;
   }
 
   /** Déclenche un déploiement de l'application Coolify (POST /deploy, vérifié live

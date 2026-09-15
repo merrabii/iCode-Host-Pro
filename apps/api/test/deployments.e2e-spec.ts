@@ -69,6 +69,8 @@ describe('Deployments GitHub → Coolify (e2e, Phase 10bis)', () => {
       deployApp: fakeDeployApp,
       applyAppLimits: jest.fn().mockResolvedValue(undefined),
       setAppEnvironment: jest.fn().mockResolvedValue(undefined),
+      applyNodePort: jest.fn().mockResolvedValue(undefined),
+      resolveExposedPort: jest.fn().mockResolvedValue(null),
       setAppDomain: jest.fn().mockResolvedValue(undefined),
       deleteApplication: jest.fn().mockResolvedValue(undefined),
       deploymentStatus: fakeDeploymentStatus,
