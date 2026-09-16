@@ -34,6 +34,7 @@ describe('ProductsService', () => {
     productAddon: { findMany: jest.fn(), create: jest.fn(), findUnique: jest.fn(), update: jest.fn(), delete: jest.fn() },
     provisionMethod: { findMany: jest.fn() },
     domain: { findMany: jest.fn() },
+    cloudflareSetting: { findFirst: jest.fn() },
   };
   const mockAudit = { record: jest.fn() };
   const actor = { sub: 'admin', email: 'admin@example.com' };
@@ -341,6 +342,112 @@ describe('ProductsService', () => {
       const out = await service.findPublicBySlug('premium');
       expect(out.freeDomains).toBeUndefined();
       expect(mockPrisma.domain.findMany).not.toHaveBeenCalled();
+    });
+
+    // ── initialDomainId : sélection initiale canonique (Phase 4) ──────────────
+    it('rootDomainId éligible parmi 2+ ⇒ initialDomainId = rootDomainId (default plateforme)', async () => {
+      mockPrisma.product.findFirst.mockResolvedValue({
+        ...baseProd,
+        freeSubdomainRule: { id: 'r1', allowedDomainIds: [] },
+      });
+      mockPrisma.domain.findMany.mockResolvedValue([
+        { id: 'dom-codediali', name: 'codediali.com' },
+        { id: 'dom-arum', name: 'arumdigital.com' },
+      ]);
+      mockPrisma.cloudflareSetting.findFirst.mockResolvedValue({ rootDomainId: 'dom-codediali' });
+      const out = await service.findPublicBySlug('premium');
+      expect(out.freeDomains).toHaveLength(2);
+      expect(out.initialDomainId).toBe('dom-codediali');
+    });
+
+    it('rootDomainId hors whitelist ⇒ jamais servi ; l’unique éligible devient initial', async () => {
+      mockPrisma.product.findFirst.mockResolvedValue({
+        ...baseProd,
+        freeSubdomainRule: { id: 'r1', allowedDomainIds: ['dom-arum'] },
+      });
+      mockPrisma.domain.findMany.mockResolvedValue([
+        { id: 'dom-codediali', name: 'codediali.com' },
+        { id: 'dom-arum', name: 'arumdigital.com' },
+      ]);
+      mockPrisma.cloudflareSetting.findFirst.mockResolvedValue({ rootDomainId: 'dom-codediali' });
+      const out = await service.findPublicBySlug('premium');
+      expect(out.freeDomains).toEqual([{ id: 'dom-arum', name: 'arumdigital.com' }]);
+      expect(out.initialDomainId).toBe('dom-arum'); // unique éligible (codediali exclu)
+    });
+
+    it('2+ éligibles, rootDomainId non-éligible ⇒ initialDomainId = null (ambiguïté, aucun pick)', async () => {
+      mockPrisma.product.findFirst.mockResolvedValue({
+        ...baseProd,
+        freeSubdomainRule: { id: 'r1', allowedDomainIds: [] },
+      });
+      mockPrisma.domain.findMany.mockResolvedValue([
+        { id: 'dom-a', name: 'a.com' },
+        { id: 'dom-b', name: 'b.com' },
+      ]);
+      mockPrisma.cloudflareSetting.findFirst.mockResolvedValue({ rootDomainId: 'dom-z' });
+      const out = await service.findPublicBySlug('premium');
+      expect(out.freeDomains).toHaveLength(2);
+      expect(out.initialDomainId).toBeNull();
+    });
+
+    it('1 seul éligible, pas de défaut plateforme ⇒ initialDomainId = ce domaine unique', async () => {
+      mockPrisma.product.findFirst.mockResolvedValue({
+        ...baseProd,
+        freeSubdomainRule: { id: 'r1', allowedDomainIds: [] },
+      });
+      mockPrisma.domain.findMany.mockResolvedValue([{ id: 'dom-only', name: 'only.com' }]);
+      mockPrisma.cloudflareSetting.findFirst.mockResolvedValue(null);
+      const out = await service.findPublicBySlug('premium');
+      expect(out.freeDomains).toEqual([{ id: 'dom-only', name: 'only.com' }]);
+      expect(out.initialDomainId).toBe('dom-only');
+    });
+
+    it('0 éligible ⇒ initialDomainId = null', async () => {
+      mockPrisma.product.findFirst.mockResolvedValue({
+        ...baseProd,
+        freeSubdomainRule: { id: 'r1', allowedDomainIds: ['dom-ghost'] },
+      });
+      mockPrisma.domain.findMany.mockResolvedValue([]);
+      mockPrisma.cloudflareSetting.findFirst.mockResolvedValue({ rootDomainId: 'dom-ghost' });
+      const out = await service.findPublicBySlug('premium');
+      expect(out.freeDomains).toEqual([]);
+      expect(out.initialDomainId).toBeNull();
+    });
+
+    it('sans FreeSubdomainRule ⇒ initialDomainId = null (freeDomains absent, comportement préservé)', async () => {
+      mockPrisma.product.findFirst.mockResolvedValue(baseProd);
+      mockPrisma.domain.findMany.mockResolvedValue([{ id: 'dom-a', name: 'codediali.com' }]);
+      const out = await service.findPublicBySlug('premium');
+      expect(out.freeDomains).toBeUndefined();
+      expect(out.initialDomainId).toBeNull();
+      expect(mockPrisma.domain.findMany).not.toHaveBeenCalled();
+    });
+
+    it('aucun secret Cloudflare (zoneId/token/accountId/cnameTarget) dans PublicProduct', async () => {
+      mockPrisma.product.findFirst.mockResolvedValue({
+        ...baseProd,
+        freeSubdomainRule: { id: 'r1', allowedDomainIds: [] },
+      });
+      mockPrisma.domain.findMany.mockResolvedValue([{ id: 'dom-a', name: 'codediali.com' }]);
+      mockPrisma.cloudflareSetting.findFirst.mockResolvedValue({ rootDomainId: 'dom-a' });
+      const out = (await service.findPublicBySlug('premium')) as Record<string, unknown>;
+      expect(JSON.stringify(out)).not.toMatch(/(zoneId|apiToken|accountId|cnameTarget)/i);
+    });
+
+    it('initialDomainId ≠ freeDomains[0] : retour DB à ordre inversé → invariant rootDomainId/unicité', async () => {
+      mockPrisma.product.findFirst.mockResolvedValue({
+        ...baseProd,
+        freeSubdomainRule: { id: 'r1', allowedDomainIds: [] },
+      });
+      mockPrisma.domain.findMany.mockResolvedValue([
+        { id: 'dom-arum', name: 'arumdigital.com' },
+        { id: 'dom-codediali', name: 'codediali.com' },
+      ]);
+      mockPrisma.cloudflareSetting.findFirst.mockResolvedValue({ rootDomainId: 'dom-codediali' });
+      const out = await service.findPublicBySlug('premium');
+      // freeDomains[0] = arumdigital, MAIS initial = codediali (default plateforme).
+      expect(out.freeDomains?.[0]?.id).toBe('dom-arum');
+      expect(out.initialDomainId).toBe('dom-codediali');
     });
   });
 });

@@ -974,6 +974,10 @@ export interface PublicProduct {
   // Phase 4 — racines éligibles {id, name} pour le sélecteur de domaine (absentes
   // si produit sans sous-domaine ; [] servi seulement si un produit a une règle).
   freeDomains?: { id: string; name: string }[];
+  // Phase 4 — domaine racine INITIAL canonique pour le sélecteur : rootDomainId
+  // éligible, sinon l'unique éligible, sinon null (ambiguïté/aucun). Jamais choisi
+  // arbitrairement (freeDomains[0]). Le client peut ensuite changer explicitement.
+  initialDomainId: string | null;
   // Phase 16 — Plan Gratuit : inscription autonome SANS checkout (décision B).
   // true → bouton « Commencez gratuitement » (visiteur) / « Créer un nouveau
   // Projet » (connecté) au lieu du tunnel de commande / panier.

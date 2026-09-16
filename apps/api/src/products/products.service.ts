@@ -111,6 +111,12 @@ export type PublicProduct =
     /** Phase 4 — racines éligibles {id, name} pour un produit à sous-domaine gratuit
      *  (résolues ACTIVE + restreintes par `allowedDomainIds`). Absent sinon. */
     freeDomains?: { id: string; name: string }[];
+    /** Phase 4 — domaine racine INITIAL canonique pour le sélecteur store :
+     *  CloudflareSetting.rootDomainId s'il est éligible, sinon l'unique éligible,
+     *  sinon `null` (ambiguïté 2+ sans défaut plateforme, aucun éligible, ou produit
+     *  sans sous-domaine gratuit). Jamais `freeDomains[0]` arbitraire. Toujours posé
+     *  par `attachFreeDomains`. */
+    initialDomainId: string | null;
   };
 
 @Injectable()
@@ -235,24 +241,43 @@ export class ProductsService {
 
   /** Phase 4 — Rattache aux produits à sous-domaine gratuit leur(s) racine(s)
    *  éligibles `{id, name}` (ACTIVE, restreinte par `allowedDomainIds` si posée ;
-   *  [] = toutes ACTIVE). Le web checkout a besoin des NOMS de zones (pas que des
-   *  ids) pour le sélecteur de racine. Aligne le store sur `findMemberFreeDomains`. */
-  private async attachFreeDomains<T extends PublicProduct>(
-    items: T[],
-  ): Promise<T[]> {
-    const withRule = items.filter((p) => !!p.freeSubdomainRule);
-    if (withRule.length === 0) return items;
-    const allActive = await this.prisma.domain.findMany({
-      where: { status: 'ACTIVE' },
-      select: { id: true, name: true },
-      orderBy: [{ name: 'asc' }],
-    });
-    return items.map((p) => {
-      if (!p.freeSubdomainRule) return p;
+   *  [] = toutes ACTIVE) + la sélection initiale canonique `initialDomainId`
+   *  (rootDomainId éligible → sinon unique éligible → sinon null). Le web checkout
+   *  a besoin des NOMS de zones + du défaut pour le sélecteur de racine. Aligne le
+   *  store sur `findMemberFreeDomains` et sur le résolveur canonique Phase 4. */
+  private async attachFreeDomains(
+    items: Array<Prisma.ProductGetPayload<{ include: typeof PUBLIC_INCLUDE }>>,
+  ): Promise<PublicProduct[]> {
+    if (!items.some((p) => !!p.freeSubdomainRule)) {
+      // Aucun produit à sous-domaine gratuit : initialDomainId = null (rien
+      // d'applicable), freeDomains absent (comportement public inchangé), aucune
+      // requête domain.
+      return items.map((p) => ({ ...p, initialDomainId: null }));
+    }
+    const [allActive, cfSettings] = await Promise.all([
+      this.prisma.domain.findMany({
+        where: { status: 'ACTIVE' },
+        select: { id: true, name: true },
+        orderBy: [{ name: 'asc' }],
+      }),
+      this.prisma.cloudflareSetting.findFirst({ select: { rootDomainId: true } }),
+    ]);
+    const rootDomainId = cfSettings?.rootDomainId ?? null;
+    return items.map((p): PublicProduct => {
+      if (!p.freeSubdomainRule) return { ...p, initialDomainId: null };
       const allowed = p.freeSubdomainRule.allowedDomainIds ?? [];
-      const list =
+      const freeDomains =
         allowed.length > 0 ? allActive.filter((d) => allowed.includes(d.id)) : allActive;
-      return { ...p, freeDomains: list };
+      // Racine initiale canonique : défaut PLATEFORME (rootDomainId) s'il est
+      // éligible, sinon l'unique éligible, sinon null (ambiguïté 2+ ou aucun).
+      // Jamais freeDomains[0] arbitraire.
+      let initialDomainId: string | null = null;
+      if (rootDomainId && freeDomains.some((d) => d.id === rootDomainId)) {
+        initialDomainId = rootDomainId;
+      } else if (freeDomains.length === 1) {
+        initialDomainId = freeDomains[0]!.id;
+      }
+      return { ...p, freeDomains, initialDomainId };
     });
   }
 

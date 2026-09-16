@@ -75,10 +75,12 @@ export default function ShopProductPage() {
       }
       const p = res.data as PublicProduct;
       setProduct(p);
-      // Phase 4 — une seule racine éligible → présélection (aucun sélecteur affiché).
-      if (p.freeSubdomainRule && p.freeDomains && p.freeDomains.length === 1) {
-        setRequestedDomainId(p.freeDomains[0].id);
-      }
+      // Phase 4 — présélection canadée via initialDomainId (défaut plateforme ou
+      // unique éligible). null (ambiguïté 2+/aucun) → pas de présélection ; le
+      // backend re-résout canoniquement. Jamais freeDomains[0] arbitraire. Appliqué
+      // UNE fois par chargement de produit (effect piloté par `slug`) : un choix
+      // manuel ultérieur du client n'est pas écrasé tant que le slug ne change pas.
+      setRequestedDomainId(p.initialDomainId ?? null);
       const defs: Record<string, string> = {};
       for (const o of p.options ?? []) {
         if (o.required && o.choices.length) defs[o.id] = o.choices[0].id;
