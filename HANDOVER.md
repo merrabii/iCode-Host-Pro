@@ -6,6 +6,9 @@ README.md → PROJECT_CONTEXT.md → PROJECT_STATUS.md → DECISIONS.md → TASK
 ## Before changing code
 Determine current phase, actual implementation, proposed versus approved decisions, blockers and owner test requirements. If unclear, analyze rather than guess.
 
+## Current task — **Phase 2 (audit produit admin, 2026-09-16) — Product Readiness alignée sur la source de vérité serveur du provisioning**
+La Roadmap d'un produit affichait une **fausse alerte BLOCKING** « Serveur Coolify non configuré » (API Node.js Starter, réellement **ACTIVE**) : elle résolvait le serveur via `pack.deploymentModuleId` — **scalaire absent** de la payload admin — au lieu de la relation embarquée **`pack.deploymentModule.server`** qu'utilise le provisioning (`getProvisioning`). Corrigé : logique readiness **extraite** (`product-roadmap-logic.ts`, module pur testable) lisant la relation réelle ; **NOT_APPLICABLE** si aucun pack (info), **BLOCKING réel conservé** si pack sans serveur. **Aucune modif backend/API ; moteur de provisioning inchangé.** Tests readiness **5/5** · tsc web **vert** · `next build` **vert**. Commit local **`fix(admin): align product readiness with provisioning`** — **non poussé**. Voir CHANGELOG 2026-09-16.
+
 ## Current state — **PHASE 17 (ADR-038) — résolution générique du port exposé des backends Node — ACTIVE live en E2E — 2026-09-15**
 Le **2026-09-15**, le GAP architectural du PORT Node est **résolu et prouvé live** (voir ADR-038). Résumé de l'état **réel** :
 - **Résolution du port** = hiérarchie **provider → contrat build-pack (nixpacks Node → 8080) → source `none` (PROVISIONING + diagnostic)**. `resolveExposedPort` (provider), `runtime-port-contract.ts`, dédup PORT dans `applyNodePort`, `resolveBackendExposedPort` dans `provisioning.service`. Plus de `NODE_CANONICAL_PORT`. Statique inchangé. Proof-gate intact (jamais de faux ACTIVE, jamais de port inventé).

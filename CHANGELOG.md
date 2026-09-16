@@ -1,5 +1,20 @@
 # CHANGELOG
 
+## 2026-09-16 — Phase 2 (audit produit admin) : **alignement de Product Readiness avec la source de vérité serveur du provisioning**
+### Problème résolu
+L'onglet **Roadmap / readiness** d'un produit affichait une **fausse alerte bloquante** « Serveur Coolify non configuré » alors que le provisioning fonctionnait réellement (cas **API Node.js Starter** : Product→Order→Provisioning→Coolify→HTTP 200→ACTIVE). Audit Phase 1 : la readiness résolvait le serveur via **`pack.deploymentModuleId`** — **scalaire absent de la payload admin** — puis un cross-lookup dans la liste tierce `modules` : toujours `undefined` ⇒ serveur « absent » à tort. À l'inverse, le **provisioning** lit la relation embarquée **`product.pack.deploymentModule.server`** (même source que `getProvisioning`), correctement peuplée.
+### Corrigé (ciblé, moteur de provisioning **inchangé**)
+- **`apps/web/src/components/admin/product-roadmap-logic.ts`** (nouveau) : logique pure de la readiness **extraite** (sans React), qui lit le module/serveur/type via la **relation `pack.deploymentModule.server`** — la représentation que le provisioning résout déjà. Suppression du cross-lookup mort (scalaire absent) et du prop `modules`.
+- **`product-roadmap-tab.tsx`** : consomme la logique pure ; corrige le commentaire trompeur (« c'était réglé ») qui masquait un 2ᵉ incident de la même classe.
+- **`lib/api.ts`** : le type `PackMin.deploymentModule` est **aligné sur la payload réelle** (`kind` + `server {id, hostname}`) — la vue produit embarque le serveur (la vue Pack, elle, non : correctement distincte).
+- **Règle NOT_APPLICABLE** : un produit **sans pack** n'emboîte plus de faux « Serveur non configuré » — sa section Déploiement devient informative ; le BLOCKING « choisir un pack » reste porté par la section Pack & classification. Un produit **avec pack mais sans serveur** conserve un **vrai BLOCKING** (il est configuré pour héberger : l'absence de serveur bloque réellement la création d'app).
+### Tests (frontend — web sans runner ; runner léger `scripts/readiness-tests.mjs`)
+TEST 1 server valide→configuré · TEST 2 pack+module sans serveur→reste bloquant · TEST 3 scalaire `deploymentModuleId` absent + relation server présente→aucun faux BLOCKING · TEST 4 reload/payload admin→readiness correcte · TEST 5 sans pack→NOT_APPLICABLE (info), aucune fausse erreur.
+### Tests / gates
+**readiness-tests 5/5 passés** · `tsc --noEmit` web **vert (EXIT 0)** · `next build` **vert (BUILD_EXIT 0, types valides)**. **Aucune modif backend/API** (la payload portait déjà la relation server) ⇒ aucun test API à rejouer (règle §11).
+### Commit state
+Commit local dédié **`fix(admin): align product readiness with provisioning`** — **non poussé** (attente GO). Aucun hardcode (serveur/ID/UUID/slug), aucun secret.
+
 ## 2026-09-15 — Phase 17 (ADR-038) : **réconciliation Deployment↔Order après preuve réelle** (divergence ACTIVE/DEPLOYING corrigée)
 ### Problème résolu
 À l'issue de la preuve produit réelle, on a observé **Order ACTIVE + row Deployment DEPLOYING**. Audit de la machine d'état (SOURCE DE VÉRITÉ) : le proof-gate store (`awaitAppReady` vrai = Coolify ACTIVE ou HTTP 2xx/3xx public) confirme réellement la mise en ligne, mais la voie store posait la row Deployment en **DEPLOYING** (`actionCreateApp`) **sans jamais la passer ACTIVE** ; la seule bascule Deployment→ACTIVE était la **réconciliation lazy du dashboard client** (`refreshStatus`), déclenchée uniquement si le client ouvre la page. ⇒ divergence **réelle à l'arrêt** : la preuve la plus forte était obtenue à l'activation de l'Order mais pas persistée sur le Deployment.

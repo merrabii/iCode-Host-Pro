@@ -488,7 +488,16 @@ export interface PackMin {
   // Phase 13 — quota d'apps + module de déploiement lié.
   maxApps?: number | null;
   deploymentModuleId?: string | null;
-  deploymentModule?: { id: string; code: string; name: string } | null;
+  // Vue PRODUIT (PRODUCT_INCLUDE) : la relation pack → module → serveur est
+  // embarquée avec kind + server (la même que le provisioning lit). La vue PACK
+  // (PackAdmin) n'embarque, elle, que { id, code, name, kind }.
+  deploymentModule?: {
+    id: string;
+    code: string;
+    name: string;
+    kind: string;
+    server: { id: string; hostname: string | null } | null;
+  } | null;
   // Bloc A — nb de sous-domaines gratuits inclus (informatif).
   freeSubdomainsIncluded?: number | null;
 }

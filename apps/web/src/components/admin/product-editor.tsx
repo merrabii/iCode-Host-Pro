@@ -144,7 +144,6 @@ export function ProductEditor({
         <ProductRoadmapTab
           key={`${product.id}-roadmap`}
           product={product}
-          modules={modules}
           onNavigate={(t: RoadmapTabKey) => selectTab(t)}
         />
       )}
