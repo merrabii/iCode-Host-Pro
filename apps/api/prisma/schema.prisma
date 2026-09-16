@@ -750,6 +750,8 @@ model Deployment {
 
   @@index([userId])
   @@index([status])
+  @@index([packId])
+  @@index([limitsStatus])
 }
 
 // ── Phase 3 — DNS & sous-domaines Cloudflare (demande propriétaire) ──────────

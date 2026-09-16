@@ -22,6 +22,9 @@
 ### Commit state
 Checkpoint de sauvegarde **local `9f78011`** (avant validation) + commit validation **local** (corrections + couverture + docs). **NON poussés** (attente GO). **LIVE VALIDATION = PENDING** (aucune opération réelle Cloudflare/Coolify/DNS/Order). Fini par **STOP** (aucune Phase 5).
 
+### Réconciliation drift `Deployment` (avant push Phase 4)
+Les index **`Deployment_packId_idx`** et **`Deployment_limitsStatus_idx`** existent en base depuis **Phase 17** (`20260913120000_add_limits_tracking`) mais n'étaient **pas déclarés** dans `schema.prisma` (migration hand-authorée). Drift **préexistant à Phase 4** (documenté dans la NOTE de la migration Phase 4, décision #19), **résolu avant push** : `@@index([packId])` + `@@index([limitsStatus])` ajoutés au modèle `Deployment`, **sans migration** (les index sont déjà en DB) ni modification DB. `prisma validate` valid · `migrate status` up-to-date (39) · `migrate diff` DB→schema = **No difference detected**. Aucun impact runtime. (Ce commit est **distinct** de la validation Phase 4.)
+
 ## 2026-09-16 — Phase 3 (Security + Turnstile) : **runtime Turnstile aligné sur le flag admin** — notion effective unique `active = enabled && configured`
 
 ## 2026-09-16 — Phase 3 (Security + Turnstile) : **runtime Turnstile aligné sur le flag admin** — notion effective unique `active = enabled && configured`
