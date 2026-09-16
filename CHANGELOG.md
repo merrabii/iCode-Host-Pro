@@ -1,5 +1,25 @@
 # CHANGELOG
 
+## 2026-09-16 — Phase 3 (Security + Turnstile) : **runtime Turnstile aligné sur le flag admin** — notion effective unique `active = enabled && configured`
+### Contexte recovery
+Le delta suivé de la session précédente (Phase 3 interrompue par un redémarrage) a été **perdu par un `git reset` à HEAD** (visible au reflog `04c6f69 HEAD@{0}: reset`), non committé/non stashé ⇒ irrécupérable. **Reconstruit depuis le baseline + le spec survivant** `public-config.controller.spec.ts` (contrat encodé), sans reproduire mécaniquement les ~183 lignes perdues.
+### Problème résolu (2 classes)
+1. **Fuite/annonce incohérente** : `public-config.controller` exposait la clé SITE **sans condition** — même si le flag admin OFF ou si la config est incomplète ⇒ un Turnstile « non actif » était servi comme s'il l'était (et `''` impossible pour le frontend de ne pas rendre le widget).
+2. **Divergence frontend/backend (login impossible)** : le frontend rend le widget sur `config.turnstileSiteKey !== ''` (sans token), mais l'enforcement backend (`auth.login` **et** `support-codes.redeem`) gate sur `settings.isTurnstileEnabled()` (flag seul). Avec `enabled=true` + config incomplète : frontend **sans widget** mais backend **exigeant un token** ⇒ login/redeem impossibles.
+### Corrigé (notion effective unique, partagée)
+- **`TurnstileService`** : ajout de **`isActive()`** = `enabled (flag) && configured (clés SITE + SECRET présentes, DB→env)` et de **`getSiteKey()`** (résolution unique DB→env, désormais l'unique source de la clé publique — suppression de la résolution dupliquée dans le contrôleur). Sémantique documentée : `configured` / `enabled` / `active` (`active = enabled && configured`).
+- **`public-config.controller`** : injecte `TurnstileService` ; la clé SITE n'est servie **QUE si `isActive()`** (sinon `''`) ; le **secret n'est jamais exposé**.
+- **`auth.service.login`** et **`support-codes.controller.redeem`** : gate aligné sur **`turnstile.isActive()`** au lieu de `settings.isTurnstileEnabled()` ⇒ plus de divergence (config incomplète → ni widget ni exigence de token).
+- **Fail-closed préservé** : un échec de `verify()` Cloudflare externe rejette (inchangé) ; « inactif » signifie **uniquement** config absente/incomplète, jamais un échec réseau.
+### Sémantique / ADR
+Invariant durable (ADR-039) : **les gateways d'enforcement Turnstile et l'exposition publique partagent la même activation effective `isActive()`** — toute nouvelle porte d'enforcement doit l'utiliser, pas le flag seul.
+### Tests
+`turnstile.service.spec` (+8 : isActive OFF/ON/keys manquantes, getSiteKey DB→env→vide) · `auth.service.spec` (+4 : OFF pas de verify, ON verify, config incomplète cohérente, échec fail-closed) · `public-config.controller.spec` (spec survivant **adapté** : le contrôleur délègue `getSiteKey()` au service — `getSiteKey` ajouté au mock ; contrat conservé : OFF→'' / ON full→clé / secret absent / ON incomplet→''). **No-op** sur `security-settings.service.spec` (cover déjà la chaîne Admin save/persist/reload).
+### Gates
+Unit API **422/422** (baseline 405 +17) · 35/35 suites · `tsc --noEmit` API **vert** · `nest build` **vert** · `tsc --noEmit` web **vert** (frontend **inchangé** : gate déjà sur `turnstileSiteKey !== ''`). E2E non rejouées (aucun chemin E2E modifié).
+### Commit state
+Commit local **`fix(security): align turnstile runtime with admin setting`** — **non poussé** (attente GO). Aucun secret hardcodé, aucune vraie clé. `support-codes.controller.ts` aligné sur `isActive()` (dépendance démontrée, voir rapport).
+
 ## 2026-09-16 — Phase 2 (audit produit admin) : **alignement de Product Readiness avec la source de vérité serveur du provisioning**
 ### Problème résolu
 L'onglet **Roadmap / readiness** d'un produit affichait une **fausse alerte bloquante** « Serveur Coolify non configuré » alors que le provisioning fonctionnait réellement (cas **API Node.js Starter** : Product→Order→Provisioning→Coolify→HTTP 200→ACTIVE). Audit Phase 1 : la readiness résolvait le serveur via **`pack.deploymentModuleId`** — **scalaire absent de la payload admin** — puis un cross-lookup dans la liste tierce `modules` : toujours `undefined` ⇒ serveur « absent » à tort. À l'inverse, le **provisioning** lit la relation embarquée **`product.pack.deploymentModule.server`** (même source que `getProvisioning`), correctement peuplée.

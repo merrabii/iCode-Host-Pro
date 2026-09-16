@@ -33,6 +33,35 @@ export class TurnstileService {
     return !!this.config.get<string>('turnstileSecretKey');
   }
 
+  /** Clé SITE PUBLIQUE (Phase 3): DB admin → env fallback. Résolution unique de
+   *  la clé du widget, partagée par isActive() et public-config.controller. */
+  async getSiteKey(): Promise<string> {
+    const stored = await this.settings.getTurnstileSiteKey().catch(() => null);
+    if (stored) return stored;
+    return this.config.get<string>('turnstileSiteKey') ?? '';
+  }
+
+  /**
+   * Activation EFFÉCTIVE (Phase 3) — la notion unique partagée par
+   * public-config (rendu du widget frontend) et auth.service (verify backend):
+   * flag admin `turnstileEnabled` ET clés SITE + SECRET présentes.
+   *
+   * Semantique retenue:
+   *   configured = clés disponibles (site + secret).
+   *   enabled    = flag administrateur.
+   *   active     = enabled && configured.
+   *
+   * À ne pas confondre avec un échec de verify() externe: ici "inactif" signifie
+   * uniquement que la configuration est absente/incomplète, pas qu'une requête
+   * Cloudflare a échoué (celle-ci reste fail-closed, voir verify()).
+   */
+  async isActive(): Promise<boolean> {
+    if (!(await this.settings.isTurnstileEnabled().catch(() => false))) return false;
+    if (!(await this.getSiteKey())) return false;
+    const secret = await this.secret().catch(() => null);
+    return !!secret;
+  }
+
   /**
    * Resolve the secret to use: DB-stored key first (admin-managed), then the
    * env fallback. Never throws — decrypt failure degrades to "not configured".

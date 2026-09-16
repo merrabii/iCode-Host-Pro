@@ -251,7 +251,11 @@ export class AuthService {
         `Trop de tentatives. Réessayez dans ${Math.ceil(rl.retryAfterMs / 1000)} s.`,
       );
     }
-    if (await this.settings.isTurnstileEnabled()) {
+    // Phase 3: le gate repose sur isActive() (flag admin ET clés SITE+SECRET
+    // présentes), la même notion que public-config → le frontend ne peut jamais
+    // être sans widget alors que le backend exigerait un token impossible à
+    // produire (divergence login impossible quand la config est incomplète).
+    if (await this.turnstile.isActive()) {
       const ok = await this.turnstile.verify(dto.turnstileToken ?? '', ip);
       if (!ok) throw new BadRequestException('Vérification anti-robot échouée.');
     }

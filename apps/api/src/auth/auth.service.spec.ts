@@ -31,7 +31,7 @@ describe('AuthService (impersonation + order-time registration, ADR-027)', () =>
   const mockAudit = { record: jest.fn() };
   const mockInvitations = {};
   const mockLimiter = { consume: jest.fn() };
-  const mockTurnstile = { verify: jest.fn() };
+  const mockTurnstile = { verify: jest.fn(), isActive: jest.fn() };
   const mockMfa = { evaluateLogin: jest.fn() };
   const mockSettings = { isSelfRegistrationEnabled: jest.fn(), isTurnstileEnabled: jest.fn() };
 
@@ -186,6 +186,54 @@ describe('AuthService (impersonation + order-time registration, ADR-027)', () =>
       mockPrisma.user.findUnique.mockResolvedValue(null);
       mockPrisma.product.findUnique.mockResolvedValue({ id: 'p1', status: ProductStatus.DRAFT });
       await expect(service.register(dto, 'p1')).rejects.toBeInstanceOf(BadRequestException);
+    });
+  });
+
+  describe('login — Turnstile enforcement (Phase 3, gated on the effective notion isActive)', () => {
+    const creds = { email: 'client@example.com', password: 'pw' };
+    const allowLogin = () => {
+      mockLimiter.consume.mockReturnValue({ allowed: true });
+      mockPrisma.user.findUnique.mockResolvedValue(client);
+      mockMfa.evaluateLogin.mockResolvedValue({ status: 'pass' });
+    };
+
+    it('OFF (even with full keys present) → no Turnstile verification', async () => {
+      mockTurnstile.isActive.mockResolvedValue(false);
+      allowLogin();
+      const res = (await service.login({ ...creds, turnstileToken: 'tok' }, '1.2.3.4')) as {
+        accessToken: string;
+      };
+      expect(mockTurnstile.verify).not.toHaveBeenCalled();
+      expect(res.accessToken).toBe('jwt.token');
+    });
+
+    it('ON + full config → token verified against Cloudflare', async () => {
+      mockTurnstile.isActive.mockResolvedValue(true);
+      mockTurnstile.verify.mockResolvedValue(true);
+      allowLogin();
+      const res = (await service.login({ ...creds, turnstileToken: 'tok' }, '1.2.3.4')) as {
+        accessToken: string;
+      };
+      expect(mockTurnstile.verify).toHaveBeenCalledWith('tok', '1.2.3.4');
+      expect(res.accessToken).toBe('jwt.token');
+    });
+
+    it('ON + incomplete config → no verification (coherent with a frontend without widget)', async () => {
+      mockTurnstile.isActive.mockResolvedValue(false);
+      allowLogin();
+      const res = (await service.login(creds, '1.2.3.4')) as { accessToken: string };
+      expect(mockTurnstile.verify).not.toHaveBeenCalled();
+      expect(res.accessToken).toBe('jwt.token');
+    });
+
+    it('ON + full config but verification fails → login rejected (fail-closed)', async () => {
+      mockTurnstile.isActive.mockResolvedValue(true);
+      mockTurnstile.verify.mockResolvedValue(false);
+      mockLimiter.consume.mockReturnValue({ allowed: true });
+      await expect(
+        service.login({ ...creds, turnstileToken: 'bad' }, '1.2.3.4'),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(mockTurnstile.verify).toHaveBeenCalled();
     });
   });
 

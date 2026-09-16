@@ -2,6 +2,7 @@ import { Controller, Get } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { SecuritySettingsService } from './security/security-settings.service';
+import { TurnstileService } from './turnstile.service';
 
 /**
  * Phase 10 (ADR-027): PUBLIC read of what the auth UI must render — which
@@ -25,6 +26,7 @@ export class PublicAuthConfigController {
   constructor(
     private readonly settings: SecuritySettingsService,
     private readonly config: ConfigService,
+    private readonly turnstile: TurnstileService,
   ) {}
 
   @Get()
@@ -36,14 +38,16 @@ export class PublicAuthConfigController {
     const githubKeys =
       !!this.config.get<string>('githubClientId') &&
       !!this.config.get<string>('githubClientSecret');
-    // Phase 11: la clé SITE gérée par l'admin (SecuritySetting) prime ; le env
-    // reste le fallback pour les déploiements configurés par variable.
-    const siteKey =
-      (await this.settings.getTurnstileSiteKey()) ??
-      this.config.get<string>('turnstileSiteKey') ??
-      '';
+    // Phase 3: la clé SITE publique n'est servie QUE si Turnstile est ACTIF
+    // (flag admin ET clés SITE + SECRET présentes). Sinon '' → le frontend
+    // (auth/page.tsx gate sur `turnstileSiteKey !== ''`) ne rend pas de widget
+    // et n'envoie pas de token — cohérent avec auth.service qui gate verify sur
+    // la même notion isActive(). Une config incomplète n'annonce jamais un
+    // Turnstile utilisable, et le SECRET n'est jamais exposé. Le env reste le
+    // fallback géré par TurnstileService.getSiteKey().
+    const active = await this.turnstile.isActive();
     return {
-      turnstileSiteKey: siteKey,
+      turnstileSiteKey: active ? await this.turnstile.getSiteKey() : '',
       oauthGoogleEnabled: (await this.settings.isOAuthGoogleEnabled()) && googleKeys,
       oauthGithubEnabled: (await this.settings.isOAuthGithubEnabled()) && githubKeys,
       selfRegistrationEnabled: await this.settings.isSelfRegistrationEnabled(),

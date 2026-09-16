@@ -96,7 +96,12 @@ export class SupportCodesController {
         HttpStatus.TOO_MANY_REQUESTS,
       );
     }
-    if (await this.settings.isTurnstileEnabled()) {
+    // Phase 3: cohérence avec auth.service/public-config — gate sur isActive()
+    // (flag admin ET clés SITE+SECRET présentes). Évite la divergence où le
+    // frontend (widget rendu selon config.turnstileSiteKey) n'enverrait aucun
+    // token alors que le backend, flag actif mais config incomplète, en exigerait
+    // un impossible à produire.
+    if (await this.turnstile.isActive()) {
       const ok = await this.turnstile.verify(dto.turnstileToken ?? '', req.ip);
       if (!ok) {
         throw new HttpException(

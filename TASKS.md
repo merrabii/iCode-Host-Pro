@@ -1024,3 +1024,29 @@ Réponse au retour propriétaire : port Coolify non mentionné, IP non auto-dét
 - [x] **Tests** : readiness **5/5 passés** (TEST1 server valide→ok · TEST2 pack+module sans serveur→reste BLOCKING · TEST3 deploymentModuleId absent + relation server présente→aucun faux BLOCKING · TEST4 reload/payload admin→correcte · TEST5 sans pack→NOT_APPLICABLE info). `tsc --noEmit` web **EXIT 0**. `next build` **BUILD_EXIT 0** (types valides). **Aucune modif backend/API** (payload portait déjà la relation) ⇒ aucun test API rejoué.
 - [x] **Docs** : CHANGELOG 2026-09-16 · PROJECT_STATUS (Overall + Current phase + Contexte Phase 17 rétro) · HANDOVER · TASKS. **Aucun nouvel ADR** (alignement, pas de nouvelle décision) ; DECISIONS.md non pertinent → non modifié.
 - [x] **Commit local** : `fix(admin): align product readiness with provisioning` — **non poussé** (attente GO). Aucun hardcode (serveur/ID/UUID/slug), aucun secret, aucun debug.
+
+--------------------------------------------------------------------
+## Phase 3 (Security + Turnstile) — RUNTIME TURNSTILE ALIGNÉ SUR LE FLAG ADMIN — 2026-09-16 (commit local non poussé)
+### Recovery
+- [!] **Constat** : le working-tree Phase 3 interrompu par un redémarrage a été **perdu par un `git reset` à HEAD** (`04c6f69 HEAD@{0} / reset` au reflog), jamais committé/stashé ⇒ irrécupérable. Seul le **spec non suivi** `public-config.controller.spec.ts` (contrat encodé) a survécu.
+- [x] **Règle** : NE PAS reproduire les ~183 lignes perdues — **reconstruire depuis le baseline + le spec survivant**, implémenter uniquement le contrat nécessaire.
+### Problème (2 classes)
+- [x] **Fuite/annonce** : `public-config` exposait la clé SITE **sans condition** (flag OFF ou config incomplète ⇒ Turnstile non actif servi comme actif).
+- [x] **Divergence frontend/backend** : frontend rend le widget sur `turnstileSiteKey !== ''` (aucun token) ; `auth.login` + `support-codes.redeem` gated sur le **flag seul** `isTurnstileEnabled()` ⇒ `enabled=true` + config incomplète ⇒ **login/redeem impossibles**.
+### Corrigé (notion effective unique)
+- [x] `turnstile.service.ts` : **`isActive()`** = `enabled && configured` (flag ET clés SITE+SECRET, DB→env) ; **`getSiteKey()`** = résolution unique DB→env (la résolution du contrôleur, dupliquée, est supprimée).
+- [x] `public-config.controller.ts` : injecte `TurnstileService` ; clé SITE servie **seulement si `isActive()`** (sinon `''`) ; **secret jamais exposé**.
+- [x] `auth.service.login` + `support-codes.controller.redeem` : gate aligné sur **`isActive()`** (+ commentaire). `support-codes` modifié car **dépendance démontrée** du même contrat (pas la raison inconnue du diff perdu).
+- [x] Sémantique fail-closed préservée : échec `verify()` externe rejette ; « inactif » = config absente/incomplète, jamais un échec réseau.
+- [x] Frontend **inchangé** (auth/page.tsx et support/page.tsx gate déjà sur `config.turnstileSiteKey !== ''`).
+### Tests
+- [x] `turnstile.service.spec` **+8** (isActive OFF·ON full·SITE manquante·SECRET manquant·env-only ; getSiteKey DB→env→vide).
+- [x] `auth.service.spec` **+4** (OFF pas de verify · ON verify · config incomplète cohérente · échec fail-closed). Spec survivant **adapté** (mock `getSiteKey`).
+- [x] `public-config.controller.spec` (survivant, maintenant suivi) : TEST1 OFF→`''` · TEST3 ON full→clé · TEST5 secret absent · TEST8 ON incomplet→`''` · OAuth non-régression.
+- [x] `security-settings.service.spec` : **inchangé** — la chaîne Admin OFF/ON save/persist/reload est déjà couverte (update `turnstileEnabled`, clés write-only, `''` efface).
+### Gates
+- [x] Unit API **422/422** (baseline 405 +17) · **35/35** suites · `tsc --noEmit` API **vert** · `nest build` **vert** · `tsc --noEmit` web **vert** (web inchangé). E2E non rejouées (aucun chemin E2E modifié).
+### Docs
+- [x] CHANGELOG · PROJECT_STATUS (Overall + Current phase + Decisions ADR-039) · TASKS · HANDOVER · **DECISIONS.md → ADR-039** (invariant `active = enabled && configured` partagé par public-config et les portes d'enforcement).
+### Commit state
+- [x] **Commit local** : `fix(security): align turnstile runtime with admin setting` — **non poussé** (attente GO). Aucun secret, aucun hardcode. **Aucun `git reset` après commit.**

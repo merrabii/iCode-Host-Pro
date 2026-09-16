@@ -187,12 +187,18 @@ describe('Security settings (e2e)', () => {
       .expect(403);
   });
 
-  it('Turnstile keys (Phase 11): admin saves site+secret, secret is write-only, public config serves the site key', async () => {
+  it('Turnstile keys (Phase 11/3): admin saves site+secret, secret is write-only, public config serves the site key', async () => {
     // Site + secret sont stockés ; le secret n'est JAMAIS renvoyé (hasSecretKey).
+    // Phase 3: la clé site n'est servie au public QUE si Turnstile est ACTIF
+    // (flag admin ET clés présentes) → on active le flag pour valider l'exposition.
     const saved = await request(app.getHttpServer())
       .put(`/${GlobalPrefix}/admin/security`)
       .set('Authorization', `Bearer ${adminToken}`)
-      .send({ turnstileSiteKey: '0x4AAA_TEST', turnstileSecretKey: '1x00000000000000000000_AA' })
+      .send({
+        turnstileEnabled: true,
+        turnstileSiteKey: '0x4AAA_TEST',
+        turnstileSecretKey: '1x00000000000000000000_AA',
+      })
       .expect(200);
     expect(saved.body.turnstileSiteKey).toBe('0x4AAA_TEST');
     expect(saved.body.turnstileHasSecretKey).toBe(true);
@@ -206,11 +212,23 @@ describe('Security settings (e2e)', () => {
     expect(pub.body.turnstileSiteKey).toBe('0x4AAA_TEST');
     expect(pub.body).not.toHaveProperty('turnstileSecretKey');
 
-    // '' efface les deux clés (retour au fallback env).
+    // Phase 3: flag OFF (même avec clés présentes) → Turnstile non annoncé actif.
+    await request(app.getHttpServer())
+      .put(`/${GlobalPrefix}/admin/security`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ turnstileEnabled: false })
+      .expect(200);
+    const off = await request(app.getHttpServer())
+      .get(`/${GlobalPrefix}/public/auth-config`)
+      .expect(200);
+    expect(off.body.turnstileSiteKey).toBe('');
+
+    // '' efface les deux clés (retour au fallback env). Flag OFF → tests suivants
+    // (login sans token, ex. MFA) non gated par Turnstile.
     const cleared = await request(app.getHttpServer())
       .put(`/${GlobalPrefix}/admin/security`)
       .set('Authorization', `Bearer ${adminToken}`)
-      .send({ turnstileSiteKey: '', turnstileSecretKey: '' })
+      .send({ turnstileEnabled: false, turnstileSiteKey: '', turnstileSecretKey: '' })
       .expect(200);
     expect(cleared.body.turnstileSiteKey).toBeNull();
     expect(cleared.body.turnstileHasSecretKey).toBe(false);

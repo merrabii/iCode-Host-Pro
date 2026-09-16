@@ -2,7 +2,11 @@ import { TurnstileService } from './turnstile.service';
 
 describe('TurnstileService (Cloudflare anti-bot, ADR-027)', () => {
   const mockConfig = { get: jest.fn() };
-  const mockSettings = { getTurnstileSecretKey: jest.fn() };
+  const mockSettings = {
+    getTurnstileSecretKey: jest.fn(),
+    getTurnstileSiteKey: jest.fn(),
+    isTurnstileEnabled: jest.fn(),
+  };
   const makeSvc = () => new TurnstileService(mockConfig as never, mockSettings as never);
 
   beforeEach(() => {
@@ -10,6 +14,10 @@ describe('TurnstileService (Cloudflare anti-bot, ADR-027)', () => {
     mockConfig.get.mockReturnValue(undefined);
     mockSettings.getTurnstileSecretKey.mockReset();
     mockSettings.getTurnstileSecretKey.mockResolvedValue(null);
+    mockSettings.getTurnstileSiteKey.mockReset();
+    mockSettings.getTurnstileSiteKey.mockResolvedValue(null);
+    mockSettings.isTurnstileEnabled.mockReset();
+    mockSettings.isTurnstileEnabled.mockResolvedValue(true);
     global.fetch = jest.fn();
   });
 
@@ -56,5 +64,54 @@ describe('TurnstileService (Cloudflare anti-bot, ADR-027)', () => {
     await expect(svc.verify('tok')).resolves.toBe(false);
     global.fetch = jest.fn().mockRejectedValue(new Error('network down'));
     await expect(svc.verify('tok')).resolves.toBe(false);
+  });
+
+  describe('getSiteKey / isActive (Phase 3 — shared effective activation)', () => {
+    it('getSiteKey: the DB admin site key wins over the env fallback', async () => {
+      mockSettings.getTurnstileSiteKey.mockResolvedValue('db-site');
+      mockConfig.get.mockImplementation((k: string) =>
+        k === 'turnstileSiteKey' ? 'env-site' : undefined,
+      );
+      await expect(makeSvc().getSiteKey()).resolves.toBe('db-site');
+    });
+
+    it('getSiteKey: env fallback used when no DB site key', async () => {
+      mockConfig.get.mockReturnValue('env-site');
+      await expect(makeSvc().getSiteKey()).resolves.toBe('env-site');
+    });
+
+    it('getSiteKey: empty when neither DB nor env is configured', async () => {
+      await expect(makeSvc().getSiteKey()).resolves.toBe('');
+    });
+
+    it('isActive = OFF (flag false) even with full keys ⇒ false', async () => {
+      mockSettings.isTurnstileEnabled.mockResolvedValue(false);
+      mockSettings.getTurnstileSiteKey.mockResolvedValue('site');
+      mockSettings.getTurnstileSecretKey.mockResolvedValue('sec');
+      await expect(makeSvc().isActive()).resolves.toBe(false);
+    });
+
+    it('isActive = ON + full config (site + secret) ⇒ true', async () => {
+      mockSettings.getTurnstileSiteKey.mockResolvedValue('site');
+      mockSettings.getTurnstileSecretKey.mockResolvedValue('sec');
+      await expect(makeSvc().isActive()).resolves.toBe(true);
+    });
+
+    it('isActive = ON but missing SITE key ⇒ false (backend never demands an unproducible token)', async () => {
+      mockSettings.getTurnstileSecretKey.mockResolvedValue('sec');
+      await expect(makeSvc().isActive()).resolves.toBe(false);
+    });
+
+    it('isActive = ON but missing SECRET key ⇒ false', async () => {
+      mockSettings.getTurnstileSiteKey.mockResolvedValue('site');
+      await expect(makeSvc().isActive()).resolves.toBe(false);
+    });
+
+    it('isActive = ON with both keys via env only ⇒ true (resolution fully reused)', async () => {
+      mockConfig.get.mockImplementation((k: string) =>
+        k === 'turnstileSiteKey' ? 'env-site' : k === 'turnstileSecretKey' ? 'env-sec' : undefined,
+      );
+      await expect(makeSvc().isActive()).resolves.toBe(true);
+    });
   });
 });
