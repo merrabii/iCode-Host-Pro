@@ -882,25 +882,59 @@ export class ProvisioningService {
     if (ctx.fqdn) return { fqdn: ctx.fqdn, message: `Sous-domaine déjà alloué : https://${ctx.fqdn}` };
     const fullOrder = await this.prisma.order.findUnique({
       where: { id: ctx.order.id },
-      include: { product: { include: { pack: { include: { deploymentModule: { include: { server: true } } } } } } },
+      include: {
+        product: {
+          include: {
+            freeSubdomainRule: true,
+            pack: { include: { deploymentModule: { include: { server: true } } } },
+          },
+        },
+      },
     });
     const server = fullOrder?.product.pack?.deploymentModule?.server ?? null;
-    const root = await this.cloudflare.findActiveRootDomain();
-    if (!root) {
-      throw new Error('Aucun domaine racine Cloudflare actif configuré.');
-    }
+    // Phase 4 — résolution DÉTERMINISTE de la racine effective : effectiveDomainId
+    // (déjà FIGÉE, gagne à tout retry #8) → requestedDomainId (choix client #5/#7/#13)
+    // → défaut (1 éligible ; >1 ambiguïté ; 0 erreur #10). AUCUN fallback arbitraire.
+    const { root } = await this.cloudflare.resolveEffectiveRoot({
+      allowedDomainIds: fullOrder?.product.freeSubdomainRule?.allowedDomainIds ?? null,
+      requestedDomainId: fullOrder?.requestedDomainId ?? null,
+      effectiveDomainId: fullOrder?.effectiveDomainId ?? null,
+      hasDeliveredFqdn: !!fullOrder?.domainValue && fullOrder.domainStatus === 'READY',
+    });
     const fallbackHost = (server as { hostname?: string } | null)?.hostname ?? root.cnameTarget ?? 'localhost';
     const seed = ctx.order.customerName || fullOrder?.product.name || 'app';
-    // Store: pas de Deployment row — on passe sans deploymentId (ClientSubdomain nullable côté store).
-    // `requested` = sous-domaine choisi par le client au checkout (Plan Gratuit) ;
-    // de la disponibilité est déjà certifiée au checkout, on le repasse ici pour
-    // l'allocation effective → l'app est servie sur https://<choix>.<racine>.
-    const alloc = await this.cloudflare.allocateClientSubdomain({
-      root,
-      seed,
-      fallbackHost,
-      requested: fullOrder?.requestedSubdomain ?? undefined,
+
+    // GEL de la racine AVANT toute allocation DNS (#8/#16) — la « fenêtre de panne »
+    // (racine résolue → DNS créé → crash avant persistence) ne peut plus JAMAIS faire
+    // re-sélectionner une autre racine au retry : effectiveDomainId est figé d'abord.
+    await this.prisma.order.update({
+      where: { id: ctx.order.id },
+      data: { effectiveDomainId: root.id },
     });
+
+    // Récupération d'une allocation partielle antérieure (crash entre DNS et persist) :
+    // si un enregistrement SOUS CETTE RACINE porte déjà le sous-domaine demandé, on le
+    // réutilise (jamais de 2ᵉ record, jamais d'autre racine). Store: pas de Deployment
+    // row — ClientSubdomain sans deploymentId.
+    let alloc: { subdomain: string; fqdn: string };
+    if (fullOrder?.requestedSubdomain) {
+      const fqdn = `${fullOrder.requestedSubdomain.trim().toLowerCase()}.${root.name}`;
+      const existing = await this.prisma.clientSubdomain.findFirst({ where: { fqdn } });
+      if (existing) {
+        alloc = { subdomain: existing.subdomain, fqdn: existing.fqdn };
+      } else {
+        // `requested` déjà certifié disponible au checkout → allocation effective.
+        alloc = await this.cloudflare.allocateClientSubdomain({
+          root,
+          seed,
+          fallbackHost,
+          requested: fullOrder.requestedSubdomain,
+        });
+      }
+    } else {
+      alloc = await this.cloudflare.allocateClientSubdomain({ root, seed, fallbackHost });
+    }
+
     // Si l'app a déjà été créée, on pose le domaine dessus puis on redéploie
     // (best-effort) pour que le conteneur redémarre avec traefik relié au
     // sous-domaine client — sans ça, l'app n'est pas servie publiquement.
@@ -914,7 +948,8 @@ export class ProvisioningService {
         // best-effort — reposable en retry
       }
     }
-    // On persiste via domainValue (Order), pas via Deployment.
+    // On persiste via domainValue (Order), pas via Deployment. DNS et Coolify utilisent
+    // la MÊME racine/FQDN (#16 : la racine effective a été figée et réutilisée partout).
     await this.prisma.order.update({
       where: { id: ctx.order.id },
       data: { domainType: 'FREE_SUBDOMAIN', domainValue: alloc.fqdn, domainStatus: 'READY' },

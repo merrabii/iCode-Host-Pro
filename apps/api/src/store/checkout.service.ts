@@ -101,9 +101,12 @@ export class CheckoutService {
 
     // 1. Produit commandable (ACTIVE, non masqué) + configuration vendable.
     const product = await this.products.findPublicBySlug(dto.productSlug);
-    // Sous-domaine choisi (produits porteurs d'une FreeSubdomainRule) : normalisé
-    // + dispo vérifiée (fail-fast). Null sinon → le provisioning auto-génère.
-    const requestedSubdomain = await this.resolveRequestedSubdomain(product, dto.subdomain);
+    // Phase 4 — sous-domaine ET domaine racine choisis par le client (produits
+    // porteurs d'une FreeSubdomainRule) : normalisés + validés (fail-fast), AUCUN
+    // fallback arbitraire (jamais allowedDomainIds[0]). `requestedDomainId` = choix
+    // explicite ; la racine effective sera FIGÉE par le provisioning. Plusieurs
+    // racines éligibles sans choix → erreur d'ambiguïté (#10).
+    const { requestedSubdomain, requestedDomainId } = await this.resolveSubdomainAndRoot(product, dto);
 
     // 2. Moyen de paiement actif (jamais les secrets — PaymentMethod.config est
     //    non secret, configEnc reste chiffré et n'est pas lu ici).
@@ -175,7 +178,7 @@ export class CheckoutService {
     // 5. Clé d'idempotence : hash déterministe de la configuration + montant.
     //    Basée sur les coordonnées de FACTURATION (billingEmail) : un changement
     //    de mode (compte/autres coordonnées) produit bien une commande distincte.
-    const key = this.idempotencyKey(dto, method.id, amountTtcCents, billingEmail, requestedSubdomain);
+    const key = this.idempotencyKey(dto, method.id, amountTtcCents, billingEmail, requestedSubdomain, requestedDomainId);
 
     // 6. Replay (double-clic / retry identique) : on renvoie la commande déjà
     //    créée, SANS recréer de compte ni de commande (§7 idempotence).
@@ -264,6 +267,7 @@ export class CheckoutService {
               : Prisma.JsonNull,
             idempotencyKey: key,
             requestedSubdomain,
+            requestedDomainId,
           },
         });
         const invoice = await tx.invoice.create({
@@ -554,13 +558,23 @@ export class CheckoutService {
     amountTtcCents: number,
     billingEmail: string,
     subdomain: string | null,
+    requestedDomainId?: string | null,
   ): string {
     const options = [...(dto.options ?? [])]
       .map((o) => `${o.optionId}:${o.choiceId}`)
       .sort()
       .join(',');
     const addons = [...(dto.addonIds ?? [])].sort().join(',');
-    const payload = [billingEmail, dto.productSlug, options, addons, methodId, amountTtcCents, subdomain ?? ''].join('|');
+    const payload = [
+      billingEmail,
+      dto.productSlug,
+      options,
+      addons,
+      methodId,
+      amountTtcCents,
+      subdomain ?? '',
+      requestedDomainId ?? '',
+    ].join('|');
     return createHash('sha256').update(payload).digest('hex');
   }
 
@@ -672,19 +686,100 @@ export class CheckoutService {
   }
 
   /**
-   * Sous-domaine choisi au checkout (produits porteurs d'une FreeSubdomainRule) :
-   * normalisé, dispo vérifiée en fail-fast. Retourne null si absent/non applicable
-   * → le provisioning auto-génère un sous-domaine (comportement Bloc E). La
-   * désallocation atomique reste garantie par allocateClientSubdomain au déploiement.
+   * Phase 4 — Résout SOUS-DOMAINE + DOMAINE RACINE choisis au checkout. Aucun
+   * fallback arbitraire (`allowedDomainIds[0]`, premier ACTIVE…). Produits sans
+   * FreeSubdomainRule → rien. Sinon :
+   *  - éligibles = racines ACTIVE restreintes par `allowedDomainIds` (si non vide) ;
+   *  - 0 éligible → erreur ; >1 éligible SANS choix → ambiguïté (#10) ; 1 → unique ;
+   *  - `requestedDomainId` fourni → doit être éligible (sinon rejet, #7/#13) ;
+   *  - la dispo du sous-domaine est vérifiée sous la racine effectivement retenue.
+   * Retourne la paire { requestedSubdomain, requestedDomainId } à persister.
+   * `effectiveDomainId` (racine figée au provisioning) reste null ici.
    */
-  private async resolveRequestedSubdomain(
+  private async resolveSubdomainAndRoot(
     product: PublicProduct,
-    subdomain?: string,
+    dto: CheckoutDto,
+  ): Promise<{ requestedSubdomain: string | null; requestedDomainId: string | null }> {
+    const rule = product.freeSubdomainRule;
+    if (!rule) return { requestedSubdomain: null, requestedDomainId: null };
+
+    const eligible = await this.prisma.domain.findMany({
+      where: {
+        status: 'ACTIVE',
+        ...(rule.allowedDomainIds && rule.allowedDomainIds.length > 0
+          ? { id: { in: rule.allowedDomainIds } }
+          : {}),
+      },
+      select: { id: true, name: true },
+      orderBy: [{ name: 'asc' }],
+    });
+    if (eligible.length === 0) {
+      throw new BadRequestException('Aucun domaine racine disponible.');
+    }
+
+    let requestedDomainId: string | null = null;
+    let root: { id: string; name: string };
+    if (dto.requestedDomainId) {
+      const chosen = eligible.find((d) => d.id === dto.requestedDomainId);
+      if (!chosen) {
+        throw new BadRequestException(
+          'Le domaine racine choisi n’est pas disponible pour ce produit.',
+        );
+      }
+      root = chosen;
+      requestedDomainId = chosen.id;
+    } else {
+      // Défaut (aucun choix) : le défaut PLATEFORME (rootDomainId, #1/#5) s'il est
+      // éligible, sinon l'unique éligible ; >1 sans défaut plateforme → ambiguïté
+      // (#10). `requestedDomainId` reste null → le provisioning re-résout la racine
+      // (effective → requested → défaut). Coherent avec CloudflareService.resolveEffectiveRoot.
+      const platformDefault = await this.platformDefaultEligible(eligible);
+      if (platformDefault) {
+        root = platformDefault;
+      } else if (eligible.length > 1) {
+        throw new BadRequestException(
+          'Ce produit propose plusieurs domaines : veuillez choisir votre domaine racine.',
+        );
+      } else {
+        root = eligible[0]!; // unique éligible (len 0 rejeté plus haut)
+      }
+    }
+
+    const requestedSubdomain = await this.resolveRequestedSubdomainUnder(
+      rule,
+      dto.subdomain,
+      root,
+    );
+    return { requestedSubdomain, requestedDomainId };
+  }
+
+  /**
+   * Récupère la racine éligible du défaut PLATEFORME (CloudflareSetting.rootDomainId)
+   * parmi la liste éligible, si elle y figure (ACTIVE + autorisée, donc éligible).
+   * Retourne null si le défaut plateforme n'existe pas ou n'est pas éligible — même
+   * logique que CloudflareService.resolveEffectiveRoot (#1/#5/#10).
+   */
+  private async platformDefaultEligible(
+    eligible: { id: string; name: string }[],
+  ): Promise<{ id: string; name: string } | null> {
+    if (!eligible.length) return null;
+    const settings = await this.prisma.cloudflareSetting.findFirst();
+    if (!settings?.rootDomainId) return null;
+    return eligible.find((d) => d.id === settings.rootDomainId) ?? null;
+  }
+
+  /**
+   * Sous-domaine choisi au checkout : normalisé, dispo vérifiée en fail-fast SOUS
+   * la racine `root` retenue (choix client ou unique éligible). Retourne null si
+   * absent/non applicable → le provisioning auto-génère un sous-domaine (Bloc E).
+   */
+  private async resolveRequestedSubdomainUnder(
+    rule: { minLength?: number; maxLength?: number; rejectPattern?: string | null },
+    subdomain: string | undefined,
+    root: { id: string; name: string },
   ): Promise<string | null> {
     const raw = subdomain?.trim();
     if (!raw) return null;
-    const rule = product.freeSubdomainRule;
-    if (!rule) return null; // produit sans sous-domaine → ignoré
     const sub = raw.toLowerCase();
     if (sub.length < (rule.minLength ?? 3) || sub.length > (rule.maxLength ?? 40)) {
       throw new BadRequestException(
@@ -694,11 +789,7 @@ export class CheckoutService {
     if (rule.rejectPattern && regexFromRejectPattern(rule.rejectPattern)?.test(sub)) {
       throw new BadRequestException(`Sous-domaine « ${sub} » non autorisé.`);
     }
-    const domainId =
-      rule.allowedDomainIds?.[0] ??
-      (await this.prisma.domain.findFirst({ where: { status: 'ACTIVE' } }))?.id;
-    if (!domainId) throw new BadRequestException('Aucun domaine racine disponible.');
-    const res = await this.cloudflare.checkSubdomainAvailability(sub, domainId);
+    const res = await this.cloudflare.checkSubdomainAvailability(sub, root.id);
     if (!res.available) {
       throw new BadRequestException(`Sous-domaine déjà pris : ${res.fqdn}`);
     }

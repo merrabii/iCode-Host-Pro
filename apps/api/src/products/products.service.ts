@@ -107,7 +107,11 @@ const PUBLIC_INCLUDE = {
 /** Type produit enrichi (valeur du PUBLIC_INCLUDE) renvoyé par le catalogue/fiche
  *  publics — expose options/choices, addons, taxRate, checkoutFields. */
 export type PublicProduct =
-  Prisma.ProductGetPayload<{ include: typeof PUBLIC_INCLUDE }>;
+  Prisma.ProductGetPayload<{ include: typeof PUBLIC_INCLUDE }> & {
+    /** Phase 4 — racines éligibles {id, name} pour un produit à sous-domaine gratuit
+     *  (résolues ACTIVE + restreintes par `allowedDomainIds`). Absent sinon. */
+    freeDomains?: { id: string; name: string }[];
+  };
 
 @Injectable()
 export class ProductsService {
@@ -207,11 +211,12 @@ export class ProductsService {
    *  status ACTIVE (jamais DRAFT/DISABLED/SUSPENDED) et non masqués (`hidden`).
    *  Triage : ordre d'affichage défini en admin, puis création. (Store, ADR-027.) */
   async findPublicCatalog(): Promise<PublicProduct[]> {
-    return this.prisma.product.findMany({
+    const products = await this.prisma.product.findMany({
       where: { status: ProductStatus.ACTIVE, hidden: false },
       orderBy: [{ displayOrder: 'asc' }, { createdAt: 'desc' }],
       include: PUBLIC_INCLUDE,
     });
+    return this.attachFreeDomains(products);
   }
 
   /** Public — fiche produit par slug (Étape 2). Ne sert QUE les produits
@@ -224,7 +229,31 @@ export class ProductsService {
     if (!product) {
       throw new NotFoundException('Product not found');
     }
-    return product;
+    const [enriched] = await this.attachFreeDomains([product]);
+    return enriched;
+  }
+
+  /** Phase 4 — Rattache aux produits à sous-domaine gratuit leur(s) racine(s)
+   *  éligibles `{id, name}` (ACTIVE, restreinte par `allowedDomainIds` si posée ;
+   *  [] = toutes ACTIVE). Le web checkout a besoin des NOMS de zones (pas que des
+   *  ids) pour le sélecteur de racine. Aligne le store sur `findMemberFreeDomains`. */
+  private async attachFreeDomains<T extends PublicProduct>(
+    items: T[],
+  ): Promise<T[]> {
+    const withRule = items.filter((p) => !!p.freeSubdomainRule);
+    if (withRule.length === 0) return items;
+    const allActive = await this.prisma.domain.findMany({
+      where: { status: 'ACTIVE' },
+      select: { id: true, name: true },
+      orderBy: [{ name: 'asc' }],
+    });
+    return items.map((p) => {
+      if (!p.freeSubdomainRule) return p;
+      const allowed = p.freeSubdomainRule.allowedDomainIds ?? [];
+      const list =
+        allowed.length > 0 ? allActive.filter((d) => allowed.includes(d.id)) : allActive;
+      return { ...p, freeDomains: list };
+    });
   }
 
   async findOne(id: string): Promise<Product> {

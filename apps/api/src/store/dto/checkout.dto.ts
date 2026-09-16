@@ -79,6 +79,15 @@ export class CheckoutDto {
   })
   subdomain?: string;
 
+  @ApiPropertyOptional({
+    description:
+      'id du domaine racine explicitement choisi par le client (Phase 4, multi-domaines). ' +
+      'Obligatoire quand plusieurs racines sont éligibles pour ce produit (sinon erreur d’ambiguïté).',
+  })
+  @IsOptional()
+  @IsString()
+  requestedDomainId?: string;
+
   @ApiProperty({ description: 'id d’un moyen de paiement actif (PaymentMethod)' })
   @IsString()
   @IsNotEmpty()

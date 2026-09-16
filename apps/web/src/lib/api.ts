@@ -291,6 +291,8 @@ export const storeCheckout = async (payload: {
   extraFields?: Record<string, string>;
   /** Sous-domaine choisi par le client (produits porteurs d'une FreeSubdomainRule). */
   subdomain?: string;
+  /** Phase 4 — domaine racine explicitement choisi (requis si plusieurs racines éligibles). */
+  requestedDomainId?: string;
   /** Point 6 : membre connecté → facturer sous les coordonnées du compte (true) ou
    *  sous d'autres coordonnées de facturation (false). Inutile pour l'invité. */
   useAccountDetails?: boolean;
@@ -318,12 +320,17 @@ export const storeCheckout = async (payload: {
 export async function checkStoreSubdomain(
   productSlug: string,
   subdomain: string,
+  requestedDomainId?: string,
 ): Promise<{ available: boolean; fqdn: string; reason?: string } | null> {
   try {
     const res = await fetch('/api/store/subdomain/check', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ productSlug, subdomain }),
+      body: JSON.stringify({
+        productSlug,
+        subdomain,
+        ...(requestedDomainId ? { requestedDomainId } : {}),
+      }),
     });
     if (!res.ok) return null;
     const data = (await res.json()) as { available: boolean; fqdn: string; reason?: string };
@@ -964,6 +971,9 @@ export interface PublicProduct {
   // Présence = le produit exige un sous-domaine choisi au checkout (Plan Gratuit,
   // « Deploy my GitHub App ») → le sélecteur de la page produit s'affiche.
   freeSubdomainRule?: FreeSubdomainRuleView | null;
+  // Phase 4 — racines éligibles {id, name} pour le sélecteur de domaine (absentes
+  // si produit sans sous-domaine ; [] servi seulement si un produit a une règle).
+  freeDomains?: { id: string; name: string }[];
   // Phase 16 — Plan Gratuit : inscription autonome SANS checkout (décision B).
   // true → bouton « Commencez gratuitement » (visiteur) / « Créer un nouveau
   // Projet » (connecté) au lieu du tunnel de commande / panier.

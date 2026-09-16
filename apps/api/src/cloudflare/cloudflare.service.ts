@@ -531,6 +531,96 @@ export class CloudflareService {
     });
   }
 
+  /**
+   * ── Phase 4 — Résolution DÉTERMINISTE de la racine effective d'une commande ──
+   * Priorité STRICTE : `effectiveDomainId` (racine déjà figée, gagne à tout retry)
+   * → `requestedDomainId` (choix client au checkout) → défaut « non autorisé ».
+   * AUCUN fallback arbitraire (jamais `allowedDomainIds[0]`, jamais le premier
+   * ACTIVE du lot) : un seul éligible → celui-ci ; plusieurs → erreur d'ambiguïté ;
+   * aucun → erreur. Une allocation NEUVE sur un Domain DISABLED est rejetée ; une
+   * allocation DÉJÀ livrée (fqdn READY) sur un domaine ensuite DISABLED est GARDÉE.
+   * Voir décisions Phase 4 #5-#10/#13/#14 et ADR.
+   */
+  async resolveEffectiveRoot(input: {
+    allowedDomainIds: string[] | null; // de la FreeSubdomainRule (null = produit sans règle)
+    requestedDomainId?: string | null; // choix client au checkout
+    effectiveDomainId?: string | null; // racine déjà figée au provisioning (retry)
+    hasDeliveredFqdn?: boolean; // fqdn READY persisté → allocation existante
+  }): Promise<{ root: Domain; source: 'effective' | 'requested' | 'default' }> {
+    // 1) Racine déjà FIGÉE — gagne sur le reste (#8). Un retry ne re-sélectionne jamais.
+    if (input.effectiveDomainId) {
+      const frozen = await this.prisma.domain.findUnique({
+        where: { id: input.effectiveDomainId },
+      });
+      if (frozen) {
+        if (frozen.status === DomainStatus.DISABLED) {
+          // Allocation DÉJÀ livrée → on garde la racine (#14, pas de migration auto).
+          if (input.hasDeliveredFqdn) return { root: frozen, source: 'effective' };
+          // Allocation NEUVE sur Domain DISABLED → rejet explicite (#13), jamais de re-pick.
+          throw new BadRequestException(
+            `Le domaine ` +
+              `« ${frozen.name} » de cette commande est désactivé : aucune nouvelle allocation n’est possible.`,
+          );
+        }
+        return { root: frozen, source: 'effective' };
+      }
+      // La racine figée a été supprimée (FK SetNull) → on suit la résolution
+      // d'une première allocation (requested, puis défaut), pas un choix arbitraire.
+    }
+
+    // 2) Choix client (#5) — validé : ACTIVE (#13) et autorisé par la règle (#7).
+    if (input.requestedDomainId) {
+      const requested = await this.prisma.domain.findUnique({
+        where: { id: input.requestedDomainId },
+      });
+      if (!requested || requested.status !== DomainStatus.ACTIVE) {
+        throw new BadRequestException(`Le domaine choisi n’est pas disponible.`);
+      }
+      if (
+        input.allowedDomainIds &&
+        input.allowedDomainIds.length > 0 &&
+        !input.allowedDomainIds.includes(requested.id)
+      ) {
+        throw new BadRequestException(`Le domaine choisi n’est pas autorisé pour ce produit.`);
+      }
+      return { root: requested, source: 'requested' };
+    }
+
+    // 3) Défaut de la PLATEFORME : CloudflareSetting.rootDomainId (#1), s'il est
+    //    ACTIVE et autorisé par la règle (#7) → utilisé sans ambiguïté. Aucun fallback
+    //    arbitraire : ce n'est pas une valeur forcée, seulement la préférence plateforme.
+    const settings = await this.prisma.cloudflareSetting.findFirst();
+    if (settings?.rootDomainId) {
+      const rootDomainId = settings.rootDomainId;
+      const root = await this.prisma.domain.findUnique({ where: { id: rootDomainId } });
+      const restricted = input.allowedDomainIds && input.allowedDomainIds.length > 0;
+      if (root && root.status === DomainStatus.ACTIVE && (!restricted || input.allowedDomainIds!.includes(root.id))) {
+        return { root, source: 'default' };
+      }
+    }
+
+    // 3bis) Défaut « non autorisé » (#10) : éligibles = allowedDomainIds (si non vide)
+    //    sinon TOUTES les racines ACTIVE. 1 → celle-ci ; >1 → ambiguïté ; 0 → erreur.
+    const eligible = await this.prisma.domain.findMany({
+      where: {
+        status: DomainStatus.ACTIVE,
+        ...(input.allowedDomainIds && input.allowedDomainIds.length > 0
+          ? { id: { in: input.allowedDomainIds } }
+          : {}),
+      },
+      orderBy: [{ name: 'asc' }],
+    });
+    if (eligible.length === 0) {
+      throw new BadRequestException(`Aucun domaine racine disponible.`);
+    }
+    if (eligible.length > 1) {
+      throw new BadRequestException(
+        `Plusieurs domaines sont disponibles — veuillez choisir votre domaine racine.`,
+      );
+    }
+    return { root: eligible[0]!, source: 'default' };
+  }
+
   /** Racines ACTIVES proposables au client pour un sous-domaine gratuit.
    *  `allowedDomainIds` = autorisations de la règle FreeSubdomainRule du produit
    *  du client (admin). Vide/null ⇒ toutes les racines ACTIVES. */

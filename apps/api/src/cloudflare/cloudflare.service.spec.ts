@@ -227,4 +227,129 @@ describe('CloudflareService', () => {
       expect(await service.findActiveRootDomain()).toEqual(rootDomain);
     });
   });
+
+  describe('resolveEffectiveRoot (Phase 4)', () => {
+    const d = (id: string, name: string, status: 'ACTIVE' | 'DISABLED'): Domain => ({
+      id,
+      name,
+      zoneId: `z-${id}`,
+      cnameTarget: null,
+      status,
+      createdAt: new Date('2026-09-01T10:00:00Z'),
+      updatedAt: new Date('2026-09-01T10:00:00Z'),
+    });
+
+    // Isolation PAR TEST : le chemin « défaut » lit désormais cloudflareSetting
+    // (rootDomainId) puis domain.findUnique/findMany. clearAllMocks() ne réinitialise
+    // que les appels, pas les implémentations → sans reset explicite, les mocks des
+    // tests précédents (racine défaut ACTIVE/DISABLED) fuiteraient et court-circuiteraient
+    // l'ambiguïté / l'absence d'éligible.
+    beforeEach(() => {
+      mockPrisma.cloudflareSetting.findFirst.mockResolvedValue(null);
+      mockPrisma.domain.findUnique.mockResolvedValue(null);
+      mockPrisma.domain.findMany.mockResolvedValue([]);
+    });
+
+    it('effectiveDomainId FIGÉ gagne sur requested + défaut (#8)', async () => {
+      mockPrisma.domain.findUnique.mockResolvedValue(d('eff1', 'frozen.com', 'ACTIVE'));
+      const out = await service.resolveEffectiveRoot({
+        allowedDomainIds: ['req1'],
+        requestedDomainId: 'req1',
+        effectiveDomainId: 'eff1',
+      });
+      expect(out).toEqual({ root: expect.objectContaining({ id: 'eff1', name: 'frozen.com' }), source: 'effective' });
+    });
+
+    it('effective sur DISABLED + fqdn déjà livré → GARDÉ (pas de migration auto, #14)', async () => {
+      mockPrisma.domain.findUnique.mockResolvedValue(d('eff1', 'frozen.com', 'DISABLED'));
+      const out = await service.resolveEffectiveRoot({
+        allowedDomainIds: ['eff1'],
+        effectiveDomainId: 'eff1',
+        hasDeliveredFqdn: true,
+      });
+      expect(out.source).toBe('effective');
+    });
+
+    it('allocation NEUVE sur effective DISABLED → rejet explicite (#13), jamais de re-pick', async () => {
+      mockPrisma.domain.findUnique.mockResolvedValue(d('eff1', 'frozen.com', 'DISABLED'));
+      await expect(
+        service.resolveEffectiveRoot({
+          allowedDomainIds: ['eff1'],
+          effectiveDomainId: 'eff1',
+          hasDeliveredFqdn: false,
+        }),
+      ).rejects.toThrow(/désactivé/);
+    });
+
+    it('requestedDomainId ACTIVE et autorisé → retourne le choix (#5)', async () => {
+      mockPrisma.domain.findUnique.mockResolvedValue(d('req1', 'codediali.com', 'ACTIVE'));
+      const out = await service.resolveEffectiveRoot({
+        allowedDomainIds: ['req1', 'dom2'],
+        requestedDomainId: 'req1',
+      });
+      expect(out).toEqual({ root: expect.objectContaining({ id: 'req1' }), source: 'requested' });
+    });
+
+    it('requestedDomainId hors whitelist → rejet (#7)', async () => {
+      mockPrisma.domain.findUnique.mockResolvedValue(d('other', 'other.com', 'ACTIVE'));
+      await expect(
+        service.resolveEffectiveRoot({ allowedDomainIds: ['dom2'], requestedDomainId: 'other' }),
+      ).rejects.toThrow(/pas autorisé/);
+    });
+
+    it('requestedDomainId DISABLED → rejet (#13)', async () => {
+      mockPrisma.domain.findUnique.mockResolvedValue(d('req1', 'codediali.com', 'DISABLED'));
+      await expect(
+        service.resolveEffectiveRoot({ allowedDomainIds: ['req1'], requestedDomainId: 'req1' }),
+      ).rejects.toThrow(/pas disponible/);
+    });
+
+    it('défaut : single racine éligible → celle-ci (#10)', async () => {
+      mockPrisma.domain.findMany.mockResolvedValue([d('a', 'a.com', 'ACTIVE')]);
+      const out = await service.resolveEffectiveRoot({ allowedDomainIds: null });
+      expect(out).toEqual({ root: expect.objectContaining({ id: 'a' }), source: 'default' });
+    });
+
+    it('défaut PLATEFORME — rootDomainId ACTIVE autorisé → utilisé (#1), pas d’ambiguïté', async () => {
+      mockPrisma.cloudflareSetting.findFirst.mockResolvedValue({ rootDomainId: 'pf1' });
+      mockPrisma.domain.findUnique.mockResolvedValue(d('pf1', 'codediali.com', 'ACTIVE'));
+      const out = await service.resolveEffectiveRoot({ allowedDomainIds: ['pf1', 'other'] });
+      expect(out).toEqual({ root: expect.objectContaining({ id: 'pf1' }), source: 'default' });
+      // Le défaut rootDomainId prime : l'intersection (plusieurs éligibles) n'est pas consultée.
+      expect(mockPrisma.domain.findMany).not.toHaveBeenCalled();
+    });
+
+    it('défaut rootDomainId DISABLED → ignoré (pas de re-pick arbitraire), intersection suivie', async () => {
+      mockPrisma.cloudflareSetting.findFirst.mockResolvedValue({ rootDomainId: 'pf1' });
+      mockPrisma.domain.findUnique.mockResolvedValue(d('pf1', 'codediali.com', 'DISABLED'));
+      mockPrisma.domain.findMany.mockResolvedValue([d('a', 'a.com', 'ACTIVE')]);
+      const out = await service.resolveEffectiveRoot({ allowedDomainIds: null });
+      expect(out).toEqual({ root: expect.objectContaining({ id: 'a' }), source: 'default' });
+    });
+
+    it('défaut rootDomainId hors whitelist (allowed non vide) → ignoré, intersection suivie (#7)', async () => {
+      mockPrisma.cloudflareSetting.findFirst.mockResolvedValue({ rootDomainId: 'pf1' });
+      mockPrisma.domain.findUnique.mockResolvedValue(d('pf1', 'codediali.com', 'ACTIVE'));
+      mockPrisma.domain.findMany.mockResolvedValue([d('a', 'a.com', 'ACTIVE')]);
+      const out = await service.resolveEffectiveRoot({ allowedDomainIds: ['a'] });
+      expect(out).toEqual({ root: expect.objectContaining({ id: 'a' }), source: 'default' });
+    });
+
+    it('défaut : plusieurs racines éligibles SANS choix → ambiguïté (#10)', async () => {
+      mockPrisma.domain.findMany.mockResolvedValue([
+        d('a', 'a.com', 'ACTIVE'),
+        d('b', 'b.com', 'ACTIVE'),
+      ]);
+      await expect(service.resolveEffectiveRoot({ allowedDomainIds: null })).rejects.toThrow(
+        /Plusieurs domaines/,
+      );
+    });
+
+    it('défaut : aucune racine éligible → erreur (#10)', async () => {
+      mockPrisma.domain.findMany.mockResolvedValue([]);
+      await expect(service.resolveEffectiveRoot({ allowedDomainIds: null })).rejects.toThrow(
+        /Aucun domaine racine/,
+      );
+    });
+  });
 });

@@ -37,6 +37,9 @@ export interface CartItem {
   // Sous-domaine choisi par le client (produits à FreeSubdomainRule — Plan Gratuit,
   // « Deploy my GitHub App »). À défaut (null/absent), l'API le génère.
   subdomain?: string;
+  // Phase 4 — domaine racine explicitement choisi (requis si plusieurs racines
+  // éligibles). Porté via le panier jusqu'au checkout.
+  requestedDomainId?: string;
 }
 
 export function emptyCart(): CartItem | null {

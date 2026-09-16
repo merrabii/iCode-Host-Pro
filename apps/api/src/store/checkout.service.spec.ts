@@ -25,6 +25,7 @@ describe('CheckoutService — idempotencyKey inclut le sous-domaine', () => {
     amountTtcCents: number,
     billingEmail: string,
     subdomain: string | null,
+    rootDomainId?: string | null,
   ): string =>
     (service as unknown as {
       idempotencyKey: (
@@ -33,8 +34,9 @@ describe('CheckoutService — idempotencyKey inclut le sous-domaine', () => {
         a: number,
         e: string,
         s: string | null,
+        r: string | null,
       ) => string;
-    }).idempotencyKey(dto, methodId, amountTtcCents, billingEmail, subdomain);
+    }).idempotencyKey(dto, methodId, amountTtcCents, billingEmail, subdomain, rootDomainId ?? null);
 
   const base = { productSlug: 'deploy-github-app' };
 
@@ -73,6 +75,18 @@ describe('CheckoutService — idempotencyKey inclut le sous-domaine', () => {
     // inchangé pour les produits sans sous-domaine, comportement historique).
     const k1 = key(base, 'pm1', 4900, 'mourad@example.com', null);
     const k2 = key(base, 'pm1', 4900, 'mourad@example.com', null);
+    expect(k1).toEqual(k2);
+  });
+
+  it('Phase 4 — même sous-domaine, racine DIFFÉRENTE ⇒ clés différentes', () => {
+    const k1 = key(base, 'pm1', 4900, 'mourad@example.com', 'alpha', 'dom1');
+    const k2 = key(base, 'pm1', 4900, 'mourad@example.com', 'alpha', 'dom2');
+    expect(k1).not.toEqual(k2);
+  });
+
+  it('Phase 4 — config identique y compris racine ⇒ MÊME clé', () => {
+    const k1 = key(base, 'pm1', 4900, 'mourad@example.com', 'alpha', 'dom1');
+    const k2 = key(base, 'pm1', 4900, 'mourad@example.com', 'alpha', 'dom1');
     expect(k1).toEqual(k2);
   });
 });

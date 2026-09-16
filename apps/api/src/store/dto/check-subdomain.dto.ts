@@ -1,5 +1,5 @@
 import { ApiProperty } from '@nestjs/swagger';
-import { IsNotEmpty, IsString, Matches, MaxLength } from 'class-validator';
+import { IsNotEmpty, IsOptional, IsString, Matches, MaxLength } from 'class-validator';
 
 /** Corps public de vérification du sous-domaine au checkout (Plan Gratuit/…). */
 export class CheckSubdomainPublicDto {
@@ -16,4 +16,12 @@ export class CheckSubdomainPublicDto {
     message: 'Sous-domaine invalide (a-z, 0-9, tirets, pas de tiret aux extrémités).',
   })
   subdomain!: string;
+
+  @ApiPropertyOptional({
+    description:
+      'id du domaine racine choisi (Phase 4, multi-domaines). Requis quand plusieurs racines éligibles.',
+  })
+  @IsOptional()
+  @IsString()
+  requestedDomainId?: string;
 }

@@ -820,4 +820,27 @@ Unit **398/398**, e2e **146/146** verts. Fichiers : `runtime-port-contract.ts` (
 - **Règle pour les futures portes** : toute nouvelle enforcement Turnstile (nouvelle porte d'authentification, formulaire public…) doit gate sur **`isActive()`**, jamais sur le flag seul, afin de conserver la cohérence frontend/backend.
 - **Tests** : unit **422/422** (baseline 405 +17) · 35/35 suites · tsc API + `nest build` verts · tsc web vert (frontend inchangé). Frontend garde son gate `turnstileSiteKey !== ''` (état cohérent : `''` ⇔ inactif ⇔ aucun widget ⇔ aucune exigence backend).
 
+## ADR-040 — Choix du domaine racine + gel `effectiveDomainId` (Phase 4, multi-domaines store, 2026-09-16)
+**Status: IMPLEMENTED** (commits locaux, NON poussés — dernières décisions validées par le propriétaire).
+
+- **Contexte** : le checkout store choisissait la racine des sous-domaines par **fallback arbitraire** (`allowedDomainIds[0]` / premier ACTIVE), et le provisioning **re-résolvait** librement la racine à chaque run. Conséquences : (a) le client ne pouvait pas choisir **laquelle** des racines (codediali.com / arumdigital.com) héberge son sous-domaine ; (b) une **fenêtre de panne** (racine résolue → DNS créé → crash avant persistence) pouvait faire re-sélectionner **une autre racine** au retry, désynchronisant DNS et Coolify. Compte Cloudflare unique, plusieurs zones/`Domain.zoneId` (pas de 2ᵉ moteur : le store s'aligne sur le mécanisme multi-domaines existant de `/client/project`, décision #15/#18).
+- **Décisions (19 validées, implémentées)** :
+  1. `CloudflareSetting.rootDomainId` = **défaut de la plateforme** (aucun `Domain.isDefault`).
+  2. `FreeSubdomainRule.allowedDomainIds` = whitelist de produits ; `[]` = **toutes** les racines ACTIVE.
+  3. `Order.requestedDomainId` = **intention/choix** du client au checkout (nullable, valeur).
+  4. `Order.effectiveDomainId` = racine **réellement résolue et FIGÉE** au provisioning, **AVANT** toute allocation DNS (nullable, valeur).
+  5. **Aucun fallback arbitraire** : jamais `allowedDomainIds[0]`, jamais premier ACTIVE, jamais ordre DB implicite.
+- **Résolution canonique de la racine effective** (`CloudflareService.resolveEffectiveRoot`, priorité stricte) :
+  1. `effectiveDomainId` persisté → gagne sur tout à chaque retry (#8) ;
+  2. `requestedDomainId` (choix client) → ACTIVE requis (#13) + dans la whitelist (#7) ;
+  3. défaut plateforme `rootDomainId` s'il est ACTIVE + autorisé (#1) ;
+  4. sinon **intersection `allowedDomainIds` ∩ ACTIVE** : exactement 1 → celle-ci ; **0 → erreur** ; **>1 → erreur d'ambiguïté** « choisissez votre domaine » (#10).
+- **Fenêtre de panne / retry** : `actionConfigureDns` résout la racine, **gèle `effectiveDomainId`** sur l'Order, PUIS alloue le DNS **sous cette racine**. Un crash (DNS créé → persist absent) : au retry `effectiveDomainId` est figé ⇒ `allocateClientSubdomain` re-tente **la même racine** et réutilise l'enregistrement existant (même fqdn) — **jamais de 2ᵉ allocation ni d'autre racine**. DNS et Coolify utilisent **exactement le même fqdn** (#16).
+- **Sémantique DISABLED** : allocation **neuve** sur racine DISABLED → rejet explicite (#13, jamais de re-pick arbitraire) ; allocation **déjà livrée** (fqdn READY persisté) sur racine ensuite DISABLED → **GARDÉE**, aucune migration automatique (#14). Anciennes commandes déjà provisionnées : **garde leur historique** (aucun backfill, #11/#12).
+- **Schema/migration** (`20260916132815_order_effective_domain`) : **non destructive**, ADD COLUMN `requestedDomainId`/`effectiveDomainId` + 2 FK nommées `ON DELETE SET NULL` sur `Order` (+ back-relations nommées sur `Domain`). Aucun DROP (les `DROP INDEX Deployment_*` détectés par Prisma relèvent d'une **dérive préexistante** hors périmètre #19, retirés de la migration). Aucun backfill. Appliquée via `prisma migrate deploy`, `migrate status` = up to date (39 migrations).
+- **Idempotence checkout** : `idempotencyKey` inclut maintenant `requestedDomainId` en plus de `requestedSubdomain` — un changement de racine crée une commande distincte (pas de replay croisé).
+- **Checkout & check public alignés** : `resolveSubdomainAndRoot`, la résolution du store `subdomain/check` ET la dispo consultent le défaut `rootDomainId` avant l'ambiguïté — cohérents entre eux et avec le provisioning.
+- **Store** : `PublicProduct.freeDomains: { id, name }[]` (racines ACTIVE éligibles) exposé pour un **sélecteur de racine** guest dès le shop quand >1 éligible ; présélection quand une seule. `/client/project` **intouché** (#18).
+- **Tests** : unit Phase 4 ajoutés (`resolveEffectiveRoot` y compris défaut racine/ambiguïté/zéro/DISABLED, `actionConfigureDns` gel-avant-DNS + retry même racine + récupération allocation partielle + DISABLED, `idempotencyKey` racine différente ⇒ clé distincte). Voir rapport final VALIDATION.
+
 # REJECTED

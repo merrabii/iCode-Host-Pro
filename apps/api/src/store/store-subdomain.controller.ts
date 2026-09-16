@@ -42,21 +42,64 @@ export class StoreSubdomainController {
     if (rule.reservedPrefixes.some((p) => sub.startsWith(p))) {
       return { available: false, fqdn: previewFqdn(sub, null), reason: 'reserved' };
     }
-    // Le bon domaine (la règle peut lister plusieurs Domain ; [] = tous les ACTIVE).
-    const domainId =
-      rule.allowedDomainIds[0] ??
-      (await this.prisma.domain.findFirst({ where: { status: 'ACTIVE' } }))?.id ??
-      null;
-    if (!domainId) {
+    // Phase 4 — la racine est choisie (requestedDomainId) ou unique : AUCUN
+    // fallback arbitraire (`allowedDomainIds[0]`, premier ACTIVE…). Éligibles =
+    // racines ACTIVE restreintes par la whitelist de la règle ([] = toutes).
+    const eligible = await this.eligibleDomains(rule);
+    if (eligible.length === 0) {
       return { available: false, fqdn: previewFqdn(sub, null), reason: 'invalid' };
     }
 
-    const res = await this.cloudflare.checkSubdomainAvailability(sub, domainId);
+    let root: { id: string; name: string };
+    if (dto.requestedDomainId) {
+      const chosen = eligible.find((d) => d.id === dto.requestedDomainId);
+      if (!chosen) {
+        return { available: false, fqdn: previewFqdn(sub, null), reason: 'invalid' };
+      }
+      root = chosen;
+    } else {
+      // Défaut : le défaut PLATEFORME (rootDomainId, #1/#5) s'il est éligible, sinon
+      // l'unique éligible ; >1 sans défaut plateforme → ambiguïté (#10), pas de pick.
+      const platformDefault = await this.platformDefaultEligible(eligible);
+      if (platformDefault) {
+        root = platformDefault;
+      } else if (eligible.length > 1) {
+        return { available: false, fqdn: previewFqdn(sub, null), reason: 'invalid' };
+      } else {
+        root = eligible[0]; // unique éligible
+      }
+    }
+
+    const res = await this.cloudflare.checkSubdomainAvailability(sub, root.id);
     return {
       available: res.available,
       fqdn: res.fqdn,
       reason: res.available ? undefined : 'taken',
     };
+  }
+
+  /** Racines éligibles (ACTIVE) pour la règle du produit : `allowedDomainIds` non
+   *  vide = whitelist ; vide = toutes les racines ACTIVE. (Aligné sur l'existant.) */
+  private async eligibleDomains(rule: { allowedDomainIds: string[] }): Promise<{ id: string; name: string }[]> {
+    return this.prisma.domain.findMany({
+      where: {
+        status: 'ACTIVE',
+        ...(rule.allowedDomainIds.length > 0 ? { id: { in: rule.allowedDomainIds } } : {}),
+      },
+      select: { id: true, name: true },
+      orderBy: [{ name: 'asc' }],
+    });
+  }
+
+  /** Racine du défaut PLATEFORME (CloudflareSetting.rootDomainId) parmi les éligibles,
+   *  si elle y figure. Même logique que CloudflareService.resolveEffectiveRoot (#1/#5). */
+  private async platformDefaultEligible(
+    eligible: { id: string; name: string }[],
+  ): Promise<{ id: string; name: string } | null> {
+    if (!eligible.length) return null;
+    const settings = await this.prisma.cloudflareSetting.findFirst();
+    if (!settings?.rootDomainId) return null;
+    return eligible.find((d) => d.id === settings.rootDomainId) ?? null;
   }
 }
 

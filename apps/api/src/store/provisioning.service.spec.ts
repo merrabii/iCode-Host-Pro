@@ -555,3 +555,182 @@ describe('ProvisioningService — actionCreateApp (choix du projet A/B voie stor
     );
   });
 });
+
+// =========================================================================
+// Phase 4 — actionConfigureDns (fenêtre de panne + gel effectiveDomainId).
+// Invariant : la racine effective est RÉSOLUE puis FIGÉE (order.update
+// effectiveDomainId) AVANT toute allocation DNS, pour qu'un retry après un
+// crash (DNS créé → persist absent) re-résolve la MÊME racine, jamais une
+// autre. Aucun fallback arbitraire ; DNS et Coolify utilisent le même fqdn (#16).
+// Les commandes testées n'ont QUE l'action CONFIGURE_DNS (branche 3,
+// appUuid=null → pas de transport, pas de CREATE_APP). Mocks Prisma/Cloudflare
+// dédiés (aucun réseau).
+// =========================================================================
+describe('ProvisioningService — actionConfigureDns (Phase 4, gel racine)', () => {
+  const mockDecrypt = jest.fn();
+  let service: ProvisioningService;
+
+  const coolifyServer = {
+    id: 'srv-coolify',
+    panelProvider: 'COOLIFY',
+    apiBaseUrl: 'http://portal.exemple.com:8000/api/v1',
+    apiTokenEnc: 'enc:coolify',
+    strictTls: true,
+    hostname: 'portal.exemple.com',
+    coolifyProjectUuid: 'proj-1',
+    coolifyServerUuid: 'srv-1',
+  };
+
+  const prisma = {
+    order: { findUnique: jest.fn(), update: jest.fn() },
+    deployment: { findFirst: jest.fn(), create: jest.fn(), update: jest.fn(), updateMany: jest.fn() },
+    provisioningLog: { create: jest.fn(), update: jest.fn(), findMany: jest.fn() },
+    orderStatusHistory: { create: jest.fn() },
+    clientSubdomain: { findFirst: jest.fn() },
+  };
+  const audit = { record: jest.fn() };
+  const cloudflare = {
+    resolveEffectiveRoot: jest.fn(),
+    allocateClientSubdomain: jest.fn(),
+    findActiveRootDomain: jest.fn(),
+  };
+  const transport = { createGitApp: jest.fn(), deployApp: jest.fn(), setAppDomain: jest.fn() };
+  const panelFactory = { create: jest.fn(() => transport) };
+  const deployments = { getOrCreateClientProject: jest.fn() };
+  const mail = { sendPlain: jest.fn() };
+
+  const root = {
+    id: 'pf1',
+    name: 'codediali.com',
+    zoneId: 'z1',
+    cnameTarget: null,
+    status: 'ACTIVE' as const,
+    createdAt: new Date('2026-09-01T10:00:00Z'),
+    updatedAt: new Date('2026-09-01T10:00:00Z'),
+  };
+
+  // Une seule shape d'order renvoyée par LES DEUX findUnique (provisionOrder initial
+  // + findUnique interne d'actionConfigureDns) : porte à la fois provisionModule,
+  // customer et freeSubdomainRule/pack/racines.
+  function orderFor(over: Record<string, unknown> = {}): Record<string, any> {
+    return {
+      id: 'ord1',
+      status: 'PAID',
+      domainValue: null,
+      domainStatus: null,
+      customerName: 'Client',
+      customerEmail: 'cl@exemple.com',
+      requestedSubdomain: 'monapp',
+      requestedDomainId: null,
+      effectiveDomainId: null,
+      customer: { userId: 'u1' },
+      product: {
+        name: 'Site',
+        moduleParams: {},
+        freeSubdomainRule: { allowedDomainIds: null, minLength: 3, maxLength: 40, rejectPattern: null },
+        pack: { deploymentModule: { kind: 'SHARED_PROJECT', sharedProjectUuid: 'proj-shared', server: coolifyServer } },
+        provisionModule: { name: 'coolify-store', actions: ['CONFIGURE_DNS'] },
+      },
+      ...over,
+    };
+  }
+
+  beforeEach(() => {
+    service = new ProvisioningService(
+      prisma as never,
+      audit as never,
+      { decrypt: mockDecrypt } as never,
+      mail as never,
+      cloudflare as never,
+      panelFactory as never,
+      deployments as never,
+    );
+    jest.clearAllMocks();
+    mockDecrypt.mockReturnValue('tok');
+    prisma.provisioningLog.create.mockResolvedValue({ id: 'log1' });
+    prisma.provisioningLog.findMany.mockResolvedValue([]);
+    prisma.deployment.findFirst.mockResolvedValue(null);
+    prisma.order.update.mockResolvedValue({});
+    prisma.clientSubdomain.findFirst.mockResolvedValue(null);
+    cloudflare.allocateClientSubdomain.mockResolvedValue({ subdomain: 'monapp', fqdn: 'monapp.codediali.com' });
+    cloudflare.resolveEffectiveRoot.mockResolvedValue({ root, source: 'default' });
+  });
+
+  it('gèle effectiveDomainId AVANT l’allocation DNS (#8/#16)', async () => {
+    prisma.order.findUnique.mockResolvedValue(orderFor());
+    await service.provisionOrder('ord1');
+
+    // Le gel de la racine est le 1er order.update(effectiveDomainId='pf1') ; son
+    // ordre GLOBAL (invocationCallOrder) précède celui de l'allocation DNS.
+    const gelIdx = prisma.order.update.mock.calls.findIndex(
+      (c) => (c[0] as { data?: { effectiveDomainId?: string } } | undefined)?.data?.effectiveDomainId === 'pf1',
+    );
+    const gelOrder = prisma.order.update.mock.invocationCallOrder[gelIdx];
+    const allocOrder = cloudflare.allocateClientSubdomain.mock.invocationCallOrder[0];
+    expect(gelIdx).toBeGreaterThanOrEqual(0);
+    expect(gelOrder).toBeLessThan(allocOrder);
+
+    // Allocation SOUS CETTE racine, avec le sous-domaine demandé.
+    expect(cloudflare.allocateClientSubdomain).toHaveBeenCalledWith(
+      expect.objectContaining({ root: expect.objectContaining({ id: 'pf1' }), requested: 'monapp' }),
+    );
+  });
+
+  it('retry → effectiveDomainId déjà figé GAGNE : résolu tel quel, pas de re-pick', async () => {
+    const order = orderFor({ effectiveDomainId: 'pf1', requestedDomainId: 'req1' });
+    prisma.order.findUnique.mockResolvedValue(order);
+
+    const out = await service.provisionOrder('ord1');
+
+    // Le résolveur reçoit bien effectiveDomainId + requestedDomainId : il décide.
+    expect(cloudflare.resolveEffectiveRoot).toHaveBeenCalledWith(
+      expect.objectContaining({ effectiveDomainId: 'pf1', requestedDomainId: 'req1' }),
+    );
+    // Allocation sous la racine figée, pas sous une autre.
+    expect(cloudflare.allocateClientSubdomain).toHaveBeenCalledWith(
+      expect.objectContaining({ root: expect.objectContaining({ id: 'pf1' }) }),
+    );
+    expect(out.fqdn).toBe('monapp.codediali.com');
+  });
+
+  it('fenêtre de panne (crash DNS→persist) → allocation partielle RÉUTILISÉE sous la même racine, jamais de 2ᵉ record', async () => {
+    // Au retry, la racine est figée (pf1) et l'enregistrement DNS existe déjà pour
+    // le sous-domaine demandé (le crash a laissé le record sans persistence Order).
+    prisma.order.findUnique.mockResolvedValue(orderFor({ effectiveDomainId: 'pf1' }));
+    prisma.clientSubdomain.findFirst.mockResolvedValue({ id: 'cs1', subdomain: 'monapp', fqdn: 'monapp.codediali.com' });
+
+    await service.provisionOrder('ord1');
+
+    // Re-cherche du fqdn DÉJÀ alloué sous la racine figée…
+    expect(prisma.clientSubdomain.findFirst).toHaveBeenCalledWith({ where: { fqdn: 'monapp.codediali.com' } });
+    // …réutilisé → AUCUNE nouvelle allocation, même racine (#16).
+    expect(cloudflare.allocateClientSubdomain).not.toHaveBeenCalled();
+    // La commande est finalisée avec le fqdn récupéré.
+    expect(prisma.order.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: 'ord1' },
+        data: expect.objectContaining({ domainValue: 'monapp.codediali.com' }),
+      }),
+    );
+  });
+
+  it('allocation NEUVE sur domain DISABLED → rejet explicite, jamais de re-pick (#13)', async () => {
+    // Échec du résolveur = step FAILED ⇒ jamais ACTIVE sans fqdn (branche 3).
+    cloudflare.resolveEffectiveRoot.mockRejectedValue(
+      new Error('Le domaine « codediali.com » de cette commande est désactivé : aucune nouvelle allocation n’est possible.'),
+    );
+    prisma.order.findUnique.mockResolvedValue(orderFor({ effectiveDomainId: 'pf1' }));
+    // Le step configure_dns est FAILED dans les logs → la branche 3 reste PROVISIONING.
+    prisma.provisioningLog.findMany
+      .mockResolvedValueOnce([{ id: 'log1', step: 'configure_dns', status: 'FAILED', message: 'domaine désactivé' }])
+      .mockResolvedValueOnce([{ id: 'log1', step: 'configure_dns', status: 'FAILED', message: 'domaine désactivé' }]);
+
+    const out = await service.provisionOrder('ord1');
+
+    expect(out.status).toBe('PROVISIONING');
+    expect(cloudflare.allocateClientSubdomain).not.toHaveBeenCalled();
+    expect(prisma.order.update).not.toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ effectiveDomainId: 'pf1' }) }),
+    );
+  });
+});

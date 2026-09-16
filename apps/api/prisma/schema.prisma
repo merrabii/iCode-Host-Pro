@@ -795,6 +795,9 @@ model Domain {
   rootOf           CloudflareSetting? @relation("RootDomain") // 1:1 — la racine sélectionnée
   clientSubdomains ClientSubdomain[]
   deployments      Deployment[]
+  // Phase 4 — ordres du store qui choisissent ce domaine comme racine.
+  requestedOrders Order[] @relation("OrderRequestedDomain")
+  effectiveOrders Order[] @relation("OrderEffectiveDomain")
   createdAt        DateTime           @default(now())
   updatedAt        DateTime           @updatedAt
 }
@@ -1127,6 +1130,17 @@ model Order {
   // sous-domaine) : passé en `requested` à l'allocation Cloudflare par le
   // provisioning (actionConfigureDns). Null = sous-domaine auto-généré.
   requestedSubdomain String?
+  // ── Phase 4 — Domaine racine (multi-domaines) ─────────────────────────────
+  // requestedDomainId = intention/choix explicit du client au checkout (racine
+  // hébergeant son sous-domaine). Nul quand aucun choix (résolution par défaut).
+  // effectiveDomainId = racine RÉELLEMENT résolue et FIGÉE au provisioning, AVANT
+  // toute allocation DNS : au retry, elle gagne toujours sur requestedDomainId et
+  // sur le défaut (aucune re-sélection de racine pendant une fenêtre de panne).
+  // Voir CloudflareService.resolveEffectiveRoot + ADR Phase 4.
+  requestedDomainId String?
+  requestedDomain   Domain? @relation("OrderRequestedDomain", fields: [requestedDomainId], references: [id], onDelete: SetNull)
+  effectiveDomainId String?
+  effectiveDomain   Domain? @relation("OrderEffectiveDomain", fields: [effectiveDomainId], references: [id], onDelete: SetNull)
   paymentMethodId   String?
   paymentMethod     PaymentMethod?    @relation(fields: [paymentMethodId], references: [id], onDelete: SetNull)
   paymentMethodName String? // snapshot

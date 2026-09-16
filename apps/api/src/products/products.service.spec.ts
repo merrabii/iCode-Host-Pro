@@ -32,6 +32,7 @@ describe('ProductsService', () => {
     },
     productAddon: { findMany: jest.fn(), create: jest.fn(), findUnique: jest.fn(), update: jest.fn(), delete: jest.fn() },
     provisionMethod: { findMany: jest.fn() },
+    domain: { findMany: jest.fn() },
   };
   const mockAudit = { record: jest.fn() };
   const actor = { sub: 'admin', email: 'admin@example.com' };
@@ -295,5 +296,50 @@ describe('ProductsService', () => {
     expect(mockPrisma.provisionMethod.findMany).toHaveBeenCalledWith(
       expect.objectContaining({ where: { isActive: true } }),
     );
+  });
+
+  // Phase 4 — le web checkout a besoin des NOMS de zones (pas que des ids) pour le
+  // sélecteur de racine. attachFreeDomains résout {id,name} des racines ACTIVE,
+  // restreintes par `allowedDomainIds` ([] = toutes ACTIVE) ; produit sans règle → rien.
+  describe('attachFreeDomains (Phase 4)', () => {
+    const baseProd = { id: 'p1', slug: 'premium', status: 'ACTIVE', hidden: false, name: 'Premium' };
+
+    it('findPublicBySlug rattache freeDomains {id,name} restreints par allowedDomainIds', async () => {
+      mockPrisma.product.findFirst.mockResolvedValue({
+        ...baseProd,
+        freeSubdomainRule: { id: 'r1', allowedDomainIds: ['dom-a', 'dom-b'] },
+      });
+      mockPrisma.domain.findMany.mockResolvedValue([
+        { id: 'dom-a', name: 'codediali.com' },
+        { id: 'dom-c', name: 'other.com' },
+      ]);
+      const out = await service.findPublicBySlug('premium');
+      // Seuls les ids de la whitelist, avec leur nom de zone.
+      expect(out.freeDomains).toEqual([{ id: 'dom-a', name: 'codediali.com' }]);
+    });
+
+    it('allowedDomainIds vide ([]) ⇒ toutes les racines ACTIVE exposées', async () => {
+      mockPrisma.product.findFirst.mockResolvedValue({
+        ...baseProd,
+        freeSubdomainRule: { id: 'r1', allowedDomainIds: [] },
+      });
+      mockPrisma.domain.findMany.mockResolvedValue([
+        { id: 'dom-a', name: 'codediali.com' },
+        { id: 'dom-b', name: 'arumdigital.com' },
+      ]);
+      const out = await service.findPublicBySlug('premium');
+      expect(out.freeDomains).toEqual([
+        { id: 'dom-a', name: 'codediali.com' },
+        { id: 'dom-b', name: 'arumdigital.com' },
+      ]);
+    });
+
+    it('produit sans FreeSubdomainRule ⇒ pas de freeDomains, aucune requête domain', async () => {
+      mockPrisma.product.findFirst.mockResolvedValue(baseProd);
+      mockPrisma.domain.findMany.mockResolvedValue([{ id: 'dom-a', name: 'codediali.com' }]);
+      const out = await service.findPublicBySlug('premium');
+      expect(out.freeDomains).toBeUndefined();
+      expect(mockPrisma.domain.findMany).not.toHaveBeenCalled();
+    });
   });
 });

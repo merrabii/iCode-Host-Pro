@@ -67,6 +67,7 @@ function CheckoutPaymentView() {
   }, [item]);
 
   const subdomain = item?.subdomain;
+  const requestedDomainId = item?.requestedDomainId;
   const productSlug = item?.product.slug ?? null;
 
   async function confirmer(e: FormEvent) {
@@ -85,6 +86,7 @@ function CheckoutPaymentView() {
         phone: contact.phone,
         paymentMethodId: methodId,
         subdomain,
+        requestedDomainId,
         useAccountDetails: contact.useAccountDetails,
       });
       const data = res.data as unknown;

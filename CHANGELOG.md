@@ -1,5 +1,21 @@
 # CHANGELOG
 
+## 2026-09-16 — Phase 4 (multi-domaines store) : **choix du domaine racine + gel `effectiveDomainId` avant DNS** (ADR-040)
+### Problème résolu (2 classes)
+1. **Aucun choix client de racine** : le checkout store choisissait la racine des sous-domaines par **fallback arbitraire** (`allowedDomainIds[0]` / premier ACTIVE) — impossible pour le client de choisir laquelle des racines (codediali.com / arumdigital.com) héberge son sous-domaine.
+2. **Fenêtre de panne / re-sélection de racine** : le provisioning re-résolvait librement la racine à chaque run ⇒ un crash (racine résolue → DNS créé → avant persistence) pouvait faire re-sélectionner **une autre racine** au retry, désynchronisant **DNS et Coolify**.
+### Implémenté (19 décisions validées par le propriétaire)
+- **Schema/migration** (`20260916132815_order_effective_domain`) : `Order.requestedDomainId` (intention client) + `Order.effectiveDomainId` (racine **FIGÉE** au provisioning), nullable, relations Prisma **nommées** (`ON DELETE SET NULL`), back-relations sur `Domain`. **Non destructif**, aucun DROP des index préexistants, aucun backfill. Toujours alimenté via `prisma migrate deploy` → `migrate status` up to date (39 migrations).
+- **`CloudflareService.resolveEffectiveRoot`** (résolveur **canonique** partagé), priorité stricte : `effectiveDomainId` → `requestedDomainId` → défaut plateforme `rootDomainId` (si ACTIVE+autorisé) → intersection `allowedDomainIds ∩ ACTIVE` (**1** → celle-ci, **0** → erreur, **>1** → ambiguïté « choisissez votre domaine »). **Aucun fallback arbitraire**.
+- **`actionConfigureDns`** : résout la racine effective, **gèle `effectiveDomainId` AVANT l'allocation DNS**. Un retry après crash re-résout **la même racine** et **réutilise l'enregistrement existant** (même fqdn) — jamais de 2ᵉ allocation, jamais d'autre racine. DNS et Coolify utilisent **le même fqdn**.
+- **Sémantique DISABLED** : allocation neuve sur racine désactivée → rejet ; allocation déjà livrée (READY) sur racine ensuite désactivée → **gardée**, aucune migration auto. Anciennes commandes provisionnées → **historique conservé**, aucun backfill.
+- **Checkout** : `resolveSubdomainAndRoot` + `store/subdomain/check` alignés sur le résolveur canonique (défaut `rootDomainId` avant ambiguïté, cohérents avec le provisioning). `idempotencyKey` inclut `requestedDomainId` (changement de racine ⇒ commande distincte, pas de replay).
+- **Shop guest** : `PublicProduct.freeDomains: { id, name }[]` exposé → **sélecteur de racine** quand >1 éligible, présélection quand une seule. `/client/project` **intouché** (#18).
+### Tests
+`resolveEffectiveRoot` (+12 : effective/requested/défaut/ambiguïté/zéro/DISABLED) · `actionConfigureDns` (+4 : gel-avant-DNS, retry même racine, récupération allocation partielle, DISABLED) · `idempotencyKey` (+2 : racine différente ⇒ clé différente, identique ⇒ même clé). Voir rapport final pour les counts et gates.
+### Commit state
+Commits **locaux uniquement** — **NON poussés** (attente GO). Fini par **STOP** (aucune Phase 5).
+
 ## 2026-09-16 — Phase 3 (Security + Turnstile) : **runtime Turnstile aligné sur le flag admin** — notion effective unique `active = enabled && configured`
 ### Contexte recovery
 Le delta suivé de la session précédente (Phase 3 interrompue par un redémarrage) a été **perdu par un `git reset` à HEAD** (visible au reflog `04c6f69 HEAD@{0}: reset`), non committé/non stashé ⇒ irrécupérable. **Reconstruit depuis le baseline + le spec survivant** `public-config.controller.spec.ts` (contrat encodé), sans reproduire mécaniquement les ~183 lignes perdues.

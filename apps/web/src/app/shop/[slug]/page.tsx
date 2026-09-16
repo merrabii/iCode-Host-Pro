@@ -60,6 +60,9 @@ export default function ShopProductPage() {
   const [fqdn, setFqdn] = useState<string | null>(null);
   const [subStatus, setSubStatus] = useState<'idle' | 'checking' | 'ok' | 'taken' | 'invalid'>('idle');
   const checkTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Phase 4 — domaine racine choisi par le client (multi-domaines). Necessaire si
+  // plusieurs racines éligibles ; présélectionné si une seule. Porté au panier.
+  const [requestedDomainId, setRequestedDomainId] = useState<string | null>(null);
 
   useEffect(() => {
     (async () => {
@@ -72,6 +75,10 @@ export default function ShopProductPage() {
       }
       const p = res.data as PublicProduct;
       setProduct(p);
+      // Phase 4 — une seule racine éligible → présélection (aucun sélecteur affiché).
+      if (p.freeSubdomainRule && p.freeDomains && p.freeDomains.length === 1) {
+        setRequestedDomainId(p.freeDomains[0].id);
+      }
       const defs: Record<string, string> = {};
       for (const o of p.options ?? []) {
         if (o.required && o.choices.length) defs[o.id] = o.choices[0].id;
@@ -82,8 +89,12 @@ export default function ShopProductPage() {
 
   // Vérification de dispo du sous-domaine (debounce) tant que le produit en exige un.
   const needsSubdomain = !!product?.freeSubdomainRule;
+  const multiRoot = (product?.freeDomains?.length ?? 0) > 1;
   useEffect(() => {
     if (!needsSubdomain) { setSubStatus('idle'); setFqdn(null); return; }
+    // Phase 4 — plusieurs racines éligibles et aucune choisie → on attend le choix
+    // (aucune vérification sous une racine arbitraire, #10).
+    if (multiRoot && !requestedDomainId) { setSubStatus('idle'); setFqdn(null); return; }
     if (checkTimer.current) clearTimeout(checkTimer.current);
     const raw = subdomain.trim().toLowerCase();
     if (!raw) {
@@ -99,7 +110,7 @@ export default function ShopProductPage() {
     setSubStatus('checking');
     checkTimer.current = setTimeout(async () => {
       if (!product?.slug) { setSubStatus('invalid'); return; }
-      const res = await checkStoreSubdomain(product.slug, raw);
+      const res = await checkStoreSubdomain(product.slug, raw, requestedDomainId ?? undefined);
       if (res) {
         setFqdn(res.fqdn);
         setSubStatus(res.available && res.reason !== 'taken' ? 'ok' : 'taken');
@@ -109,7 +120,7 @@ export default function ShopProductPage() {
     }, 500);
     return () => { if (checkTimer.current) clearTimeout(checkTimer.current); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [subdomain, needsSubdomain]);
+  }, [subdomain, needsSubdomain, requestedDomainId, multiRoot]);
 
   useEffect(() => () => { if (checkTimer.current) clearTimeout(checkTimer.current); }, []);
 
@@ -206,6 +217,9 @@ export default function ShopProductPage() {
                   fqdn={fqdn}
                   status={subStatus}
                   maxLength={product.freeSubdomainRule?.maxLength ?? 40}
+                  freeDomains={product.freeDomains ?? []}
+                  requestedDomainId={requestedDomainId}
+                  setRequestedDomainId={setRequestedDomainId}
                 />
               )}
 
@@ -310,8 +324,11 @@ export default function ShopProductPage() {
               product={product}
               selected={selected}
               addons={addons}
-              subdomainOk={needsSubdomain ? subStatus === 'ok' : true}
+              subdomainOk={
+                needsSubdomain ? (!!requestedDomainId && subStatus === 'ok') : true
+              }
               subdomain={subdomain}
+              requestedDomainId={requestedDomainId ?? undefined}
             />
           </div>
         )}
@@ -320,20 +337,29 @@ export default function ShopProductPage() {
   );
 }
 
-/** Sélecteur de sous-domaine (colonne principale) — nom + aperçu + dispo en direct. */
+/** Sélecteur de sous-domaine (colonne principale) — nom + aperçu + dispo en direct.
+ *  Phase 4 : si plusieurs racines éligibles, un sélecteur de domaine racine précède
+ *  le champ (la dispo n'est vérifiée que sous la racine choisie, #10). */
 function SubdomainChooser({
   subdomain,
   setSubdomain,
   fqdn,
   status,
   maxLength,
+  freeDomains,
+  requestedDomainId,
+  setRequestedDomainId,
 }: {
   subdomain: string;
   setSubdomain: (v: string) => void;
   fqdn: string | null;
   status: 'idle' | 'checking' | 'ok' | 'taken' | 'invalid';
   maxLength: number;
+  freeDomains: { id: string; name: string }[];
+  requestedDomainId: string | null;
+  setRequestedDomainId: (id: string | null) => void;
 }) {
+  const multiRoot = freeDomains.length > 1;
   return (
     <div className="store-subdomain card">
       <div className="store-subdomain-head">
@@ -342,6 +368,25 @@ function SubdomainChooser({
           <div className="muted store-subdomain-sub">Un sous-domaine gratuit et unique, activé immédiatement.</div>
         </div>
       </div>
+
+      {multiRoot && (
+        <div className="store-subdomain-roots">
+          <div className="store-subdomain-roots-label">Domaine :</div>
+          {freeDomains.map((d) => (
+            <label key={d.id} className={`store-subdomain-root${requestedDomainId === d.id ? ' active' : ''}`}>
+              <input
+                type="radio"
+                name="root-domain"
+                value={d.id}
+                checked={requestedDomainId === d.id}
+                onChange={() => setRequestedDomainId(d.id)}
+              />
+              <span>{d.name}</span>
+            </label>
+          ))}
+        </div>
+      )}
+
       <div className={`store-subdomain-input${status === 'invalid' ? ' invalid' : ''}${status === 'ok' ? ' ok' : ''}`}>
         <span className="store-subdomain-prefix">https://</span>
         <input
@@ -354,8 +399,9 @@ function SubdomainChooser({
         />
       </div>
       <p className="store-subdomain-hint muted">
-        {status === 'idle' && fqdn && <>Votre application sera servie sur <b>{fqdn}</b>.</>}
-        {status === 'idle' && !fqdn && <>Lettres et chiffres, tirets autorisés.</>}
+        {multiRoot && !requestedDomainId && <>Choisissez d’abord votre domaine racine.</>}
+        {!multiRoot && status === 'idle' && fqdn && <>Votre application sera servie sur <b>{fqdn}</b>.</>}
+        {!multiRoot && status === 'idle' && !fqdn && <>Lettres et chiffres, tirets autorisés.</>}
         {status === 'checking' && <>Vérification de disponibilité…</>}
         {status === 'invalid' && <span className="danger-text">Nom invalide (a–z, 0–9, tirets, sans tiret aux extrémités).</span>}
         {status === 'taken' && fqdn && <span className="danger-text">Déjà pris : {fqdn}. Essayez un autre nom.</span>}
@@ -394,12 +440,14 @@ function PurchasePanel({
   addons,
   subdomainOk,
   subdomain,
+  requestedDomainId,
 }: {
   product: PublicProduct;
   selected: Record<string, string>;
   addons: Record<string, boolean>;
   subdomainOk: boolean;
   subdomain: string;
+  requestedDomainId?: string;
 }) {
   const router = useRouter();
   const toast = useToast();
@@ -474,6 +522,7 @@ function PurchasePanel({
       options: optionsMap,
       addons: addonsMap,
       subdomain: product.freeSubdomainRule ? subdomain.trim().toLowerCase() : undefined,
+      requestedDomainId,
     });
     toast.ok('Produit ajouté au panier.');
     router.push('/cart');
