@@ -821,7 +821,7 @@ Unit **398/398**, e2e **146/146** verts. Fichiers : `runtime-port-contract.ts` (
 - **Tests** : unit **422/422** (baseline 405 +17) · 35/35 suites · tsc API + `nest build` verts · tsc web vert (frontend inchangé). Frontend garde son gate `turnstileSiteKey !== ''` (état cohérent : `''` ⇔ inactif ⇔ aucun widget ⇔ aucune exigence backend).
 
 ## ADR-040 — Choix du domaine racine + gel `effectiveDomainId` (Phase 4, multi-domaines store, 2026-09-16)
-**Status: IMPLEMENTED** (commits locaux, NON poussés — dernières décisions validées par le propriétaire).
+**Status: LOCALLY-VALIDATED** (2026-09-16 — validé localement par tests+builds ; **LIVE VALIDATION PENDING**, aucun push). Checkpoint de sauvegarde `9f78011` + commit validation local (voir CHANGELOG 2026-09-16).
 
 - **Contexte** : le checkout store choisissait la racine des sous-domaines par **fallback arbitraire** (`allowedDomainIds[0]` / premier ACTIVE), et le provisioning **re-résolvait** librement la racine à chaque run. Conséquences : (a) le client ne pouvait pas choisir **laquelle** des racines (codediali.com / arumdigital.com) héberge son sous-domaine ; (b) une **fenêtre de panne** (racine résolue → DNS créé → crash avant persistence) pouvait faire re-sélectionner **une autre racine** au retry, désynchronisant DNS et Coolify. Compte Cloudflare unique, plusieurs zones/`Domain.zoneId` (pas de 2ᵉ moteur : le store s'aligne sur le mécanisme multi-domaines existant de `/client/project`, décision #15/#18).
 - **Décisions (19 validées, implémentées)** :
@@ -841,6 +841,6 @@ Unit **398/398**, e2e **146/146** verts. Fichiers : `runtime-port-contract.ts` (
 - **Idempotence checkout** : `idempotencyKey` inclut maintenant `requestedDomainId` en plus de `requestedSubdomain` — un changement de racine crée une commande distincte (pas de replay croisé).
 - **Checkout & check public alignés** : `resolveSubdomainAndRoot`, la résolution du store `subdomain/check` ET la dispo consultent le défaut `rootDomainId` avant l'ambiguïté — cohérents entre eux et avec le provisioning.
 - **Store** : `PublicProduct.freeDomains: { id, name }[]` (racines ACTIVE éligibles) exposé pour un **sélecteur de racine** guest dès le shop quand >1 éligible ; présélection quand une seule. `/client/project` **intouché** (#18).
-- **Tests** : unit Phase 4 ajoutés (`resolveEffectiveRoot` y compris défaut racine/ambiguïté/zéro/DISABLED, `actionConfigureDns` gel-avant-DNS + retry même racine + récupération allocation partielle + DISABLED, `idempotencyKey` racine différente ⇒ clé distincte). Voir rapport final VALIDATION.
+- **Tests** : unit Phase 4 ajoutés (`resolveEffectiveRoot` y compris défaut racine/ambiguïté/zéro/DISABLED, `actionConfigureDns` gel-avant-DNS + retry même racine + récupération allocation partielle + DISABLED, `idempotencyKey` racine différente ⇒ clé distincte). Suite Phase 4 **93/93** (Cloudflare+Checkout+Provisioning+Products+`store-subdomain.controller`) ; suite unit API complète **458/458** (36 suites, dont `invitations` 16/16) ; typecheck+build API et web verts ; `prisma validate` + `migrate status` up to date. Corrections faites au pas de validation : import `ApiPropertyOptional` (DTO), mock `findFirst` (spec products), couverture ajoutée `store-subdomain.controller` + `resolveSubdomainAndRoot`. **LIVE = PENDING.**
 
 # REJECTED

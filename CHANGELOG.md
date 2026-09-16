@@ -12,9 +12,17 @@
 - **Checkout** : `resolveSubdomainAndRoot` + `store/subdomain/check` alignés sur le résolveur canonique (défaut `rootDomainId` avant ambiguïté, cohérents avec le provisioning). `idempotencyKey` inclut `requestedDomainId` (changement de racine ⇒ commande distincte, pas de replay).
 - **Shop guest** : `PublicProduct.freeDomains: { id, name }[]` exposé → **sélecteur de racine** quand >1 éligible, présélection quand une seule. `/client/project` **intouché** (#18).
 ### Tests
-`resolveEffectiveRoot` (+12 : effective/requested/défaut/ambiguïté/zéro/DISABLED) · `actionConfigureDns` (+4 : gel-avant-DNS, retry même racine, récupération allocation partielle, DISABLED) · `idempotencyKey` (+2 : racine différente ⇒ clé différente, identique ⇒ même clé). Voir rapport final pour les counts et gates.
+`resolveEffectiveRoot` (+12 : effective/requested/défaut/ambiguïté/zéro/DISABLED) · `actionConfigureDns` (+4 : gel-avant-DNS, retry même racine, récupération allocation partielle, DISABLED) · `idempotencyKey` (+2 : racine différente ⇒ clé différente, identique ⇒ même clé).
+### Validation locale du 2026-09-16 (après checkpoint `9f78011`)
+- **Suites Phase 4 : 93/93** (5 suites : Cloudflare, Checkout, Provisioning, Products, **`store-subdomain.controller`** — ce dernier + les 6 tests `resolveSubdomainAndRoot` ajoutés au pas de validation pour couvrir les items 12/18/19).
+- **Suite unit API complète : 458/458** (36 suites, dont `invitations` 16/16 — l'ancien flake d'order-dependency n'est plus reproduit).
+- **E2E `app` (health) : 1/1** · **`prisma validate` + `migrate status` = up to date** (39 migrations).
+- **Typecheck API + `nest build` : verts** (`dist/src/main.js`) · **Typecheck web + `next build` : verts** (30 routes, `/client/project` non refactoré).
+- **Corrections apportées au pas de validation** : import `ApiPropertyOptional` manquant dans `check-subdomain.dto.ts` (aurait cassé le build API) ; `findFirst` manquant sur le mock `product` de `products.service.spec.ts` (bloquait la compilation des tests produits).
 ### Commit state
-Commits **locaux uniquement** — **NON poussés** (attente GO). Fini par **STOP** (aucune Phase 5).
+Checkpoint de sauvegarde **local `9f78011`** (avant validation) + commit validation **local** (corrections + couverture + docs). **NON poussés** (attente GO). **LIVE VALIDATION = PENDING** (aucune opération réelle Cloudflare/Coolify/DNS/Order). Fini par **STOP** (aucune Phase 5).
+
+## 2026-09-16 — Phase 3 (Security + Turnstile) : **runtime Turnstile aligné sur le flag admin** — notion effective unique `active = enabled && configured`
 
 ## 2026-09-16 — Phase 3 (Security + Turnstile) : **runtime Turnstile aligné sur le flag admin** — notion effective unique `active = enabled && configured`
 ### Contexte recovery
