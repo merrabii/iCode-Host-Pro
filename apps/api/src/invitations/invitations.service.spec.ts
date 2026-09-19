@@ -192,15 +192,35 @@ describe('InvitationsService', () => {
   });
 
   describe('consume', () => {
-    const inv = {
-      id: 'i1',
-      email: 'guest@example.com',
-      tokenHash: 'x',
-      issuerId: 'admin',
-      usedAt: null as Date | null,
-      revokedAt: null as Date | null,
-      expiresAt: new Date(Date.now() + 1000),
+    let inv: {
+      id: string;
+      email: string;
+      tokenHash: string;
+      issuerId: string;
+      usedAt: Date | null;
+      revokedAt: Date | null;
+      expiresAt: Date;
     };
+
+    beforeEach(() => {
+      jest.useFakeTimers();
+      const baseTime = new Date('2026-09-19T12:00:00.000Z').getTime();
+      jest.setSystemTime(baseTime);
+
+      inv = {
+        id: 'i1',
+        email: 'guest@example.com',
+        tokenHash: 'x',
+        issuerId: 'admin',
+        usedAt: null,
+        revokedAt: null,
+        expiresAt: new Date(baseTime + 24 * 60 * 60 * 1000), // 1 day in the future
+      };
+    });
+
+    afterEach(() => {
+      jest.useRealTimers();
+    });
 
     it('rejects an unknown token', async () => {
       mockPrisma.invitation.findUnique.mockResolvedValue(null);
