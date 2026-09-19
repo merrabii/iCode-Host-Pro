@@ -6,6 +6,15 @@ README.md → PROJECT_CONTEXT.md → PROJECT_STATUS.md → DECISIONS.md → TASK
 ## Before changing code
 Determine current phase, actual implementation, proposed versus approved decisions, blockers and owner test requirements. If unclear, analyze rather than guess.
 
+## Current task — **Couverture E2E Phase 4 — checkout Store multi-domaines (2026-09-19) — IMPLEMENTED + VALIDATED**
+Contexte de reprise :
+- **Nouveau fichier** : `apps/api/test/store-checkout-domains.e2e-spec.ts` (21 tests E2E, 3 groupes A/B/C), sur la plateforme white-label Code Diali. **Aucune modification de code métier.**
+- **Scénarios couverts** : `POST /api/store/subdomain/check` (whitelist `allowedDomainIds`, racine DISABLED, ambiguïté sans pick arbitraire, défaut plateforme `rootDomainId`, racine unique) ; `POST /api/store/checkout` (persistance réelle de `requestedDomainId`, rejets fail-fast, **idempotence distincte selon la racine**, chemin membre) ; provisioning multi-domaines (`requestedDomainId` réellement consommé, **`effectiveDomainId` gelé AVANT l'allocation DNS** — prouvé via la trace au `createRecord`, retry `force=1` conservant racine/FQDN/allocation, **commande legacy `requestedDomainId=null` compatible**, durcissement racine DISABLED).
+- **Aucun appel réel** : Cloudflare/Coolify/SMTP mockés (records DNS en mémoire) ; `CloudflareService`/`CryptoService`/`PrismaService` réels ; singletons `CloudflareSetting`/`BillingSetting` restaurés à l'identique, fixtures nettoyées.
+- **Validations** : e2e API **171/171 PASS (21 suites)** · unit API **495/495 PASS (38 suites)** · typecheck API PASS · build API PASS · typecheck Web PASS · build Web PASS (2 typechecks + 2 builds) · runtime API `GET http://localhost:3001/api/health` → **HTTP 200** · runtime Web `GET http://localhost:3000/` → **HTTP 200**.
+- **Risques documentés (préexistants)** : **lint** — script `lint` présent mais ESLint et sa configuration **absents de ce checkout** (monorepo pnpm, aucun `eslint@` au lockfile), aucune installation ni modification de dépendance faite, suivi séparé recommandé ; **flakiness loopback `panel-transport.factory.spec.ts`** — première passe complète 492/495 (3 échecs réseau), test isolé 35/35, re-passe complète 495/495, fichier **non modifié**, non corrigée (à stabiliser ultérieurement).
+- **Prochaine étape** : aucune en attente — implémentation et validations **terminées** ; toute prochaine étape fonctionnelle sera décidée séparément par le propriétaire.
+
 ## Current task — **Rate-limit admin du statut public de commande + TRUST_PROXY (ADR-041, 2026-09-19) — IMPLEMENTED + VERIFIED**
 Le suivi public d'une commande (`GET /api/store/orders/:id/status`) était sans limitation. Implémenté :
 - **Endpoint public sans PII** : `{found, status}` uniquement — AUCUNE donnée personnelle.

@@ -1098,3 +1098,39 @@ Le suivi public d'une commande (`GET /api/store/orders/:id/status`) était sans 
 - PROJECT_STATUS.md : à mettre à jour
 - HANDOVER.md : à mettre à jour
 - docs/plan-infrastructure.md : à mettre à jour
+
+--------------------------------------------------------------------
+## 2026-09-19 — Couverture E2E Phase 4 (checkout Store multi-domaines) — IMPLEMENTED + VALIDATED
+
+### Contexte
+Le moteur Phase 4 (ADR-040 : choix de la racine + gel `effectiveDomainId` avant DNS) reposait sur des tests unitaires. Cette tâche ajoute une couverture E2E de bout en bout du checkout store multi-domaines de la plateforme white-label Code Diali. **Aucune modification de code métier.**
+
+### Fichier créé
+- [x] `apps/api/test/store-checkout-domains.e2e-spec.ts` (nouveau, **21 tests**, 787 lignes — groupes A / B / C)
+
+### Implémentation (couverture de tests)
+- [x] **A.** `POST /api/store/subdomain/check` : whitelist, racine DISABLED, ambiguïté (aucun pick arbitraire), défaut plateforme, racine unique.
+- [x] **B.** `POST /api/store/checkout` : persistance réelle de `requestedDomainId`, rejets fail-fast, **idempotence distincte selon la racine**, chemin membre (2 commandes distinctes).
+- [x] **C.** Provisioning multi-domaines : `requestedDomainId` consommé, **`effectiveDomainId` gelé AVANT l'allocation DNS** (trace au `createRecord`), retry `force=1` conservant racine/FQDN/allocation, **commande legacy `requestedDomainId=null` compatible**, durcissement racine DISABLED.
+- [x] **Aucun appel réel** : CloudflareTransportFactory (records en mémoire), MailTransportFactory (aucun SMTP), PanelTransportFactory (aucun Coolify) mockés ; CloudflareService/CryptoService/PrismaService réels.
+- [x] **Hygiène** : singletons CloudflareSetting/BillingSetting restaurés à l'identique, fixtures nettoyées (suppressions bornées).
+
+### Validations (relancées, toutes PASS)
+- [x] E2E API complète : **171/171 PASS (21 suites)** (150 + 21).
+- [x] Unit API : **495/495 PASS (38 suites)**.
+- [x] Typecheck API PASS · Build API PASS · Typecheck Web PASS · Build Web PASS (2 typechecks + 2 builds).
+- [x] Runtime API : `GET http://localhost:3001/api/health` → **HTTP 200**.
+- [x] Runtime Web : `GET http://localhost:3000/` → **HTTP 200**.
+- [x] **Lint NON exécutable** : ESLint + configuration absents de ce checkout (préexistant), aucune installation/modification de dépendance faite — suivi séparé recommandé (n'ajoute pas ESLint maintenant).
+- [x] **Flakiness loopback préexistante documentée** : première passe complète 492/495 (3 échecs dans `panel-transport.factory.spec.ts`), isolé 35/35, re-passe complète 495/495 ; fichier non modifié ; **non corrigée**, sujette à stabilisation ultérieure.
+
+### État
+- [x] Implémentation **terminée** : **21 nouveaux tests** E2E (787 lignes, groupes A/B/C).
+- [x] Couverture E2E Phase 4 **validée** : e2e **171/171** PASS (21 suites) ; unit **495/495** PASS (38 suites) ; validations API/Web réussies.
+- [x] Changement inclus dans `test(store): add multi-domain checkout e2e coverage`.
+- [x] Docs ajoutées : CHANGELOG, TASKS, PROJECT_STATUS, HANDOVER.
+
+### Suivis futurs
+- **Lint (préexistant, séparé)** : script `lint` présent mais **ESLint et sa configuration absents de ce checkout** (monorepo pnpm, aucun `eslint@` au lockfile) ; aucune installation/modification de dépendance faite ici — installation et intégration à suivre séparément.
+- **Flakiness loopback (préexistant, séparé)** : `servers/panel-transport.factory.spec.ts` — première passe complète 492/495 (3 échecs réseau), isolé 35/35, re-passe complète 495/495, fichier non modifié, non corrigé — à stabiliser ultérieurement.
+- Aucune autre action en attente pour cette tâche (implémentation + validations terminées) ; toute prochaine étape fonctionnelle sera décidée séparément par le propriétaire.

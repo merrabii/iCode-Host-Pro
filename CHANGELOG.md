@@ -1,5 +1,24 @@
 # CHANGELOG
 
+## 2026-09-19 — **Couverture E2E Phase 4 — checkout Store multi-domaines** (test uniquement, aucune modification de code métier)
+### Contexte
+Le moteur Phase 4 (ADR-040 : choix de la racine + gel `effectiveDomainId` avant DNS, plateforme white-label Code Diali) reposait sur des tests unitaires. Cette tâche ajoute une couverture E2E de bout en bout du checkout store multi-domaines.
+### Implémenté (couverture de tests)
+- **Nouveau fichier** : `apps/api/test/store-checkout-domains.e2e-spec.ts` (787 lignes, **21 tests**, trois groupes) :
+  - **A.** `POST /api/store/subdomain/check` — whitelist `allowedDomainIds`, racine DISABLED, ambiguïté (aucun pick arbitraire), défaut plateforme `rootDomainId`, racine unique éligible ;
+  - **B.** `POST /api/store/checkout` — persistance réelle de `requestedSubdomain` + `requestedDomainId`, rejets fail-fast (racine inexistante / hors whitelist / DISABLED / ambiguïté), **idempotence distincte selon la racine**, chemin membre (2 commandes, racines différentes) ;
+  - **C.** Provisioning multi-domaines — `requestedDomainId` réellement consommé par le provisioning, **`effectiveDomainId` gelé AVANT l'allocation DNS** (prouvé par la trace au moment de `createRecord`), retry `force=1` **conservant racine, FQDN et allocation** (ni 2ᵉ allocation ni 2ᵉ enregistrement), **commande legacy `requestedDomainId=null` compatible** (résolution par unicité), durcissement racine DISABLED (livrée conservée, nouvelle allocation rejetée).
+- **Aucun appel réel** : `CloudflareTransportFactory` (records DNS en mémoire), `MailTransportFactory` (aucun SMTP), `PanelTransportFactory` (aucun Coolify) — tous mockés ; `CloudflareService`, `CryptoService` et `PrismaService` RÉELS.
+- **Hygiène** : singletons `CloudflareSetting`/`BillingSetting` capturés puis **restaurés à l'identique**, fixtures nettoyées au `afterAll` (suppressions bornées aux ids de la suite).
+### Validations (avant ce changement documentaire)
+- E2E API complète : **171/171 PASS (21 suites)** (150 préexistants + 21 nouveaux).
+- Unit API : **495/495 PASS (38 suites)**.
+- Typecheck API PASS · Build API (`nest build`) PASS · Typecheck Web PASS · Build Web (`next build`) PASS (2 typechecks + 2 builds).
+- Runtime API : `GET http://localhost:3001/api/health` → **HTTP 200** (`{"status":"ok","database":"ok"}`).
+- Runtime Web : `GET http://localhost:3000/` → **HTTP 200** (Next.js 15.5.24, « Ready in 6.8s »).
+- **Lint (préexistant, non bloquant)** : le script `lint` existe (`eslint "src/**/*.ts"`) mais **ESLint et sa configuration sont absents de ce checkout** (monorepo pnpm — aucun `eslint@` dans `pnpm-lock.yaml`, ni `.bin/eslint`, ni `eslint.config.*`) ; **aucune installation ni modification de dépendance** dans cette tâche ; suivi séparé recommandé.
+- **Risque préexistant (flakiness loopback)** : première passe complète **492/495** (3 échecs loopback dans `servers/panel-transport.factory.spec.ts`) ; test isolé **35/35** ; nouvelle passe complète **495/495** ; fichier non modifié ; **non présentée comme corrigée**, sujet distinct à stabiliser ultérieurement.
+
 ## 2026-09-19 — **Rate-limit admin du statut public de commande + TRUST_PROXY** (ADR-041)
 ### Problème résolu
 Le suivi public d'une commande (`GET /api/store/orders/:id/status`) était sans limitation : un identifiant connu pouvait être interrogé sans restriction, sans information sur l'origine (IP).
