@@ -899,7 +899,7 @@ Réponse au retour propriétaire : port Coolify non mentionné, IP non auto-dét
   - `deployEnabled` activé **temporairement** (ligne SecuritySetting jetable, restaurée après) : `detect` `https://github.com/expressjs/express.git` → **201** `{defaultBranch:"master", language:"JavaScript", suggestedBuildPack:"nixpacks"}` (détection GitHub réelle) ; URL privée `192.168.1.10` → **400** (SSRF) ; `gitlab.com/gitlab-org/gitlab` → **201** fallback `main`/`nixpacks` + détail.
   - **Ligne `deployEnabled` supprimée après smoke (état initial restauré).**
 - **Causes racines du « rien ne se passe sur l'espace client » (à corriger par le propriétaire)** : (1) **`deployEnabled` est OFF** (aucune ligne `SecuritySetting` → flag par défaut) ⇒ le panneau « Déploiements » n'apparaît pas sur `/client` ; (2) **aucun `Service` ACTIVE** n'existe ⇒ même avec le flag ON, le client n'a rien sur quoi déployer ; (3) **jeton API Coolify stocké refusé** par le vrai serveur (`403 « You are not allowed to access the API »` sur `portal.arumdigital.com:8000` — token périmé/read-only) ⇒ le smoke deploy complet réel est bloqué côté infra, pas côté code. Pour valider le cycle complet : activer `deployEnabled` dans `/manager/securite`, affecter un `Service` ACTIVE au serveur coolify-portal, et re-vérifier le panneau Coolify (`/manager/serveurs`) avec un jeton **ROOT/write**.
-- NB : flaky pré-existant documenté `invitations.service.spec` (passe en isolation) — NON touché par 10bis.5.
+- NB : test `invitations.service.spec` désormais déterministe (fake timers Jest, horloge contrôlée) — NON touché par 10bis.5.
 
 # PHASES 12 — 15 (+ CLOUDFLARE DNS) : IMPLÉMENTÉES ET POUSSÉES (rattrapage gouvernance 2026-09-08)
 
@@ -1050,3 +1050,51 @@ Réponse au retour propriétaire : port Coolify non mentionné, IP non auto-dét
 - [x] CHANGELOG · PROJECT_STATUS (Overall + Current phase + Decisions ADR-039) · TASKS · HANDOVER · **DECISIONS.md → ADR-039** (invariant `active = enabled && configured` partagé par public-config et les portes d'enforcement).
 ### Commit state
 - [x] **Commit local** : `fix(security): align turnstile runtime with admin setting` — **non poussé** (attente GO). Aucun secret, aucun hardcode. **Aucun `git reset` après commit.**
+
+--------------------------------------------------------------------
+## 2026-09-19 — Rate-limit admin du statut public de commande + TRUST_PROXY (ADR-041) — IMPLEMENTED + VERIFIED
+
+### Contexte
+Le suivi public d'une commande (`GET /api/store/orders/:id/status`) était sans limitation : un identifiant connu pouvait être interrogé sans restriction.
+
+### Fichiers créés
+- Migration additive : `apps/api/prisma/migrations/20260919155137_order_status_rate_limit/`
+- Tests : `apps/api/src/config/configuration.spec.ts`, `apps/api/src/store/checkout.controller.spec.ts`, `apps/api/test/store-order-status.e2e-spec.ts`
+
+### Fichiers modifiés
+- `apps/api/.env.example` (+TRUST_PROXY documentation)
+- `apps/api/prisma/schema.prisma` (+3 colonnes SecuritySetting)
+- `apps/api/src/app.module.ts` (import SecurityModule)
+- `apps/api/src/auth/security/dto/update-security-settings.dto.ts` (+3 champs rate-limit avec bornes)
+- `apps/api/src/auth/security/security-settings.service.ts` (+cache TTL 30s, getOrderStatusRateLimit, invalidation immédiate, bornes + fallback)
+- `apps/api/src/auth/security/security-settings.service.spec.ts` (+tests rate-limit)
+- `apps/api/src/config/configuration.ts` (+parseTrustProxy, trustProxy dans AppConfig)
+- `apps/api/src/main.ts` (applique trustProxy au boot, log)
+- `apps/api/src/store/checkout.controller.ts` (endpoint status + rate-limit + 429 Retry-After)
+- `apps/api/test/security-settings.e2e-spec.ts` (+tests admin rate-limit)
+- `apps/web/src/app/manager/securite/page.tsx` (panneau Rate-limit : toggle, bornes 5-1000/10-3600, preview lisible, avertissement si désactivé, restauration true/30/60, bouton Enregistrer unique)
+- `apps/web/src/lib/api.ts` (+types rate-limit)
+
+### Implémentation
+- **Endpoint public sans PII** : `{found, status}` uniquement
+- **HTTP 429 + Retry-After** (secondes)
+- **Configuration admin** : `enabled` (bool), `max` (5..1000), `windowSec` (10..3600), défauts `true/30/60`
+- **Cache mémoire TTL 30 s** + invalidation locale immédiate après `update()`
+- **TRUST_PROXY** : défaut `false` (XFF ignoré), `"true"` REFUSÉ, seuls IP/CIDR explicites ou presets acceptés
+- **Mono-instance** : `SaRateLimiter` mémoire suffit ; Redis futur pour multi-instances (ADR-007)
+- **Migration additive** : 3 colonnes, défauts, aucun DROP/backfill
+
+### Validations
+- `corepack pnpm --filter @codediali/api exec tsc --noEmit` → PASS
+- `corepack pnpm --filter @codediali/api run build` → PASS
+- `corepack pnpm --filter @codediali/web exec tsc --noEmit` → PASS
+- `corepack pnpm --filter @codediali/web run build` → PASS (30 routes)
+- Unit API : **495/495 PASS (38 suites)**
+- E2E API : **150/150 PASS (20 suites)**
+
+### Documentation
+- DECISIONS.md : ADR-041 ajouté
+- CHANGELOG.md : entrée 2026-09-19 ajoutée
+- PROJECT_STATUS.md : à mettre à jour
+- HANDOVER.md : à mettre à jour
+- docs/plan-infrastructure.md : à mettre à jour

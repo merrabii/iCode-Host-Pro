@@ -1301,6 +1301,12 @@ export interface SecuritySettings {
   mfaRequiredForAdmins: boolean;
   selfRegistrationEnabled: boolean;
   deployEnabled: boolean;
+  /** Rate-limit administrable du statut public de commande (défauts true/30/60). */
+  orderStatusRateLimitEnabled: boolean;
+  /** Nombre maximal de requêtes par IP dans la fenêtre (5..1000). */
+  orderStatusRateLimitMax: number;
+  /** Fenêtre en secondes (10..3600). */
+  orderStatusRateLimitWindowSec: number;
   createdAt: string | null;
   updatedAt: string | null;
 }

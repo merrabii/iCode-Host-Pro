@@ -40,6 +40,14 @@ export default function SecuritePage() {
   const [secretKey, setSecretKey] = useState('');
   const [savingKeys, setSavingKeys] = useState(false);
 
+  // Rate-limit du statut public de commande (admin-configurable). Saisie LOCALE :
+  // rien n'est sauvegardé avant le clic sur « Enregistrer » (le bouton
+  // « Restaurer » ne fait que remettre true / 30 / 60 à l'écran).
+  const [rlEnabled, setRlEnabled] = useState(true);
+  const [rlMax, setRlMax] = useState('30');
+  const [rlWindowSec, setRlWindowSec] = useState('60');
+  const [savingRl, setSavingRl] = useState(false);
+
   const load = useCallback(async () => {
     if (!token) return;
     const res = await getSecuritySettings(token);
@@ -47,6 +55,10 @@ export default function SecuritePage() {
       const data = res.data as SecuritySettings;
       setSettings(data);
       setSiteKey(data.turnstileSiteKey ?? '');
+      // Rate-limit : valeurs serveur → état local (défauts sûrs si absentes).
+      setRlEnabled(data.orderStatusRateLimitEnabled ?? true);
+      setRlMax(String(data.orderStatusRateLimitMax ?? 30));
+      setRlWindowSec(String(data.orderStatusRateLimitWindowSec ?? 60));
     } else toast.error((res.data as { message?: string })?.message ?? 'Lecture impossible.');
   }, [token, toast]);
 
@@ -110,6 +122,46 @@ export default function SecuritePage() {
     toast.ok('Clé secrète effacée.');
   }
 
+  // ── Rate-limit du statut public de commande ────────────────────────────────
+
+  /** Sauvegarde EXPLICITE (bouton « Enregistrer ») — le toggle et le bouton
+   *  « Restaurer » ne modifient que la saisie locale. */
+  async function saveRateLimit() {
+    if (!token) return;
+    const max = Number(rlMax);
+    const windowSec = Number(rlWindowSec);
+    if (!Number.isInteger(max) || max < 5 || max > 1000) {
+      toast.error('Nombre de requêtes invalide : entier entre 5 et 1000.');
+      return;
+    }
+    if (!Number.isInteger(windowSec) || windowSec < 10 || windowSec > 3600) {
+      toast.error('Fenêtre invalide : entier entre 10 et 3600 secondes.');
+      return;
+    }
+    setSavingRl(true);
+    const res = await updateSecuritySettings(token, {
+      orderStatusRateLimitEnabled: rlEnabled,
+      orderStatusRateLimitMax: max,
+      orderStatusRateLimitWindowSec: windowSec,
+    } as never);
+    setSavingRl(false);
+    if (!res.ok) {
+      toast.error((res.data as { message?: string })?.message ?? 'Enregistrement impossible.');
+      return;
+    }
+    setSettings(res.data as SecuritySettings);
+    toast.ok('Protection du suivi de commande enregistrée.');
+  }
+
+  /** Restauration LOCALE des valeurs recommandées (true / 30 / 60) — aucune
+   *  écriture : l'admin confirme ensuite avec « Enregistrer ». */
+  function restoreRateLimitDefaults() {
+    setRlEnabled(true);
+    setRlMax('30');
+    setRlWindowSec('60');
+    toast.ok('Valeurs recommandées appliquées — cliquez sur « Enregistrer » pour confirmer.');
+  }
+
   if (phase === 'loading' || (phase === 'ready' && !settings)) return <PageLoading label="Chargement des options de sécurité…" />;
   if (phase === 'denied' || !token) {
     return (
@@ -122,6 +174,9 @@ export default function SecuritePage() {
   const s = settings!;
   const siteConfigured = !!s.turnstileSiteKey;
   const secretConfigured = !!s.turnstileHasSecretKey;
+  // Texte lisible du rate-limit : valeurs saisies si valides, sinon les défauts.
+  const rlMaxPreview = /^\d+$/.test(rlMax.trim()) ? rlMax.trim() : '30';
+  const rlWindowPreview = /^\d+$/.test(rlWindowSec.trim()) ? rlWindowSec.trim() : '60';
 
   return (
     <AppShell me={{ email: 'admin', role: 'ADMIN' }} nav={ADMIN_NAV}>
@@ -167,6 +222,81 @@ export default function SecuritePage() {
               <Button onClick={saveKeys} disabled={savingKeys} busy={savingKeys}>Enregistrer les clés</Button>
               <span className="muted" style={{ fontSize: 12, alignSelf: 'center' }}>
                 Priorité : clé DB (cette page) &gt; variable env <code>TURNSTILE_*</code>.
+              </span>
+            </div>
+          </div>
+        </div>
+
+        {/* ── Rate-limit du statut public de commande (admin-configurable) ── */}
+        <div className="panel mt">
+          <div className="panel-head row" style={{ justifyContent: 'space-between', flexWrap: 'wrap', gap: 8 }}>
+            <b>Rate-limit du suivi de commande</b>
+            <Badge tone={rlEnabled ? 'ok' : 'warn'}>{rlEnabled ? 'Activé' : 'Désactivé'}</Badge>
+          </div>
+          <div className="panel-body stack" style={{ gap: 12 }}>
+            <p className="muted" style={{ fontSize: 13 }}>
+              Limite les appels à <code>/api/store/orders/&lt;id&gt;/status</code> (suivi public d’une commande
+              par son identifiant). Valeurs recommandées : 30 requêtes par IP pendant 60 secondes.
+            </p>
+
+            {!rlEnabled && (
+              <Alert tone="warn" title="Protection désactivée">
+                Le statut public des commandes n’est plus limité : un identifiant connu peut être interrogé
+                sans restriction. Réactivez la protection dès que possible.
+              </Alert>
+            )}
+
+            <div className="row" style={ss.panelBody}>
+              <div className="flex-1" style={{ minWidth: 200 }}>
+                <b style={{ fontSize: 15 }}>Activer la protection</b>
+                <p className="muted mt-sm" style={{ fontSize: 13 }}>Applique la limite ci-dessous à chaque adresse IP.</p>
+              </div>
+              <label className="switch">
+                <input type="checkbox" checked={rlEnabled} disabled={savingRl} onChange={(e) => setRlEnabled(e.target.checked)} />
+                <span className="slider" aria-hidden="true" />
+              </label>
+            </div>
+
+            <div className="row" style={{ gap: 12, flexWrap: 'wrap' }}>
+              <label className="field" style={{ minWidth: 220 }}>
+                <span className="field-label">Nombre maximal de requêtes (5 à 1000)</span>
+                <input
+                  className="input"
+                  type="number"
+                  min={5}
+                  max={1000}
+                  step={1}
+                  value={rlMax}
+                  onChange={(e) => setRlMax(e.target.value)}
+                  disabled={savingRl || !rlEnabled}
+                />
+              </label>
+              <label className="field" style={{ minWidth: 220 }}>
+                <span className="field-label">Fenêtre en secondes (10 à 3600)</span>
+                <input
+                  className="input"
+                  type="number"
+                  min={10}
+                  max={3600}
+                  step={1}
+                  value={rlWindowSec}
+                  onChange={(e) => setRlWindowSec(e.target.value)}
+                  disabled={savingRl || !rlEnabled}
+                />
+              </label>
+            </div>
+
+            <p style={{ fontSize: 13, fontWeight: 600 }}>
+              {`Maximum ${rlMaxPreview} requêtes par adresse IP pendant ${rlWindowPreview} secondes`}
+            </p>
+
+            <div className="row" style={{ gap: 8, flexWrap: 'wrap' }}>
+              <Button onClick={saveRateLimit} disabled={savingRl} busy={savingRl}>Enregistrer</Button>
+              <Button variant="ghost" onClick={restoreRateLimitDefaults} disabled={savingRl}>
+                Restaurer les valeurs recommandées
+              </Button>
+              <span className="muted" style={{ fontSize: 12, alignSelf: 'center' }}>
+                La restauration remplit le formulaire (30 / 60) — cliquez sur « Enregistrer » pour confirmer.
               </span>
             </div>
           </div>

@@ -1,5 +1,26 @@
 # CHANGELOG
 
+## 2026-09-19 — **Rate-limit admin du statut public de commande + TRUST_PROXY** (ADR-041)
+### Problème résolu
+Le suivi public d'une commande (`GET /api/store/orders/:id/status`) était sans limitation : un identifiant connu pouvait être interrogé sans restriction, sans information sur l'origine (IP).
+
+### Implémenté
+- **Endpoint public sans PII** : `GET /api/store/orders/:id/status` → `{ found: boolean, status?: string }`. AUCUNE donnée personnelle (email, facture, dates).
+- **HTTP 429 + Retry-After** : dépassement → 429 avec header `Retry-After` (secondes). `enabled=false` (admin) → limiteur non appelé.
+- **Configuration admin** (`/manager/securite`, migration additive `20260919155137_order_status_rate_limit`) : `orderStatusRateLimitEnabled` (bool, défaut `true`), `orderStatusRateLimitMax` (entier 5..1000, défaut `30`), `orderStatusRateLimitWindowSec` (entier 10..3600, défaut `60`). Défauts `true/30/60` = protection ACTIVE par défaut.
+- **Cache TTL 30 s** (`SecuritySettingsService.orderStatusRateLimitCache`) : lecture mémoire sans Prisma ; **invalidation locale immédiate** après `update()` admin. Erreur DB → dernier cache connu, sinon fallback `true/30/60`.
+- **TRUST_PROXY** (`parseTrustProxy` dans `configuration.ts`) :
+  - Défaut `false` : X-Forwarded-For ignoré, `req.ip` = adresse socket.
+  - `"true"` **REFUSÉ** (avertissement + `false`) — rendrait XFF forgeable.
+  - Seuls **IP/CIDR explicites** (ex. `172.18.0.0/16`) ou presets `loopback/linklocal/uniquelocal` acceptés. Entrées invalides ignorées + log. Sans entrée valide → `false` + avertissement.
+  - Pas de nombre de hops.
+- **Architecture mono-instance** : `SaRateLimiter` (mémoire, fenêtre glissante par IP) suffit. Store partagé (Redis) requis seulement en multi-réplicas (ADR-007 PROPOSED).
+
+### Tests
+- `security-settings.e2e-spec.ts` (admin settings rate-limit), `store-order-status.e2e-spec.ts` (endpoint + 429 + bornes + cache + TRUST_PROXY).
+- **Unit API : 495/495 PASS (38 suites)** · **E2E API : 150/150 PASS (20 suites)**.
+- Typecheck API PASS · Build API PASS · Typecheck Web PASS · Build Web PASS (30 routes).
+
 ## 2026-09-16 — Phase 4 (multi-domaines store) : **choix du domaine racine + gel `effectiveDomainId` avant DNS** (ADR-040)
 ### Problème résolu (2 classes)
 1. **Aucun choix client de racine** : le checkout store choisissait la racine des sous-domaines par **fallback arbitraire** (`allowedDomainIds[0]` / premier ACTIVE) — impossible pour le client de choisir laquelle des racines (codediali.com / arumdigital.com) héberge son sous-domaine.

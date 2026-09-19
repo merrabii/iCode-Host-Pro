@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { AuditService } from '../../audit/audit.service';
 import { CryptoService } from '../../crypto/crypto.service';
@@ -17,8 +17,34 @@ export interface SecuritySettingsView {
   mfaRequiredForAdmins: boolean;
   selfRegistrationEnabled: boolean;
   deployEnabled: boolean;
+  /** Rate-limit admin du statut public de commande (défauts true/30/60). */
+  orderStatusRateLimitEnabled: boolean;
+  orderStatusRateLimitMax: number;
+  orderStatusRateLimitWindowSec: number;
   createdAt: string | null;
   updatedAt: string | null;
+}
+
+/** Fallback sécurisé du rate-limit du statut public de commande : protection
+ *  ACTIVE 30 requêtes / 60 s quand la config est absente, invalide ou que la
+ *  base est injoignable sans cache exploitable. */
+export const ORDER_STATUS_RATE_LIMIT_FALLBACK = {
+  enabled: true,
+  limit: 30,
+  windowMs: 60_000,
+} as const;
+
+/** Bornes fonctionnelles (le DTO applique les mêmes — double protection, la
+ *  DB peut contenir des valeurs historiques hors bornes). */
+export const ORDER_STATUS_RATE_LIMIT_BOUNDS = {
+  limit: { min: 5, max: 1000 },
+  windowSec: { min: 10, max: 3600 },
+} as const;
+
+export interface OrderStatusRateLimitConfig {
+  enabled: boolean;
+  limit: number;
+  windowMs: number;
 }
 
 const DEFAULT_FLAGS: Omit<SecuritySettingsView, 'id' | 'createdAt' | 'updatedAt'> = {
@@ -30,6 +56,9 @@ const DEFAULT_FLAGS: Omit<SecuritySettingsView, 'id' | 'createdAt' | 'updatedAt'
   mfaRequiredForAdmins: false,
   selfRegistrationEnabled: false,
   deployEnabled: false,
+  orderStatusRateLimitEnabled: true,
+  orderStatusRateLimitMax: 30,
+  orderStatusRateLimitWindowSec: 60,
 };
 
 export type SecurityFlags = Pick<
@@ -63,11 +92,42 @@ const CREATE_DATA: Prisma.SecuritySettingCreateInput = {
   mfaRequiredForAdmins: false,
   selfRegistrationEnabled: false,
   deployEnabled: false,
+  orderStatusRateLimitEnabled: true,
+  orderStatusRateLimitMax: 30,
+  orderStatusRateLimitWindowSec: 60,
 };
 
 type SecurityRow = NonNullable<
   Awaited<ReturnType<PrismaService['securitySetting']['findFirst']>>
 >;
+
+/** Clamp défensif (la DB peut contenir des valeurs historiques hors bornes) ;
+ *  toute valeur non finie retombe sur le fallback sécurisé. */
+function clampInt(value: number, min: number, max: number, fallback: number): number {
+  if (!Number.isFinite(value)) return fallback;
+  return Math.min(max, Math.max(min, Math.trunc(value)));
+}
+
+function rateLimitFromRow(row: SecurityRow): OrderStatusRateLimitConfig {
+  return {
+    // `?? true` : une valeur absente/invalide ne doit JAMAIS désactiver la
+    // protection silencieusement — elle retombe sur le fallback sécurisé.
+    enabled: row.orderStatusRateLimitEnabled ?? true,
+    limit: clampInt(
+      row.orderStatusRateLimitMax,
+      ORDER_STATUS_RATE_LIMIT_BOUNDS.limit.min,
+      ORDER_STATUS_RATE_LIMIT_BOUNDS.limit.max,
+      ORDER_STATUS_RATE_LIMIT_FALLBACK.limit,
+    ),
+    windowMs:
+      clampInt(
+        row.orderStatusRateLimitWindowSec,
+        ORDER_STATUS_RATE_LIMIT_BOUNDS.windowSec.min,
+        ORDER_STATUS_RATE_LIMIT_BOUNDS.windowSec.max,
+        ORDER_STATUS_RATE_LIMIT_FALLBACK.windowMs / 1000,
+      ) * 1000,
+  };
+}
 
 // Phase 10 (ADR-027): owns the singleton SecuritySetting row — admin feature
 // flags that make every security option OPTIONAL and toggleable. Reads are
@@ -76,6 +136,14 @@ type SecurityRow = NonNullable<
 // AES-256-GCM encrypted via CryptoService — never returned).
 @Injectable()
 export class SecuritySettingsService {
+  private readonly log = new Logger(SecuritySettingsService.name);
+  /** Cache mémoire du rate-limit du statut de commande (TTL 30 s, pattern
+   *  MfaChallengeStore). Mono-instance assumé ; la stratégie multi-instances
+   *  (Redis) suivra ADR-007 sans changer la signature du getter. */
+  private orderStatusRateLimitCache: { value: OrderStatusRateLimitConfig; fetchedAt: number } | null =
+    null;
+  private readonly orderStatusRateLimitCacheTtlMs = 30_000;
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly audit: AuditService,
@@ -98,6 +166,9 @@ export class SecuritySettingsService {
       mfaRequiredForAdmins: row.mfaRequiredForAdmins,
       selfRegistrationEnabled: row.selfRegistrationEnabled,
       deployEnabled: row.deployEnabled,
+      orderStatusRateLimitEnabled: row.orderStatusRateLimitEnabled,
+      orderStatusRateLimitMax: row.orderStatusRateLimitMax,
+      orderStatusRateLimitWindowSec: row.orderStatusRateLimitWindowSec,
       createdAt: row.createdAt.toISOString(),
       updatedAt: row.updatedAt.toISOString(),
     };
@@ -141,7 +212,23 @@ export class SecuritySettingsService {
       secretChanged = true;
     }
 
-    if (Object.keys(patch).length === 0 && !siteChanged && !secretChanged) {
+    // Rate-limit du statut public de commande (entiers bornés par le DTO ;
+    // re-clampés à la lecture par rateLimitFromRow).
+    let rateLimitChanged = false;
+    if (dto.orderStatusRateLimitEnabled !== undefined) {
+      data.orderStatusRateLimitEnabled = dto.orderStatusRateLimitEnabled;
+      rateLimitChanged = true;
+    }
+    if (dto.orderStatusRateLimitMax !== undefined) {
+      data.orderStatusRateLimitMax = dto.orderStatusRateLimitMax;
+      rateLimitChanged = true;
+    }
+    if (dto.orderStatusRateLimitWindowSec !== undefined) {
+      data.orderStatusRateLimitWindowSec = dto.orderStatusRateLimitWindowSec;
+      rateLimitChanged = true;
+    }
+
+    if (Object.keys(patch).length === 0 && !siteChanged && !secretChanged && !rateLimitChanged) {
       return this.toView(row);
     }
 
@@ -149,6 +236,8 @@ export class SecuritySettingsService {
       where: { id: row.id },
       data,
     });
+    // Invalidation locale IMMÉDIATE du cache rate-limit après un update admin.
+    this.orderStatusRateLimitCache = null;
     await this.audit.record({
       actorId: actor.sub,
       actorEmail: actor.email,
@@ -207,5 +296,43 @@ export class SecuritySettingsService {
     } catch {
       return null; // clé de chiffrement absente/changée → dégrade en "non configurée"
     }
+  }
+
+  // ── Rate-limit du statut public de commande (cache TTL 30 s) ───────────────
+
+  /**
+   * Configuration effective du rate-limit de GET /store/orders/:id/status.
+   * Cache mémoire 30 s : aucune requête Prisma tant que le cache est frais ;
+   * invalidation locale immédiate après tout update admin (update() ci-dessus).
+   * Erreur DB → dernier cache connu (même périmé), sinon fallback sécurisé
+   * {enabled:true, 30/60 s} ; row absente → fallback sécurisé. Valeurs
+   * re-clampées aux bornes fonctionnelles à la lecture.
+   */
+  async getOrderStatusRateLimit(): Promise<OrderStatusRateLimitConfig> {
+    const now = Date.now();
+    if (
+      this.orderStatusRateLimitCache &&
+      now - this.orderStatusRateLimitCache.fetchedAt < this.orderStatusRateLimitCacheTtlMs
+    ) {
+      return this.orderStatusRateLimitCache.value;
+    }
+    let next: OrderStatusRateLimitConfig;
+    try {
+      const row = await this.row();
+      next = row ? rateLimitFromRow(row) : { ...ORDER_STATUS_RATE_LIMIT_FALLBACK };
+    } catch (err) {
+      if (this.orderStatusRateLimitCache) return this.orderStatusRateLimitCache.value;
+      this.log.warn(
+        `Lecture du rate-limit statut de commande impossible (${String(err)}) — fallback sécurisé 30/60 s.`,
+      );
+      return { ...ORDER_STATUS_RATE_LIMIT_FALLBACK };
+    }
+    this.orderStatusRateLimitCache = { value: next, fetchedAt: now };
+    if (!next.enabled) {
+      this.log.warn(
+        'Rate-limit du statut public de commande DÉSACTIVÉ par configuration admin.',
+      );
+    }
+    return next;
   }
 }

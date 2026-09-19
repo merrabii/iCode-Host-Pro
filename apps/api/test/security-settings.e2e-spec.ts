@@ -28,6 +28,23 @@ describe('Security settings (e2e)', () => {
   let userToken = '';
   let adminId = '';
   let productId = '';
+  // État du singleton AVANT la suite : s'il existait, il est restauré à
+  // l'identique en afterAll ; s'il n'existait pas, les rows créées par les
+  // tests sont supprimées (aucune configuration résiduelle).
+  type PriorSettings = {
+    turnstileEnabled: boolean;
+    turnstileSiteKey: string | null;
+    turnstileSecretEnc: string | null;
+    oauthGoogleEnabled: boolean;
+    oauthGithubEnabled: boolean;
+    mfaRequiredForAdmins: boolean;
+    selfRegistrationEnabled: boolean;
+    deployEnabled: boolean;
+    orderStatusRateLimitEnabled: boolean;
+    orderStatusRateLimitMax: number;
+    orderStatusRateLimitWindowSec: number;
+  };
+  let priorSettings: PriorSettings | null = null;
 
   const setCookies = (res: request.Response): string[] =>
     (res.headers['set-cookie'] as unknown as string[] | undefined) ?? [];
@@ -60,7 +77,24 @@ describe('Security settings (e2e)', () => {
     prisma = moduleRef.get(PrismaService);
     limiter = moduleRef.get(SaRateLimiter);
 
-    // Clean singleton → every flag defaults OFF.
+    // Clean singleton → every flag defaults OFF, APRÈS avoir mémorisé l'état
+    // initial (restauré à la fin : aucune config résiduelle laissée derrière).
+    const existing = await prisma.securitySetting.findFirst();
+    priorSettings = existing
+      ? {
+          turnstileEnabled: existing.turnstileEnabled,
+          turnstileSiteKey: existing.turnstileSiteKey,
+          turnstileSecretEnc: existing.turnstileSecretEnc,
+          oauthGoogleEnabled: existing.oauthGoogleEnabled,
+          oauthGithubEnabled: existing.oauthGithubEnabled,
+          mfaRequiredForAdmins: existing.mfaRequiredForAdmins,
+          selfRegistrationEnabled: existing.selfRegistrationEnabled,
+          deployEnabled: existing.deployEnabled,
+          orderStatusRateLimitEnabled: existing.orderStatusRateLimitEnabled,
+          orderStatusRateLimitMax: existing.orderStatusRateLimitMax,
+          orderStatusRateLimitWindowSec: existing.orderStatusRateLimitWindowSec,
+        }
+      : null;
     await prisma.securitySetting.deleteMany({}).catch(() => {});
 
     await prisma.user.create({
@@ -101,7 +135,12 @@ describe('Security settings (e2e)', () => {
       })
       .catch(() => {});
     await prisma.product.deleteMany({ where: { id: productId } }).catch(() => {});
+    // Restauration EXACTE : la row préexistante est recréée telle quelle ;
+    // sinon les rows du test sont supprimées (aucune config résiduelle).
     await prisma.securitySetting.deleteMany({}).catch(() => {});
+    if (priorSettings) {
+      await prisma.securitySetting.create({ data: priorSettings }).catch(() => {});
+    }
     delete process.env.GOOGLE_CLIENT_ID;
     delete process.env.GOOGLE_CLIENT_SECRET;
     await app.close();
@@ -128,6 +167,76 @@ describe('Security settings (e2e)', () => {
         deployEnabled: false,
       }),
     );
+  });
+
+  it('order status rate-limit: 401/403, bornes 400, 200 ADMIN, lecture après mise à jour', async () => {
+    const url = `/${GlobalPrefix}/admin/security`;
+
+    // 401 sans authentification, 403 pour un utilisateur non ADMIN.
+    await request(app.getHttpServer()).put(url).send({ orderStatusRateLimitMax: 30 }).expect(401);
+    await request(app.getHttpServer())
+      .put(url)
+      .set('Authorization', `Bearer ${userToken}`)
+      .send({ orderStatusRateLimitMax: 30 })
+      .expect(403);
+
+    try {
+      // Bornes : limit 5..1000, fenêtre 10..3600 s (entiers uniquement).
+      for (const bad of [
+        { orderStatusRateLimitMax: 4 },
+        { orderStatusRateLimitMax: 1001 },
+        { orderStatusRateLimitMax: 30.5 },
+        { orderStatusRateLimitWindowSec: 9 },
+        { orderStatusRateLimitWindowSec: 3601 },
+        { orderStatusRateLimitWindowSec: 60.5 },
+      ]) {
+        await request(app.getHttpServer())
+          .put(url)
+          .set('Authorization', `Bearer ${adminToken}`)
+          .send(bad)
+          .expect(400);
+      }
+
+      // 200 ADMIN + lecture après mise à jour (valeurs persistées).
+      const updated = await request(app.getHttpServer())
+        .put(url)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ orderStatusRateLimitEnabled: true, orderStatusRateLimitMax: 7, orderStatusRateLimitWindowSec: 120 })
+        .expect(200);
+      expect(updated.body).toEqual(
+        expect.objectContaining({
+          orderStatusRateLimitEnabled: true,
+          orderStatusRateLimitMax: 7,
+          orderStatusRateLimitWindowSec: 120,
+        }),
+      );
+      const read = await request(app.getHttpServer())
+        .get(url)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .expect(200);
+      expect(read.body).toEqual(
+        expect.objectContaining({
+          orderStatusRateLimitEnabled: true,
+          orderStatusRateLimitMax: 7,
+          orderStatusRateLimitWindowSec: 120,
+        }),
+      );
+
+      // Désactivation administrable → enabled=false persisté.
+      const disabled = await request(app.getHttpServer())
+        .put(url)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ orderStatusRateLimitEnabled: false })
+        .expect(200);
+      expect(disabled.body.orderStatusRateLimitEnabled).toBe(false);
+    } finally {
+      // Restauration : le formulaire revient aux valeurs par défaut de la suite.
+      await request(app.getHttpServer())
+        .put(url)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ orderStatusRateLimitEnabled: true, orderStatusRateLimitMax: 30, orderStatusRateLimitWindowSec: 60 })
+        .catch(() => {});
+    }
   });
 
   it('the OAuth toggle applies live: on → provider reachable, off → 403', async () => {

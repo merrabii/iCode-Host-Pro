@@ -78,6 +78,12 @@ model SecuritySetting {
   mfaRequiredForAdmins    Boolean  @default(false)
   selfRegistrationEnabled Boolean  @default(false) // création de compte à la commande
   deployEnabled           Boolean  @default(false) // Phase 10bis GitHub → Coolify
+  // Rate-limit admin du statut public de commande (GET /store/orders/:id/status).
+  // Défauts = protection active 30 requêtes / 60 s. Bornes appliquées au DTO et
+  // re-clampées à la lecture : limit 5..1000, fenêtre 10..3600 s.
+  orderStatusRateLimitEnabled   Boolean @default(true)
+  orderStatusRateLimitMax       Int     @default(30)
+  orderStatusRateLimitWindowSec Int     @default(60)
   createdAt               DateTime @default(now())
   updatedAt               DateTime @updatedAt
 }

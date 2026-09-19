@@ -18,6 +18,9 @@ describe('SecuritySettingsService (singleton admin flags, ADR-027)', () => {
     mfaRequiredForAdmins: false,
     selfRegistrationEnabled: false,
     deployEnabled: false,
+    orderStatusRateLimitEnabled: true,
+    orderStatusRateLimitMax: 30,
+    orderStatusRateLimitWindowSec: 60,
     createdAt: new Date('2026-09-02T00:00:00Z'),
     updatedAt: new Date('2026-09-02T00:00:00Z'),
     ...over,
@@ -120,6 +123,131 @@ describe('SecuritySettingsService (singleton admin flags, ADR-027)', () => {
     expect(mockPrisma.securitySetting.update).toHaveBeenCalledWith({
       where: { id: 's1' },
       data: { turnstileSiteKey: null, turnstileSecretEnc: null },
+    });
+  });
+
+  // ── Rate-limit du statut public de commande (cache TTL 30 s + fallback) ────
+  describe('getOrderStatusRateLimit (cache + fallback sécurisé)', () => {
+    const rlRow = (over: Record<string, unknown> = {}) =>
+      row({
+        orderStatusRateLimitEnabled: true,
+        orderStatusRateLimitMax: 30,
+        orderStatusRateLimitWindowSec: 60,
+        ...over,
+      });
+
+    it('row absente → fallback sécurisé { enabled: true, limit: 30, windowMs: 60_000 }', async () => {
+      mockPrisma.securitySetting.findFirst.mockResolvedValue(null);
+      await expect(service.getOrderStatusRateLimit()).resolves.toEqual({
+        enabled: true,
+        limit: 30,
+        windowMs: 60_000,
+      });
+    });
+
+    it('lit les valeurs admin (fenêtre secondes → millisecondes)', async () => {
+      mockPrisma.securitySetting.findFirst.mockResolvedValue(
+        rlRow({ orderStatusRateLimitMax: 100, orderStatusRateLimitWindowSec: 300 }),
+      );
+      await expect(service.getOrderStatusRateLimit()).resolves.toEqual({
+        enabled: true,
+        limit: 100,
+        windowMs: 300_000,
+      });
+    });
+
+    it('cache frais (30 s) : une seule lecture DB pour plusieurs appels', async () => {
+      mockPrisma.securitySetting.findFirst.mockResolvedValue(rlRow());
+      await service.getOrderStatusRateLimit();
+      await service.getOrderStatusRateLimit();
+      await service.getOrderStatusRateLimit();
+      expect(mockPrisma.securitySetting.findFirst).toHaveBeenCalledTimes(1);
+    });
+
+    it('TTL expiré → relecture DB', async () => {
+      jest.useFakeTimers();
+      try {
+        mockPrisma.securitySetting.findFirst.mockResolvedValue(rlRow());
+        await service.getOrderStatusRateLimit();
+        jest.advanceTimersByTime(30_001);
+        await service.getOrderStatusRateLimit();
+        expect(mockPrisma.securitySetting.findFirst).toHaveBeenCalledTimes(2);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('update admin → invalidation immédiate du cache', async () => {
+      // 1ʳᵉ lecture = 30 (mise en cache) ; l'update admin réécrit la config à 50.
+      mockPrisma.securitySetting.findFirst
+        .mockResolvedValueOnce(rlRow({ orderStatusRateLimitMax: 30 }))
+        .mockResolvedValue(rlRow({ orderStatusRateLimitMax: 50 }));
+      mockPrisma.securitySetting.update.mockResolvedValue(rlRow({ orderStatusRateLimitMax: 50 }));
+      await service.getOrderStatusRateLimit(); // remplit le cache (30)
+      await service.update({ orderStatusRateLimitMax: 50 }, actor); // invalide le cache
+      const out = await service.getOrderStatusRateLimit(); // re-lit la DB → 50
+      expect(out.limit).toBe(50);
+    });
+
+    it('erreur DB avec cache exploitable → dernier cache conservé (même périmé)', async () => {
+      jest.useFakeTimers();
+      try {
+        mockPrisma.securitySetting.findFirst.mockResolvedValueOnce(
+          rlRow({ orderStatusRateLimitMax: 42 }),
+        );
+        await service.getOrderStatusRateLimit(); // cache = 42
+        jest.advanceTimersByTime(60_000); // cache périmé
+        mockPrisma.securitySetting.findFirst.mockRejectedValueOnce(new Error('DB down'));
+        await expect(service.getOrderStatusRateLimit()).resolves.toEqual({
+          enabled: true,
+          limit: 42,
+          windowMs: 60_000,
+        });
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('erreur DB sans cache → fallback sécurisé 30/60', async () => {
+      mockPrisma.securitySetting.findFirst.mockRejectedValue(new Error('DB down'));
+      await expect(service.getOrderStatusRateLimit()).resolves.toEqual({
+        enabled: true,
+        limit: 30,
+        windowMs: 60_000,
+      });
+    });
+
+    it('valeurs DB hors bornes re-clampées (5..1000 / 10..3600 s)', async () => {
+      mockPrisma.securitySetting.findFirst.mockResolvedValue(
+        rlRow({ orderStatusRateLimitMax: 99999, orderStatusRateLimitWindowSec: 1 }),
+      );
+      await expect(service.getOrderStatusRateLimit()).resolves.toEqual({
+        enabled: true,
+        limit: 1000,
+        windowMs: 10_000,
+      });
+    });
+
+    it('enabled absent/undefined → true (jamais de désactivation silencieuse)', async () => {
+      mockPrisma.securitySetting.findFirst.mockResolvedValue(
+        rlRow({ orderStatusRateLimitEnabled: undefined }),
+      );
+      await expect(service.getOrderStatusRateLimit()).resolves.toEqual({
+        enabled: true,
+        limit: 30,
+        windowMs: 60_000,
+      });
+    });
+
+    it('limite/fenêtre absentes → 30 / 60 s (fallback sécurisé)', async () => {
+      mockPrisma.securitySetting.findFirst.mockResolvedValue(
+        rlRow({ orderStatusRateLimitMax: undefined, orderStatusRateLimitWindowSec: undefined }),
+      );
+      await expect(service.getOrderStatusRateLimit()).resolves.toEqual({
+        enabled: true,
+        limit: 30,
+        windowMs: 60_000,
+      });
     });
   });
 });

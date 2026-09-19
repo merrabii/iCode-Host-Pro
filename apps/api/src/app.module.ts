@@ -1,4 +1,4 @@
-import { Module } from '@nestjs/common';
+import { Logger, Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { PrismaModule } from './prisma/prisma.module';
 import { HealthModule } from './health/health.module';
@@ -27,7 +27,9 @@ import { loadAppConfig } from './config/configuration';
   imports: [
     ConfigModule.forRoot({
       isGlobal: true,
-      load: [loadAppConfig],
+      // La journalisation des valeurs TRUST_PROXY invalides passe par le Logger
+      // Nest (utilisable au chargement de configuration, avant le bootstrap).
+      load: [() => loadAppConfig((message) => new Logger('TrustProxy').warn(message))],
     }),
     PrismaModule,
     HealthModule,

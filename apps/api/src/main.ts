@@ -10,6 +10,16 @@ async function bootstrap() {
   const app = await NestFactory.create(AppModule);
   const config = app.get(ConfigService);
 
+  // Trust proxy (Express) — parseTrustProxy : false par défaut. Un avertissement
+  // au boot rend visible une configuration active ou des entrées rejetées.
+  const trustProxy = config.get<boolean | string[]>('trustProxy') ?? false;
+  app.getHttpAdapter().getInstance().set('trust proxy', trustProxy);
+  if (trustProxy === false) {
+    console.log('Trust proxy: désactivé (défaut) — X-Forwarded-For ignoré, req.ip = adresse socket.');
+  } else {
+    console.log(`Trust proxy: pairs approuvés = ${(trustProxy as string[]).join(', ')}.`);
+  }
+
   // Versioned REST prefix (ADR-005).
   app.setGlobalPrefix(GlobalPrefix);
 

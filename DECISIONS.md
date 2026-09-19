@@ -90,6 +90,13 @@ le complète avec les credentials + la vérification d'API.
 - ADR-032 Modules de déploiement A/B + projet client + monitoring (below) — 2026-09-06, Phase 13.
 - ADR-033 Contrôle DNS Cloudflare admin + sous-domaine client (below) — 2026-09-05.
 - ADR-034 Plateforme multi-brand / white-label configurable (below) — 2026-09-08, Phase 14.
+- ADR-035 Ordre piloté par la commande + plan gratuit + build config fichier (below) — 2026-09-11, Phase 16.
+- ADR-036 Sonde de connectivité réelle des serveurs + auto-détection IP/port + métriques (below) — 2026-09-01, Phase 8.
+- ADR-037 Provisioning store à preuve réelle + sous-domaines gratuits par produit (below) — 2026-09-15.
+- ADR-038 Résolution générique du port exposé des backends Node (below) — 2026-09-15.
+- ADR-039 Runtime Turnstile aligné sur le flag admin (below) — 2026-09-16.
+- ADR-040 Choix du domaine racine + gel effectiveDomainId avant DNS (below) — 2026-09-16.
+- ADR-041 Rate-limit admin du statut public de commande + TRUST_PROXY (below) — 2026-09-19.
 
 ## ADR-011 — Socle config minimal (Phase 0)
 **Status: APPROVED** (2026-08-30, Phase 0 GO)
@@ -842,5 +849,26 @@ Unit **398/398**, e2e **146/146** verts. Fichiers : `runtime-port-contract.ts` (
 - **Checkout & check public alignés** : `resolveSubdomainAndRoot`, la résolution du store `subdomain/check` ET la dispo consultent le défaut `rootDomainId` avant l'ambiguïté — cohérents entre eux et avec le provisioning.
 - **Store** : `PublicProduct.freeDomains: { id, name }[]` (racines ACTIVE éligibles) exposé pour un **sélecteur de racine** guest dès le shop quand >1 éligible ; présélection quand une seule. `/client/project` **intouché** (#18).
 - **Tests** : unit Phase 4 ajoutés (`resolveEffectiveRoot` y compris défaut racine/ambiguïté/zéro/DISABLED, `actionConfigureDns` gel-avant-DNS + retry même racine + récupération allocation partielle + DISABLED, `idempotencyKey` racine différente ⇒ clé distincte). Suite Phase 4 **93/93** (Cloudflare+Checkout+Provisioning+Products+`store-subdomain.controller`) ; suite unit API complète **458/458** (36 suites, dont `invitations` 16/16) ; typecheck+build API et web verts ; `prisma validate` + `migrate status` up to date. Corrections faites au pas de validation : import `ApiPropertyOptional` (DTO), mock `findFirst` (spec products), couverture ajoutée `store-subdomain.controller` + `resolveSubdomainAndRoot`. **LIVE = PENDING.**
+
+## ADR-041 — Rate-limit admin du statut public de commande + TRUST_PROXY (2026-09-19)
+**Status: IMPLEMENTED + VERIFIED** (corepack pnpm typecheck/build API/Web PASS ; unit 495/495 38 suites ; e2e 150/150 20 suites).
+
+- **Contexte** : le suivi public d'une commande (`GET /api/store/orders/:id/status`) était sans limitation. Un identifiant connu pouvait être interrogé sans restriction. Objectif : rate-limit IP administrable, sans PII dans la réponse, aligné sur l'architecture mono-instance actuelle avec stratégie Redis future pour multi-instances.
+
+- **Décisions** :
+  1. **Endpoint public sans PII** : `GET /api/store/orders/:id/status` ne renvoie **que** `{ found: boolean, status?: string }` — AUCUNE donnée personnelle (ni email, ni numéro de facture, ni dates). `found=false` pour ordre inexistant ; `found=true + status` pour ordre existant.
+  2. **HTTP 429 + Retry-After** : dépassement → 429 avec header `Retry-After` (secondes). Si `enabled=false` (admin), le limiteur n'est **pas appelé**.
+  3. **Configuration admin** (`SecuritySetting` singleton, migration additive `20260919155137_order_status_rate_limit`) : trois colonnes — `orderStatusRateLimitEnabled` (booléen, défaut `true`), `orderStatusRateLimitMax` (entier, défaut `30`), `orderStatusRateLimitWindowSec` (entier, défaut `60`). **Tous défauts `true/30/60`** : la protection est ACTIVE par défaut.
+  4. **Bornes fonctionnelles** (validées côté DTO + re-clampées à la lecture) : `max` entre **5 et 1000** requêtes ; `windowSec` entre **10 et 3600** secondes. Valeurs hors bornes (historiques) re-clampées au fallback sûr (30/60) à la lecture — jamais de désactivation silencieuse.
+  5. **Cache mémoire TTL 30 s** (`orderStatusRateLimitCache` dans `SecuritySettingsService`) : aucune requête Prisma tant que frais ; **invalidation locale immédiate** après tout `update()` admin. Erreur DB → dernier cache connu (même périmé), sinon fallback sécurisé `{enabled:true, 30/60s}`.
+  6. **TRUST_PROXY** (`configuration.ts` → `parseTrustProxy`) :
+     - **Défaut `false`** : X-Forwarded-For **ignoré**, `req.ip` = adresse socket.
+     - Le littéral `"true"` est **REFUSÉ** au boot (avertissement + `false`) — rendrait XFF forgeable par n'importe quel client joignant l'API directement.
+     - Seuls **IP/CIDR explicites** (ex. `172.18.0.0/16`) ou presets autorisés (`loopback`, `linklocal`, `uniquelocal`) sont acceptés. Entrées invalides ignorées + journalisées. Liste entièrement invalide → `false` + avertissement.
+     - **Pas de nombre de hops** : la chaîne de proxies n'est pas garantie par la topologie de déploiement.
+  7. **Architecture mono-instance actuelle** : le rate-limiter `SaRateLimiter` (fenêtre glissante en mémoire par IP, `auth/rate-limiter.ts`) suffit en mono-instance. Un store partagé (Redis/table) ne se justifie qu'en **multi-réplicas** (ADR-007 PROPOSED).
+  8. **Migration additive** : `ALTER TABLE SecuritySetting ADD COLUMN` (3 colonnes, défauts `true/30/60`) — aucun DROP, aucun backfill, `prisma migrate deploy` appliqué, `migrate status` up to date.
+
+- **Tests** : `security-settings.e2e-spec.ts` (admin settings + rate-limit) + `store-order-status.e2e-spec.ts` (endpoint public + 429 + bornes + cache + TRUST_PROXY). Suite unit API **495/495** (38 suites) ; suite e2e **150/150** (20 suites).
 
 # REJECTED
