@@ -47,19 +47,43 @@ describe('SecuritySettingsService (singleton admin flags, ADR-027)', () => {
     expect(view.oauthGithubEnabled).toBe(false);
     expect(view.mfaRequiredForAdmins).toBe(false);
     expect(view.selfRegistrationEnabled).toBe(false);
-    expect(view.deployEnabled).toBe(false);
+    expect(view.deployEnabled).toBe(true);
   });
 
-  it('every policy helper defaults to false', async () => {
+  it('every policy helper defaults safely (deployEnabled is the only default-ON flag)', async () => {
     mockPrisma.securitySetting.findFirst.mockResolvedValue(null);
     await expect(service.isTurnstileEnabled()).resolves.toBe(false);
     await expect(service.isOAuthGoogleEnabled()).resolves.toBe(false);
     await expect(service.isOAuthGithubEnabled()).resolves.toBe(false);
     await expect(service.isMfaRequiredForAdmins()).resolves.toBe(false);
     await expect(service.isSelfRegistrationEnabled()).resolves.toBe(false);
-    await expect(service.isDeployEnabled()).resolves.toBe(false);
+    await expect(service.isDeployEnabled()).resolves.toBe(true); // Phase 17A.1 : par défaut ACTIVÉ
     await expect(service.getTurnstileSiteKey()).resolves.toBeNull();
     await expect(service.getTurnstileSecretKey()).resolves.toBeNull();
+  });
+
+  // ── Phase 17A.1 — deployEnabled par défaut TRUE, mais verrouillage / persistance
+  //    du false explicite strictement préservés (contrôle de sécurité inchangé).
+  it('Phase 17A.1 — absence de ligne ⇒ deploy ACTIVÉ (true) par défaut', async () => {
+    mockPrisma.securitySetting.findFirst.mockResolvedValue(null); // aucune ligne
+    const view = await service.get();
+    expect(view.deployEnabled).toBe(true); // canevas / nouvelle installation
+    await expect(service.isDeployEnabled()).resolves.toBe(true);
+  });
+
+  it('Phase 17A.1 — deployEnabled=false explicitement persisté ⇒ déploiement VERROUILLÉ', async () => {
+    // L'admin désactive explicitement ⇒ la valeur false EN BASE prévaut (gate coupé).
+    mockPrisma.securitySetting.findFirst.mockResolvedValue(row({ deployEnabled: false }));
+    const view = await service.get();
+    expect(view.deployEnabled).toBe(false);
+    await expect(service.isDeployEnabled()).resolves.toBe(false); // sécurité inchangée
+  });
+
+  it('Phase 17A.1 — deployEnabled=true explicite persisté ⇒ ACTIVÉ (réactivation durable)', async () => {
+    mockPrisma.securitySetting.findFirst.mockResolvedValue(row({ deployEnabled: true }));
+    const view = await service.get();
+    expect(view.deployEnabled).toBe(true);
+    await expect(service.isDeployEnabled()).resolves.toBe(true);
   });
 
   it('update creates the singleton on first use, applies the patch and audits', async () => {

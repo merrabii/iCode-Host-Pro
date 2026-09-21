@@ -47,6 +47,12 @@ export interface OrderStatusRateLimitConfig {
   windowMs: number;
 }
 
+// Phase 17A.1 : SOURCE CANONIQUE UNIQUE du défaut. Aucun littéral indépendant
+// ailleurs : DEFAULT_FLAGS, CREATE_DATA et le fallback d'isDeployEnabled()
+// référencent tous DEPLOY_ENABLED_DEFAULT. Un deployEnabled=false explicite
+// persisté reste respecté tel quel ; une absence de valeur ⇒ ACTIVÉ.
+const DEPLOY_ENABLED_DEFAULT = true;
+
 const DEFAULT_FLAGS: Omit<SecuritySettingsView, 'id' | 'createdAt' | 'updatedAt'> = {
   turnstileEnabled: false,
   turnstileSiteKey: null,
@@ -55,7 +61,9 @@ const DEFAULT_FLAGS: Omit<SecuritySettingsView, 'id' | 'createdAt' | 'updatedAt'
   oauthGithubEnabled: false,
   mfaRequiredForAdmins: false,
   selfRegistrationEnabled: false,
-  deployEnabled: false,
+  // Phase 17A.1 : deployEnabled est ACTIVÉ par défaut. La seule façon de le
+  // désactiver est une valeur explicite false persistée par l'admin.
+  deployEnabled: DEPLOY_ENABLED_DEFAULT,
   orderStatusRateLimitEnabled: true,
   orderStatusRateLimitMax: 30,
   orderStatusRateLimitWindowSec: 60,
@@ -91,7 +99,10 @@ const CREATE_DATA: Prisma.SecuritySettingCreateInput = {
   oauthGithubEnabled: false,
   mfaRequiredForAdmins: false,
   selfRegistrationEnabled: false,
-  deployEnabled: false,
+  // Phase 17A.1 : une ligne recréée (nouvelle installation / reset) repart sur
+  // deployEnabled = TRUE ; un false explicite persisté (`false` en base) reste
+  // respecté tel quel.
+  deployEnabled: DEPLOY_ENABLED_DEFAULT,
   orderStatusRateLimitEnabled: true,
   orderStatusRateLimitMax: 30,
   orderStatusRateLimitWindowSec: 60,
@@ -277,7 +288,11 @@ export class SecuritySettingsService {
   }
 
   async isDeployEnabled(): Promise<boolean> {
-    return (await this.row())?.deployEnabled ?? false;
+    // Phase 17A.1 : source CANONIQUE unique. Absence de ligne (ou valeur
+    // absente) → ACTIVÉ (true). Seul un deployEnabled=false explicitement
+    // persisté par l'admin désactive le déploiement ; réactivé explicitement
+    // → true, persisté.
+    return (await this.row())?.deployEnabled ?? DEPLOY_ENABLED_DEFAULT;
   }
 
   // ── Turnstile keys (Phase 11) ───────────────────────────────────────────────

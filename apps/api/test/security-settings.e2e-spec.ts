@@ -164,7 +164,9 @@ describe('Security settings (e2e)', () => {
         oauthGithubEnabled: false,
         mfaRequiredForAdmins: false,
         selfRegistrationEnabled: false,
-        deployEnabled: false,
+        // Phase 17A.1 : deployEnabled ACTIVÉ par défaut (DEFAULT_FLAGS →
+        // DEPLOY_ENABLED_DEFAULT=true). Ce spec ADMIN reflète la constante.
+        deployEnabled: true,
       }),
     );
   });

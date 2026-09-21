@@ -77,7 +77,10 @@ model SecuritySetting {
   oauthGithubEnabled      Boolean  @default(false)
   mfaRequiredForAdmins    Boolean  @default(false)
   selfRegistrationEnabled Boolean  @default(false) // création de compte à la commande
-  deployEnabled           Boolean  @default(false) // Phase 10bis GitHub → Coolify
+  // Phase 17A.1 : deployEnabled est ACTIVÉ par défaut → bascule une nouvelle
+  // installation sur déploiement OK sauf déni explicite false. Le contrôle de
+  // sécurité et le processus de déploiement restent strictement inchangés.
+  deployEnabled           Boolean  @default(true)
   // Rate-limit admin du statut public de commande (GET /store/orders/:id/status).
   // Défauts = protection active 30 requêtes / 60 s. Bornes appliquées au DTO et
   // re-clampées à la lecture : limit 5..1000, fenêtre 10..3600 s.
