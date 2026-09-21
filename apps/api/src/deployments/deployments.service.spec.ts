@@ -1,5 +1,6 @@
 import { BadGatewayException, BadRequestException, ForbiddenException, NotFoundException } from '@nestjs/common';
-import { DeploymentsService } from './deployments.service';
+import { DeploymentsService, mapCoolifyStatus } from './deployments.service';
+import { DeploymentStatus } from '@prisma/client';
 
 // Phase 10bis (N) — unit du service de déploiement : toutes les gardes
 // (deployEnabled, GitHub lié, dépôt possédé, Service ACTIVE sur serveur Coolify
@@ -1053,7 +1054,51 @@ describe('DeploymentsService', () => {
       );
       expect(mockPrisma.deployment.create).toHaveBeenCalledWith({
         data: expect.objectContaining({ moduleId: 'modA' }),
-      });
+      }      );
     });
+  });
+});
+
+// Phase 17A — tests déterministes du mapping brut Coolify → statut plateforme.
+// Chaque case listée par la sous-phase est couverte : jamais de faux ACTIVE
+// (notamment `exited` seul ou avec santé), `running`* → ACTIVE, transitions
+// start/déploiement → DEPLOYING, terminaisons anormales → FAILED, et inconnu
+// → null (l'appelant conserve l'état courant).
+describe('mapCoolifyStatus (Phase 17A — mapping déterministe)', () => {
+  it.each([
+    ['running', DeploymentStatus.ACTIVE],
+    ['running:healthy', DeploymentStatus.ACTIVE],
+    ['running:unknown', DeploymentStatus.ACTIVE],
+    ['running:unhealthy', DeploymentStatus.ACTIVE],
+    ['finished', DeploymentStatus.ACTIVE],
+    ['success', DeploymentStatus.ACTIVE],
+    ['successful', DeploymentStatus.ACTIVE],
+    ['deployed', DeploymentStatus.ACTIVE],
+    // Phase 17A : un conteneur arrêté ne sert JAMAIS l'app (ni ACTIVE, ni
+    // FAILED prématuré pendant une transition `exited` → `running`).
+    ['exited', null],
+    ['exited:unhealthy', null],
+    ['exited:healthy', null],
+    ['exited:unknown', null],
+    ['EXITED:UNHEALTHY', null],
+    ['queued', DeploymentStatus.DEPLOYING],
+    ['in_progress', DeploymentStatus.DEPLOYING],
+    ['starting', DeploymentStatus.DEPLOYING],
+    ['building', DeploymentStatus.DEPLOYING],
+    ['deploying', DeploymentStatus.DEPLOYING],
+    ['processing', DeploymentStatus.DEPLOYING],
+    ['pending', DeploymentStatus.DEPLOYING],
+    ['building:healthy', DeploymentStatus.DEPLOYING],
+    ['failed', DeploymentStatus.FAILED],
+    ['error', DeploymentStatus.FAILED],
+    ['cancelled', DeploymentStatus.FAILED],
+    ['canceled', DeploymentStatus.FAILED],
+    ['crash', DeploymentStatus.FAILED],
+    ['running:crash', DeploymentStatus.FAILED],
+    ['unknown', null],
+    ['', null],
+    ['   running  ', DeploymentStatus.ACTIVE],
+  ])('%p → %p', (raw, expected) => {
+    expect(mapCoolifyStatus(raw)).toBe(expected);
   });
 });

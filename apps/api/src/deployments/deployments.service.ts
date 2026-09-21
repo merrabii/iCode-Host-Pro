@@ -71,20 +71,29 @@ type DeploymentWithRefs = Deployment & {
  *  Exporté pour réutilisation par ProvisioningService (preuve de mise en ligne
  *  avant confirmation d'une commande store). */
 export function mapCoolifyStatus(raw: string): DeploymentStatus | null {
-  const s = raw.toLowerCase();
-  // Coolify rend l'état d'une app sous la forme « <état>:<santé> » (ex
-  // « running:healthy », « running:unknown », « exited:unhealthy »). Toute
-  // variante « running»* = l'app TOURNE → ACTIVE.
-  if (s.startsWith('running') || ['exited', 'finished', 'success', 'successful', 'deployed'].includes(s)) {
-    return DeploymentStatus.ACTIVE;
-  }
-  if (['queued', 'in_progress', 'starting', 'building', 'deploying', 'processing', 'pending'].includes(s)) {
-    return DeploymentStatus.DEPLOYING;
-  }
+  // Phase 17A — mapping déterministe et sans faux ACTIVE. Ordre strict :
+  // 1) FAILED d'abord : `crash` (ex « running:crash ») prime sur `running`
+  //    et `failed/error/cancelled/canceled` → jamais de faux ACTIVE/FAILED ;
+  // 2) ACTIVE : `running`* (avec ou sans suffixe santé) + terminaisons
+  //    positives (« finished», « success», « successful», « deployed») ;
+  // 3) DEPLOYING : transitions start/déploiement, y compris avec suffixe
+  //    santé (« building:healthy », « starting:... ») ;
+  // 4) `exited` (avec ou sans suffixe santé) N'EST PAS ACTIVE — un conteneur
+  //    arrêté ne peut pas servir l'app (jamais de faux ACTIVE). Fallthrough
+  //    → `null` : l'appelant conserve l'état courant (ni ACTIVE, ni FAILED
+  //    prématuré pendant une transition Coolify `exited` → `running`).
+  // Les espaces périphériques et la casse sont normalisés (déterministe).
+  const s = raw.trim().toLowerCase();
   if (['failed', 'error', 'cancelled', 'canceled', 'crash'].some((x) => s.includes(x))) {
     return DeploymentStatus.FAILED;
   }
-  return null; // statut inconnu → on garde l'état courant
+  if (s.startsWith('running') || ['finished', 'success', 'successful', 'deployed'].includes(s)) {
+    return DeploymentStatus.ACTIVE;
+  }
+  if (['queued', 'in_progress', 'starting', 'building', 'deploying', 'processing', 'pending'].some((x) => s.startsWith(x))) {
+    return DeploymentStatus.DEPLOYING;
+  }
+  return null; // statut inconnu (dont `exited*`) → on garde l'état courant
 }
 
 /**
