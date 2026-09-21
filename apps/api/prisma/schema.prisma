@@ -754,13 +754,26 @@ model Deployment {
   // était perdu. `orderId` (unique) = une app par commande, retry idempotent.
   orderId          String?          @unique
   order            Order?           @relation(fields: [orderId], references: [id], onDelete: SetNull)
-  createdAt        DateTime       @default(now())
-  updatedAt        DateTime       @updatedAt
+  // Phase 17B — réconciliateur asynchrone des déploiements restés DEPLOYING après
+  // le proof-gate borné (file anti-famine, backoff borné, confirmation terminale
+  // sur 2 lectures espacées). `reconcileNextAt` = prochaine échéance d'éligibilité
+  // (null = jamais planifiée/legacy → éligible immédiatement, NULLS FIRST) ;
+  // `reconcileAttempts` = lectures indéterminées consécutives (backoff) ;
+  // `reconcileTerminalFailures` = preuves terminales FAILED consécutives ;
+  // `reconcileLastCheckedAt` = dernière lecture externe (diagnostic). Aucune donnée
+  // sensible (dates + compteurs) — le détail vit dans AuditLog/OrderStatusHistory.
+  reconcileNextAt           DateTime?
+  reconcileAttempts         Int            @default(0)
+  reconcileTerminalFailures Int            @default(0)
+  reconcileLastCheckedAt    DateTime?
+  createdAt                 DateTime       @default(now())
+  updatedAt                 DateTime       @updatedAt
 
   @@index([userId])
   @@index([status])
   @@index([packId])
   @@index([limitsStatus])
+  @@index([status, reconcileNextAt])
 }
 
 // ── Phase 3 — DNS & sous-domaines Cloudflare (demande propriétaire) ──────────
