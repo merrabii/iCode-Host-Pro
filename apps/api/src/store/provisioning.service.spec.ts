@@ -52,6 +52,7 @@ describe('ProvisioningService — syncAppLimits', () => {
       mockCloudflare as never,
       mockPanelFactory as never,
       mockDeployments as never,
+      { isServed: jest.fn() } as never,
     );
     jest.clearAllMocks();
     mockDecrypt.mockReturnValue('tok');
@@ -160,6 +161,7 @@ describe('ProvisioningService — actionCreateApp (choix du projet A/B voie stor
   const audit = { record: jest.fn() };
   const deployments = { getOrCreateClientProject: jest.fn() };
   const mail = { sendPlain: jest.fn() };
+  const mockHttp = { isServed: jest.fn() };
 
   function orderFor(moduleKind: string | null) {
     return {
@@ -232,6 +234,7 @@ describe('ProvisioningService — actionCreateApp (choix du projet A/B voie stor
       { findActiveRootDomain: jest.fn(), allocateClientSubdomain: jest.fn() } as never,
       panelFactory as never,
       deployments as never,
+      mockHttp as never,
     );
     jest.clearAllMocks();
     mockDecrypt.mockReturnValue('tok');
@@ -554,6 +557,43 @@ describe('ProvisioningService — actionCreateApp (choix du projet A/B voie stor
       expect.objectContaining({ action: 'provision.deployment_active', details: expect.objectContaining({ ok: true }) }),
     );
   });
+
+  // 17B.3A — la preuve HTTP est DÉLÉGUÉE au service partagé HttpAvailabilityService :
+  // awaitAppReady tente le fallback HTTP exactement comme avant quand le canal de
+  // statut Coolify est indisponible (serveur absent). Aucun changement de sémantique.
+  it('17B.3A — serveur indisponible + preuve HTTP OK ⇒ Order ACTIVE + email (fallback awaitAppReady)', async () => {
+    const order = orderFor('PER_CLIENT_PROJECT') as Record<string, unknown>;
+    order.customerEmail = 'cl@exemple.com';
+    order.customerName = 'Client';
+    order.domainValue = 'app.example.com';
+    prisma.order.findUnique.mockResolvedValue(order as never);
+    (prisma as Record<string, any>).server = { findUnique: jest.fn().mockResolvedValue(null) };
+    mockHttp.isServed.mockResolvedValue(true);
+
+    const out = await service.provisionOrder('ord1');
+
+    expect(mockHttp.isServed).toHaveBeenCalledWith('app.example.com');
+    expect(out.status).toBe('ACTIVE');
+    expect((prisma as Record<string, any>).orderStatusHistory.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({ orderId: 'ord1', status: 'ACTIVE' }),
+    });
+    expect(mail.sendPlain).toHaveBeenCalledWith(expect.objectContaining({ to: 'cl@exemple.com' }));
+  });
+
+  // Priorité des preuves inchangée : le statut Coolify ACTIVE suffit → la preuve
+  // HTTP n'est pas requise (donc pas appelée) dans ce chemin.
+  it('17B.3A — Coolify ACTIVE en premier ⇒ preuve HTTP jamais appelée (priorité inchangée)', async () => {
+    const order = orderFor('PER_CLIENT_PROJECT') as Record<string, unknown>;
+    order.domainValue = 'app.example.com';
+    prisma.order.findUnique.mockResolvedValue(order as never);
+    (prisma as Record<string, any>).server = coolifyProofServer();
+    (transport as Record<string, any>).deploymentStatus = jest.fn().mockResolvedValue({ rawStatus: 'running:healthy', detail: 'running' });
+
+    const out = await service.provisionOrder('ord1');
+
+    expect(out.status).toBe('ACTIVE');
+    expect(mockHttp.isServed).not.toHaveBeenCalled();
+  });
 });
 
 // =========================================================================
@@ -644,6 +684,7 @@ describe('ProvisioningService — actionConfigureDns (Phase 4, gel racine)', () 
       cloudflare as never,
       panelFactory as never,
       deployments as never,
+      { isServed: jest.fn() } as never,
     );
     jest.clearAllMocks();
     mockDecrypt.mockReturnValue('tok');

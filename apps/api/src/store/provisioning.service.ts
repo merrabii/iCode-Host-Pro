@@ -12,6 +12,7 @@ import { CryptoService } from '../crypto/crypto.service';
 import { MailSettingsService } from '../mail/mail-settings.service';
 import { CloudflareService } from '../cloudflare/cloudflare.service';
 import { DeploymentsService, mapCoolifyStatus } from '../deployments/deployments.service';
+import { HttpAvailabilityService } from '../common/http-availability.service';
 import { resolveEffectiveLimits } from '../deployments/limits.util';
 import { clientAreaUrl } from './web-links';
 import {
@@ -48,6 +49,7 @@ export class ProvisioningService {
     private readonly cloudflare: CloudflareService,
     private readonly panelFactory: PanelTransportFactory,
     private readonly deployments: DeploymentsService,
+    private readonly httpAvailability: HttpAvailabilityService,
   ) {}
 
   /**
@@ -291,21 +293,11 @@ export class ProvisioningService {
           // Coolify injoignable → on tente la preuve HTTP avant de relancer.
         }
       }
-      // Preuve 2 : le sous-domaine répond (best-effort).
-      if (fqdn && (await this.isServed(fqdn))) return true;
+      // Preuve 2 : le sous-domaine répond (best-effort, service HTTP partagé 17B.3A).
+      if (fqdn && (await this.httpAvailability.isServed(fqdn))) return true;
       await this.sleep(5000);
     }
     return false;
-  }
-
-  /** HEAD/GET best-effort sur le sous-domaine : 2xx/3xx = l'app est servie. */
-  private async isServed(fqdn: string): Promise<boolean> {
-    try {
-      const res = await fetch(`https://${fqdn}`, { method: 'HEAD', redirect: 'follow', signal: AbortSignal.timeout(8000) });
-      return res.status >= 200 && res.status < 400;
-    } catch {
-      return false;
-    }
   }
 
   private sleep(ms: number): Promise<void> {

@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { AuthModule } from '../auth/auth.module';
 import { CloudflareModule } from '../cloudflare/cloudflare.module';
+import { HttpAvailabilityService } from '../common/http-availability.service';
 import { CryptoModule } from '../crypto/crypto.module';
 import { DeploymentsModule } from '../deployments/deployments.module';
 import { MailModule } from '../mail/mail.module';
@@ -28,7 +29,7 @@ import { StoreSubdomainController } from './store-subdomain.controller';
     StoreProvisioningAdminController,
     StoreSubdomainController,
   ],
-  providers: [CheckoutService, ProvisioningService, PanelTransportFactory],
-  exports: [ProvisioningService],
+  providers: [CheckoutService, ProvisioningService, PanelTransportFactory, HttpAvailabilityService],
+  exports: [ProvisioningService, HttpAvailabilityService],
 })
 export class StoreModule {}
