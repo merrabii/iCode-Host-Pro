@@ -48,6 +48,14 @@ export interface ActivationResult {
 }
 
 /**
+ * 17B.3C - delai canonique avant la PREMIERE verification asynchrone du futur
+ * reconciliateur (17B.4+), mesure depuis l expiration normale du proof-gate
+ * synchrone (120 s). Reutilise par la planification initiale et, plus tard,
+ * par le worker/backoff. Aucun worker n est cree ni demarre ici.
+ */
+export const INITIAL_RECONCILE_DELAY_MS = 30_000;
+
+/**
  * Bloc D — provision réel d'une commande store.
  *
  * Déclenché juste après `checkout.service` (même requête) ou via un appel
@@ -231,6 +239,11 @@ export class ProvisioningService {
         OrderStatus.PROVISIONING,
         'Build en cours — confirmation différée jusqu’à la mise en ligne effective.',
       );
+      // 17B.3C - planification PERSISTEE initiale de la reconciliation (idempotente,
+      // atomique en base) : premiere echeance posee sur le Deployment DEPLOYING de
+      // la commande, sans worker ni increment de compteur. Une echeance deja
+      // presente n est jamais ecrasee ni repoussee (condition reconcileNextAt=null).
+      await this.scheduleInitialReconcile(orderId);
       return this.finalResult(orderId, OrderStatus.PROVISIONING, fqdn);
     }
 
@@ -478,6 +491,27 @@ export class ProvisioningService {
       }
     }
     return outcome;
+  }
+
+  /**
+   * 17B.3C - planifie la PREMIERE reconciliation persistee d'un deploiement reste
+   * DEPLOYING apres l expiration normale du proof-gate. Idempotente et atomique :
+   * updateMany ne touche QUE le Deployment de la commande encore DEPLOYING ET
+   * sans echeance deja posee (reconcileNextAt = null). Garanties :
+   *   - l echeance est calculee UNE seule fois (now + INITIAL_RECONCILE_DELAY_MS) ;
+   *   - une echeance deja presente n est NI ecrasee NI repoussee (condition base) ;
+   *   - reconcileAttempts / reconcileTerminalFailures restent inchangees et
+   *     reconcileLastCheckedAt reste vide (aucune tentative n a eu lieu) ;
+   *   - Deployment ACTIVE/FAILED/PENDING/absent => count 0, aucun effet.
+   * Aucun worker n est cree ni demarre (17B.4+). now est injectable pour des
+   * tests deterministes (horloge controlee, sans fake timers).
+   */
+  private async scheduleInitialReconcile(orderId: string, now: Date = new Date()): Promise<{ count: number }> {
+    const nextAt = new Date(now.getTime() + INITIAL_RECONCILE_DELAY_MS);
+    return this.prisma.deployment.updateMany({
+      where: { orderId, status: DeploymentStatus.DEPLOYING, reconcileNextAt: null },
+      data: { reconcileNextAt: nextAt },
+    });
   }
 
   /**

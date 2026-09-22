@@ -1,5 +1,5 @@
 import { NotFoundException } from '@nestjs/common';
-import { ProvisioningService } from './provisioning.service';
+import { ProvisioningService, INITIAL_RECONCILE_DELAY_MS } from './provisioning.service';
 
 // Bloc 2/3 — unit de syncAppLimits : ré-applique les limites RAM/CPU du pack
 // courant aux apps DÉJÀ déployées de l'abonné (upgrade sans perte), format
@@ -640,6 +640,104 @@ describe('ProvisioningService — actionCreateApp (choix du projet A/B voie stor
     expect(prisma.$transaction).not.toHaveBeenCalled();
     expect(mail.sendPlain).not.toHaveBeenCalled();
   });
+  // =========================================================================
+  // 17B.3C — planification PERSISTÉE initiale de la réconciliation après
+  // expiration normale du proof-gate (ready=false). Aucun worker créé (17B.4+).
+  // L'Order reste PROVISIONNING, le Deployment DEPLOYING ; seule
+  // `reconcileNextAt` est posée (future, délai canonique INITIAL_RECONCILE_DELAY_MS),
+  // atomiquement et idempotemment sur la row de la commande
+  // (status=DEPLOYING ET reconcileNextAt=null).
+  // =========================================================================
+  it('17B.3C CAS1 — proof-gate false ⇒ reconcileNextAt future posée, jamais ACTIVE ni email', async () => {
+    prisma.order.findUnique.mockResolvedValue(orderFor('PER_CLIENT_PROJECT'));
+    deployments.getOrCreateClientProject.mockResolvedValue({ id: 'cp1', projectUuid: 'proj-dedie-client' });
+    (prisma as Record<string, any>).server = coolifyProofServer();
+    // rawStatus mappé FAILED → awaitAppReady renvoie false immédiatement.
+    (transport as Record<string, any>).deploymentStatus = jest.fn().mockResolvedValue({ rawStatus: 'crash', detail: 'crash' });
+
+    const before = Date.now();
+    const out = await service.provisionOrder('ord1');
+    const call = prisma.deployment.updateMany.mock.calls[0];
+
+    // Order conservé en PROVISIONING, historique de confirmation différée conservé.
+    expect(out.status).toBe('PROVISIONING');
+    expect(prisma.orderStatusHistory.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          orderId: 'ord1',
+          status: 'PROVISIONING',
+          note: expect.stringContaining('Build en cours'),
+        }),
+      }),
+    );
+    // Planification : condition atomique exacte + échéance future (délai canonique).
+    expect(call[0]).toEqual({
+      where: { orderId: 'ord1', status: 'DEPLOYING', reconcileNextAt: null },
+      data: { reconcileNextAt: expect.any(Date) },
+    });
+    const delta = call[0].data.reconcileNextAt.getTime() - before;
+    expect(delta).toBeGreaterThanOrEqual(INITIAL_RECONCILE_DELAY_MS);
+    expect(delta).toBeLessThan(INITIAL_RECONCILE_DELAY_MS + 1000);
+    // Seule l'échéance est posée : aucun compteur, aucune dernière lecture.
+    expect(call[0].data).toEqual({ reconcileNextAt: expect.any(Date) });
+    // Aucune activation, aucun email, aucune mutation transactionnelle.
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+    expect(mail.sendPlain).not.toHaveBeenCalled();
+    expect(audit.record).not.toHaveBeenCalledWith(
+      expect.objectContaining({ action: 'provision.deployment_active', details: expect.objectContaining({ ok: true }) }),
+    );
+  });
+
+  it('17B.3C CAS2/8 — retry proof-gate false ⇒ pas de 2ème app, échéance jamais repoussée', async () => {
+    prisma.order.findUnique.mockResolvedValue(orderFor('PER_CLIENT_PROJECT'));
+    deployments.getOrCreateClientProject.mockResolvedValue({ id: 'cp1', projectUuid: 'proj-dedie-client' });
+    (prisma as Record<string, any>).server = coolifyProofServer();
+    (transport as Record<string, any>).deploymentStatus = jest.fn().mockResolvedValue({ rawStatus: 'crash', detail: 'crash' });
+    // Row existante réutilisée (DÉJÀ en DEPLOYING) : retry de la MÊME commande.
+    prisma.deployment.findFirst.mockResolvedValue({ id: 'd1', coolifyUuid: 'app9', status: 'DEPLOYING' });
+
+    await service.provisionOrder('ord1');
+    await service.provisionOrder('ord1');
+
+    // Jamais de créations d'app ni de row : l'app/app9 et la row sont réutilisées
+    // dès le premier run (idempotence stricte, pas même une 1ère création).
+    expect(transport.createGitApp).not.toHaveBeenCalled();
+    expect(prisma.deployment.create).not.toHaveBeenCalled();
+    // Deux poses idempotentes : condition TOUJOURS reconcileNextAt=null (jamais poussée).
+    expect(prisma.deployment.updateMany).toHaveBeenCalledTimes(2);
+    const w1 = prisma.deployment.updateMany.mock.calls[0][0].where;
+    const w2 = prisma.deployment.updateMany.mock.calls[1][0].where;
+    expect(w1).toEqual({ orderId: 'ord1', status: 'DEPLOYING', reconcileNextAt: null });
+    expect(w2).toEqual(w1);
+  });
+
+  it('17B.3C CAS3 — proof-gate true ⇒ activation atomique SANS aucune planification', async () => {
+    prisma.order.findUnique.mockResolvedValue(orderFor('PER_CLIENT_PROJECT'));
+    deployments.getOrCreateClientProject.mockResolvedValue({ id: 'cp1', projectUuid: 'proj-dedie-client' });
+    (prisma as Record<string, any>).server = coolifyProofServer();
+    (transport as Record<string, any>).deploymentStatus = jest.fn().mockResolvedValue({ rawStatus: 'running:healthy', detail: 'running' });
+
+    const out = await service.provisionOrder('ord1');
+
+    expect(out.status).toBe('ACTIVE');
+    expect(prisma.deployment.updateMany).not.toHaveBeenCalled();
+    expect(tx.deployment.updateMany).toHaveBeenCalledWith({
+      where: { orderId: 'ord1', status: 'DEPLOYING' },
+      data: { status: 'ACTIVE' },
+    });
+  });
+
+  it('17B.3C CAS7 — erreur réelle de l activation atomique ⇒ propagée, AUCUNE planification', async () => {
+    prisma.order.findUnique.mockResolvedValue(orderFor('PER_CLIENT_PROJECT'));
+    deployments.getOrCreateClientProject.mockResolvedValue({ id: 'cp1', projectUuid: 'proj-dedie-client' });
+    (prisma as Record<string, any>).server = coolifyProofServer();
+    (transport as Record<string, any>).deploymentStatus = jest.fn().mockResolvedValue({ rawStatus: 'running:healthy', detail: 'running' });
+    tx.orderStatusHistory.create.mockRejectedValue(new Error('history boom'));
+
+    await expect(service.provisionOrder('ord1')).rejects.toThrow('history boom');
+    expect(prisma.deployment.updateMany).not.toHaveBeenCalled();
+    expect(mail.sendPlain).not.toHaveBeenCalled();
+  });
 });
 
 // =========================================================================
@@ -1180,5 +1278,132 @@ describe('ProvisioningService — activateOrderAfterProof (17B.3B)', () => {
     expect(audit.record).not.toHaveBeenCalledWith(
       expect.objectContaining({ action: 'provision.deployment_active', details: expect.objectContaining({ ok: true }) }),
     );
+  });
+});
+
+// =========================================================================
+// 17B.3C — scheduleInitialReconcile : planification PERSISTÉE initiale de la
+// réconciliation après expiration du proof-gate. « Horloge contrôlée » via le
+// paramètre `now` (aucun fake timer, aucun réseau) : l'échéance vaut EXACTEMENT
+// now + INITIAL_RECONCILE_DELAY_MS. Un mini-modèle simule la condition atomique
+// Prisma (status=DEPLOYING ET reconcileNextAt=null) pour prouver l'idempotence,
+// l'absence d'écrasement d'une échéance existante et l'absence de planification
+// hors DEPLOYING (ACTIVE/FAILED/PENDING/absent ⇒ count 0, aucun effet).
+// =========================================================================
+describe('ProvisioningService — scheduleInitialReconcile (17B.3C)', () => {
+  let service: ProvisioningService;
+
+  const prisma = {
+    deployment: { updateMany: jest.fn() },
+    order: { findUnique: jest.fn(), update: jest.fn() },
+    provisioningLog: { create: jest.fn(), update: jest.fn(), findMany: jest.fn() },
+    orderStatusHistory: { create: jest.fn() },
+    $transaction: jest.fn(),
+  };
+  // Mini-modèle de la row Deployment (seule la planification nous intéresse) :
+  // `present=false` simule l'absence de row (Deployment absent).
+  let deploymentRow: { present: boolean; status: string; reconcileNextAt: Date | null };
+
+  beforeEach(() => {
+    service = new ProvisioningService(
+      prisma as never,
+      { record: jest.fn() } as never,
+      { decrypt: jest.fn() } as never,
+      { sendPlain: jest.fn() } as never,
+      { findActiveRootDomain: jest.fn(), allocateClientSubdomain: jest.fn() } as never,
+      { create: jest.fn() } as never,
+      { getOrCreateClientProject: jest.fn() } as never,
+      { isServed: jest.fn() } as never,
+    );
+    deploymentRow = { present: true, status: 'DEPLOYING', reconcileNextAt: null };
+    jest.clearAllMocks();
+    // Simulation de la garde atomique en base.
+    prisma.deployment.updateMany.mockImplementation(async (args: any) => {
+      if (!deploymentRow.present || deploymentRow.status !== 'DEPLOYING' || deploymentRow.reconcileNextAt !== null) {
+        return { count: 0 };
+      }
+      deploymentRow.reconcileNextAt = args.data.reconcileNextAt;
+      return { count: 1 };
+    });
+  });
+
+  const sched = (now: Date) =>
+    (service as unknown as { scheduleInitialReconcile(orderId: string, now: Date): Promise<{ count: number }> }).scheduleInitialReconcile('ord1', now);
+
+  it('exporte la constante canonique INITIAL_RECONCILE_DELAY_MS = 30_000', () => {
+    expect(INITIAL_RECONCILE_DELAY_MS).toBe(30_000);
+  });
+
+  it('crée reconcileNextAt = now + délai canonique, condition atomique exacte', async () => {
+    const now = new Date('2026-09-22T00:00:00.000Z');
+    const res = await sched(now);
+
+    expect(res).toEqual({ count: 1 });
+    expect(deploymentRow.reconcileNextAt).toEqual(new Date('2026-09-22T00:00:30.000Z'));
+    expect(prisma.deployment.updateMany).toHaveBeenCalledWith({
+      where: { orderId: 'ord1', status: 'DEPLOYING', reconcileNextAt: null },
+      data: { reconcileNextAt: new Date('2026-09-22T00:00:30.000Z') },
+    });
+  });
+
+  it('ne renseigne QUE reconcileNextAt (attempts/terminalFailures/lastCheckedAt intacts)', async () => {
+    const now = new Date('2026-09-22T00:00:00.000Z');
+    await sched(now);
+
+    expect(prisma.deployment.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({ data: { reconcileNextAt: expect.any(Date) } }),
+    );
+    const dataArg = prisma.deployment.updateMany.mock.calls[0][0].data;
+    // data contient EXACTEMENT reconcileNextAt : aucun compteur incrémenté,
+    // reconcileLastCheckedAt reste null (aucune tentative du futur worker).
+    expect(Object.keys(dataArg)).toEqual(['reconcileNextAt']);
+    expect(dataArg.reconcileNextAt.getTime()).toBe(now.getTime() + INITIAL_RECONCILE_DELAY_MS);
+  });
+
+  it('échéance déjà présente ⇒ jamais écrasée ni repoussée (idempotent)', async () => {
+    const existing = new Date('2026-09-22T01:00:00.000Z');
+    deploymentRow.reconcileNextAt = existing;
+
+    const res = await sched(new Date('2026-09-22T00:00:00.000Z'));
+
+    expect(res).toEqual({ count: 0 });
+    expect(deploymentRow.reconcileNextAt).toEqual(existing);
+  });
+
+  it('double appel ⇒ UNE seule échéance, identique, jamais repoussée', async () => {
+    const now = new Date('2026-09-22T00:00:00.000Z');
+    const first = await sched(now);
+    const second = await sched(now);
+
+    expect(first).toEqual({ count: 1 });
+    expect(second).toEqual({ count: 0 });
+    expect(deploymentRow.reconcileNextAt).toEqual(new Date('2026-09-22T00:00:30.000Z'));
+    expect(prisma.deployment.updateMany).toHaveBeenCalledTimes(2);
+  });
+
+  it('Deployment ACTIVE ⇒ aucune planification (count 0, champ inchangé)', async () => {
+    deploymentRow.status = 'ACTIVE';
+
+    const res = await sched(new Date('2026-09-22T00:00:00.000Z'));
+
+    expect(res).toEqual({ count: 0 });
+    expect(deploymentRow.reconcileNextAt).toBeNull();
+  });
+
+  it('Deployment FAILED/PENDING ⇒ aucune planification (count 0, champ inchangé)', async () => {
+    for (const status of ['FAILED', 'PENDING']) {
+      deploymentRow = { present: true, status, reconcileNextAt: null };
+      const res = await sched(new Date('2026-09-22T00:00:00.000Z'));
+      expect(res).toEqual({ count: 0 });
+      expect(deploymentRow.reconcileNextAt).toBeNull();
+    }
+  });
+
+  it('Deployment absent ⇒ no-op contrôlé (count 0, aucune création artificielle)', async () => {
+    deploymentRow.present = false;
+
+    const res = await sched(new Date('2026-09-22T00:00:00.000Z'));
+
+    expect(res).toEqual({ count: 0 });
   });
 });
