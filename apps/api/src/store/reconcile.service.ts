@@ -74,7 +74,7 @@ export class ReconcileService {
       errors: 0,
       alerts: 0,
     };
-    const config = this.settings.getSettings();
+    const config = await this.settings.getSettings();
     if (!config.enabled) {
       stats.enabled = false;
       return stats;

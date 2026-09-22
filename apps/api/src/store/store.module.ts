@@ -15,6 +15,7 @@ import { DeploymentEvidenceService } from './deployment-evidence.service';
 import { PaymentMethodsController } from './payment-methods.controller';
 import { ProvisioningService } from './provisioning.service';
 import { ReconcileService } from './reconcile.service';
+import { ReconcileSettingAdminController } from './reconcile-setting.admin.controller';
 import { ReconcileSettingsService } from './reconcile-settings.service';
 import { CoolifyEvidenceConnector } from './evidence-connectors/coolify-evidence.connector';
 import { StoreProvisioningAdminController } from './store-provisioning.admin.controller';
@@ -36,6 +37,7 @@ import { StoreSubdomainController } from './store-subdomain.controller';
     CheckoutController,
     StoreProvisioningAdminController,
     StoreSubdomainController,
+    ReconcileSettingAdminController,
   ],
   providers: [
     CheckoutService,

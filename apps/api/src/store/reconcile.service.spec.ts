@@ -170,7 +170,7 @@ function makeService(
       return OBS.unknown();
     }),
   };
-  const settingsSvc = { getSettings: jest.fn(() => settings) };
+  const settingsSvc = { getSettings: jest.fn(async () => settings) };
   const provisioning = {
     activateOrderAfterProof: jest.fn().mockResolvedValue({
       orderIsActive: true,

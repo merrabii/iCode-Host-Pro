@@ -2,7 +2,10 @@ import {
   RECONCILE_DEFAULT_SETTINGS,
   RECONCILE_ENV_KEYS,
   RECONCILE_SETTINGS_BOUNDS,
+  ReconcileSettingOverrides,
+  applyReconcileOverrides,
   resolveReconcileSettings,
+  resolveReconcileSettingsFull,
   validateReconcileSettings,
 } from './reconcile-settings';
 
@@ -119,5 +122,141 @@ describe('ReconcileSettings — validateReconcileSettings', () => {
   it('non-entier/non-nombre ⇒ problème listé', () => {
     const issues = validateReconcileSettings({ ...RECONCILE_DEFAULT_SETTINGS, batchSize: 2.5 as never });
     expect(issues.some((i) => i.includes('batchSize'))).toBe(true);
+  });
+});
+
+// 17B.4C1 — overrides DB appliqués sur la base env → défauts (module PUR).
+describe('ReconcileSettings — applyReconcileOverrides (DB prioritaire)', () => {
+  const warns: string[] = [];
+  const warn = (m: string) => warns.push(m);
+  beforeEach(() => warns.splice(0));
+
+  it('aucun override ⇒ base inchangée, aucun warn', () => {
+    const out = applyReconcileOverrides(RECONCILE_DEFAULT_SETTINGS, {}, warn);
+    expect(out).toEqual(RECONCILE_DEFAULT_SETTINGS);
+    expect(warns).toHaveLength(0);
+  });
+
+  it('override non null prioritaire (DATABASE) ; null retombe sur env/défaut', () => {
+    const base = { ...RECONCILE_DEFAULT_SETTINGS, batchSize: 5 };
+    const out = applyReconcileOverrides(base, { batchSize: 42, scanIntervalMs: null }, warn);
+    expect(out.batchSize).toBe(42);
+    expect(out.scanIntervalMs).toBe(RECONCILE_DEFAULT_SETTINGS.scanIntervalMs);
+    expect(warns).toHaveLength(0);
+  });
+
+  it('enabled=false comme true, overrides explicites prioritaires', () => {
+    expect(applyReconcileOverrides(RECONCILE_DEFAULT_SETTINGS, { enabled: false }).enabled).toBe(false);
+    expect(applyReconcileOverrides(RECONCILE_DEFAULT_SETTINGS, { enabled: true }).enabled).toBe(true);
+  });
+
+  it('override hors bornes ⇒ warn + conservation env/défaut (jamais accepté silencieusement)', () => {
+    const out = applyReconcileOverrides(
+      RECONCILE_DEFAULT_SETTINGS,
+      { leaseMs: 999, batchSize: 5000 },
+      warn,
+    );
+    expect(out.leaseMs).toBe(RECONCILE_DEFAULT_SETTINGS.leaseMs);
+    expect(out.batchSize).toBe(RECONCILE_DEFAULT_SETTINGS.batchSize);
+    expect(warns.length).toBe(2);
+  });
+
+  it('paire invalide (max<initial) appliquée ⇒ défauts de la paire + warn', () => {
+    const out = applyReconcileOverrides(
+      RECONCILE_DEFAULT_SETTINGS,
+      { backoffInitialMs: 1_800_000, maxBackoffMs: 1_000_000 },
+      warn,
+    );
+    expect(out.maxBackoffMs).toBe(RECONCILE_DEFAULT_SETTINGS.maxBackoffMs);
+    expect(out.backoffInitialMs).toBe(RECONCILE_DEFAULT_SETTINGS.backoffInitialMs);
+    expect(warns.some((m) => m.includes('maxBackoffMs'))).toBe(true);
+  });
+
+  it('bornes minimales/maximales exactes acceptées', () => {
+    const out = applyReconcileOverrides(
+      RECONCILE_DEFAULT_SETTINGS,
+      {
+        scanIntervalMs: RECONCILE_SETTINGS_BOUNDS.scanIntervalMs.min,
+        batchSize: RECONCILE_SETTINGS_BOUNDS.batchSize.max,
+        leaseMs: RECONCILE_SETTINGS_BOUNDS.leaseMs.max,
+        attemptAlertThreshold: RECONCILE_SETTINGS_BOUNDS.attemptAlertThreshold.min,
+        backoffInitialMs: RECONCILE_SETTINGS_BOUNDS.backoffInitialMs.min,
+        maxBackoffMs: RECONCILE_SETTINGS_BOUNDS.maxBackoffMs.max,
+      },
+      warn,
+    );
+    expect(out.scanIntervalMs).toBe(RECONCILE_SETTINGS_BOUNDS.scanIntervalMs.min);
+    expect(out.batchSize).toBe(RECONCILE_SETTINGS_BOUNDS.batchSize.max);
+    expect(out.leaseMs).toBe(RECONCILE_SETTINGS_BOUNDS.leaseMs.max);
+    expect(out.attemptAlertThreshold).toBe(RECONCILE_SETTINGS_BOUNDS.attemptAlertThreshold.min);
+    expect(out.backoffInitialMs).toBe(RECONCILE_SETTINGS_BOUNDS.backoffInitialMs.min);
+    expect(out.maxBackoffMs).toBe(RECONCILE_SETTINGS_BOUNDS.maxBackoffMs.max);
+    expect(warns).toHaveLength(0);
+  });
+});
+
+// 17B.4C1 — sources exactes DATABASE/ENV/DEFAULT (resolveReconcileSettingsFull).
+describe('ReconcileSettings — resolveReconcileSettingsFull (sources)', () => {
+  const warns: string[] = [];
+  const warn = (m: string) => warns.push(m);
+  const env = (o: Record<string, string>): Record<string, string | undefined> => ({ ...o });
+  beforeEach(() => warns.splice(0));
+
+  it('rien défini ⇒ tout DEFAULT', () => {
+    const { settings, sources } = resolveReconcileSettingsFull({}, {}, warn);
+    expect(settings).toEqual(RECONCILE_DEFAULT_SETTINGS);
+    expect(sources).toEqual({
+      enabled: 'DEFAULT',
+      scanIntervalMs: 'DEFAULT',
+      batchSize: 'DEFAULT',
+      leaseMs: 'DEFAULT',
+      attemptAlertThreshold: 'DEFAULT',
+      backoffInitialMs: 'DEFAULT',
+      maxBackoffMs: 'DEFAULT',
+    });
+  });
+
+  it('env définie ⇒ ENV ; override DB non null ⇒ DATABASE prioritaire', () => {
+    const { settings, sources } = resolveReconcileSettingsFull(
+      env({ [RECONCILE_ENV_KEYS.batchSize]: '25', [RECONCILE_ENV_KEYS.leaseMs]: '60000' }),
+      { batchSize: 7 },
+      warn,
+    );
+    expect(settings.batchSize).toBe(7);
+    expect(settings.leaseMs).toBe(60_000);
+    expect(sources.batchSize).toBe('DATABASE');
+    expect(sources.leaseMs).toBe('ENV');
+    expect(sources.enabled).toBe('DEFAULT');
+  });
+
+  it('null sur un champ = retour ENV/DEFAULT (source recalculée)', () => {
+    const { settings, sources } = resolveReconcileSettingsFull(
+      env({ [RECONCILE_ENV_KEYS.enabled]: 'true' }),
+      { enabled: null },
+      warn,
+    );
+    expect(settings.enabled).toBe(true);
+    expect(sources.enabled).toBe('ENV');
+  });
+
+  it('override hors bornes ⇒ valeur non DB (source ENV ou DEFAULT) et warn', () => {
+    const { settings, sources } = resolveReconcileSettingsFull(
+      env({ [RECONCILE_ENV_KEYS.batchSize]: '25' }),
+      { batchSize: 5000 },
+      warn,
+    );
+    expect(settings.batchSize).toBe(25);
+    expect(sources.batchSize).toBe('ENV');
+    expect(warns.length).toBeGreaterThan(0);
+  });
+
+  it('env invalide ⇒ DEFAULT (jamais de valeur hors bornes acceptée)', () => {
+    const { settings, sources } = resolveReconcileSettingsFull(
+      env({ [RECONCILE_ENV_KEYS.leaseMs]: '999' }),
+      {},
+      warn,
+    );
+    expect(settings.leaseMs).toBe(RECONCILE_DEFAULT_SETTINGS.leaseMs);
+    expect(sources.leaseMs).toBe('DEFAULT');
   });
 });

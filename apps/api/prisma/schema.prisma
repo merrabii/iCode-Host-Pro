@@ -91,6 +91,24 @@ model SecuritySetting {
   updatedAt               DateTime @updatedAt
 }
 
+// 17B.4C1 — overrides admin du réconciliateur asynchrone (chaîne DB → env → défaut).
+// Singleton DÉTERMINISTE par id fixe (convention BrandConfig « id: 'brand' ») :
+// jamais plusieurs lignes actives. Colonnes NULLABLES = override absent/null →
+// retour au fallback env/défaut. Aucune valeur secrète. La ligne ne démarre
+// AUCUN worker : l'activation réelle reste une fonction 17B.4C2 (config/DI).
+model ReconcileSetting {
+  id                    String   @id // singleton : id fixe 'reconcile'
+  enabled               Boolean? // override de RECONCILE_ENABLED
+  scanIntervalMs        Int?     // override de RECONCILE_SCAN_INTERVAL_MS
+  batchSize             Int?     // override de RECONCILE_BATCH_SIZE
+  leaseMs               Int?     // override de RECONCILE_LEASE_MS
+  attemptAlertThreshold Int?     // override de RECONCILE_ATTEMPT_ALERT_THRESHOLD
+  backoffInitialMs      Int?     // override de RECONCILE_BACKOFF_INITIAL_MS
+  maxBackoffMs          Int?     // override de RECONCILE_MAX_BACKOFF_MS
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+}
+
 // Phase 10 (ADR-027): client-generated 6-digit support access code. The raw
 // code is shown ONCE and never stored: only HMAC-SHA256(pepper, code) is kept
 // (`codeHash`). One active code per client (generation revokes the previous in
