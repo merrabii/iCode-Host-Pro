@@ -24,6 +24,30 @@ import {
 import { resolveBuildPackPortContract } from '../servers/runtime-port-contract';
 
 /**
+ * Résultat d'une tentative d'activation atomique post-preuve (17B.3B).
+ * ActivationResult EST LA SOURCE DE VÉRITÉ de l'état post-transaction : chaque
+ * champ reflète les états RÉELLEMENT obtenus dans la transaction (jamais des
+ * lectures pré-transaction). `orderIsActive`/`deploymentIsActive` portent
+ * l'état final ; `orderActivated`/`deploymentActivated` la transition gagnée ;
+ * `noop` + `reason` documentent les no-op explicites (interdits, absents,
+ * déjà-actifs).
+ */
+export interface ActivationResult {
+  /** État final de l'Order : true si réellement ACTIVE (pré-existant ou gagné ici). */
+  orderIsActive: boolean;
+  /** État final de la row Deployment : true si réellement ACTIVE. */
+  deploymentIsActive: boolean;
+  /** true uniquement si la transition Order PROVISIONING→ACTIVE a été GAGNÉE ici. */
+  orderActivated: boolean;
+  /** true uniquement si la transition Deployment DEPLOYING→ACTIVE a été GAGNÉE ici. */
+  deploymentActivated: boolean;
+  /** true si AUCUNE écriture ni transition n'a eu lieu (CAS4 déjà-actif, CAS5/6/7). */
+  noop: boolean;
+  /** Motif d'un no-op explicite (path safe, aucun secret). */
+  reason?: string;
+}
+
+/**
  * Bloc D — provision réel d'une commande store.
  *
  * Déclenché juste après `checkout.service` (même requête) ou via un appel
@@ -190,16 +214,14 @@ export class ProvisioningService {
       const serverId = (order.product.pack?.deploymentModule?.server as { id?: string } | null | undefined)?.id ?? null;
       const ready = await this.awaitAppReady({ coolifyUuid: appUuid!, serverId }, fqdn);
       if (ready) {
-        await this.setOrderStatus(orderId, OrderStatus.ACTIVE, 'Application en ligne — mise en place confirmée.');
-        // La preuve de mise en ligne (prod réelle : Coolify ACTIVE ou HTTP 2xx/3xx
-        // public) est atteinte : la row Deployment DE cette commande doit refléter
-        // ACTIVE au même instant, sinon elle démeure DEPLOYING à l'arrêt (seule la
-        // consultation du dashboard client la réconcilie sinon). Ciblé sur LA row de
-        // la commande (orderId @unique), idempotent, jamais FAILED→ACTIVE, jamais de
-        // création, conditionnel donc sûr en concurrence avec `refreshStatus`.
-        await this.reconcileDeploymentActive(orderId);
-        if (fqdn) await this.deliverEmail(order.customerEmail, order.customerName, fqdn, orderId);
-        return this.finalResult(orderId, OrderStatus.ACTIVE, fqdn);
+        // 17B.3B — activation ATOMIQUE Order + Deployment (+ OrderStatusHistory)
+        // via la couture publique idempotente, puis email de livraison APRÈS
+        // commit, uniquement si l'Order vient réellement d'être activé. L'état
+        // final rapporté est dérivé UNIQUEMENT d'ActivationResult (source de
+        // vérité post-transaction) : ACTIVE ssi l'Order est réellement ACTIVE.
+        const act = await this.activateOrderAfterProof(orderId);
+        const outcome = act.orderIsActive ? OrderStatus.ACTIVE : OrderStatus.PROVISIONING;
+        return this.finalResult(orderId, outcome, fqdn);
       }
       // Build encore en cours (légitime, plusieurs minutes) : PROVISIONING, SANS email
       // « en ligne ». Le dashboard client re-sonde et reflète le vrai état (DEPLOYING).
@@ -247,15 +269,22 @@ export class ProvisioningService {
 
   /** Email de livraison doté de la gestion d'échec commune (best-effort, audité). */
   private async deliverEmail(to: string, name: string, fqdn: string, orderId: string): Promise<void> {
-    await this.sendDeliveryEmail(to, name, fqdn, orderId).catch((e) => {
+    try {
+      await this.sendDeliveryEmail(to, name, fqdn, orderId);
+    } catch (e) {
       this.log.warn(`delivery email order=${orderId} failed: ${String(e)}`);
-      this.audit.record({
-        action: 'provision.delivery_email',
-        resourceType: 'order',
-        resourceId: orderId,
-        details: { ok: false, error: String(e) },
-      });
-    });
+      // Audit best-effort : un échec d'audit ne doit jamais rejeter l'activation.
+      try {
+        await this.audit.record({
+          action: 'provision.delivery_email',
+          resourceType: 'order',
+          resourceId: orderId,
+          details: { ok: false, error: String(e) },
+        });
+      } catch (ae) {
+        this.log.warn(`post-commit audit delivery_email order=${orderId} failed: ${String(ae)}`);
+      }
+    }
   }
 
   /**
@@ -336,42 +365,119 @@ export class ProvisioningService {
   }
 
   /**
-   * Réconcilie l'état de la row Deployment de la commande après une preuve de
-   * mise en ligne réelle (Order passé ACTIVE). Seule la row de CELLE-ci est
-   * visée — jamais « Order ACTIVE ⇒ toutes ses Deployments ACTIVE » :
-   * `updateMany` est borné par `orderId` (+ `orderId @unique` ⇒ une seule row)
-   * ET par `status: DEPLOYING`, donc :
-   *  - idempotent : un ACTIVE déjà posé (double activation) reste ACTIVE, apiSafe ;
-   *  - jamais FAILED→ACTIVE arbitrairement sans nouvelle preuve ;
-   *  - jamais de création de Deployment ;
-   *  - conditionnel : sûr en concurrence avec la réconciliation lazy du dashboard
-   *    (`refreshStatus`), l'un des deux arrivant le premier ne produit pas de conflit.
-   * Best-effort et audité : un échec de sync ne doit pas casser l'activation dejà
-   * PROUVÉE de l'Order (source de vérité métier), il est tracé pour relance.
+   * 17B.3B — couture publique d'activation ATOMIQUE post-preuve de mise en
+   * ligne, réutilisée par le proof-gate (provisionOrder) et, plus tard, par le
+   * réconciliateur (17B.4+). Dans UNE transaction interactive :
+   *   • Order PROVISIONING→ACTIVE et Deployment DEPLOYING→ACTIVE, UNIQUEMENT
+   *     les transitions nécessaires (lectures faites DANS la transaction) ;
+   *     une transition nécessaire qui rend count≠1 (course perdue face à un
+   *     concurrent) déclenche une erreur interne contrôlée → rollback complet ;
+   *   • OrderStatusHistory ACTIVE créée UNIQUEMENT si l'Order vient d'être
+   *     réellement activé dans cette transaction (jamais de doublon).
+   * Gardes (no-op explicites, AUCUNE écriture) : Order absent (`order_absent`) ;
+   * Order ≠ PROVISIONING/ACTIVE (`order_status_*`) ; Deployment ABSENT
+   * (`deployment_missing` — l'Order n'est JAMAIS activé seul) ; Deployment
+   * FAILED/PENDING (`deployment_status_*`, jamais FAILED→ACTIVE) ; Order ET
+   * Deployment déjà ACTIVE (`already_active`, no-op idempotent).
+   * Après commit : audit `provision.deployment_active` et email de livraison
+   * BEST-EFFORT (catch + Logger.warn sans donnée sensible), un échec audit ou
+   * email ne rejette JAMAIS la couture et ne fausse jamais le résultat — le
+   * retour reflète les états RÉELLEMENT obtenus dans la base validée.
    */
-  private async reconcileDeploymentActive(orderId: string): Promise<void> {
+  async activateOrderAfterProof(orderId: string): Promise<ActivationResult> {
+    let outcome: ActivationResult;
     try {
-      const res = await this.prisma.deployment.updateMany({
-        where: { orderId, status: DeploymentStatus.DEPLOYING },
-        data: { status: DeploymentStatus.ACTIVE },
+      outcome = await this.prisma.$transaction(async (tx) => {
+        const ord = await tx.order.findUnique({ where: { id: orderId }, select: { status: true } });
+        if (!ord) {
+          return { orderIsActive: false, deploymentIsActive: false, orderActivated: false, deploymentActivated: false, noop: true, reason: 'order_absent' };
+        }
+        if (ord.status !== OrderStatus.PROVISIONING && ord.status !== OrderStatus.ACTIVE) {
+          return { orderIsActive: false, deploymentIsActive: false, orderActivated: false, deploymentActivated: false, noop: true, reason: `order_status_${ord.status}` };
+        }
+        const dep = await tx.deployment.findFirst({ where: { orderId }, select: { status: true } });
+        if (!dep) {
+          return { orderIsActive: false, deploymentIsActive: false, orderActivated: false, deploymentActivated: false, noop: true, reason: 'deployment_missing' };
+        }
+        if (dep.status !== DeploymentStatus.DEPLOYING && dep.status !== DeploymentStatus.ACTIVE) {
+          return { orderIsActive: false, deploymentIsActive: false, orderActivated: false, deploymentActivated: false, noop: true, reason: `deployment_status_${dep.status}` };
+        }
+
+        const orderUpdateNeeded = ord.status === OrderStatus.PROVISIONING;
+        const deploymentUpdateNeeded = dep.status === DeploymentStatus.DEPLOYING;
+        if (!orderUpdateNeeded && !deploymentUpdateNeeded) {
+          return { orderIsActive: true, deploymentIsActive: true, orderActivated: false, deploymentActivated: false, noop: true, reason: 'already_active' };
+        }
+
+        const orderRes = orderUpdateNeeded
+          ? await tx.order.updateMany({
+              where: { id: orderId, status: OrderStatus.PROVISIONING },
+              data: { status: OrderStatus.ACTIVE },
+            })
+          : { count: 0 as const };
+        if (orderUpdateNeeded && orderRes.count !== 1) {
+          throw new Error(`activateOrderAfterProof lost race order=${orderId}`);
+        }
+        const depRes = deploymentUpdateNeeded
+          ? await tx.deployment.updateMany({
+              where: { orderId, status: DeploymentStatus.DEPLOYING },
+              data: { status: DeploymentStatus.ACTIVE },
+            })
+          : { count: 0 as const };
+        if (deploymentUpdateNeeded && depRes.count !== 1) {
+          throw new Error(`activateOrderAfterProof lost race deployment=${orderId}`);
+        }
+
+        const orderActivated = orderUpdateNeeded && orderRes.count === 1;
+        const deploymentActivated = deploymentUpdateNeeded && depRes.count === 1;
+        if (orderActivated) {
+          await tx.orderStatusHistory.create({
+            data: { orderId, status: OrderStatus.ACTIVE, note: 'Application en ligne — mise en place confirmée.' },
+          });
+        }
+        return {
+          orderIsActive: orderActivated || !orderUpdateNeeded,
+          deploymentIsActive: deploymentActivated || !deploymentUpdateNeeded,
+          orderActivated,
+          deploymentActivated,
+          noop: false,
+        };
       });
-      if (res.count > 0) {
-        await this.audit.record({
-          action: 'provision.deployment_active',
-          resourceType: 'deployment',
-          resourceId: orderId,
-          details: { orderId, ok: true, reconciled: res.count, from: DeploymentStatus.DEPLOYING, to: DeploymentStatus.ACTIVE },
-        });
-      }
     } catch (e) {
-      this.log.warn(`reconcile deployment order=${orderId} failed: ${String(e)}`);
-      await this.audit.record({
-        action: 'provision.deployment_active',
-        resourceType: 'deployment',
-        resourceId: orderId,
-        details: { orderId, ok: false, error: String(e) },
-      });
+      this.log.warn(`activateOrderAfterProof order=${orderId} rollback: ${String(e)}`);
+      throw e;
     }
+
+    if (!outcome.noop) {
+      if (outcome.deploymentActivated) {
+        try {
+          await this.audit.record({
+            action: 'provision.deployment_active',
+            resourceType: 'deployment',
+            resourceId: orderId,
+            details: { orderId, ok: true, reconciled: 1, from: DeploymentStatus.DEPLOYING, to: DeploymentStatus.ACTIVE },
+          });
+        } catch (e) {
+          this.log.warn(`post-commit audit deployment_active order=${orderId} failed: ${String(e)}`);
+        }
+      }
+      if (outcome.orderActivated) {
+        try {
+          // Relecture APRÈS commit : les données de l'email viennent de l'Order —
+          // Order.domainValue est le fqdn store réel, jamais un champ Order.fqdn.
+          const fresh = await this.prisma.order.findUnique({
+            where: { id: orderId },
+            select: { customerEmail: true, customerName: true, domainValue: true },
+          });
+          if (fresh?.domainValue) {
+            await this.deliverEmail(fresh.customerEmail, fresh.customerName, fresh.domainValue, orderId);
+          }
+        } catch (e) {
+          this.log.warn(`post-commit delivery email order=${orderId} failed: ${String(e)}`);
+        }
+      }
+    }
+    return outcome;
   }
 
   /**
