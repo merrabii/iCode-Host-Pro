@@ -10,8 +10,13 @@ import { PanelTransportFactory } from '../servers/panel-transport.factory';
 import { BillingPaymentAdminController } from './billing-payment.admin.controller';
 import { CheckoutController } from './checkout.controller';
 import { CheckoutService } from './checkout.service';
+import { DEPLOYMENT_EVIDENCE_CONNECTORS } from './deployment-evidence';
+import { DeploymentEvidenceService } from './deployment-evidence.service';
 import { PaymentMethodsController } from './payment-methods.controller';
 import { ProvisioningService } from './provisioning.service';
+import { ReconcileService } from './reconcile.service';
+import { ReconcileSettingsService } from './reconcile-settings.service';
+import { CoolifyEvidenceConnector } from './evidence-connectors/coolify-evidence.connector';
 import { StoreProvisioningAdminController } from './store-provisioning.admin.controller';
 import { StoreSubdomainController } from './store-subdomain.controller';
 
@@ -19,6 +24,9 @@ import { StoreSubdomainController } from './store-subdomain.controller';
  * Bloc C/D — module store (tunnel d'achat sans compte, paiement simulé, provisioning).
  * Réutilise AuthModule (SaRateLimiter), MailModule, ProductsModule, CloudflareModule
  * et PanelTransportFactory (pose du domaine Coolify).
+ * 17B.4B — ajoute le moteur de réconciliation asynchrone (ReconcileService, pas
+ * de boucle : scanOnce est appelé explicitement, le timer 17B.4C viendra après),
+ * la couche évidence et le connecteur Coolify enregistré dans le registre DI.
  */
 @Module({
   imports: [AuthModule, CloudflareModule, CryptoModule, DeploymentsModule, MailModule, ProductsModule],
@@ -29,7 +37,27 @@ import { StoreSubdomainController } from './store-subdomain.controller';
     StoreProvisioningAdminController,
     StoreSubdomainController,
   ],
-  providers: [CheckoutService, ProvisioningService, PanelTransportFactory, HttpAvailabilityService],
-  exports: [ProvisioningService, HttpAvailabilityService],
+  providers: [
+    CheckoutService,
+    ProvisioningService,
+    PanelTransportFactory,
+    HttpAvailabilityService,
+    ReconcileSettingsService,
+    CoolifyEvidenceConnector,
+    DeploymentEvidenceService,
+    {
+      provide: DEPLOYMENT_EVIDENCE_CONNECTORS,
+      useFactory: (coolify: CoolifyEvidenceConnector) => [coolify],
+      inject: [CoolifyEvidenceConnector],
+    },
+    ReconcileService,
+  ],
+  exports: [
+    ProvisioningService,
+    HttpAvailabilityService,
+    ReconcileSettingsService,
+    DeploymentEvidenceService,
+    ReconcileService,
+  ],
 })
 export class StoreModule {}

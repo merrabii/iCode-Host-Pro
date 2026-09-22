@@ -1,3 +1,5 @@
+import { ReconcileSettings, resolveReconcileSettings } from '../store/reconcile-settings';
+
 /** Trust-proxy value accepted by Express `app.set('trust proxy', …)`. */
 export type TrustProxySetting = boolean | string[];
 
@@ -126,6 +128,11 @@ export interface AppConfig {
   /** Trust proxy Express (parseTrustProxy) : false par défaut — X-Forwarded-For
    *  n'est honoré que depuis des pairs explicitement approuvés. */
   trustProxy: TrustProxySetting;
+  /** Phase 17B — configuration du réconciliateur asynchrone des déploiements,
+   *  résolue depuis l'environnement via la SOURCE UNIQUE du moteur
+   *  (store/reconcile-settings.ts) : clés RECONCILE_*, défauts + bornes les
+   *  MÊMES que ReconcileSettingsService. Jamais de secret dans ces valeurs. */
+  reconcile: ReconcileSettings;
 }
 
 export function loadAppConfig(
@@ -165,5 +172,6 @@ export function loadAppConfig(
     impersonationExpiresIn: process.env.IMPERSONATION_EXPIRES_IN ?? '60m',
     oauthStateTtlSeconds: Number(process.env.OAUTH_STATE_TTL_SECONDS ?? 600),
     trustProxy: parseTrustProxy(process.env.TRUST_PROXY, warn),
+    reconcile: resolveReconcileSettings(process.env, warn),
   };
 }
