@@ -14,6 +14,7 @@ import { DEPLOYMENT_EVIDENCE_CONNECTORS } from './deployment-evidence';
 import { DeploymentEvidenceService } from './deployment-evidence.service';
 import { PaymentMethodsController } from './payment-methods.controller';
 import { ProvisioningService } from './provisioning.service';
+import { ReconcileRunnerService } from './reconcile.runner.service';
 import { ReconcileService } from './reconcile.service';
 import { ReconcileSettingAdminController } from './reconcile-setting.admin.controller';
 import { ReconcileSettingsService } from './reconcile-settings.service';
@@ -53,6 +54,7 @@ import { StoreSubdomainController } from './store-subdomain.controller';
       inject: [CoolifyEvidenceConnector],
     },
     ReconcileService,
+    ReconcileRunnerService,
   ],
   exports: [
     ProvisioningService,
