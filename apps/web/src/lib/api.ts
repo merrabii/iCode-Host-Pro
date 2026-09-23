@@ -1316,9 +1316,7 @@ export const updateSecuritySettings = (
   dto: Partial<SecuritySettings> & { turnstileSiteKey?: string; turnstileSecretKey?: string },
 ) => apiJson('/api/admin/security', t, { method: 'PUT', body: JSON.stringify(dto) });
 
-// ── Admin reconcile settings (17B.4D-B : lecture seule — GET uniquement) ────
-// Les helpers d'écriture (PATCH / reset) arrivent en 17B.4D-C avec leurs
-// protections ; la page /manager/reconciliation n'écrit encore rien.
+// ── Admin reconcile settings (17B.4B/4C1 lecture ; 17B.4D-C écriture NUMÉRIQUE)
 export type ReconcileSettingKey =
   | 'enabled'
   | 'scanIntervalMs'
@@ -1327,6 +1325,9 @@ export type ReconcileSettingKey =
   | 'attemptAlertThreshold'
   | 'backoffInitialMs'
   | 'maxBackoffMs';
+
+/** 17B.4D-C : seules ces SIX clés sont modifiables — `enabled` est EXCLU (activation = 17B.4E). */
+export type ReconcileNumericSettingKey = Exclude<ReconcileSettingKey, 'enabled'>;
 
 export type ReconcileSettingSource = 'DATABASE' | 'ENV' | 'DEFAULT';
 
@@ -1340,6 +1341,18 @@ export interface ReconcileSettingsView {
 }
 
 export const getReconcileSettings = (t: string) => apiJson('/api/admin/reconcile', t);
+
+/** PATCH strictement limité aux six clés numériques — `enabled`, boolean, string
+ *  et propriété inconnue sont refusés au niveau TypeScript. `null` = retrait de
+ *  l'override (retour ENV/DEFAULT). */
+export type ReconcileNumericSettingsPatch = Partial<
+  Record<ReconcileNumericSettingKey, number | null>
+>;
+
+/** Seule écriture des réglages : PATCH /api/admin/reconcile (17B.4D-C).
+ *  Aucun helper reset — POST /api/admin/reconcile/reset est interdit côté web. */
+export const updateReconcileSettings = (t: string, patch: ReconcileNumericSettingsPatch) =>
+  apiJson('/api/admin/reconcile', t, { method: 'PATCH', body: JSON.stringify(patch) });
 
 // ── Base de connaissance (Phase 11) ────────────────────────────────────────
 export type KnowledgeAudience = 'ADMIN' | 'CLIENT';
