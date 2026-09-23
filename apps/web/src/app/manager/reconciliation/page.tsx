@@ -9,6 +9,7 @@ import { ADMIN_NAV } from '@/config/nav';
 import { useAdminSession } from '@/lib/session';
 import {
   apiError,
+  disableReconciliation,
   getReconcileSettings,
   updateReconcileSettings,
   type ReconcileNumericSettingKey,
@@ -18,11 +19,11 @@ import {
   type ReconcileSettingsView,
 } from '@/lib/api';
 
-// 17B.4D-C — édition SÉCURISÉE des SIX paramètres numériques des réglages de
-// réconciliation. `enabled` reste strictement en lecture seule (activation
-// exclusive de 17B.4E). Écriture = UNIQUEMENT PATCH /api/admin/reconcile via
-// updateReconcileSettings, payload construit à partir de NUMERIC_KEYS (jamais
-// enabled, jamais de spread de view.effective, jamais de POST /reset).
+// 17B.4E-B — durcissement : allowlist runtime dans le helper numérique ;
+// enabled reste read-only (aucune activation UI). Si effective.enabled===true
+// (état anormal / résiduel), un bouton d'arrêt d'urgence « Désactiver
+// immédiatement » appelle uniquement disableReconciliation (payload
+// { enabled: false } sans confirmation). Activation live = phase ultérieure.
 
 interface SettingMeta {
   key: ReconcileSettingKey;
@@ -374,6 +375,7 @@ export default function ReconciliationPage() {
   const [fieldErrors, setFieldErrors] = useState<Partial<Record<ReconcileNumericSettingKey, string>>>({});
   const [formError, setFormError] = useState<string | null>(null);
   const [confirmReset, setConfirmReset] = useState(false);
+  const [disabling, setDisabling] = useState(false);
 
   const load = useCallback(async () => {
     if (!token) return;
@@ -493,6 +495,44 @@ export default function ReconciliationPage() {
     }
   }
 
+  /** 17B.4E-B — arrêt d'urgence : AUCUNE confirmation (ne doit pas ralentir).
+   *  Appelle uniquement disableReconciliation → { enabled: false }. */
+  async function emergencyDisable() {
+    if (!token || disabling) return;
+    setDisabling(true);
+    setFormError(null);
+    try {
+      const res = await disableReconciliation(token);
+      if (!res.ok) {
+        const msg = apiError(res, 'Désactivation impossible.');
+        setFormError(msg);
+        toast.error(msg);
+        await load();
+        return;
+      }
+      const data = res.data as ReconcileSettingsView;
+      if (data.effective.enabled !== false) {
+        const msg = 'Désactivation non confirmée par le serveur — nouvel état inconnu.';
+        setFormError(msg);
+        toast.error(msg);
+        await load();
+        return;
+      }
+      setView(data);
+      setDraft({});
+      setFieldErrors({});
+      setFormError(null);
+      toast.ok('Moteur de réconciliation désactivé.');
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setFormError(msg);
+      toast.error(msg);
+      await load();
+    } finally {
+      setDisabling(false);
+    }
+  }
+
   if (phase === 'loading' || (phase === 'ready' && !view && !loadError)) {
     return <PageLoading label="Chargement des réglages de réconciliation…" />;
   }
@@ -513,6 +553,8 @@ export default function ReconciliationPage() {
   const enabledOverridden = v ? hasOverride(v, 'enabled') : false;
   const overrideCount = v ? countOverrides(v) : 0;
   const totalKeys = 7;
+  const engineActive = enabledEffective === true;
+  const emergencyBusy = disabling || saving || loading;
 
   return (
     <AppShell me={{ email: 'admin', role: 'ADMIN' }} nav={ADMIN_NAV}>
@@ -523,12 +565,21 @@ export default function ReconciliationPage() {
           sub="Le moteur vérifie les déploiements en attente auprès des panels et signale les écarts. Cette page affiche la configuration effective, sa source (base, variables d'environnement ou défauts), permet d'éditer les six paramètres numériques et de retirer leurs overrides."
         />
 
-        <Alert tone="info" title="Édition des paramètres numériques (17B.4D-C)">
+        <Alert tone="info" title="Édition des paramètres numériques (17B.4D-C / 17B.4E-B)">
           Les six paramètres numériques sont éditables (brouillon local, puis « Enregistrer »).
           Le champ « Moteur actif » (enabled) reste strictement en lecture seule : aucun payload
-          enabled n'est jamais envoyé. L'activation sera disponible uniquement pendant la
-          validation contrôlée de la phase 17B.4E.
+          enabled n'est jamais envoyé par les helpers numériques. L'activation contrôlée
+          appartient à la phase live ultérieure (après création d'un candidat jetable).
         </Alert>
+
+        {engineActive && (
+          <Alert tone="error" title="Moteur actif — arrêt d'urgence disponible">
+            La valeur effective de « Moteur actif » est à <b>true</b> (état anormal pendant
+            17B.4E-B, résiduel d'un test ou écriture admin). Le runner peut déjà scanner.
+            Utilisez immédiatement le bouton ci-dessous pour forcer l'arrêt
+            ({"{ enabled: false }"}, sans confirmation).
+          </Alert>
+        )}
 
         {loadError && !v && (
           <Alert tone="error" title="Erreur de chargement">{loadError}</Alert>
@@ -595,8 +646,21 @@ export default function ReconciliationPage() {
                       Défaut : {formatMetaDefault(enabledMeta)}
                     </p>
                     <Alert tone="warn" title="Activation verrouillée">
-                      L'activation sera disponible uniquement pendant la validation contrôlée de la phase 17B.4E.
+                      L'activation contrôlée appartient à la phase live ultérieure (après
+                      candidat jetable certifié). Aucun bouton Activer n'existe sur cette page.
                     </Alert>
+                    {engineActive && (
+                      <div style={{ marginTop: 10 }}>
+                        <Button
+                          variant="danger"
+                          onClick={() => void emergencyDisable()}
+                          disabled={emergencyBusy}
+                          busy={disabling}
+                        >
+                          {disabling ? 'Désactivation…' : 'Désactiver immédiatement'}
+                        </Button>
+                      </div>
+                    )}
                   </div>
                   <div style={ss.valueCol}>
                     <div style={{ fontWeight: 700, fontSize: 15 }}>

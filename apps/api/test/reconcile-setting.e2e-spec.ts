@@ -10,12 +10,13 @@ import { GlobalPrefix } from './../src/config/constants';
 import { RECONCILE_DEFAULT_SETTINGS, RECONCILE_SETTING_SINGLETON_ID } from './../src/store/reconcile-settings';
 import { ReconcileSettingsService } from './../src/store/reconcile-settings.service';
 
-// 17B.4C1 — persistance PostgreSQL + API admin des réglages de réconciliation.
-// AppModule réel + PostgreSQL local : aucune ligne active initialement ;
-// rectifications d'overrides administrées strictement ADMIN ; sources exactes ;
-// atomicité (PATCH invalide → 400, DB inchangée) ; singleton garanti ;
-// persistance à travers une recréation d'application ; AUCUN worker démarré
-// même avec enabled=true (l'activation réelle est 17B.4C2).
+// 17B.4C1 → 17B.4E-B — persistance PostgreSQL + API admin des réglages de
+// réconciliation. AppModule réel + PostgreSQL local : aucune ligne active
+// initialement ; overrides ADMIN ; sources exactes ; atomicité ; singleton ;
+// persistance. 17B.4E-B : NE PERSISTE JAMAIS enabled=true (contrat de sécurité) —
+// le lifecycle enabled=true n'est couvert QUE par les unitaires du runner (mocks
+// + faux timers, jamais un provider réel). L'ancien test #10 (enabled=true +
+// attente 600 ms « aucun worker ») est obsolète depuis 17B.4C2 (runner actif).
 describe('Reconcile settings (e2e, 17B.4C1)', () => {
   const url = `/${GlobalPrefix}/admin/reconcile`;
 
@@ -178,7 +179,7 @@ describe('Reconcile settings (e2e, 17B.4C1)', () => {
     expect(after).toEqual(before);
   });
 
-  it('5. enabled=false explicite persisté puis true (sources DATABASE)', async () => {
+  it('5. enabled=false explicite persisté (sources DATABASE, effectif false)', async () => {
     const off = await request(app.getHttpServer())
       .patch(url)
       .set('Authorization', `Bearer ${adminToken}`)
@@ -186,14 +187,29 @@ describe('Reconcile settings (e2e, 17B.4C1)', () => {
       .expect(200);
     expect(off.body.effective.enabled).toBe(false);
     expect(off.body.sources.enabled).toBe('DATABASE');
+    expect(off.body.overrides.enabled).toBe(false);
 
-    const on = await request(app.getHttpServer())
+    // Relecture GET : la valeur false est bien persistée et source DATABASE.
+    const read = await request(app.getHttpServer())
+      .get(url)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .expect(200);
+    expect(read.body.effective.enabled).toBe(false);
+    expect(read.body.sources.enabled).toBe('DATABASE');
+
+    // Contrat 17B.4E-B : enabled=true est INTERDIT dans cet e2e.
+    // Un PATCH { enabled: true } ne doit jamais être émis ici (lifecycle
+    // enabled=true = unitaires runner uniquement, mocks + faux timers).
+    // On vérifie au contraire que la persistance false résiste à un
+    // PATCH numérique concurrent.
+    const afterNumeric = await request(app.getHttpServer())
       .patch(url)
       .set('Authorization', `Bearer ${adminToken}`)
-      .send({ enabled: true })
+      .send({ batchSize: 11 })
       .expect(200);
-    expect(on.body.effective.enabled).toBe(true);
-    expect(on.body.sources.enabled).toBe('DATABASE');
+    expect(afterNumeric.body.effective.enabled).toBe(false);
+    expect(afterNumeric.body.sources.enabled).toBe('DATABASE');
+    expect(afterNumeric.body.effective.batchSize).toBe(11);
   });
 
   it('6. null sur un champ supprime l\'override → retour env/défaut', async () => {
@@ -208,10 +224,11 @@ describe('Reconcile settings (e2e, 17B.4C1)', () => {
   });
 
   it('7. reset → retour env/défauts (overrides vides), idempotent', async () => {
+    // Setup : uniquement numérique + enabled=false (jamais true, contrat 4E-B).
     await request(app.getHttpServer())
       .patch(url)
       .set('Authorization', `Bearer ${adminToken}`)
-      .send({ batchSize: 55, enabled: true })
+      .send({ batchSize: 55, enabled: false })
       .expect(200);
 
     const res = await request(app.getHttpServer())
@@ -221,12 +238,14 @@ describe('Reconcile settings (e2e, 17B.4C1)', () => {
     expect(res.body.overrides).toEqual({});
     expect(res.body.effective).toEqual(RECONCILE_DEFAULT_SETTINGS);
     expect(res.body.sources.batchSize).toBe('DEFAULT');
+    expect(res.body.effective.enabled).toBe(false);
 
     const again = await request(app.getHttpServer())
       .post(`${url}/reset`)
       .set('Authorization', `Bearer ${adminToken}`)
       .expect(201);
     expect(again.body.effective).toEqual(RECONCILE_DEFAULT_SETTINGS);
+    expect(again.body.effective.enabled).toBe(false);
   });
 
   it('8. une seule ligne singleton après de multiples PATCH', async () => {
@@ -256,25 +275,45 @@ describe('Reconcile settings (e2e, 17B.4C1)', () => {
     expect(view.effective.batchSize).toBe(77);
   });
 
-  it('10. AUCUN worker automatique : enabled=true en base ne déclenche pas de scan', async () => {
+  it('10. enabled=false en base : effective=false, source DATABASE, AUCUN scan déclenché', async () => {
+    // Remplace l'ancien test #10 (enabled=true + 600 ms « aucun worker »),
+    // OBSOLÈTE depuis 17B.4C2 : le runner est actif (StoreModule), relit
+    // getSettings() à chaque wake et appelle scanOnce() si enabled=true.
+    // Persister enabled=true ici activerait le vrai runner → INTERDIT (4E-B).
+    // Couverture correcte : enabled=false persistant + aucun scan en fenêtre.
     const beforeScans = await prisma.auditLog.count({
       where: { action: { contains: 'reconcile' } },
     });
     const res = await request(app.getHttpServer())
       .patch(url)
       .set('Authorization', `Bearer ${adminToken}`)
-      .send({ enabled: true })
+      .send({ enabled: false })
       .expect(200);
-    expect(res.body.effective.enabled).toBe(true);
+    expect(res.body.effective.enabled).toBe(false);
     expect(res.body.sources.enabled).toBe('DATABASE');
+    expect(res.body.overrides.enabled).toBe(false);
 
-    // Aucun scanOnce déclenché automatiquement : attendre puis constater l'absence
-    // d'activité moteur (le seul événement reconcile est l'audit du PATCH admin).
+    // Relecture directe DATABASE (source de vérité, pas le cache éventuel).
+    const row = await prisma.reconcileSetting.findUnique({
+      where: { id: RECONCILE_SETTING_SINGLETON_ID },
+    });
+    expect(row?.enabled).toBe(false);
+
+    // enabled=false : aucun scanOnce ne peut être déclenché par le runner.
+    // Le seul événement « reconcile » dans la fenêtre est l'audit du PATCH.
     await new Promise((r) => setTimeout(r, 600));
     const afterScans = await prisma.auditLog.count({
       where: { action: { contains: 'reconcile' } },
     });
-    expect(afterScans).toBe(beforeScans + 1); // uniquement l'audit update du PATCH ci-dessus
+    expect(afterScans).toBe(beforeScans + 1);
+
+    // GET persistant : effectif toujours false après la fenêtre d'attente.
+    const read = await request(app.getHttpServer())
+      .get(url)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .expect(200);
+    expect(read.body.effective.enabled).toBe(false);
+    expect(read.body.sources.enabled).toBe('DATABASE');
   });
 
   it('11. le config public auth-config n\'expose aucun réglage de réconciliation', async () => {
@@ -331,5 +370,25 @@ describe('Reconcile settings (e2e, 17B.4C1)', () => {
     expect(rows).toHaveLength(1);
     expect(rows[0].id).toBe(RECONCILE_SETTING_SINGLETON_ID);
     expect(rows[0].batchSize).toBe(13);
+  });
+
+  it('14. fin de suite : enabled=false persistant, source DATABASE, état neutre', async () => {
+    // Filet de sécurité 17B.4E-B : la suite se termine TOUJOURS avec
+    // enabled=false effectif et persistant (aucun runner réel activé).
+    await request(app.getHttpServer())
+      .patch(url)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ enabled: false })
+      .expect(200);
+    const final = await request(app.getHttpServer())
+      .get(url)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .expect(200);
+    expect(final.body.effective.enabled).toBe(false);
+    expect(final.body.sources.enabled).toBe('DATABASE');
+    const row = await prisma.reconcileSetting.findUnique({
+      where: { id: RECONCILE_SETTING_SINGLETON_ID },
+    });
+    expect(row?.enabled).toBe(false);
   });
 });

@@ -1349,10 +1349,85 @@ export type ReconcileNumericSettingsPatch = Partial<
   Record<ReconcileNumericSettingKey, number | null>
 >;
 
-/** Seule écriture des réglages : PATCH /api/admin/reconcile (17B.4D-C).
- *  Aucun helper reset — POST /api/admin/reconcile/reset est interdit côté web. */
-export const updateReconcileSettings = (t: string, patch: ReconcileNumericSettingsPatch) =>
-  apiJson('/api/admin/reconcile', t, { method: 'PATCH', body: JSON.stringify(patch) });
+/** 17B.4E-B — allowlist RUNTIME canonique des seules clés numériques éditables.
+ *  `enabled` n'y figure jamais : toute tentative de le passer est rejetée avant
+ *  tout appel réseau (défense en profondeur au-delà du typage structurel). */
+export const RECONCILE_NUMERIC_ALLOWLIST: readonly ReconcileNumericSettingKey[] = [
+  'scanIntervalMs',
+  'batchSize',
+  'leaseMs',
+  'attemptAlertThreshold',
+  'backoffInitialMs',
+  'maxBackoffMs',
+];
+
+/**
+ * 17B.4E-B — sanitization structurelle AVANT tout PATCH numérique.
+ * - inspecte chaque clé reçue ;
+ * - rejette explicitement `enabled` et toute clé hors allowlist (erreur locale,
+ *   jamais de suppression silencieuse) ;
+ * - rejette toute valeur qui n'est ni `null` ni un number fini entier ;
+ * - reconstruit un NOUVEL objet contenant uniquement les six clés autorisées.
+ * Les bornes métier restent dans la page + backend ; ici : frontière seule.
+ */
+export function sanitizeReconcileNumericPatch(
+  patch: ReconcileNumericSettingsPatch,
+): ReconcileNumericSettingsPatch {
+  const allow = new Set<string>(RECONCILE_NUMERIC_ALLOWLIST);
+  const out: ReconcileNumericSettingsPatch = {};
+  for (const key of Object.keys(patch)) {
+    if (key === 'enabled') {
+      throw new Error(
+        'Patch numérique refusé : la clé « enabled » est interdite (activation réservée à une phase ultérieure).',
+      );
+    }
+    if (!allow.has(key)) {
+      throw new Error(`Patch numérique refusé : clé inconnue « ${key} » hors allowlist.`);
+    }
+    const value = (patch as Record<string, unknown>)[key];
+    if (value === null) {
+      (out as Record<string, unknown>)[key] = null;
+      continue;
+    }
+    if (typeof value !== 'number' || !Number.isFinite(value) || !Number.isInteger(value)) {
+      throw new Error(
+        `Patch numérique refusé : la valeur de « ${key} » doit être un entier fini ou null.`,
+      );
+    }
+    (out as Record<string, unknown>)[key] = value;
+  }
+  // Reconstruction stricte : seules les clés de l'allowlist présentes dans `out`.
+  const rebuilt: ReconcileNumericSettingsPatch = {};
+  for (const key of RECONCILE_NUMERIC_ALLOWLIST) {
+    if (Object.prototype.hasOwnProperty.call(out, key)) {
+      rebuilt[key] = out[key];
+    }
+  }
+  return rebuilt;
+}
+
+/** Seule écriture NUMÉRIQUE : PATCH /api/admin/reconcile (17B.4D-C + 17B.4E-B).
+ *  Aucun helper reset — POST /api/admin/reconcile/reset est interdit côté web.
+ *  Le payload est sanitizé (allowlist + types) PUIS reconstruit avant stringify. */
+export const updateReconcileSettings = (t: string, patch: ReconcileNumericSettingsPatch) => {
+  const safe = sanitizeReconcileNumericPatch(patch);
+  return apiJson('/api/admin/reconcile', t, {
+    method: 'PATCH',
+    body: JSON.stringify(safe),
+  });
+};
+
+/**
+ * 17B.4E-B — helper DÉSACTIVATION UNIQUE (arrêt d'urgence).
+ * Le type n'accepte QUE `false` (littéral) : `true` et `null` sont des erreurs
+ * de compilation. Payload strictement séparé des six clés numériques.
+ * Aucun helper d'activation `true` dans cette sous-phase.
+ */
+export const disableReconciliation = (t: string) =>
+  apiJson('/api/admin/reconcile', t, {
+    method: 'PATCH',
+    body: JSON.stringify({ enabled: false as const }),
+  });
 
 // ── Base de connaissance (Phase 11) ────────────────────────────────────────
 export type KnowledgeAudience = 'ADMIN' | 'CLIENT';
