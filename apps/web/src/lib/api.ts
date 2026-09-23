@@ -1316,6 +1316,31 @@ export const updateSecuritySettings = (
   dto: Partial<SecuritySettings> & { turnstileSiteKey?: string; turnstileSecretKey?: string },
 ) => apiJson('/api/admin/security', t, { method: 'PUT', body: JSON.stringify(dto) });
 
+// ── Admin reconcile settings (17B.4D-B : lecture seule — GET uniquement) ────
+// Les helpers d'écriture (PATCH / reset) arrivent en 17B.4D-C avec leurs
+// protections ; la page /manager/reconciliation n'écrit encore rien.
+export type ReconcileSettingKey =
+  | 'enabled'
+  | 'scanIntervalMs'
+  | 'batchSize'
+  | 'leaseMs'
+  | 'attemptAlertThreshold'
+  | 'backoffInitialMs'
+  | 'maxBackoffMs';
+
+export type ReconcileSettingSource = 'DATABASE' | 'ENV' | 'DEFAULT';
+
+/** Vue GET /api/admin/reconcile — overrides + effectif + source par champ. */
+export interface ReconcileSettingsView {
+  overrides: Partial<Record<ReconcileSettingKey, boolean | number | null>>;
+  effective: Record<ReconcileSettingKey, boolean | number>;
+  sources: Record<ReconcileSettingKey, ReconcileSettingSource>;
+  createdAt: string | null;
+  updatedAt: string | null;
+}
+
+export const getReconcileSettings = (t: string) => apiJson('/api/admin/reconcile', t);
+
 // ── Base de connaissance (Phase 11) ────────────────────────────────────────
 export type KnowledgeAudience = 'ADMIN' | 'CLIENT';
 export type KnowledgeType = 'INFORMATIVE' | 'TECHNICAL' | 'HOWTO';
