@@ -11,7 +11,7 @@ import { CryptoService } from '../crypto/crypto.service';
 import { CloudflareService } from '../cloudflare/cloudflare.service';
 import { PanelKind, PanelTarget, PanelTransportFactory } from '../servers/panel-transport.factory';
 
-/** Résultat d'une opération externe (provider ou DNS) sur cancel. */
+/** Résultat d'une opération externe (provider ou DNS) sur cancel/terminate. */
 export type ExternalCleanup = 'deleted' | 'absent' | 'skipped' | 'failed' | 'unknown';
 
 /** Résultat d'une row locale après confirmation externe. */
@@ -39,6 +39,26 @@ export interface CancelProvisioningResult {
   partial: boolean;
 }
 
+/**
+ * 17B.4E-E2-B — résultat stable de la terminaison d'un service actif.
+ * `project` est TOUJOURS `retained` (pas de suppression de projet en E2-B ;
+ * GC / projet par service = 17B.4F).
+ */
+export interface TerminateActiveServiceResult {
+  orderId: string;
+  orderStatus: OrderStatus;
+  alreadyTerminated: boolean;
+  provider: ExternalCleanup;
+  dns: ExternalCleanup;
+  deployment: LocalCleanup;
+  clientSubdomain: LocalCleanup;
+  /** Lecture seule — PAID reste PAID, aucun remboursement automatique. */
+  invoice: string;
+  subscription: 'cancelled' | 'already_cancelled' | 'absent';
+  project: 'retained';
+  partial: boolean;
+}
+
 interface CancelActor {
   sub: string;
   email: string;
@@ -63,6 +83,18 @@ interface ResolvedCs {
     deploymentId: string | null;
   } | null;
   ownership: CsOwnership;
+}
+
+/** Issue partagée des phases provider/DNS/local/Subscription/Invoice. */
+interface CleanupOutcome {
+  provider: ExternalCleanup;
+  dns: ExternalCleanup;
+  deploymentLocal: LocalCleanup;
+  csLocal: LocalCleanup;
+  subscription: 'cancelled' | 'already_cancelled' | 'absent';
+  invoiceLabel: string;
+  ownership: CsOwnership;
+  partial: boolean;
 }
 
 /**
@@ -98,6 +130,9 @@ export function isAbsentExternalError(e: unknown): boolean {
  *   • Invoice JAMAIS modifiée ; Subscription par orderId exact ;
  *   • provider via PanelTransport (resourceId opaque) ;
  *   • row locale supprimée SEULEMENT si externe confirmé ET appartenance prouvée.
+ *
+ * 17B.4E-E2-B — `terminateActiveService` partage le MÊME moteur de cleanup
+ * (`performCleanup`) sans changer le contrat de `cancel-provisioning`.
  * Aucun ID de candidat 17B.4E dans ce code.
  */
 @Injectable()
@@ -117,40 +152,18 @@ export class OrderCancelService {
     reason: string,
     actor: CancelActor,
   ): Promise<CancelProvisioningResult> {
-    const trimmed = (reason ?? '').trim();
-    if (trimmed.length < 8) {
-      throw new ConflictException('Le motif d’annulation doit faire au moins 8 caractères.');
-    }
+    const trimmed = this.assertReason(reason);
 
     // ── Phase 0 : lecture gate (aucune mutation) ──
-    const order = await this.prisma.order.findUnique({
-      where: { id: orderId },
-      select: {
-        id: true,
-        status: true,
-        domainValue: true,
-        effectiveDomainId: true,
-        requestedDomainId: true,
-        customer: { select: { userId: true } },
-      },
-    });
-    if (!order) throw new NotFoundException('Commande introuvable.');
+    const order = await this.loadOrderGate(orderId);
     if (order.status !== OrderStatus.PROVISIONING && order.status !== OrderStatus.CANCELLED) {
       throw new ConflictException(
         `Annulation du provisioning impossible depuis le statut ${order.status} (PROVISIONING ou CANCELLED uniquement).`,
       );
     }
-    const orderGate: OrderGateRow = {
-      id: order.id,
-      status: order.status,
-      domainValue: order.domainValue,
-      effectiveDomainId: order.effectiveDomainId,
-      requestedDomainId: order.requestedDomainId,
-      customerUserId: order.customer?.userId ?? null,
-    };
+    const orderGate: OrderGateRow = { ...order };
 
     let alreadyCancelled = false;
-    let orderJustCancelled = false;
 
     // ── Phase 1 (D1) : CAS + history + reconcileNextAt dans UNE transaction ──
     if (order.status === OrderStatus.PROVISIONING) {
@@ -176,31 +189,14 @@ export class OrderCancelService {
           return { kind: 'cancelled' as const };
         }
         // CAS perdu : relecture DANS la transaction.
-        const re = await tx.order.findUnique({
-          where: { id: orderId },
-          select: {
-            id: true,
-            status: true,
-            domainValue: true,
-            effectiveDomainId: true,
-            requestedDomainId: true,
-            customer: { select: { userId: true } },
-          },
-        });
-        if (!re) throw new NotFoundException('Commande introuvable.');
+        const re = await this.readGateInTx(tx, orderId);
         if (re.status === OrderStatus.CANCELLED) {
           // Rejeu idempotent : neutralise aussi l'éligibilité runner.
           await tx.deployment.updateMany({
             where: { orderId },
             data: { reconcileNextAt: null },
           });
-          return {
-            kind: 'replay' as const,
-            order: {
-              ...re,
-              customerUserId: re.customer?.userId ?? null,
-            },
-          };
+          return { kind: 'replay' as const, order: re };
         }
         // Activation (ou autre transition) gagnée → 409, zéro écriture de cleanup.
         throw new ConflictException(
@@ -208,15 +204,10 @@ export class OrderCancelService {
         );
       });
       if (outcome.kind === 'cancelled') {
-        orderJustCancelled = true;
         orderGate.status = OrderStatus.CANCELLED;
       } else {
         alreadyCancelled = true;
-        orderGate.status = outcome.order.status;
-        orderGate.domainValue = outcome.order.domainValue;
-        orderGate.effectiveDomainId = outcome.order.effectiveDomainId;
-        orderGate.requestedDomainId = outcome.order.requestedDomainId;
-        orderGate.customerUserId = outcome.order.customerUserId;
+        Object.assign(orderGate, outcome.order);
       }
     } else {
       // Déjà CANCELLED au gate : neutralisation idempotente avant rejeu cleanup.
@@ -227,6 +218,285 @@ export class OrderCancelService {
       });
     }
 
+    const cleanup = await this.performCleanup(orderGate, actor, 'cancel');
+
+    // ── Phase 6 : audit (détails métier contrôlés — pas d'exception brute) ──
+    await this.audit.record({
+      actorId: actor.sub,
+      actorEmail: actor.email,
+      action: 'order.cancel_provisioning',
+      resourceType: 'order',
+      resourceId: orderId,
+      details: {
+        reason: trimmed,
+        orderJustCancelled: !alreadyCancelled,
+        alreadyCancelled,
+        provider: cleanup.provider,
+        dns: cleanup.dns,
+        deployment: cleanup.deploymentLocal,
+        clientSubdomain: cleanup.csLocal,
+        csOwnership: cleanup.ownership,
+        invoice: cleanup.invoiceLabel,
+        invoicePolicy: 'no_auto_change_b1',
+        subscription: cleanup.subscription,
+        partial: cleanup.partial,
+      },
+    });
+
+    return {
+      orderId,
+      orderStatus: OrderStatus.CANCELLED,
+      alreadyCancelled,
+      provider: cleanup.provider,
+      dns: cleanup.dns,
+      deployment: cleanup.deploymentLocal,
+      clientSubdomain: cleanup.csLocal,
+      invoice: cleanup.invoiceLabel,
+      subscription: cleanup.subscription,
+      partial: cleanup.partial,
+    };
+  }
+
+  /**
+   * 17B.4E-E2-B — terminaison idempotente d'un service DÉJÀ ACTIVÉ.
+   *
+   * Séparation métier (figée) :
+   *   • PROVISIONING → `cancel-provisioning` (409 ici + indication) ;
+   *   • ACTIVE → première terminaison (CAS ACTIVE→CANCELLED) ;
+   *   • CANCELLED → rejeu idempotent (`alreadyTerminated=true`) ;
+   *   • SUSPENDED/PENDING/PAID/REFUNDED/autres → 409
+   *     (audit : `Order.SUSPENDED` n'est JAMAIS écrit en production — la
+   *     suspension réelle est `SubscriptionStatus.SUSPENDED`).
+   *
+   * Politique post-terminaison :
+   *   • Order → CANCELLED + UNE seule OrderStatusHistory ;
+   *   • `Deployment.reconcileNextAt=null` dans la MÊME tx que le CAS
+   *     (neutralise toute activation/réconciliation tardive) ;
+   *   • Subscription par `orderId` exact → CANCELLED ;
+   *   • Invoice lecture seule (PAID reste PAID, aucun remboursement) ;
+   *   • Deployment supprimé SEULEMENT si provider deleted/absent confirmé ;
+   *   • DNS supprimé SEULEMENT si ownership prouvé + deleted/absent confirmé ;
+   *   • ClientSubdomain supprimé SEULEMENT si DNS confirmé ET ownership prouvé ;
+   *   • ClientProject + projet Coolify TOUJOURS conservés (`project=retained`)
+   *     — projet partagé client/serveur, GC = 17B.4F.
+   *
+   * Idempotence rejeu : pas de 2e transition ni 2e history ; rejoue UNIQUEMENT
+   * les restes externes/locaux conservés ; `alreadyTerminated=true`.
+   */
+  async terminateActiveService(
+    orderId: string,
+    reason: string,
+    actor: CancelActor,
+  ): Promise<TerminateActiveServiceResult> {
+    const trimmed = this.assertReason(reason);
+
+    // ── Phase 0 : gate (lecture seule) ──
+    const order = await this.loadOrderGate(orderId);
+    if (order.status === OrderStatus.PROVISIONING) {
+      throw new ConflictException(
+        'Terminaison impossible sur un Order PROVISIONING — utilisez cancel-provisioning.',
+      );
+    }
+    if (order.status !== OrderStatus.ACTIVE && order.status !== OrderStatus.CANCELLED) {
+      throw new ConflictException(
+        `Terminaison impossible depuis le statut ${order.status} (ACTIVE ou CANCELLED uniquement).`,
+      );
+    }
+    const orderGate: OrderGateRow = { ...order };
+
+    let alreadyTerminated = false;
+
+    // ── Phase 1 : CAS ACTIVE→CANCELLED + history + reconcileNextAt (UNE tx) ──
+    if (order.status === OrderStatus.ACTIVE) {
+      const outcome = await this.prisma.$transaction(async (tx) => {
+        const won = await tx.order.updateMany({
+          where: { id: orderId, status: OrderStatus.ACTIVE },
+          data: { status: OrderStatus.CANCELLED },
+        });
+        if (won.count === 1) {
+          await tx.orderStatusHistory.create({
+            data: {
+              orderId,
+              status: OrderStatus.CANCELLED,
+              note: trimmed,
+              actorId: actor.sub,
+              actorEmail: actor.email,
+            },
+          });
+          await tx.deployment.updateMany({
+            where: { orderId },
+            data: { reconcileNextAt: null },
+          });
+          return { kind: 'terminated' as const };
+        }
+        // CAS perdu : relecture DANS la transaction.
+        const re = await this.readGateInTx(tx, orderId);
+        if (re.status === OrderStatus.CANCELLED) {
+          // Concurrent terminate a gagné → rejeu idempotent, zéro 2e history.
+          await tx.deployment.updateMany({
+            where: { orderId },
+            data: { reconcileNextAt: null },
+          });
+          return { kind: 'replay' as const, order: re };
+        }
+        // Autre transition concurrente → 409, zéro écriture de cleanup.
+        throw new ConflictException(
+          `Course perdue face à une transition concurrente (statut actuel ${re.status}).`,
+        );
+      });
+      if (outcome.kind === 'terminated') {
+        orderGate.status = OrderStatus.CANCELLED;
+      } else {
+        alreadyTerminated = true;
+        Object.assign(orderGate, outcome.order);
+      }
+    } else {
+      // Déjà CANCELLED au gate : rejeu idempotent.
+      alreadyTerminated = true;
+      await this.prisma.deployment.updateMany({
+        where: { orderId },
+        data: { reconcileNextAt: null },
+      });
+    }
+
+    const cleanup = await this.performCleanup(orderGate, actor, 'terminate');
+
+    // ── Audit append-only (un par appel — ADR-019) ──
+    await this.audit.record({
+      actorId: actor.sub,
+      actorEmail: actor.email,
+      action: 'order.terminate_active_service',
+      resourceType: 'order',
+      resourceId: orderId,
+      details: {
+        reason: trimmed,
+        orderJustTerminated: !alreadyTerminated,
+        alreadyTerminated,
+        provider: cleanup.provider,
+        dns: cleanup.dns,
+        deployment: cleanup.deploymentLocal,
+        clientSubdomain: cleanup.csLocal,
+        csOwnership: cleanup.ownership,
+        invoice: cleanup.invoiceLabel,
+        invoicePolicy: 'no_auto_refund_e2b',
+        subscription: cleanup.subscription,
+        project: 'retained',
+        partial: cleanup.partial,
+      },
+    });
+
+    return {
+      orderId,
+      orderStatus: OrderStatus.CANCELLED,
+      alreadyTerminated,
+      provider: cleanup.provider,
+      dns: cleanup.dns,
+      deployment: cleanup.deploymentLocal,
+      clientSubdomain: cleanup.csLocal,
+      invoice: cleanup.invoiceLabel,
+      subscription: cleanup.subscription,
+      project: 'retained',
+      partial: cleanup.partial,
+    };
+  }
+
+  // ─────────────────────────── moteur partagé (B1 + E2-B) ───────────────────
+
+  private assertReason(reason: string): string {
+    const trimmed = (reason ?? '').trim();
+    if (trimmed.length < 8) {
+      throw new ConflictException('Le motif d’annulation doit faire au moins 8 caractères.');
+    }
+    return trimmed;
+  }
+
+  private async loadOrderGate(orderId: string): Promise<OrderGateRow> {
+    const order = await this.prisma.order.findUnique({
+      where: { id: orderId },
+      select: {
+        id: true,
+        status: true,
+        domainValue: true,
+        effectiveDomainId: true,
+        requestedDomainId: true,
+        customer: { select: { userId: true } },
+      },
+    });
+    if (!order) throw new NotFoundException('Commande introuvable.');
+    return this.toGateRow(order);
+  }
+
+  private toGateRow(order: {
+    id: string;
+    status: OrderStatus;
+    domainValue: string | null;
+    effectiveDomainId: string | null;
+    requestedDomainId: string | null;
+    customer?: { userId: string | null } | null;
+  }): OrderGateRow {
+    return {
+      id: order.id,
+      status: order.status,
+      domainValue: order.domainValue,
+      effectiveDomainId: order.effectiveDomainId,
+      requestedDomainId: order.requestedDomainId,
+      customerUserId: order.customer?.userId ?? null,
+    };
+  }
+
+  private async readGateInTx(
+    tx: {
+      order: {
+        findUnique: (args: {
+          where: { id: string };
+          select: {
+            id: true;
+            status: true;
+            domainValue: true;
+            effectiveDomainId: true;
+            requestedDomainId: true;
+            customer: { select: { userId: true } };
+          };
+        }) => Promise<{
+          id: string;
+          status: OrderStatus;
+          domainValue: string | null;
+          effectiveDomainId: string | null;
+          requestedDomainId: string | null;
+          customer: { userId: string | null } | null;
+        } | null>;
+      };
+    },
+    orderId: string,
+  ): Promise<OrderGateRow> {
+    const re = await tx.order.findUnique({
+      where: { id: orderId },
+      select: {
+        id: true,
+        status: true,
+        domainValue: true,
+        effectiveDomainId: true,
+        requestedDomainId: true,
+        customer: { select: { userId: true } },
+      },
+    });
+    if (!re) throw new NotFoundException('Commande introuvable.');
+    return this.toGateRow(re);
+  }
+
+  /**
+   * Phases 2–5 partagées (provider, DNS, rows locales, Subscription, Invoice)
+   * entre cancel-provisioning (B1) et terminate (E2-B).
+   * `logPrefix` est un littéral ferme ('cancel' | 'terminate') — D5 : les
+   * Logger.warn restent strictement statiques.
+   */
+  private async performCleanup(
+    orderGate: OrderGateRow,
+    actor: CancelActor,
+    logPrefix: 'cancel' | 'terminate',
+  ): Promise<CleanupOutcome> {
+    const orderId = orderGate.id;
+
     // ── Phase 2 : rows pour cleanup externe ──
     const deployment = await this.prisma.deployment.findUnique({
       where: { orderId },
@@ -235,9 +505,6 @@ export class OrderCancelService {
     const resolved = await this.resolveClientSubdomain(orderGate, deployment);
 
     // ── Phase 3 : externe provider (PanelTransport, resourceId opaque) ──
-    // C2 : sans Deployment → absent/skipped confirmé ; avec resourceId opaque →
-    // suppression PanelTransport ; Deployment SANS resourceId → unknown (jamais
-    // interprété comme « pas de ressource provider »), row conservée.
     let provider: ExternalCleanup = 'skipped';
     let providerConfirmed = true;
     if (!deployment) {
@@ -264,7 +531,7 @@ export class OrderCancelService {
           } else {
             provider = 'failed';
             providerConfirmed = false;
-            this.log.warn('cancel: suppression provider échouée — ressource conservée');
+            this.log.warn(`${logPrefix}: suppression provider échouée — ressource conservée`);
           }
         }
       } else {
@@ -272,10 +539,9 @@ export class OrderCancelService {
         providerConfirmed = false;
       }
     } else {
-      // C2 : resourceId opaque absent → état inconnu, jamais « skipped » confirmé.
       provider = 'unknown';
       providerConfirmed = false;
-      this.log.warn('cancel: ressource provider non identifiable — déploiement conservé');
+      this.log.warn(`${logPrefix}: ressource provider non identifiable — déploiement conservé`);
     }
 
     // ── Phase 4 : externe DNS (D2 + D3) ──
@@ -284,12 +550,7 @@ export class OrderCancelService {
     if (resolved.ownership === 'absent' || !resolved.cs) {
       dns = 'skipped';
       dnsConfirmed = true;
-    } else if (
-      resolved.ownership === 'ambiguous' ||
-      resolved.ownership === 'foreign'
-    ) {
-      // D3/C1 : appartenance non prouvée ou row d'un autre déploiement →
-      // ni delete CF ni delete local.
+    } else if (resolved.ownership === 'ambiguous' || resolved.ownership === 'foreign') {
       dns = 'unknown';
       dnsConfirmed = false;
     } else if (resolved.cs.domainId && resolved.cs.recordId) {
@@ -304,11 +565,10 @@ export class OrderCancelService {
         } else {
           dns = 'failed';
           dnsConfirmed = false;
-          this.log.warn('cancel: suppression DNS échouée — enregistrement conservé');
+          this.log.warn(`${logPrefix}: suppression DNS échouée — enregistrement conservé`);
         }
       }
     } else {
-      // D2 : identifiants incomplets → JAMAIS interprétés comme « record absent ».
       dns = 'unknown';
       dnsConfirmed = false;
     }
@@ -316,7 +576,7 @@ export class OrderCancelService {
     // ── Phase 5 : rows locales conditionnelles + Subscription (lien exact) ──
     let deploymentLocal: LocalCleanup = 'absent';
     let csLocal: LocalCleanup = 'absent';
-    let subscription: CancelProvisioningResult['subscription'] = 'absent';
+    let subscription: CleanupOutcome['subscription'] = 'absent';
     let invoiceLabel = 'absent';
     const ownership = resolved.ownership;
 
@@ -349,6 +609,7 @@ export class OrderCancelService {
       }
 
       // Subscription — lien exact order.id (jamais de comparaison de dates).
+      // ACTIVE/SUSPENDED/PENDING → CANCELLED ; CANCELLED → already_cancelled.
       const sub = await tx.subscription.findUnique({ where: { orderId } });
       if (sub && sub.orderId === orderGate.id) {
         if (sub.status === SubscriptionStatus.CANCELLED) {
@@ -364,7 +625,7 @@ export class OrderCancelService {
         subscription = 'absent';
       }
 
-      // Invoice — STRICTEMENT lecture seule en B1 (jamais d'écriture).
+      // Invoice — STRICTEMENT lecture seule (jamais d'écriture).
       const inv = await tx.invoice.findUnique({ where: { orderId } });
       if (!inv) {
         invoiceLabel = 'absent';
@@ -383,7 +644,6 @@ export class OrderCancelService {
       }
     });
 
-    // C2 : provider unknown/failed → partial forcé (impossible partial=false).
     const partial =
       provider === 'failed' ||
       provider === 'unknown' ||
@@ -392,39 +652,14 @@ export class OrderCancelService {
       ownership === 'ambiguous' ||
       ownership === 'foreign';
 
-    // ── Phase 6 : audit (détails métier contrôlés — pas d'exception brute) ──
-    await this.audit.record({
-      actorId: actor.sub,
-      actorEmail: actor.email,
-      action: 'order.cancel_provisioning',
-      resourceType: 'order',
-      resourceId: orderId,
-      details: {
-        reason: trimmed,
-        orderJustCancelled,
-        alreadyCancelled,
-        provider,
-        dns,
-        deployment: deploymentLocal,
-        clientSubdomain: csLocal,
-        csOwnership: ownership,
-        invoice: invoiceLabel,
-        invoicePolicy: 'no_auto_change_b1',
-        subscription,
-        partial,
-      },
-    });
-
     return {
-      orderId,
-      orderStatus: OrderStatus.CANCELLED,
-      alreadyCancelled,
       provider,
       dns,
-      deployment: deploymentLocal,
-      clientSubdomain: csLocal,
-      invoice: invoiceLabel,
+      deploymentLocal,
+      csLocal,
       subscription,
+      invoiceLabel,
+      ownership,
       partial,
     };
   }

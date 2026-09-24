@@ -8,6 +8,7 @@ import { Role } from '@prisma/client';
 import { ProvisioningService } from './provisioning.service';
 import { OrderCancelService } from './order-cancel.service';
 import { CancelProvisioningDto } from './dto/cancel-provisioning.dto';
+import { TerminateActiveServiceDto } from './dto/terminate-active-service.dto';
 import { PrismaService } from '../prisma/prisma.service';
 import { NotFoundException } from '@nestjs/common';
 
@@ -18,8 +19,9 @@ interface AdminActor {
 
 /**
  * ADMIN — relance du provisioning d'une commande (retry idempotent),
- * ré-synchronisation des limites (Bloc 2) et annulation idempotente d'un
- * provisioning incomplet (17B.4E-D-B1). La commande reste côté store
+ * ré-synchronisation des limites (Bloc 2), annulation idempotente d'un
+ * provisioning incomplet (17B.4E-D-B1) et terminaison idempotente d'un
+ * service actif (17B.4E-E2-B). La commande reste côté store
  * (ressource Order), d'où ce contrôleur store/admin.
  */
 @ApiTags('store/provisioning')
@@ -59,6 +61,24 @@ export class StoreProvisioningAdminController {
     @CurrentUser() actor: AdminActor,
   ) {
     return this.orderCancel.cancelProvisioning(id, dto.reason, actor);
+  }
+
+  /**
+   * 17B.4E-E2-B — terminaison idempotente d'un service DÉJÀ ACTIVÉ.
+   * Gate : Order ACTIVE (1re terminaison) ou CANCELLED (rejeu idempotent) ;
+   * PROVISIONING → 409 (utiliser cancel-provisioning) ; autres → 409.
+   * Invoice PAID jamais modifiée ; projet Coolify/ClientProject conservé.
+   */
+  @Post('orders/:id/terminate')
+  @ApiOperation({
+    summary: 'Terminer un service actif (rollback idempotent, sans projet)',
+  })
+  async terminateActiveService(
+    @Param('id') id: string,
+    @Body() dto: TerminateActiveServiceDto,
+    @CurrentUser() actor: AdminActor,
+  ) {
+    return this.orderCancel.terminateActiveService(id, dto.reason, actor);
   }
 
   /**
