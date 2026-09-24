@@ -12,6 +12,7 @@ import { CheckoutController } from './checkout.controller';
 import { CheckoutService } from './checkout.service';
 import { DEPLOYMENT_EVIDENCE_CONNECTORS } from './deployment-evidence';
 import { DeploymentEvidenceService } from './deployment-evidence.service';
+import { OrderCancelService } from './order-cancel.service';
 import { PaymentMethodsController } from './payment-methods.controller';
 import { ProvisioningService } from './provisioning.service';
 import { ReconcileRunnerService } from './reconcile.runner.service';
@@ -43,6 +44,7 @@ import { StoreSubdomainController } from './store-subdomain.controller';
   providers: [
     CheckoutService,
     ProvisioningService,
+    OrderCancelService,
     PanelTransportFactory,
     HttpAvailabilityService,
     ReconcileSettingsService,
@@ -58,6 +60,7 @@ import { StoreSubdomainController } from './store-subdomain.controller';
   ],
   exports: [
     ProvisioningService,
+    OrderCancelService,
     HttpAvailabilityService,
     ReconcileSettingsService,
     DeploymentEvidenceService,

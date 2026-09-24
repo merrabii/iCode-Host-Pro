@@ -1,4 +1,4 @@
-import { Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { ConflictException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import {
   DeploymentStatus,
   LimitsStatus,
@@ -108,6 +108,14 @@ export class ProvisioningService {
       },
     });
     if (!order) throw new NotFoundException('Commande introuvable.');
+
+    // 17B.4E-D-B1 — un Order CANCELLED/REFUNDED n'est JAMAIS re-provisionné,
+    // même en force (sinon un cancel partiel serait réversible par un retry).
+    if (order.status === OrderStatus.CANCELLED || order.status === OrderStatus.REFUNDED) {
+      throw new ConflictException(
+        `Commande ${order.status} — provisioning impossible (utiliser cancel-provisioning pour le nettoyage).`,
+      );
+    }
 
     if (
       !opts?.force &&
@@ -278,6 +286,111 @@ export class ProvisioningService {
       fqdn,
       steps: finalLogs.map((l) => ({ step: l.step, status: l.status, message: l.message })),
     };
+  }
+
+  /**
+   * 17B.4E-D-B1 (fix H + D3/C1) — lie le ClientSubdomain de CETTE commande à son
+   * Deployment. Jamais de `updateMany` par fqdn seul :
+   *  • cible = row retournée par l'allocation (id exact) ou trouvée par fqdn
+   *    unique, puis `update` par `id` uniquement ;
+   *  • ownership : fqdn = Order.domainValue (si figé) + domainId ∈ {effective,
+   *    requested, knownDomainId} + owner (Customer.userId ↔ Deployment.userId
+   *    si les deux existent) ; CS déjà lié à un autre deployment → no-op ;
+   *  • sans preuve de domaine/owner → no-op (log statique).
+   * Best-effort : un échec ne casse jamais le provisioning (log statique D5).
+   */
+  private async linkClientSubdomainToDeployment(
+    orderId: string,
+    fqdn: string | null,
+    knownDeploymentId?: string | null,
+    knownDomainId?: string | null,
+    knownCsId?: string | null,
+  ): Promise<void> {
+    try {
+      if (!fqdn && !knownCsId) return;
+      let deploymentId = knownDeploymentId ?? null;
+      let deploymentUserId: string | null = null;
+      if (!deploymentId && orderId) {
+        const dep = await this.prisma.deployment.findUnique({
+          where: { orderId },
+          select: { id: true, userId: true },
+        });
+        deploymentId = dep?.id ?? null;
+        deploymentUserId = dep?.userId ?? null;
+      } else if (deploymentId) {
+        const dep = await this.prisma.deployment.findUnique({
+          where: { id: deploymentId },
+          select: { id: true, userId: true },
+        });
+        deploymentUserId = dep?.userId ?? null;
+      }
+      if (!deploymentId) return;
+
+      const order = await this.prisma.order.findUnique({
+        where: { id: orderId },
+        select: {
+          domainValue: true,
+          effectiveDomainId: true,
+          requestedDomainId: true,
+          customer: { select: { userId: true } },
+        },
+      });
+      if (!order) return;
+      if (fqdn) {
+        // fqdn déjà persisté sur l'Order doit correspondre ; si pas encore figé
+        // (fenêtre CONFIGURE_DNS avant l'update domainValue), exiger knownDomainId.
+        if (order.domainValue && order.domainValue !== fqdn) return;
+        if (!order.domainValue && !knownDomainId) return;
+      }
+
+      // Owner : si Customer.userId et Deployment.userId existent, ils doivent concorder.
+      const orderOwner = order.customer?.userId ?? null;
+      if (orderOwner && deploymentUserId && orderOwner !== deploymentUserId) return;
+
+      let cs: { id: string; domainId: string; deploymentId: string | null } | null;
+      if (knownCsId) {
+        cs = await this.prisma.clientSubdomain.findUnique({
+          where: { id: knownCsId },
+          select: { id: true, domainId: true, deploymentId: true },
+        });
+        if (cs && fqdn) {
+          const full = await this.prisma.clientSubdomain.findUnique({
+            where: { id: cs.id },
+            select: { id: true, fqdn: true, domainId: true, deploymentId: true },
+          });
+          if (full && full.fqdn !== fqdn) return;
+          cs = full
+            ? { id: full.id, domainId: full.domainId, deploymentId: full.deploymentId }
+            : null;
+        }
+      } else if (fqdn) {
+        cs = await this.prisma.clientSubdomain.findFirst({
+          where: { fqdn },
+          select: { id: true, domainId: true, deploymentId: true },
+        });
+      } else {
+        return;
+      }
+      if (!cs) return;
+      if (cs.deploymentId === deploymentId) return;
+      if (cs.deploymentId !== null) return;
+
+      const domainIds = [
+        knownDomainId,
+        order.effectiveDomainId,
+        order.requestedDomainId,
+      ].filter((x): x is string => !!x);
+      if (domainIds.length === 0) return;
+      if (!domainIds.includes(cs.domainId)) return;
+
+      await this.prisma.clientSubdomain.update({
+        where: { id: cs.id },
+        data: { deploymentId },
+      });
+    } catch {
+      // Best-effort : message STATIQUE — jamais String(e)/message/name (D5).
+      this.log.warn('provision: liaison ClientSubdomain impossible');
+    }
   }
 
   /** Email de livraison doté de la gestion d'échec commune (best-effort, audité). */
@@ -902,6 +1015,9 @@ export class ProvisioningService {
           ...(ctx.fqdn ? { fqdn: ctx.fqdn } : {}),
         },
       });
+      // 17B.4E-D-B1 (fix H) — re-lie le ClientSubdomain si la row venait d'être
+      // créée/renouvelée (retry idempotent).
+      await this.linkClientSubdomainToDeployment(ctx.order.id, ctx.fqdn, row.id);
       await this.audit.record({
         actorId: userId,
         actorEmail: fullOrder.customerEmail,
@@ -943,6 +1059,9 @@ export class ProvisioningService {
           ...(ctx.fqdn ? { fqdn: ctx.fqdn } : {}),
         },
       });
+      // 17B.4E-D-B1 (fix H) — lie le ClientSubdomain à la row DÈS sa création
+      // (quel que soit l'ordre CREATE_APP / CONFIGURE_DNS).
+      await this.linkClientSubdomainToDeployment(ctx.order.id, ctx.fqdn, createdRow.id);
       await this.audit.record({
         actorId: userId,
         actorEmail: fullOrder.customerEmail,
@@ -1046,14 +1165,35 @@ export class ProvisioningService {
 
     // Récupération d'une allocation partielle antérieure (crash entre DNS et persist) :
     // si un enregistrement SOUS CETTE RACINE porte déjà le sous-domaine demandé, on le
-    // réutilise (jamais de 2ᵉ record, jamais d'autre racine). Store: pas de Deployment
-    // row — ClientSubdomain sans deploymentId.
+    // réutilise (jamais de 2ᵉ record, jamais d'autre racine). 17B.4E-D-B1 (fix H) :
+    // le ClientSubdomain est lié à la row Deployment DÈS qu'elle existe — l'ordre
+    // CREATE_APP / CONFIGURE_DNS n'a plus d'importance.
+    const existingDeployment = ctx.order.id
+      ? await this.prisma.deployment.findUnique({
+          where: { orderId: ctx.order.id },
+          select: { id: true },
+        })
+      : null;
     let alloc: { subdomain: string; fqdn: string };
     if (fullOrder?.requestedSubdomain) {
       const fqdn = `${fullOrder.requestedSubdomain.trim().toLowerCase()}.${root.name}`;
       const existing = await this.prisma.clientSubdomain.findFirst({ where: { fqdn } });
       if (existing) {
         alloc = { subdomain: existing.subdomain, fqdn: existing.fqdn };
+        // D3/C1 : ownership stricte — même row, update par id, domaine = racine figée.
+        if (
+          existingDeployment &&
+          !existing.deploymentId &&
+          existing.domainId === root.id
+        ) {
+          await this.linkClientSubdomainToDeployment(
+            ctx.order.id,
+            existing.fqdn,
+            existingDeployment.id,
+            root.id,
+            existing.id,
+          );
+        }
       } else {
         // `requested` déjà certifié disponible au checkout → allocation effective.
         alloc = await this.cloudflare.allocateClientSubdomain({
@@ -1061,11 +1201,25 @@ export class ProvisioningService {
           seed,
           fallbackHost,
           requested: fullOrder.requestedSubdomain,
+          ...(existingDeployment ? { deploymentId: existingDeployment.id } : {}),
         });
       }
     } else {
-      alloc = await this.cloudflare.allocateClientSubdomain({ root, seed, fallbackHost });
+      alloc = await this.cloudflare.allocateClientSubdomain({
+        root,
+        seed,
+        fallbackHost,
+        ...(existingDeployment ? { deploymentId: existingDeployment.id } : {}),
+      });
     }
+    // Si la row n'existait pas au moment de l'alloc (CREATE_APP après DNS),
+    // on la lie dès maintenant (D3 : ownership via racine figée root.id).
+    await this.linkClientSubdomainToDeployment(
+      ctx.order.id,
+      alloc.fqdn,
+      existingDeployment?.id ?? null,
+      root.id,
+    );
 
     // Si l'app a déjà été créée, on pose le domaine dessus puis on redéploie
     // (best-effort) pour que le conteneur redémarre avec traefik relié au

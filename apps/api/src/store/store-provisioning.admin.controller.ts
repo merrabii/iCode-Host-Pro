@@ -1,17 +1,26 @@
-import { Controller, Param, Post, Query, UseGuards } from '@nestjs/common';
+import { Body, Controller, Param, Post, Query, UseGuards } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
 import { Roles } from '../auth/decorators/roles.decorator';
+import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import { Role } from '@prisma/client';
 import { ProvisioningService } from './provisioning.service';
+import { OrderCancelService } from './order-cancel.service';
+import { CancelProvisioningDto } from './dto/cancel-provisioning.dto';
 import { PrismaService } from '../prisma/prisma.service';
 import { NotFoundException } from '@nestjs/common';
 
+interface AdminActor {
+  sub: string;
+  email: string;
+}
+
 /**
- * ADMIN — relance du provisioning d'une commande (retry idempotent) et
- * ré-synchronisation des limites des apps déjà déployées (Bloc 2).
- * La commande reste côté store (ressource Order), d'où ce contrôleur store/admin.
+ * ADMIN — relance du provisioning d'une commande (retry idempotent),
+ * ré-synchronisation des limites (Bloc 2) et annulation idempotente d'un
+ * provisioning incomplet (17B.4E-D-B1). La commande reste côté store
+ * (ressource Order), d'où ce contrôleur store/admin.
  */
 @ApiTags('store/provisioning')
 @Controller('store/admin')
@@ -20,6 +29,7 @@ import { NotFoundException } from '@nestjs/common';
 export class StoreProvisioningAdminController {
   constructor(
     private readonly provisioning: ProvisioningService,
+    private readonly orderCancel: OrderCancelService,
     private readonly prisma: PrismaService,
   ) {}
 
@@ -32,6 +42,23 @@ export class StoreProvisioningAdminController {
     return this.provisioning.provisionOrder(id, {
       force: force === '1' || force === 'true',
     });
+  }
+
+  /**
+   * 17B.4E-D-B1 — annulation générique d'un provisioning incomplet.
+   * Gate : Order PROVISIONING (cancel) ou CANCELLED (rejeu idempotent) ;
+   * tous les autres statuts → 409. Invoice PAID jamais modifiée (left_paid).
+   */
+  @Post('orders/:id/cancel-provisioning')
+  @ApiOperation({
+    summary: 'Annuler un provisioning incomplet (rollback idempotent)',
+  })
+  async cancelProvisioning(
+    @Param('id') id: string,
+    @Body() dto: CancelProvisioningDto,
+    @CurrentUser() actor: AdminActor,
+  ) {
+    return this.orderCancel.cancelProvisioning(id, dto.reason, actor);
   }
 
   /**

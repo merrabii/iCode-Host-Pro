@@ -154,9 +154,10 @@ describe('ProvisioningService — actionCreateApp (choix du projet A/B voie stor
   const panelFactory = { create: jest.fn(() => transport) };
   const prisma = {
     order: { findUnique: jest.fn(), update: jest.fn() },
-    deployment: { findFirst: jest.fn(), create: jest.fn(), update: jest.fn(), updateMany: jest.fn() },
+    deployment: { findFirst: jest.fn(), findUnique: jest.fn(), create: jest.fn(), update: jest.fn(), updateMany: jest.fn() },
     provisioningLog: { create: jest.fn(), update: jest.fn(), findMany: jest.fn() },
     orderStatusHistory: { create: jest.fn() },
+    clientSubdomain: { findFirst: jest.fn(), findUnique: jest.fn(), update: jest.fn(), updateMany: jest.fn() },
     $transaction: jest.fn(),
   };
   // 17B.3B — scope transactionnel mocké : le proof-gate ready=true passe par la
@@ -249,8 +250,10 @@ describe('ProvisioningService — actionCreateApp (choix du projet A/B voie stor
     prisma.provisioningLog.create.mockResolvedValue({ id: 'log1' });
     prisma.provisioningLog.findMany.mockResolvedValue([]);
     prisma.deployment.findFirst.mockResolvedValue(null);
+    prisma.deployment.findUnique.mockResolvedValue(null);
     prisma.deployment.create.mockResolvedValue({ id: 'd1' });
     prisma.deployment.update.mockResolvedValue({ id: 'd1' });
+    prisma.clientSubdomain.updateMany.mockResolvedValue({ count: 0 });
     transport.createGitApp.mockResolvedValue({ uuid: 'app9' });
     transport.deployApp.mockResolvedValue(undefined);
     // 17B.3B — transaction mockée : le callback reçoit le scope tx, gardes au plus
@@ -738,6 +741,189 @@ describe('ProvisioningService — actionCreateApp (choix du projet A/B voie stor
     expect(prisma.deployment.updateMany).not.toHaveBeenCalled();
     expect(mail.sendPlain).not.toHaveBeenCalled();
   });
+
+  // 17B.4E-D-B1 — un Order CANCELLED/REFUNDED n'est JAMAIS re-provisionné,
+  // même avec force=true (le cancel partiel reste non réversible par retry).
+  it.each(['CANCELLED', 'REFUNDED'])(
+    '17B.4E U21 — Order %s ⇒ ConflictException même force=true, aucune action',
+    async (status) => {
+      prisma.order.findUnique.mockResolvedValue({ ...orderFor('PER_CLIENT_PROJECT'), status });
+
+      await expect(service.provisionOrder('ord1', { force: true })).rejects.toMatchObject({
+        status: 409,
+      });
+      expect(transport.createGitApp).not.toHaveBeenCalled();
+      expect(prisma.deployment.create).not.toHaveBeenCalled();
+      expect(prisma.orderStatusHistory.create).not.toHaveBeenCalled();
+    },
+  );
+
+  // 17B.4E-D-B1 (fix H + D3) — le ClientSubdomain est lié à la row DÈS sa création,
+  // par `update` sur l'id (jamais updateMany par fqdn seul), ownership prouvé.
+  it('17B.4E U22 — actionCreateApp lie ClientSubdomain.deploymentId après create (update par id)', async () => {
+    prisma.order.findUnique.mockResolvedValue({
+      ...orderFor('PER_CLIENT_PROJECT'),
+      domainValue: 'app.example.com',
+      effectiveDomainId: 'dom-1',
+      requestedDomainId: null,
+    });
+    deployments.getOrCreateClientProject.mockResolvedValue({ id: 'cp1', projectUuid: 'proj-dedie-client' });
+    prisma.deployment.create.mockResolvedValue({ id: 'd-new' });
+    // Owner C1 : Deployment.userId concorde avec Customer.userId (u1).
+    prisma.deployment.findUnique.mockResolvedValue({ id: 'd-new', userId: 'u1' });
+    prisma.clientSubdomain.findFirst.mockResolvedValue({
+      id: 'cs-1',
+      fqdn: 'app.example.com',
+      domainId: 'dom-1',
+      deploymentId: null,
+    });
+    prisma.clientSubdomain.findUnique.mockResolvedValue({
+      id: 'cs-1',
+      fqdn: 'app.example.com',
+      domainId: 'dom-1',
+      deploymentId: null,
+    });
+    prisma.clientSubdomain.update.mockResolvedValue({});
+
+    await service.provisionOrder('ord1');
+
+    expect(prisma.clientSubdomain.update).toHaveBeenCalledWith({
+      where: { id: 'cs-1' },
+      data: { deploymentId: 'd-new' },
+    });
+    expect(prisma.clientSubdomain.updateMany).not.toHaveBeenCalled();
+  });
+
+  // C1 — owner discordant : Customer.userId ≠ Deployment.userId → no-op (jamais de vol).
+  it('17B.4E U22d — owner discordant (Deployment.userId ≠ Customer.userId) → AUCUNE liaison', async () => {
+    prisma.order.findUnique.mockResolvedValue({
+      ...orderFor('PER_CLIENT_PROJECT'),
+      domainValue: 'app.example.com',
+      effectiveDomainId: 'dom-1',
+      requestedDomainId: null,
+    });
+    deployments.getOrCreateClientProject.mockResolvedValue({ id: 'cp1', projectUuid: 'proj-dedie-client' });
+    prisma.deployment.create.mockResolvedValue({ id: 'd-new' });
+    prisma.deployment.findUnique.mockResolvedValue({ id: 'd-new', userId: 'owner-OTHER' });
+    prisma.clientSubdomain.findFirst.mockResolvedValue({
+      id: 'cs-1',
+      fqdn: 'app.example.com',
+      domainId: 'dom-1',
+      deploymentId: null,
+    });
+    prisma.clientSubdomain.findUnique.mockResolvedValue({
+      id: 'cs-1',
+      fqdn: 'app.example.com',
+      domainId: 'dom-1',
+      deploymentId: null,
+    });
+
+    await service.provisionOrder('ord1');
+
+    expect(prisma.clientSubdomain.update).not.toHaveBeenCalled();
+    expect(prisma.clientSubdomain.updateMany).not.toHaveBeenCalled();
+  });
+
+  // C1 — owner concordant explicite (les deux userId existent et matchent) → update par id.
+  it('17B.4E U22e — owner concordant (Customer.userId === Deployment.userId) → liaison par id', async () => {
+    prisma.order.findUnique.mockResolvedValue({
+      ...orderFor('PER_CLIENT_PROJECT'),
+      domainValue: 'app.example.com',
+      effectiveDomainId: 'dom-1',
+      requestedDomainId: null,
+    });
+    deployments.getOrCreateClientProject.mockResolvedValue({ id: 'cp1', projectUuid: 'proj-dedie-client' });
+    prisma.deployment.create.mockResolvedValue({ id: 'd-new' });
+    prisma.deployment.findUnique.mockResolvedValue({ id: 'd-new', userId: 'u1' });
+    prisma.clientSubdomain.findFirst.mockResolvedValue({
+      id: 'cs-1',
+      fqdn: 'app.example.com',
+      domainId: 'dom-1',
+      deploymentId: null,
+    });
+    prisma.clientSubdomain.findUnique.mockResolvedValue({
+      id: 'cs-1',
+      fqdn: 'app.example.com',
+      domainId: 'dom-1',
+      deploymentId: null,
+    });
+    prisma.clientSubdomain.update.mockResolvedValue({});
+
+    await service.provisionOrder('ord1');
+
+    expect(prisma.clientSubdomain.update).toHaveBeenCalledWith({
+      where: { id: 'cs-1' },
+      data: { deploymentId: 'd-new' },
+    });
+    expect(prisma.clientSubdomain.updateMany).not.toHaveBeenCalled();
+  });
+
+  // D3 — sans preuve de domaine (effectiveDomainId null + domainValue null sans
+  // knownDomainId) la liaison est un no-op : jamais d’updateMany par fqdn.
+  it('17B.4E U22b — sans ownership prouvé, AUCUNE liaison ClientSubdomain', async () => {
+    prisma.order.findUnique.mockResolvedValue({
+      ...orderFor('PER_CLIENT_PROJECT'),
+      domainValue: 'app.example.com',
+      effectiveDomainId: null,
+      requestedDomainId: null,
+    });
+    deployments.getOrCreateClientProject.mockResolvedValue({ id: 'cp1', projectUuid: 'proj-dedie-client' });
+    prisma.deployment.create.mockResolvedValue({ id: 'd-new' });
+    prisma.deployment.findUnique.mockResolvedValue({ id: 'd-new', userId: 'u1' });
+    prisma.clientSubdomain.findFirst.mockResolvedValue({
+      id: 'cs-1',
+      fqdn: 'app.example.com',
+      domainId: 'dom-Z',
+      deploymentId: null,
+    });
+    prisma.clientSubdomain.findUnique.mockResolvedValue({
+      id: 'cs-1',
+      fqdn: 'app.example.com',
+      domainId: 'dom-Z',
+      deploymentId: null,
+    });
+
+    await service.provisionOrder('ord1');
+
+    expect(prisma.clientSubdomain.update).not.toHaveBeenCalled();
+    expect(prisma.clientSubdomain.updateMany).not.toHaveBeenCalled();
+  });
+
+  // D5 — échec de la liaison : message STATIQUE, jamais String(e)/message/name.
+  it('17B.4E U22c — échec liaison ClientSubdomain → Logger.warn STATIQUE sans secret', async () => {
+    const { Logger } = await import('@nestjs/common');
+    const warnSpy = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    try {
+      prisma.order.findUnique.mockResolvedValue({
+        ...orderFor('PER_CLIENT_PROJECT'),
+        domainValue: 'app.example.com',
+        effectiveDomainId: 'dom-1',
+      });
+      deployments.getOrCreateClientProject.mockResolvedValue({ id: 'cp1', projectUuid: 'proj-dedie-client' });
+      prisma.deployment.create.mockResolvedValue({ id: 'd-new' });
+      prisma.deployment.findUnique.mockResolvedValue({ id: 'd-new', userId: 'u1' });
+      prisma.clientSubdomain.findFirst.mockRejectedValue(
+        Object.assign(new Error('SECRET_LINK_MSG token=SECRET_TOKEN'), { name: 'SECRET_LINK_NAME' }),
+      );
+      prisma.clientSubdomain.findUnique.mockRejectedValue(
+        Object.assign(new Error('SECRET_LINK_MSG token=SECRET_TOKEN'), { name: 'SECRET_LINK_NAME' }),
+      );
+
+      await service.provisionOrder('ord1');
+
+      expect(warnSpy).toHaveBeenCalled();
+      const all = warnSpy.mock.calls
+        .flat()
+        .map((a: unknown) => (typeof a === 'string' ? a : JSON.stringify(a)))
+        .join('\n');
+      for (const marker of ['SECRET_LINK_MSG', 'SECRET_LINK_NAME', 'SECRET_TOKEN']) {
+        expect(all).not.toContain(marker);
+      }
+      expect(all).toContain('provision: liaison ClientSubdomain impossible');
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
 });
 
 // =========================================================================
@@ -767,10 +953,10 @@ describe('ProvisioningService — actionConfigureDns (Phase 4, gel racine)', () 
 
   const prisma = {
     order: { findUnique: jest.fn(), update: jest.fn() },
-    deployment: { findFirst: jest.fn(), create: jest.fn(), update: jest.fn(), updateMany: jest.fn() },
+    deployment: { findFirst: jest.fn(), findUnique: jest.fn(), create: jest.fn(), update: jest.fn(), updateMany: jest.fn() },
     provisioningLog: { create: jest.fn(), update: jest.fn(), findMany: jest.fn() },
     orderStatusHistory: { create: jest.fn() },
-    clientSubdomain: { findFirst: jest.fn() },
+    clientSubdomain: { findFirst: jest.fn(), findUnique: jest.fn(), update: jest.fn(), updateMany: jest.fn() },
   };
   const audit = { record: jest.fn() };
   const cloudflare = {
@@ -835,8 +1021,11 @@ describe('ProvisioningService — actionConfigureDns (Phase 4, gel racine)', () 
     prisma.provisioningLog.create.mockResolvedValue({ id: 'log1' });
     prisma.provisioningLog.findMany.mockResolvedValue([]);
     prisma.deployment.findFirst.mockResolvedValue(null);
+    prisma.deployment.findUnique.mockResolvedValue(null);
     prisma.order.update.mockResolvedValue({});
     prisma.clientSubdomain.findFirst.mockResolvedValue(null);
+    prisma.clientSubdomain.updateMany.mockResolvedValue({ count: 0 });
+    prisma.clientSubdomain.update.mockResolvedValue({});
     cloudflare.allocateClientSubdomain.mockResolvedValue({ subdomain: 'monapp', fqdn: 'monapp.codediali.com' });
     cloudflare.resolveEffectiveRoot.mockResolvedValue({ root, source: 'default' });
   });
@@ -917,6 +1106,72 @@ describe('ProvisioningService — actionConfigureDns (Phase 4, gel racine)', () 
     expect(prisma.order.update).not.toHaveBeenCalledWith(
       expect.objectContaining({ data: expect.objectContaining({ effectiveDomainId: 'pf1' }) }),
     );
+  });
+
+  // 17B.4E-D-B1 (fix H + D3) — CREATE_APP avant CONFIGURE_DNS : l'alloc porte le
+  // deploymentId ; la re-vérification lie par `update` sur id (jamais updateMany fqdn),
+  // ownership via knownDomainId = racine figée root.id.
+  it('17B.4E U23 — DNS après Deployment : allocate reçoit deploymentId + liaison update par id', async () => {
+    prisma.order.findUnique.mockResolvedValue(orderFor());
+    prisma.deployment.findUnique.mockResolvedValue({ id: 'dep-h', userId: 'u1' });
+    // 1er findFirst : check requestedSubdomain avant alloc → null (alloc neuve).
+    // 2e findFirst (link) : row allouée sous root, deploymentId null.
+    prisma.clientSubdomain.findFirst
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({
+        id: 'cs-u23',
+        fqdn: 'monapp.codediali.com',
+        domainId: 'pf1',
+        deploymentId: null,
+      });
+    prisma.clientSubdomain.findUnique.mockResolvedValue({
+      id: 'cs-u23',
+      fqdn: 'monapp.codediali.com',
+      domainId: 'pf1',
+      deploymentId: null,
+    });
+    prisma.clientSubdomain.update.mockResolvedValue({});
+
+    await service.provisionOrder('ord1');
+
+    expect(cloudflare.allocateClientSubdomain).toHaveBeenCalledWith(
+      expect.objectContaining({ deploymentId: 'dep-h' }),
+    );
+    expect(prisma.clientSubdomain.update).toHaveBeenCalledWith({
+      where: { id: 'cs-u23' },
+      data: { deploymentId: 'dep-h' },
+    });
+    expect(prisma.clientSubdomain.updateMany).not.toHaveBeenCalled();
+  });
+
+  // D3 — row existante déjà sous la racine figée mais domaine != root → pas de vol.
+  it('17B.4E U23b — CS existant domaine non concordant → AUCUNE liaison (jamais updateMany)', async () => {
+    prisma.order.findUnique.mockResolvedValue(orderFor());
+    prisma.deployment.findUnique.mockResolvedValue({ id: 'dep-h', userId: 'u1' });
+    prisma.clientSubdomain.findFirst
+      .mockResolvedValueOnce({
+        id: 'cs-vol',
+        fqdn: 'monapp.codediali.com',
+        domainId: 'dom-AUTRE',
+        deploymentId: null,
+      })
+      .mockResolvedValueOnce({
+        id: 'cs-vol',
+        fqdn: 'monapp.codediali.com',
+        domainId: 'dom-AUTRE',
+        deploymentId: null,
+      });
+    prisma.clientSubdomain.findUnique.mockResolvedValue({
+      id: 'cs-vol',
+      fqdn: 'monapp.codediali.com',
+      domainId: 'dom-AUTRE',
+      deploymentId: null,
+    });
+
+    await service.provisionOrder('ord1');
+
+    expect(prisma.clientSubdomain.update).not.toHaveBeenCalled();
+    expect(prisma.clientSubdomain.updateMany).not.toHaveBeenCalled();
   });
 });
 
