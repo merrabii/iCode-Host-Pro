@@ -57,6 +57,7 @@ model User {
   knowledgeArticles KnowledgeArticle[] // articles de base de connaissance (Phase 11)
   deployments       Deployment[] // déploiements GitHub → Coolify (Phase 10bis)
   clientProjects    ClientProject[] // projets Coolify dédiés du client (Module B)
+  hostingServices   HostingService[] // services hébergement achetés (17B.4F-B1)
 
   @@unique([oauthProvider, oauthSubject])
   @@index([email])
@@ -294,6 +295,7 @@ model Product {
   addons             ProductAddon[] // suppléments/add-ons (Onglet 7)
   checkoutFields     ProductCheckoutField[] // champs de facturation configurables (admin)
   orders             Order[] // commandes passées sur ce produit (Phase 15)
+  hostingServices    HostingService[] // services achetés référençant ce produit (17B.4F-B1)
 }
 
 // ── Phase 15 — Taux de taxe (config globale, Onglet 2 référence ces taux) ─────
@@ -467,6 +469,7 @@ model HostingPack {
   products   Product[] // packs référencés par des produits (Restrict)
   categories ProductCategory[] // catégories dont ce pack est le recommandé
   deployments Deployment[] // apps créées sous ce pack (Phase 17 — quota par pack)
+  hostingServices HostingService[] // services dont CE pack est la référence à l'achat (17B.4F-B1)
 }
 
 // ── Phase 13 — modules/méthodes de déploiement (A/B) ─────────────────────────
@@ -509,6 +512,7 @@ model DeploymentModule {
   packs          HostingPack[] // plans liés à ce module
   clientProjects ClientProject[] // projets client créés par ce module (Module B)
   deployments    Deployment[]
+  hostingServices HostingService[] // services achetés sous CE module (17B.4F-B1)
 }
 
 // Projet Coolify dédié d'un client (Module B) — UN par (client, serveur, module).
@@ -527,6 +531,25 @@ model ClientProject {
   module      DeploymentModule? @relation(fields: [moduleId], references: [id], onDelete: SetNull)
   name        String // ex « client-<uid> »
   projectUuid String // uuid du projet Coolify
+  // ── 17B.4F-B1 — relation de TRANSITION vers le service hébergement ─────────
+  // Nullable pendant toute la migration legacy : aucun projet existant n'est
+  // relié artificiellement (classification = 17B.4F, backfill = 17B.4F-D).
+  // La contrainte historique @@unique([userId, serverId]) reste EN PLACE : elle
+  // porte encore tous les parcours actuels et ne sera retirée qu'en 17B.4F-D,
+  // après migration du resolver vers (hostingServiceId, serverId).
+  // RÉFÉRENCEMENT DU RISQUE (formulation exacte) : un utilisateur ne peut pas
+  // encore disposer de plusieurs projets ClientProject DISTINCTS sur le même
+  // serveur ; cela bloque le futur projet dédié par HostingService, PAS
+  // plusieurs applications dans le projet legacy actuel.
+  // La nouvelle
+  // contrainte est SANS CONFLIT avec les lignes legacy : PostgreSQL traite les
+  // NULL comme distincts (NULLS DISTINCT), donc tous les projets à
+  // hostingServiceId NULL coexistent sous (NULL, serverId).
+  hostingServiceId String?
+  // RESTRICT (référentiel fail-closed) : un service encore rattaché à un projet
+  // client ne peut être SUPPRIMÉ — aucune désolidarisation silencieuse, le
+  // cleanup métier (17B.4F-D) précède toute suppression. Rien n'est mis à NULL.
+  hostingService   HostingService? @relation(fields: [hostingServiceId], references: [id], onDelete: Restrict)
   createdAt   DateTime          @default(now())
   updatedAt   DateTime          @updatedAt
 
@@ -535,6 +558,8 @@ model ClientProject {
   // Un SEUL projet Coolify par client par serveur — l'app suivante réutilise,
   // elle ne recrée jamais un projet.
   @@unique([userId, serverId])
+  // Futur : UN SEUL projet par service hébergement et par serveur (17B.4F-D).
+  @@unique([hostingServiceId, serverId])
   @@index([userId])
 }
 
@@ -683,6 +708,10 @@ model Subscription {
   orderId String? @unique
   order   Order?   @relation(fields: [orderId], references: [id], onDelete: SetNull)
 
+  // Services hébergement nés de CET abonnement (17B.4F-B1) — relation inverse
+  // uniquement : aucun abonnement existant n'est transformé dans cette phase.
+  hostingServices HostingService[]
+
   @@index([userId])
   @@index([status])
 }
@@ -784,14 +813,136 @@ model Deployment {
   reconcileAttempts         Int            @default(0)
   reconcileTerminalFailures Int            @default(0)
   reconcileLastCheckedAt    DateTime?
+  // ── 17B.4F-B1 — service hébergement propriétaire de cette app ──────────────
+  // TRANSITION uniquement : null sur TOUTES les lignes existantes (legacy) et
+  // sur tout déploiement créé avant l'activation du quota par service. Le lien
+  // se pose (1) via l'allocation persistante HostingServiceAllocation, jamais
+  // par écriture directe opportuniste. RESTRICT (référentiel fail-closed) :
+  // un service encore lié à un déploiement ne peut être SUPPRIMÉ — aucune
+  // désolidarisation silencieuse, le cleanup métier précède toute suppression.
+  // Aucun déploiement n'est relié arbitrairement dans B1.
+  hostingServiceId String?
+  hostingService   HostingService? @relation(fields: [hostingServiceId], references: [id], onDelete: Restrict)
   createdAt                 DateTime       @default(now())
   updatedAt                 DateTime       @updatedAt
+
+  allocations HostingServiceAllocation[] // réservations de slot de ce service (17B.4F)
 
   @@index([userId])
   @@index([status])
   @@index([packId])
   @@index([limitsStatus])
   @@index([status, reconcileNextAt])
+  @@index([hostingServiceId])
+}
+
+// ── Phase 17B.4F-B1 — FONDATION ADDITIVE : service acheté + allocation ────────
+// `HostingService` = UNE instance de service achetée par un client (1 ligne par
+// achat), porteuse des snapshots commerciaux FIGÉS à l'achat : la modification
+// future du catalogue (pack/produit/module) ne modifie JAMAIS silencieusement
+// le contrat acheté. `HostingServiceAllocation` = réservation persistante d'un
+// slot d'application sur CE service (verrou transactionnel + allocation, phase
+// 17B.4F-C). Le quota futur est appliqué PAR hostingServiceId — jamais globalement
+// par utilisateur ni par pack. Aucune ligne n'est créée par la migration et
+// aucun endpoint ne mutant ces modèles n'existe en B1.
+enum HostingServiceStatus {
+  PROVISIONING // acheté, pas encore pleinement provisionné
+  ACTIVE // service opérationnel
+  SUSPENDED // suspendu (facturation/support) — apps existantes inchangées
+  CANCELLATION_PENDING // résiliation demandée, pas encore effective
+  CANCELLED // résilié — PLUS AUCUNE réservation de slot autorisée
+  REVIEW_REQUIRED // ambiguïté métier (classification legacy) — résolution admin
+}
+
+enum HostingServiceAllocationStatus {
+  RESERVED // slot réservé (consomme)
+  BOUND // lié à un déploiement (consomme)
+  RELEASING // libération en cours, provider incertain (CONSOMME encore — un slot
+  // incertain n'est jamais libéré d'office)
+  RELEASED // libéré (ne consomme plus) — transition implémentée en 17B.4F-C
+}
+
+model HostingService {
+  id     String           @id @default(cuid())
+  userId String // AUTORITÉ d'ownership — toujours issue du jeton serveur,
+  // jamais fournie comme autorité par un client
+  // RESTRICT (référentiel fail-closed) : un utilisateur possédant un service
+  // hébergement ne peut être SUPPRIMÉ — cleanup métier obligatoire d'abord.
+  user   User             @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  // ── Provenance commerciale (nullable pendant la transition) ───────────────
+  // 1:1 et UNIQUE : UNE commande / UN abonnement ne portent QU'UN service.
+  // SetNull : la suppression d'une commande/abonnement ne supprime pas le
+  // service acheté (les snapshots restent la référence contractuelle).
+  orderId        String?        @unique
+  order          Order?         @relation(fields: [orderId], references: [id], onDelete: SetNull)
+  subscriptionId String?        @unique
+  subscription   Subscription?  @relation(fields: [subscriptionId], references: [id], onDelete: SetNull)
+
+  // ── Références historiques au catalogue (nullable, SetNull) ───────────────
+  // Résolution = pour SUIVRE le catalogue ; CONTRACT = les snapshots ci-dessous.
+  // Aucune de ces colonnes n'est recalculée après création.
+  productId           String?
+  product             Product?           @relation(fields: [productId], references: [id], onDelete: SetNull)
+  packId              String?
+  pack                HostingPack?       @relation(fields: [packId], references: [id], onDelete: SetNull)
+  deploymentModuleId  String?
+  deploymentModule    DeploymentModule?  @relation(fields: [deploymentModuleId], references: [id], onDelete: SetNull)
+
+  status HostingServiceStatus @default(PROVISIONING)
+
+  // ── Snapshots contractuels (figés à l'achat, jamais recalculés) ───────────
+  // maxAppsSnapshot : null = ILLIMITÉ — convention explicite et déjà testée du
+  // repo (« maxApps = null ⇒ illimité », deployments.service) ; 0 = aucun slot.
+  // Valeur négative INTERDITE (service + contrainte CHECK). ramMb/cpuCores sont
+  // NOT NULL : un service sans limites RAC/CPU exploitables n'existe pas.
+  maxAppsSnapshot        Int?
+  ramMbSnapshot          Int
+  cpuCoresSnapshot       Float
+  storageLimitGbSnapshot Int? // informatif (quota disque non actif, cf. HostingPack)
+  packNameSnapshot       String? // libellé lisible du pack acheté
+  productNameSnapshot    String? // libellé lisible du produit acheté
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  deployments  Deployment[] // apps rattachées (17B.4F-D)
+  allocations  HostingServiceAllocation[] // réservations de slots
+  clientProjects ClientProject[] // projets dédiés de ce service (17B.4F-D)
+
+  @@index([userId])
+  @@index([status])
+  @@index([packId])
+}
+
+model HostingServiceAllocation {
+  id               String                    @id @default(cuid())
+  hostingServiceId String // NOT NULL : une allocation appartient à UN seul service
+  // RESTRICT (référentiel fail-closed) : un service portant AU MOINS UNE
+  // allocation ne peut être SUPPRIMÉ — le slot reste compté, aucune ligne
+  // d'allocation n'est détruite silencieusement. Libération = 17B.4F-C,
+  // suppression du service = cleanup métier explicite puis suppression.
+  hostingService   HostingService            @relation(fields: [hostingServiceId], references: [id], onDelete: Restrict)
+  // ≤ 1 allocation par déploiement — UNIQUE : un Deployment ne peut jamais être
+  // compté deux fois dans deux slots différents. SetNull : si la ligne déploiement
+  // disparaît, l'allocation RESTE (slot encore consommé tant que non libérée).
+  deploymentId String?              @unique
+  deployment   Deployment?          @relation(fields: [deploymentId], references: [id], onDelete: SetNull)
+  // Clé d'idempotence/réservation UNIQUE : un retry concurrent de la même
+  // réservation ne crée JAMAIS une deuxième ligne (refus explicite, pas de
+  // double consommation silencieuse).
+  idempotencyKey String @unique
+  status         HostingServiceAllocationStatus @default(RESERVED)
+  reservedAt     DateTime @default(now())
+  boundAt        DateTime?
+  releasedAt     DateTime?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  // Index de comptage/verrouillage : le quota futur compte les statuts
+  // CONSOMMANTS (RESERVED | BOUND | RELEASING) par service — jamais un simple
+  // count(*) Deployment.
+  @@index([hostingServiceId, status])
 }
 
 // ── Phase 3 — DNS & sous-domaines Cloudflare (demande propriétaire) ──────────
@@ -1206,6 +1357,10 @@ model Order {
   // (row Deployment `orderId` @unique) : plusieurs commandes du même produit
   // = plusieurs apps visibles, sans écrasement de la commande précédente.
   deployments   Deployment[]
+  // Services hébergement nés de CETTE commande (17B.4F-B1) — relation inverse
+  // uniquement (1:1 porté par HostingService.orderId) : aucun Order existant
+  // n'est transformé, aucun workflow de commande n'est modifié.
+  hostingServices HostingService[]
 
   @@index([customerId])
   @@index([status])
