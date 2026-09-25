@@ -1,3 +1,4 @@
+import { Logger } from '@nestjs/common';
 import { ReconcileService, RECONCILE_TERMINAL_THRESHOLD, ReconcileScanStats } from './reconcile.service';
 import { reconcileBackoffDelayMs } from './reconcile-backoff';
 import { RECONCILE_DEFAULT_SETTINGS, ReconcileSettings } from './reconcile-settings';
@@ -88,7 +89,7 @@ class MiniDb {
   }
 
   async updateMany(args: {
-    where: { id: string; status: string; reconcileNextAt?: { not: null; lte: Date } };
+    where: { id: string; status?: string; reconcileNextAt?: { not: null; lte?: Date } };
     data: Record<string, unknown>;
   }): Promise<{ count: number }> {
     if (
@@ -105,15 +106,17 @@ class MiniDb {
       throw new Error('replanification boom (simulé)');
     }
     const matches = this.rows.filter(
-      (r) => r.id === args.where.id && r.status === args.where.status,
+      (r) => r.id === args.where.id && (args.where.status === undefined || r.status === args.where.status),
     );
     for (const r of matches) {
-      if (
-        args.where.reconcileNextAt &&
-        (r.reconcileNextAt === null ||
-          this.atMs(r.reconcileNextAt) > this.atMs(args.where.reconcileNextAt.lte))
-      ) {
-        return { count: 0 };
+      if (args.where.reconcileNextAt) {
+        if (r.reconcileNextAt === null) return { count: 0 };
+        if (
+          args.where.reconcileNextAt.lte !== undefined &&
+          this.atMs(r.reconcileNextAt) > this.atMs(args.where.reconcileNextAt.lte)
+        ) {
+          return { count: 0 };
+        }
       }
       if ('status' in args.data) r.status = args.data.status as string;
       if ('reconcileNextAt' in args.data) r.reconcileNextAt = args.data.reconcileNextAt as Date | null;
@@ -439,6 +442,69 @@ describe('ReconcileService — matrice de décision', () => {
     expect(evidence.observe).toHaveBeenCalledWith('d1');
     expect(provisioning.activateOrderAfterProof).toHaveBeenCalledWith('ord-d1');
     expect(db.rows[0]!.reconcileNextAt).toBeNull();
+  });
+
+  it('B0.6 : activation qui bascule la row en ACTIVE ⇒ lease libéré, LastCheckedAt/Attempts PRÉSERVÉS', async () => {
+    const db = new MiniDb();
+    db.rows = [dueRow('d1')];
+    const { service, provisioning } = makeService(db, MOTOR_SETTINGS, { d1: OBS.runningHealthy() });
+    // Reproduit la VRAIE couture 17B.3B : DEPLOYING → ACTIVE en base
+    // (le statut ne reste PAS artificiellement DEPLOYING).
+    provisioning.activateOrderAfterProof.mockImplementation(async (orderId: string) => {
+      const row = db.rows.find((r) => r.orderId === orderId);
+      if (row) row.status = 'ACTIVE';
+      return {
+        orderIsActive: true,
+        deploymentIsActive: true,
+        orderActivated: true,
+        deploymentActivated: true,
+        noop: false,
+      };
+    });
+
+    const stats = await service.scanOnce(NOW);
+
+    expect(stats.activated).toBe(1);
+    expect(db.rows[0]!.status).toBe('ACTIVE');
+    // Régression B0.6 : l'ancien garde `status=DEPLOYING` laissait le lease posé.
+    expect(db.rows[0]!.reconcileNextAt).toBeNull();
+    // CORRECTIF : la libération ne touche QUE reconcileNextAt — la preuve
+    // d'observation écrite par le claim (NOW) et le compteur d'attempts
+    // restent intacts ; reconcileTerminalFailures et le statut aussi.
+    expect(db.rows[0]!.reconcileLastCheckedAt).toEqual(NOW);
+    expect(db.rows[0]!.reconcileLastCheckedAt).not.toBeNull();
+    expect(db.rows[0]!.reconcileAttempts).toBe(1);
+    expect(db.rows[0]!.reconcileTerminalFailures).toBe(0);
+
+    // Idempotence : une seconde passe ne voit plus le candidat (ni ACTIVE, ni
+    // lease) → aucune écriture, les valeurs préservées sont inchangées.
+    const again = await service.scanOnce(new Date(NOW.getTime() + 60_000));
+    expect(again.scanned).toBe(0);
+    expect(db.rows[0]!.reconcileNextAt).toBeNull();
+    expect(db.rows[0]!.reconcileLastCheckedAt).toEqual(NOW);
+    expect(db.rows[0]!.reconcileAttempts).toBe(1);
+    expect(db.rows[0]!.status).toBe('ACTIVE');
+  });
+
+  it('B0.8 : aucune exception brute (marqueur secret) n’atteint le Logger', async () => {
+    const warnSpy = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    try {
+      const db = new MiniDb();
+      db.rows = [dueRow('d1')];
+      const { service, evidence } = makeService(db, MOTOR_SETTINGS, {});
+      evidence.observe.mockRejectedValue(new Error('HTTP 500 JWT_SECRET=abc123'));
+      db.throwOnRescheduleWrites = true;
+
+      await service.scanOnce(NOW);
+
+      const logs = JSON.stringify(warnSpy.mock.calls);
+      expect(warnSpy).toHaveBeenCalled();
+      expect(logs).not.toContain('JWT_SECRET=abc123');
+      expect(logs).not.toContain('HTTP 500');
+      expect(logs).toContain('reconcile:');
+    } finally {
+      warnSpy.mockRestore();
+    }
   });
 
   it('RUNNING + HTTP_REQUIRED + httpServed=true ⇒ activation', async () => {

@@ -500,14 +500,14 @@ export default function ClientPage() {
             <StatCard
               label="Applications"
               value={quota.used}
-              unit={quota.pack.maxApps ? `/ ${quota.pack.maxApps}` : '/ ∞'}
-              warn={quota.pack.maxApps != null && quota.used > quota.pack.maxApps}
+              unit={quota.limit ? `/ ${quota.limit}` : '/ ∞'}
+              warn={quota.quotaFull}
               tone="primary"
               icon={<IconBox />}
-              sub={quota.pack.maxApps
-                ? quota.used >= quota.pack.maxApps
+              sub={quota.limit
+                ? quota.quotaFull
                   ? 'Quota atteint — supprimez ou passez au plan supérieur'
-                  : `${quota.pack.maxApps - quota.used} place(s) restante(s)`
+                  : `${quota.remaining ?? 0} place(s) restante(s)`
                 : 'Illimité'}
             />
             <StatCard
@@ -739,7 +739,7 @@ export default function ClientPage() {
                       <UsageBar
                         label={`Quota d'applications — plan ${quota.pack.name}`}
                         used={quota.used}
-                        limit={quota.pack.maxApps}
+                        limit={quota.limit}
                       />
                     </div>
                   )}

@@ -33,6 +33,7 @@ import {
   memoryFromMb,
 } from '../servers/panel-transport.factory';
 import { resolveEffectiveLimits } from './limits.util';
+import { isAbsentExternalError } from '../store/order-cancel.service';
 import { CloudflareService } from '../cloudflare/cloudflare.service';
 import { CreateDeploymentDto } from './dto/create-deployment.dto';
 import { BuildConfig, DetectResult, GithubRepo, GithubService } from './github.service';
@@ -45,7 +46,12 @@ export type DeploymentView = Omit<Deployment, 'coolifyUuid'> & {
 
 /** Quota d'apps du pack exposé au client (Phase 13) — le compteur
  *  « N utilisées / M autorisées » du dashboard + les limites RAM/CPU par app.
- *  `maxApps = null` ⇒ illimité. `used` = apps non-FAILED du compte. */
+ *  `maxApps = null` ⇒ illimité.
+ *  B0.3/B0.4 — `used`, `limit`, `remaining` et `quotaFull` proviennent du MÊME
+ *  helper pack-scoped que l'enforcement : aucun recalcul côté client, aucune
+ *  valeur incertaine. `used` = TOUTES les lignes Deployment locales du
+ *  (userId, packId), y compris FAILED, tant que la suppression provider n'est
+ *  pas confirmée (la row existe ⇒ la ressource n'est pas réputée libérée). */
 export interface ClientDeployQuota {
   pack: {
     name: string;
@@ -55,6 +61,12 @@ export interface ClientDeployQuota {
     maxApps: number | null;
   };
   used: number;
+  /** Budget d'apps du pack (maxApps) — null = illimité. */
+  limit: number | null;
+  /** Places restantes — null = illimité (jamais de valeur fabriquée). */
+  remaining: number | null;
+  /** Prédicat exact de l'enforcement : vrai ⇒ création refusée. */
+  quotaFull: boolean;
 }
 
 /** Réponse de listMine (Phase 13) : les déploiements + le quota du pack actif. */
@@ -278,6 +290,14 @@ export class DeploymentsService {
       );
     }
 
+    // B0.5 — VALIDATION AVANT TOUTE ACTION EXTERNE : pack/module/serveur
+    // résolus en base (aucune écriture, aucun appel GitHub, aucun appel
+    // provider) puis quota contrôlé (fail-closed B0.3). Rien n'est créé — ni
+    // row, ni DNS, ni projet provider, ni appel réseau — si le compte n'a pas
+    // de pack actif ou si le quota est refusé / indéterminable.
+    const { server, pack, module } = await this.resolvePackTarget(actor.sub);
+    await this.assertUnderPackQuota(actor.sub, pack, module);
+
     // ── Résolution du dépôt : mode GitHub lié (token + propriété) ou URL. ─────
     let repoUrl: string;
     let repoFullName: string;
@@ -300,17 +320,13 @@ export class DeploymentsService {
       repoUrl = `https://github.com/${repoFullName}.git`;
     }
 
-    // Phase 13 — cible résolue depuis le pack ACTIF → module A/B quand aucun
-    // Service n'est choisi ; un `serviceId` fourni honore le comportement
-    // historique (serveur du Service + pack de son abonnement).
-    const { server, pack, module, projectUuid, clientProjectId } =
-      await this.resolveDeployTarget(actor.sub);
-    // Phase 17 (3d) — quota PAR PACK (jamais fusionné entre packs d'un même
-    // client). Compte et somme les ressources des apps du client rattachées à CE
-    // pack précis, compare au budget dérivé du pack (limite par app × maxApps),
-    // et refuse la création si elle dépasserait. Appliqué AVANT toute création
-    // côté Coolify.
-    await this.assertUnderPackQuota(actor.sub, pack, module);
+    // Phase 13 — projet provider (module A partagé / B dédié), résolu UNIQUEMENT
+    // après la validation pack + quota (B0.5 : aucune ressource externe avant).
+    const { projectUuid, clientProjectId } = await this.resolveProject(
+      module,
+      server,
+      actor.sub,
+    );
 
     const branch = dto.branch?.trim() ? dto.branch.trim() : (detectedBranch ?? 'main');
 
@@ -582,9 +598,10 @@ export class DeploymentsService {
     return { deployments: latest.map((r) => this.toView(r)), quota };
   }
 
-  /** Quota d'apps du pack ACTIF du compte : `{ pack, used }`, ou null si aucun
-   *  pack/module n'est actif (pas de quota à afficher). `used` = apps non-FAILED,
-   *  exactement le même décompte que l'enforcement `maxApps` de create(). */
+  /** Quota d'apps du pack ACTIF du compte, ou null si aucun pack n'est actif
+   *  OU si le comptage est indéterminable (B0.3 — un quota incertain n'est
+   *  JAMAIS présenté comme certain : la création reste refusée fail-closed par
+   *  `assertUnderPackQuota`). `used` = même décompte que l'enforcement. */
   private async resolveQuota(userId: string): Promise<ClientDeployQuota | null> {
     const subscription = await this.prisma.subscription.findFirst({
       where: { userId, status: SubscriptionStatus.ACTIVE },
@@ -593,9 +610,10 @@ export class DeploymentsService {
     });
     const pack = subscription?.product?.pack ?? null;
     if (!pack || pack.status !== PackStatus.ACTIVE) return null;
-    const used = await this.prisma.deployment.count({
-      where: { userId, status: { not: DeploymentStatus.FAILED } },
-    });
+    const rows = await this.packUsage(userId, pack.id);
+    if (!rows) return null;
+    const limit = pack.maxApps ?? null;
+    const used = rows.length;
     return {
       pack: {
         name: pack.name,
@@ -605,7 +623,32 @@ export class DeploymentsService {
         maxApps: pack.maxApps,
       },
       used,
+      limit,
+      remaining: limit == null ? null : Math.max(0, limit - used),
+      quotaFull: limit != null && used >= limit,
     };
+  }
+
+  /**
+   * B0.3/B0.4 — SOURCE UNIQUE du quota par pack : UNE lecture `findMany`
+   * pack-scoped partagée par l'affichage (`resolveQuota`) et l'enforcement
+   * (`assertUnderPackQuota`). Compte TOUTES les lignes locales du
+   * (userId, packId), y compris FAILED — la suppression provider/DNS n'est
+   * réputée confirmée que lorsque la row a effectivement disparu.
+   * Retourne `null` quand le comptage est indéterminable (appelant fail-closed).
+   */
+  private async packUsage(
+    userId: string,
+    packId: string,
+  ): Promise<Array<{ limitsRamMb: number | null; limitsCpu: number | null }> | null> {
+    try {
+      return await this.prisma.deployment.findMany({
+        where: { userId, packId },
+        select: { limitsRamMb: true, limitsCpu: true },
+      });
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -632,13 +675,21 @@ export class DeploymentsService {
 
   /**
    * Supprime une app du client (Phase 13 — libère le quota maxApps pour en
-   * recréer une autre) : best-effort sur Coolify (DELETE de l'application) et
-   * sur Cloudflare (suppression du CNAME du sous-domaine), puis suppression
-   * des rows ClientSubdomain + Deployment. Un échec réseau ne bloque JAMAIS
-   * la suppression locale : l'app peut rester orpheline sur Coolify mais le
-   * quota du compte est libéré immédiatement (audit `*.warn` pour le support).
+   * recréer une autre).
+   *
+   * Contrat B0.1/B0.2 (suppression SÛRE) :
+   *   • provider : suppression classée — « absent » confirmé ⇒ on continue ;
+   *     tout autre échec ⇒ AUCUNE suppression locale + 502 (la ressource
+   *     reste gérable côté panneau, jamais d'app orpheline) ;
+   *   • DNS : ownership STRICT — l'enregistrement n'est touché QUE si la row
+   *     ClientSubdomain prouve appartenir à CETTE app (`deploymentId === id`) ;
+   *     échec non-absent ⇒ row conservée (partial=true) et re-nettoyable ;
+   *   • B0.8 : aucun message brut du provider dans l'audit ni dans la réponse.
    */
-  async remove(id: string, actor: Actor): Promise<{ removed: true; appName: string | null }> {
+  async remove(
+    id: string,
+    actor: Actor,
+  ): Promise<{ removed: true; appName: string | null; partial: boolean }> {
     const row = await this.prisma.deployment.findFirst({
       where: { id, userId: actor.sub },
       include: { server: true, clientSubdomain: { include: { domain: true } } },
@@ -647,7 +698,7 @@ export class DeploymentsService {
       throw new NotFoundException('Déploiement introuvable.');
     }
 
-    // 1. Coolify — suppression de l'application (best-effort).
+    // 1. Provider — suppression SÛRE (B0.1).
     if (
       row.coolifyUuid &&
       row.server &&
@@ -665,43 +716,57 @@ export class DeploymentsService {
           action: 'deploy.delete.coolify',
           resourceType: 'deployment',
           resourceId: id,
-          details: { coolifyUuid: row.coolifyUuid, appName: row.appName },
+          details: { coolifyUuid: row.coolifyUuid, appName: row.appName, outcome: 'deleted' },
         });
       } catch (err) {
-        const m = err instanceof Error ? err.message : String(err);
+        // Jamais de message d'exception dans l'audit (B0.8) : uniquement la
+        // classe de sortie, déterminée par la classification 404 générique.
+        const outcome = isAbsentExternalError(err) ? 'absent' : 'failed';
         await this.audit.record({
           actorId: actor.sub,
           actorEmail: actor.email,
-          action: 'deploy.delete.coolify.warn',
+          action: outcome === 'absent' ? 'deploy.delete.coolify' : 'deploy.delete.coolify.warn',
           resourceType: 'deployment',
           resourceId: id,
-          details: { coolifyUuid: row.coolifyUuid, message: m },
+          details: { coolifyUuid: row.coolifyUuid, outcome },
         });
+        if (outcome === 'failed') {
+          throw new BadGatewayException(
+            "Suppression de l'application impossible sur l'hébergement : aucune suppression locale effectuée. Réessayez plus tard ou contactez le support.",
+          );
+        }
       }
     }
 
-    // 2. Cloudflare — suppression de l'enregistrement DNS du sous-domaine
-    //    (best-effort ; recordId peut manquer si la création DNS avait échoué).
+    // 2. Cloudflare — ownership STRICT de la row (B0.2).
     const cs = row.clientSubdomain;
-    if (cs?.recordId && cs.domainId) {
+    const ownsCs = Boolean(cs) && cs!.deploymentId === id;
+    let dnsFailed = false;
+    if (ownsCs && cs!.recordId && cs!.domainId) {
       try {
-        await this.cloudflare.deleteDnsRecord(cs.domainId, cs.recordId, actor);
+        await this.cloudflare.deleteDnsRecord(cs!.domainId, cs!.recordId, actor);
       } catch (err) {
-        const m = err instanceof Error ? err.message : String(err);
-        await this.audit.record({
-          actorId: actor.sub,
-          actorEmail: actor.email,
-          action: 'deploy.delete.dns.warn',
-          resourceType: 'deployment',
-          resourceId: id,
-          details: { fqdn: cs.fqdn, message: m },
-        });
+        if (!isAbsentExternalError(err)) {
+          dnsFailed = true;
+          await this.audit.record({
+            actorId: actor.sub,
+            actorEmail: actor.email,
+            action: 'deploy.delete.dns.warn',
+            resourceType: 'deployment',
+            resourceId: id,
+            details: { fqdn: cs!.fqdn, outcome: 'failed' },
+          });
+        }
       }
     }
 
-    // 3. Rows locales (ordre respectant les FK : sous-domaine → déploiement).
+    // 3. Rows locales (ordre respectant les FK). Ownership strict (B0.2) :
+    //    sans row appartenant à CETTE app, aucun ClientSubdomain n'est supprimé.
+    //    DNS non confirmé ⇒ row conservée (partial) pour re-nettoyage.
     await this.prisma.$transaction(async (tx) => {
-      await tx.clientSubdomain.deleteMany({ where: { deploymentId: id } });
+      if (ownsCs && !dnsFailed) {
+        await tx.clientSubdomain.deleteMany({ where: { deploymentId: id } });
+      }
       await tx.deployment.delete({ where: { id } });
     });
 
@@ -716,29 +781,29 @@ export class DeploymentsService {
         repoFullName: row.repoFullName,
         hadCoolifyApp: Boolean(row.coolifyUuid),
         hadSubdomain: Boolean(cs),
+        dnsOutcome: dnsFailed ? 'failed' : ownsCs ? 'deleted' : 'absent',
+        partial: dnsFailed,
         freedQuota: true,
       },
     });
-    return { removed: true, appName: row.appName };
+    return { removed: true, appName: row.appName, partial: dnsFailed };
   }
 
   // ── Internes ───────────────────────────────────────────────────────────────
 
   /**
-   * Phase 13 (Bloc 4) — cible de déploiement : la table `Service` a été
-   * supprimée, la cible est TOUJOURS résolue depuis le pack ACTIF du client
-   * (abonnement ACTIVE → produit → pack) → module de déploiement A/B.
-   * Le projet Coolify est ensuite déduit du module (A = projet partagé configuré ;
-   * B = projet dédié du client, créé paresseusement à la première app).
+   * Phase 13 (Bloc 4) + B0.5 — cible de déploiement résolue STRICTEMENT en
+   * base : abonnement ACTIVE → produit → pack ACTIF → module de déploiement
+   * A/B → serveur Coolify connecté. AUCUNE action externe ici (le projet
+   * provider est résolu séparément par `resolveProject`, après quota).
+   * Sert de gate de validation : sans pack actif → 403.
    */
-  private async resolveDeployTarget(
+  private async resolvePackTarget(
     userId: string,
   ): Promise<{
     server: Server;
-    pack: HostingPack | null;
-    module: DeploymentModule | null;
-    projectUuid?: string;
-    clientProjectId?: string;
+    pack: HostingPack;
+    module: DeploymentModule;
   }> {
     const subscription = await this.prisma.subscription.findFirst({
       where: { userId, status: SubscriptionStatus.ACTIVE },
@@ -767,8 +832,7 @@ export class DeploymentsService {
       );
     }
     const server = this.requireCoolifyServer(module.server);
-    const project = await this.resolveProject(module, server, userId);
-    return { server, pack, module, ...project };
+    return { server, pack, module };
   }
 
   /** Vérifie que le serveur est Coolify + connecté (panelOk + credentials). */
@@ -876,11 +940,11 @@ export class DeploymentsService {
   }
 
   /**
-   * Phase 17 (3d) — QUOTA PAR PACK, jamais fusionné entre packs d'un même client.
-   * Compte et somme les ressources des apps du client rattachées à CE pack précis
-   * (packId), compare au budget DÉRIVÉ du pack (limite effective par app × maxApps),
-   * et refuse la création si elle dépasserait le quota d'apps OU les ressources
-   * du pack. Appelé AVANT toute création côté Coolify.
+   * Phase 17 (3d) + B0.3 — QUOTA PAR PACK, jamais fusionné entre packs d'un
+   * même client. Compte les apps locales rattachées à CE pack précis et compare
+   * au budget dérivé du pack (limite effective par app × maxApps).
+   * Fail-closed : un comptage indéterminable refuse la création — et cet appel
+   * est placé AVANT toute écriture DB, DNS ou action provider (B0.5).
    */
   private async assertUnderPackQuota(
     userId: string,
@@ -888,12 +952,13 @@ export class DeploymentsService {
     module?: DeploymentModule | null,
   ): Promise<void> {
     if (!pack) return;
+    const deps = await this.packUsage(userId, pack.id);
+    if (!deps) {
+      throw new ForbiddenException(
+        "Quota d'applications non déterminable : création refusée (fail-closed). Contactez le support.",
+      );
+    }
     const eff = resolveEffectiveLimits(pack, module);
-    // Apps du client qui appartiennent à CE pack précis (jamais d'autres packs).
-    const deps = await this.prisma.deployment.findMany({
-      where: { userId, packId: pack.id, status: { not: DeploymentStatus.FAILED } },
-      select: { limitsRamMb: true, limitsCpu: true },
-    });
     const count = deps.length;
     const maxApps = pack.maxApps ?? null;
     if (maxApps != null && count >= maxApps) {

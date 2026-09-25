@@ -1,10 +1,12 @@
 import {
   BadRequestException,
+  ConflictException,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
 import {
   PackStatus,
+  Prisma,
   ProductStatus,
   Subscription,
   SubscriptionStatus,
@@ -71,6 +73,31 @@ export class SubscriptionsService {
       throw new NotFoundException('Souscription introuvable.');
     }
     return sub;
+  }
+
+  /**
+   * B0.7 — apps hébergées encore rattachées à CETTE souscription : par la
+   * commande qui l'a créée (`orderId`) et/ou par le pack de son produit
+   * (`packId`). Les deux critères sont scopés sur `userId` (jamais de compte
+   * d'un autre client). 0 ⇒ aucune condition de blocage.
+   */
+  private async countLinkedDeployments(
+    userId: string,
+    sub: Pick<Subscription, 'orderId' | 'productId'>,
+  ): Promise<number> {
+    const product = await this.prisma.product.findUnique({
+      where: { id: sub.productId },
+      select: { packId: true },
+    });
+    const packId = product?.packId ?? null;
+    if (!sub.orderId && !packId) return 0;
+    const where: Prisma.DeploymentWhereInput =
+      sub.orderId && packId
+        ? { userId, OR: [{ orderId: sub.orderId }, { packId }] }
+        : sub.orderId
+          ? { userId, orderId: sub.orderId }
+          : { userId, packId: packId! };
+    return this.prisma.deployment.count({ where });
   }
 
   /** USER: list own subscriptions (product included). */
@@ -147,7 +174,13 @@ export class SubscriptionsService {
     return updated;
   }
 
-  /** USER: cancel an own ACTIVE/SUSPENDED subscription → CANCELLED. */
+  /**
+   * USER: cancel an own ACTIVE/SUSPENDED subscription → CANCELLED.
+   * B0.7 — l'annulation est REFUSÉE tant que des applications hébergées sont
+   * encore rattachées à la souscription (Deployment.orderId) ou à SON pack
+   * (Deployment.packId) : annuler laisserait des apps orphelines sans abonnement
+   * actif. Aucune écriture n'a lieu quand le refus s'applique (fail-closed).
+   */
   async cancelMySubscription(id: string, actor: Actor): Promise<Subscription> {
     const sub = await this.findMySubscription(id, actor.sub);
     if (
@@ -157,6 +190,12 @@ export class SubscriptionsService {
     ) {
       throw new BadRequestException(
         'Cette souscription ne peut pas être annulée.',
+      );
+    }
+    const linked = await this.countLinkedDeployments(actor.sub, sub);
+    if (linked > 0) {
+      throw new ConflictException(
+        `Annulation impossible : ${linked} application(s) hébergée(s) sont encore rattachées à cette souscription. Supprimez-les d'abord depuis votre espace client.`,
       );
     }
     const updated = await this.prisma.subscription.update({

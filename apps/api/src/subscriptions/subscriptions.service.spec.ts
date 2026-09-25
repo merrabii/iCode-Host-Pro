@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ConflictException,
   NotFoundException,
 } from '@nestjs/common';
 import { SubscriptionsService } from './subscriptions.service';
@@ -16,6 +17,7 @@ describe('SubscriptionsService', () => {
       findMany: jest.fn(),
       update: jest.fn(),
     },
+    deployment: { count: jest.fn() },
     server: { findUnique: jest.fn() },
   };
   const mockAudit = { record: jest.fn() };
@@ -59,6 +61,75 @@ describe('SubscriptionsService', () => {
       expect(mockAudit.record).toHaveBeenCalledWith(
         expect.objectContaining({ action: 'subscription.cancel', actorId: 'u1', resourceId: 's1' }),
       );
+    });
+
+    // B0.7 — annulation refusée tant que des apps sont encore rattachées.
+    it('B0.7 : refuse l’annulation (409) quand une app est liée par orderId, sans aucune écriture', async () => {
+      mockPrisma.subscription.findFirst.mockResolvedValue({
+        id: 's1',
+        status: 'ACTIVE',
+        productId: 'p1',
+        orderId: 'ord-1',
+      });
+      mockPrisma.product.findUnique.mockResolvedValue({ packId: null });
+      mockPrisma.deployment.count.mockResolvedValue(2);
+
+      await expect(service.cancelMySubscription('s1', user)).rejects.toBeInstanceOf(
+        ConflictException,
+      );
+      expect(mockPrisma.deployment.count).toHaveBeenCalledWith({
+        where: { userId: 'u1', orderId: 'ord-1' },
+      });
+      expect(mockPrisma.subscription.update).not.toHaveBeenCalled();
+      expect(mockAudit.record).not.toHaveBeenCalled();
+    });
+
+    it('B0.7 : refuse aussi via le pack du produit (packId) et balaie orderId OR packId scopés userId', async () => {
+      mockPrisma.subscription.findFirst.mockResolvedValue({
+        id: 's1',
+        status: 'ACTIVE',
+        productId: 'p1',
+        orderId: 'ord-1',
+      });
+      mockPrisma.product.findUnique.mockResolvedValue({ packId: 'pack1' });
+      mockPrisma.deployment.count.mockResolvedValue(1);
+
+      await expect(service.cancelMySubscription('s1', user)).rejects.toBeInstanceOf(
+        ConflictException,
+      );
+      expect(mockPrisma.deployment.count).toHaveBeenCalledWith({
+        where: { userId: 'u1', OR: [{ orderId: 'ord-1' }, { packId: 'pack1' }] },
+      });
+
+      // Sans commande liée, seul le pack compte (toujours scopé sur le compte).
+      mockPrisma.subscription.findFirst.mockResolvedValue({
+        id: 's2',
+        status: 'ACTIVE',
+        productId: 'p1',
+        orderId: null,
+      });
+      await expect(service.cancelMySubscription('s2', user)).rejects.toBeInstanceOf(
+        ConflictException,
+      );
+      expect(mockPrisma.deployment.count).toHaveBeenCalledWith({
+        where: { userId: 'u1', packId: 'pack1' },
+      });
+    });
+
+    it('B0.7 : 0 app liée ⇒ annulation autorisée (aucun faux blocage)', async () => {
+      mockPrisma.subscription.findFirst.mockResolvedValue({
+        id: 's1',
+        status: 'ACTIVE',
+        productId: 'p1',
+        orderId: 'ord-1',
+      });
+      mockPrisma.product.findUnique.mockResolvedValue({ packId: 'pack1' });
+      mockPrisma.deployment.count.mockResolvedValue(0);
+      mockPrisma.subscription.update.mockResolvedValue({ id: 's1', status: 'CANCELLED' });
+
+      await expect(service.cancelMySubscription('s1', user)).resolves.toMatchObject({
+        status: 'CANCELLED',
+      });
     });
   });
 

@@ -1610,7 +1610,11 @@ export const getMyDeployment = (t: string, id: string) =>
 /** Supprime une app du client — libère le quota d'apps du pack (Phase 13). */
 export const deleteMyDeployment = (t: string, id: string) =>
   apiJson(`/api/client/deployments/${id}`, t, { method: 'DELETE' });
-/** Quota d'apps du pack ACTIF (Phase 13) — compteur « N utilisées / M autorisées ». */
+/** Quota d'apps du pack ACTIF (Phase 13) — compteur « N utilisées / M autorisées ».
+ *  B0.3/B0.4 : `limit`, `remaining` et `quotaFull` sont calculés par le serveur
+ *  avec le MÊME helper pack-scoped que l'enforcement — le client ne recalcule
+ *  JAMAIS (aucune valeur incertaine). `used` inclut les lignes FAILED tant que
+ *  la suppression provider n'est pas confirmée. */
 export interface ClientDeployQuota {
   pack: {
     name: string;
@@ -1620,6 +1624,12 @@ export interface ClientDeployQuota {
     maxApps: number | null;
   };
   used: number;
+  /** Budget d'apps du pack (maxApps) — null = illimité. */
+  limit: number | null;
+  /** Places restantes — null = illimité. */
+  remaining: number | null;
+  /** Prédicat exact de l'enforcement : vrai ⇒ création refusée. */
+  quotaFull: boolean;
 }
 /** Réponse de listMyDeployments (Phase 13) : apps + quota du pack. */
 export interface ClientDeploymentsPayload {

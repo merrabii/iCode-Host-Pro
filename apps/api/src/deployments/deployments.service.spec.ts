@@ -19,11 +19,16 @@ describe('DeploymentsService', () => {
     cloudflareSetting: { findFirst: jest.fn(), create: jest.fn(), update: jest.fn(), updateMany: jest.fn() },
     domain: { findFirst: jest.fn(), findUnique: jest.fn() },
     clientSubdomain: { findFirst: jest.fn(), create: jest.fn() },
+    $transaction: jest.fn(),
   };
   const mockAudit = { record: jest.fn() };
   const mockSettings = { isDeployEnabled: jest.fn() };
   const mockCrypto = { encrypt: jest.fn(), decrypt: jest.fn() };
-  const mockCloudflare = { findActiveRootDomain: jest.fn(), allocateClientSubdomain: jest.fn() };
+  const mockCloudflare = {
+    findActiveRootDomain: jest.fn(),
+    allocateClientSubdomain: jest.fn(),
+    deleteDnsRecord: jest.fn(),
+  };
   const mockGithub = {
     decryptToken: jest.fn(),
     listRepos: jest.fn(),
@@ -42,8 +47,15 @@ describe('DeploymentsService', () => {
     applyAppLimits: jest.fn(),
     deployApp: jest.fn(),
     deploymentStatus: jest.fn(),
+    deleteApplication: jest.fn(),
   };
   const mockPanelFactory = { create: jest.fn(() => mockTransport) };
+
+  // Transaction simulée pour remove() — les deux écritures locales y sont faites.
+  const mockTx = {
+    clientSubdomain: { deleteMany: jest.fn() },
+    deployment: { delete: jest.fn() },
+  };
 
   const actor = { sub: 'u1', email: 'client@example.com' };
 
@@ -180,6 +192,17 @@ describe('DeploymentsService', () => {
     });
     mockPrisma.subscription.findFirst.mockResolvedValue(autoTarget());
     mockCrypto.decrypt.mockReturnValue('coolify-token');
+    // Comptage quota par défaut : aucun app existante (les tests qui comptent
+    // surchargent ce mock).
+    mockPrisma.deployment.findMany.mockResolvedValue([]);
+    // B0.1 — transaction locale : callback exécuté sur le tx simulé.
+    mockTx.clientSubdomain.deleteMany.mockResolvedValue({ count: 1 });
+    mockTx.deployment.delete.mockResolvedValue({});
+    mockPrisma.$transaction.mockImplementation(async (fn: (t: unknown) => unknown) =>
+      fn(mockTx),
+    );
+    mockTransport.deleteApplication.mockResolvedValue(undefined);
+    mockCloudflare.deleteDnsRecord.mockResolvedValue({ id: 'rec-1' });
   });
 
   describe('create()', () => {
@@ -645,12 +668,12 @@ describe('DeploymentsService', () => {
 
   describe('listMine() / findMine()', () => {
     it('listMine ne renvoie que les déploiements du client, masqués + quota du pack ACTIF', async () => {
+      // MÊME lecture pack-scoped que l'enforcement (B0.3/B0.4) : 1 ligne locale.
       mockPrisma.deployment.findMany.mockResolvedValue([deploymentRow()]);
       // Pack ACTIF du compte (module lié, maxApps=2) → quota exposé au client.
       mockPrisma.subscription.findFirst.mockResolvedValue({
         product: { pack: { id: 'pack1', name: 'Starter', status: 'ACTIVE', ramMb: 1024, cpuCores: 1, storageLimit: 20, maxApps: 2, bandwidth: null } },
       });
-      mockPrisma.deployment.count.mockResolvedValue(1);
       const out = await service.listMine(actor);
       expect(mockPrisma.deployment.findMany).toHaveBeenCalledWith({
         where: { userId: 'u1' },
@@ -662,7 +685,46 @@ describe('DeploymentsService', () => {
       expect(out.quota).toEqual({
         pack: expect.objectContaining({ name: 'Starter', maxApps: 2, ramMb: 1024, cpuCores: 1 }),
         used: 1,
+        limit: 2,
+        remaining: 1,
+        quotaFull: false,
       });
+      // B0.3 — un seul et même comptage : ni count() global, ni prédicat FAILED.
+      expect(mockPrisma.deployment.findMany).toHaveBeenCalledWith({
+        where: { userId: 'u1', packId: 'pack1' },
+        select: { limitsRamMb: true, limitsCpu: true },
+      });
+      expect(mockPrisma.deployment.count).not.toHaveBeenCalled();
+    });
+
+    it('B0.3 : le comptage inclut les lignes FAILED (aucun prédicat status != FAILED)', async () => {
+      mockPrisma.subscription.findFirst.mockResolvedValue({
+        product: { pack: { id: 'pack1', name: 'Starter', status: 'ACTIVE', ramMb: 512, cpuCores: 1, storageLimit: null, maxApps: 2, bandwidth: null } },
+      });
+      mockPrisma.deployment.findMany
+        .mockResolvedValueOnce([]) // liste du dashboard (aucune app affichée)
+        .mockResolvedValueOnce([
+          { limitsRamMb: null, limitsCpu: null },
+          { limitsRamMb: null, limitsCpu: null },
+        ]);
+
+      const out = await service.listMine(actor);
+
+      expect(out.deployments).toHaveLength(0);
+      expect(out.quota).toMatchObject({ used: 2, limit: 2, remaining: 0, quotaFull: true });
+      expect(mockPrisma.deployment.count).not.toHaveBeenCalled();
+    });
+
+    it('B0.3 fail-closed : comptage indéterminable ⇒ quota null (jamais présenté comme certain)', async () => {
+      mockPrisma.subscription.findFirst.mockResolvedValue({
+        product: { pack: { id: 'pack1', name: 'Starter', status: 'ACTIVE', ramMb: 512, cpuCores: 1, storageLimit: null, maxApps: 2, bandwidth: null } },
+      });
+      mockPrisma.deployment.findMany
+        .mockResolvedValueOnce([])
+        .mockRejectedValueOnce(new Error('db down'));
+
+      const out = await service.listMine(actor);
+      expect(out.quota).toBeNull();
     });
 
     it('listMine : aucun pack ACTIF ⇒ quota null (pas de compteur à afficher)', async () => {
@@ -996,11 +1058,14 @@ describe('DeploymentsService', () => {
         ForbiddenException,
       );
       expect(mockPrisma.deployment.findMany).toHaveBeenCalledWith({
-        where: { userId: 'u1', packId: 'pack1', status: { not: 'FAILED' } },
+        where: { userId: 'u1', packId: 'pack1' },
         select: { limitsRamMb: true, limitsCpu: true },
       });
       expect(mockPrisma.deployment.create).not.toHaveBeenCalled();
       expect(mockTransport.createGitApp).not.toHaveBeenCalled();
+      // B0.5 — JAMAIS d'action externe avant la validation pack + quota.
+      expect(mockGithub.repoExists).not.toHaveBeenCalled();
+      expect(mockTransport.createProject).not.toHaveBeenCalled();
     });
 
     it("quota d'apps du pack : sous la limite (1/2) → déploiement autorisé", async () => {
@@ -1019,7 +1084,7 @@ describe('DeploymentsService', () => {
       happyMocks();
       const out = await service.create({ repoFullName: 'owner/repo' }, actor);
       expect(mockPrisma.deployment.findMany).toHaveBeenCalledWith({
-        where: { userId: 'u1', packId: 'pack1', status: { not: 'FAILED' } },
+        where: { userId: 'u1', packId: 'pack1' },
         select: { limitsRamMb: true, limitsCpu: true },
       });
       expect(out.status).toBe('DEPLOYING');
@@ -1055,6 +1120,164 @@ describe('DeploymentsService', () => {
       expect(mockPrisma.deployment.create).toHaveBeenCalledWith({
         data: expect.objectContaining({ moduleId: 'modA' }),
       }      );
+    });
+
+    it('B0.5 : aucun pack actif ⇒ 403 AVANT tout appel GitHub, provider ou row', async () => {
+      mockPrisma.subscription.findFirst.mockResolvedValue(null);
+      await expect(
+        service.create({ repoUrl: 'https://github.com/owner/repo.git' }, actor),
+      ).rejects.toBeInstanceOf(ForbiddenException);
+      expect(mockGithub.detectRepo).not.toHaveBeenCalled();
+      expect(mockGithub.repoExists).not.toHaveBeenCalled();
+      expect(mockPrisma.user.findUnique).not.toHaveBeenCalled();
+      expect(mockTransport.createProject).not.toHaveBeenCalled();
+      expect(mockPrisma.deployment.create).not.toHaveBeenCalled();
+      expect(mockTransport.createGitApp).not.toHaveBeenCalled();
+    });
+
+    it('B0.5 : pack actif mais module non résolvable ⇒ 400 AVANT toute action externe', async () => {
+      mockPrisma.subscription.findFirst.mockResolvedValue(
+        activeSubscription(packWithModule({ deploymentModule: null })),
+      );
+      mockPrisma.deploymentModule.findFirst.mockResolvedValue(null);
+      await expect(
+        service.create({ repoFullName: 'owner/repo' }, actor),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(mockGithub.repoExists).not.toHaveBeenCalled();
+      expect(mockPrisma.deployment.create).not.toHaveBeenCalled();
+    });
+
+    it('B0.3 fail-closed : comptage quota indéterminable ⇒ 403, aucune écriture ni action externe', async () => {
+      mockPrisma.subscription.findFirst.mockResolvedValue(
+        activeSubscription(packWithModule({ maxApps: 2 })),
+      );
+      mockPrisma.deployment.findMany.mockRejectedValue(new Error('db down'));
+
+      await expect(
+        service.create({ repoFullName: 'owner/repo' }, actor),
+      ).rejects.toBeInstanceOf(ForbiddenException);
+      expect(mockGithub.repoExists).not.toHaveBeenCalled();
+      expect(mockTransport.createProject).not.toHaveBeenCalled();
+      expect(mockPrisma.deployment.create).not.toHaveBeenCalled();
+      expect(mockTransport.createGitApp).not.toHaveBeenCalled();
+      expect(mockPrisma.$transaction).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('remove() — B0.1/B0.2 suppression sûre', () => {
+    const removeRow = (over: Record<string, unknown> = {}) => ({
+      ...deploymentRow({ status: 'ACTIVE', appName: 'mon-app' }),
+      server: serverRow(),
+      clientSubdomain: {
+        id: 'cs1',
+        subdomain: 'monapp',
+        domainId: 'dom1',
+        fqdn: 'monapp.example.com',
+        recordId: 'rec1',
+        deploymentId: 'dep1',
+        domain: { id: 'dom1', name: 'example.com', zoneId: 'zone1' },
+      },
+      ...over,
+    });
+
+    it('ownership client : 404 pour une app d’un autre client (aucun appel provider/DNS)', async () => {
+      mockPrisma.deployment.findFirst.mockResolvedValue(null);
+      await expect(service.remove('dep-autrui', actor)).rejects.toBeInstanceOf(NotFoundException);
+      expect(mockTransport.deleteApplication).not.toHaveBeenCalled();
+      expect(mockCloudflare.deleteDnsRecord).not.toHaveBeenCalled();
+      expect(mockPrisma.$transaction).not.toHaveBeenCalled();
+    });
+
+    it('heureux : provider + DNS confirmés puis rows locales supprimées, partial=false', async () => {
+      mockPrisma.deployment.findFirst.mockResolvedValue(removeRow());
+      const out = await service.remove('dep1', actor);
+      expect(mockTransport.deleteApplication).toHaveBeenCalledWith(
+        expect.objectContaining({ provider: 'COOLIFY', token: 'coolify-token' }),
+        'app-1',
+      );
+      expect(mockCloudflare.deleteDnsRecord).toHaveBeenCalledWith('dom1', 'rec1', actor);
+      expect(mockTx.clientSubdomain.deleteMany).toHaveBeenCalledWith({
+        where: { deploymentId: 'dep1' },
+      });
+      expect(mockTx.deployment.delete).toHaveBeenCalledWith({ where: { id: 'dep1' } });
+      expect(out).toEqual({ removed: true, appName: 'mon-app', partial: false });
+    });
+
+    it('B0.1 : échec provider non-absent ⇒ 502 et AUCUNE suppression locale (fail-closed)', async () => {
+      mockPrisma.deployment.findFirst.mockResolvedValue(removeRow());
+      mockTransport.deleteApplication.mockRejectedValue(
+        new Error('HTTP 500 JWT_SECRET=abc123'),
+      );
+
+      await expect(service.remove('dep1', actor)).rejects.toBeInstanceOf(BadGatewayException);
+
+      expect(mockPrisma.$transaction).not.toHaveBeenCalled();
+      expect(mockTx.deployment.delete).not.toHaveBeenCalled();
+      expect(mockTx.clientSubdomain.deleteMany).not.toHaveBeenCalled();
+      expect(mockCloudflare.deleteDnsRecord).not.toHaveBeenCalled();
+      // B0.8 — aucun message d'exception brut dans l'audit.
+      const dump = JSON.stringify(mockAudit.record.mock.calls);
+      expect(dump).toContain('"outcome":"failed"');
+      expect(dump).not.toContain('JWT_SECRET=abc123');
+    });
+
+    it('B0.1 : ressource provider déjà absente (404) confirmée ⇒ suppression locale poursuivie', async () => {
+      mockPrisma.deployment.findFirst.mockResolvedValue(removeRow());
+      mockTransport.deleteApplication.mockRejectedValue(new Error('HTTP 404 not found'));
+
+      const out = await service.remove('dep1', actor);
+
+      expect(out).toEqual({ removed: true, appName: 'mon-app', partial: false });
+      expect(mockTx.deployment.delete).toHaveBeenCalledWith({ where: { id: 'dep1' } });
+      expect(mockCloudflare.deleteDnsRecord).toHaveBeenCalled();
+    });
+
+    it('B0.2 : row ClientSubdomain étrangère ⇒ JAMAIS d’appel DNS, row conservée, app supprimée', async () => {
+      mockPrisma.deployment.findFirst.mockResolvedValue(
+        removeRow({
+          clientSubdomain: {
+            id: 'csX',
+            subdomain: 'autrui',
+            domainId: 'dom1',
+            fqdn: 'autrui.example.com',
+            recordId: 'rec1',
+            deploymentId: 'autre-app',
+            domain: { id: 'dom1', name: 'example.com', zoneId: 'zone1' },
+          },
+        }),
+      );
+
+      const out = await service.remove('dep1', actor);
+
+      expect(mockCloudflare.deleteDnsRecord).not.toHaveBeenCalled();
+      expect(mockTx.clientSubdomain.deleteMany).not.toHaveBeenCalled();
+      expect(mockTx.deployment.delete).toHaveBeenCalledWith({ where: { id: 'dep1' } });
+      expect(out).toEqual({ removed: true, appName: 'mon-app', partial: false });
+    });
+
+    it('B0.2 : échec DNS non-absent ⇒ row CS conservée + partial=true, app supprimée', async () => {
+      mockPrisma.deployment.findFirst.mockResolvedValue(removeRow());
+      mockCloudflare.deleteDnsRecord.mockRejectedValue(new Error('HTTP 500 CF_TOKEN=xyz789'));
+
+      const out = await service.remove('dep1', actor);
+
+      expect(out).toEqual({ removed: true, appName: 'mon-app', partial: true });
+      expect(mockTx.clientSubdomain.deleteMany).not.toHaveBeenCalled();
+      expect(mockTx.deployment.delete).toHaveBeenCalledWith({ where: { id: 'dep1' } });
+      expect(JSON.stringify(mockAudit.record.mock.calls)).not.toContain('CF_TOKEN=xyz789');
+    });
+
+    it('B0.2 : record DNS déjà absent (404) confirmé ⇒ row CS supprimée, partial=false', async () => {
+      mockPrisma.deployment.findFirst.mockResolvedValue(removeRow());
+      mockCloudflare.deleteDnsRecord.mockRejectedValue(new Error('record does not exist (404)'));
+
+      const out = await service.remove('dep1', actor);
+
+      expect(out).toEqual({ removed: true, appName: 'mon-app', partial: false });
+      expect(mockTx.clientSubdomain.deleteMany).toHaveBeenCalledWith({
+        where: { deploymentId: 'dep1' },
+      });
+      expect(mockTx.deployment.delete).toHaveBeenCalledWith({ where: { id: 'dep1' } });
     });
   });
 });

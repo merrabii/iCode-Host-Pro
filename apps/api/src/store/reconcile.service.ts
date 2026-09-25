@@ -157,8 +157,8 @@ export class ReconcileService {
           },
         });
         stats.alerts += 1;
-      } catch (e) {
-        this.log.warn(`reconcile: alerte de seuil non journalisée deployment=${candidate.id}: ${String(e)}`);
+      } catch {
+        this.log.warn(`reconcile: alerte de seuil non journalisée deployment=${candidate.id}`);
       }
     }
 
@@ -170,8 +170,8 @@ export class ReconcileService {
     let obs: ProviderDeploymentObservation;
     try {
       obs = await this.evidence.observe(candidate.id);
-    } catch (e) {
-      this.log.warn(`reconcile: observation échouée deployment=${candidate.id}: ${String(e)}`);
+    } catch {
+      this.log.warn(`reconcile: observation échouée deployment=${candidate.id} — état conservé`);
       stats.errors += 1;
       await this.safeReschedule(candidate.id, now, config, attemptsAfter, prevFailures, stats);
       return;
@@ -240,13 +240,13 @@ export class ReconcileService {
                   'Échec de déploiement confirmé (2 vérifications terminales consécutives) — relance requise.',
               },
             });
-          } catch (e) {
-            this.log.warn(`reconcile: historique terminal non journalisé deployment=${candidate.id}: ${String(e)}`);
+          } catch {
+            this.log.warn(`reconcile: historique terminal non journalisé deployment=${candidate.id}`);
           }
         }
       }
-    } catch (e) {
-      this.log.warn(`reconcile: échec terminal non appliqué deployment=${candidate.id}: ${String(e)}`);
+    } catch {
+      this.log.warn(`reconcile: échec terminal non appliqué deployment=${candidate.id} — lease en place`);
       stats.errors += 1;
       // L'échec interne ne fabrique JAMAIS d'état : lease toujours en place → reprise.
     }
@@ -281,22 +281,27 @@ export class ReconcileService {
     try {
       // Activation TOTALE via la couture 17B.3B (jamais de logique dupliquée).
       await this.provisioning.activateOrderAfterProof(candidate.orderId);
-    } catch (e) {
-      this.log.warn(`reconcile: activation échouée deployment=${candidate.id}: ${String(e)}`);
+    } catch {
+      this.log.warn(`reconcile: activation échouée deployment=${candidate.id} — rollback`);
       stats.errors += 1;
       await this.safeReschedule(candidate.id, now, config, attemptsAfter, 0, stats);
       return;
     }
 
-    // Après activation : plus de réconciliation pour ce déploiement. Le garde
-    // status=DEPLOYING rend cette écriture sûre (jamais par-dessus un ACTIVE/FAILED).
+    // Après activation : plus de réconciliation pour ce déploiement. B0.6 — le
+    // garde `status=DEPLOYING` empêchait la libération quand
+    // activateOrderAfterProof basculait déjà la row en ACTIVE (cas nominal) :
+    // reconcileNextAt restait posé et la row ACTIVE devenait un lease fantôme.
+    // On ne touche QU'à l'échéance : `status`, `reconcileAttempts`,
+    // `reconcileTerminalFailures` et surtout `reconcileLastCheckedAt` (preuve
+    // d'observation écrite au claim/scan) sont préservés ; idempotent.
     try {
       await this.prisma.deployment.updateMany({
-        where: { id: candidate.id, status: DeploymentStatus.DEPLOYING },
-        data: { reconcileNextAt: null, reconcileLastCheckedAt: null },
+        where: { id: candidate.id, reconcileNextAt: { not: null } },
+        data: { reconcileNextAt: null },
       });
-    } catch (e) {
-      this.log.warn(`reconcile: libération du lease échouée deployment=${candidate.id}: ${String(e)}`);
+    } catch {
+      this.log.warn(`reconcile: libération du lease non journalisée deployment=${candidate.id}`);
     }
     stats.activated += 1;
   }
@@ -323,8 +328,8 @@ export class ReconcileService {
         },
       });
       stats.rescheduled += 1;
-    } catch (e) {
-      this.log.warn(`reconcile: replanification échouée deployment=${id}: ${String(e)}`);
+    } catch {
+      this.log.warn(`reconcile: replanification non appliquée deployment=${id} — lease en place`);
       stats.errors += 1;
     }
   }

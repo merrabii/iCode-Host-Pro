@@ -132,7 +132,7 @@ export default function ClientProjectPage() {
           setEntry('url');
         }
       }
-      if (deps && !Array.isArray(deps) && deps.quota) setQuota(deps.quota);
+      if (deps && !Array.isArray(deps)) setQuota(deps.quota ?? null);
       // Racines gratuites proposées (choix du domaine du sous-domaine).
       const dms = await listFreeDomains(t);
       if (dms.ok) setFreeDomains((dms.data as { id: string; name: string }[]) ?? []);
@@ -300,7 +300,13 @@ export default function ClientProjectPage() {
   }
 
   const pack = quota?.pack ?? null;
-  const quotaFull = pack?.maxApps != null && quota!.used >= pack.maxApps;
+  // B0.3/B0.4 — les décisions viennent DU serveur (helper pack-scoped unique) :
+  // aucun recalcul local, aucune valeur incertaine.
+  const quotaFull = quota?.quotaFull ?? false;
+  // B0.5 — aucun pack actif (quota null) ⇒ création bloquée côté UI avec message
+  // explicite ; le serveur refuse de toute façon (403) avant toute action externe.
+  const noPack = quota === null;
+  const blockDeploy = noPack || quotaFull;
   const sourceLabel =
     preview?.source === 'codediali.toml'
       ? 'codediali.toml'
@@ -331,6 +337,13 @@ export default function ClientProjectPage() {
           <div className="alert error" style={{ marginBottom: 16 }}>
             Quota d&apos;applications atteint sur le plan {pack?.name}. Supprimez une application
             ou passez à un plan supérieur pour en créer une nouvelle.
+          </div>
+        )}
+
+        {noPack && (
+          <div className="alert error" style={{ marginBottom: 16 }}>
+            Aucun pack d&apos;hébergement actif : la création de projet est désactivée.
+            Contactez l&apos;équipe support pour activer un plan.
           </div>
         )}
 
@@ -560,12 +573,12 @@ export default function ClientProjectPage() {
                 <div className="row" style={{ justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
                   <span className="muted" style={{ fontSize: 12.5 }}>
                     {quota
-                      ? `${quota.used} app(s) utilisée(s)${pack?.maxApps ? ` / ${pack.maxApps}` : ''} sur le plan ${pack?.name}.`
-                      : 'Serveur et infrastructure pilotés par la plateforme.'}
+                      ? `${quota.used} app(s) utilisée(s)${quota.limit ? ` / ${quota.limit}` : ''} sur le plan ${pack?.name}.`
+                      : "Aucun pack d'hébergement actif — contactez le support pour activer un plan."}
                   </span>
                   <Button
                     onClick={deploy}
-                    disabled={isImp || deploying || quotaFull}
+                    disabled={isImp || deploying || blockDeploy}
                   >
                     <IconPlus /> {deploying ? 'Déploiement…' : 'Déployer'}
                   </Button>

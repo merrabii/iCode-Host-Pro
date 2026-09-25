@@ -29,6 +29,10 @@ describe('Client workspace (e2e)', () => {
   let productId = '';
   let subId = '';
   let subBId = '';
+  // Fixtures suivies par ID EXACT — teardown déterministe (jamais de filtre
+  // large). La ligne Deployment du test B0.7 et son pack sont tracés ici.
+  const trackedDeploymentIds: string[] = [];
+  const trackedPackIds: string[] = [];
 
   beforeAll(async () => {
     const moduleRef = await Test.createTestingModule({ imports: [AppModule] }).compile();
@@ -101,7 +105,17 @@ describe('Client workspace (e2e)', () => {
   }
 
   afterAll(async () => {
-    // Deleting users cascades subscriptions; product remains free (Restrict).
+    // Teardown déterministe : fixtures suivies par id exact (fonctionne même
+    // si un test a échoué), puis cascade des comptes de la suite.
+    if (trackedDeploymentIds.length) {
+      await prisma.deployment
+        .deleteMany({ where: { id: { in: trackedDeploymentIds } } })
+        .catch(() => {});
+    }
+    if (trackedPackIds.length) {
+      await prisma.hostingPack.deleteMany({ where: { id: { in: trackedPackIds } } }).catch(() => {});
+    }
+    await prisma.product.updateMany({ where: { id: productId }, data: { packId: null } }).catch(() => {});
     await prisma.user
       .deleteMany({ where: { email: { in: [userA, userB, adminEmail] } } })
       .catch(() => {});
@@ -151,6 +165,51 @@ describe('Client workspace (e2e)', () => {
     expect(mine.product).toMatchObject({ id: productId });
     expect(mine).not.toHaveProperty('server');
     expect(mine).not.toHaveProperty('serverId');
+  });
+
+  // B0.7 — tant qu'une application est encore rattachée à la souscription
+  // (pack du produit lié / commande liée), l'annulation est refusée : aucune
+  // écriture, aucun audit, statut inchangé.
+  it('B0.7: cancel refused (409) while an application is still linked — no write, no audit', async () => {
+    const aUserId = await aMeUserId(aToken);
+    const beforeAudits = await prisma.auditLog.count({
+      where: { actorId: aUserId, action: 'subscription.cancel' },
+    });
+
+    const pack = await prisma.hostingPack.create({
+      data: { name: `b07pack_${stamp}`, ramMb: 512, cpuCores: 1, maxApps: 5 },
+    });
+    trackedPackIds.push(pack.id);
+    await prisma.product.update({ where: { id: productId }, data: { packId: pack.id } });
+    const dep = await prisma.deployment.create({
+      data: {
+        userId: aUserId,
+        packId: pack.id,
+        repoFullName: 'b07/linked-app',
+        appName: `b07-${stamp}`,
+      },
+    });
+    trackedDeploymentIds.push(dep.id);
+
+    try {
+      const res = await request(app.getHttpServer())
+        .patch(`/${GlobalPrefix}/client/subscriptions/${subId}/cancel`)
+        .set('Authorization', `Bearer ${aToken}`)
+        .expect(409);
+      expect(String(res.body.message)).toContain('application');
+
+      const still = await prisma.subscription.findUnique({ where: { id: subId } });
+      expect(still?.status).toBe('ACTIVE');
+      const afterAudits = await prisma.auditLog.count({
+        where: { actorId: aUserId, action: 'subscription.cancel' },
+      });
+      expect(afterAudits).toBe(beforeAudits);
+      expect(await prisma.deployment.findUnique({ where: { id: dep.id } })).toBeTruthy();
+    } finally {
+      await prisma.deployment.delete({ where: { id: dep.id } }).catch(() => {});
+      await prisma.product.update({ where: { id: productId }, data: { packId: null } });
+      await prisma.hostingPack.delete({ where: { id: pack.id } }).catch(() => {});
+    }
   });
 
   it('ADMIN lists all subscriptions (rapport Bloc 5) incl. product + pack + order', async () => {
