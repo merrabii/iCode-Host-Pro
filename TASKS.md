@@ -1134,3 +1134,82 @@ Le moteur Phase 4 (ADR-040 : choix de la racine + gel `effectiveDomainId` avant 
 - **Lint (préexistant, séparé)** : script `lint` présent mais **ESLint et sa configuration absents de ce checkout** (monorepo pnpm, aucun `eslint@` au lockfile) ; aucune installation/modification de dépendance faite ici — installation et intégration à suivre séparément.
 - **Flakiness loopback (préexistant, séparé)** : `servers/panel-transport.factory.spec.ts` — première passe complète 492/495 (3 échecs réseau), isolé 35/35, re-passe complète 495/495, fichier non modifié, non corrigé — à stabiliser ultérieurement.
 - Aucune autre action en attente pour cette tâche (implémentation + validations terminées) ; toute prochaine étape fonctionnelle sera décidée séparément par le propriétaire.
+
+--------------------------------------------------------------------
+## 2026-09-26 — 17B.4F-C1 : moteur de réservation transactionnel (hosting) — IMPLEMENTED + VALIDATED (non commité, non poussé)
+
+### Contexte
+Suite de 17B.4F-B1 (fondation `HostingService` / `HostingServiceAllocation`, commit `a96684f`, poussé). Cette étape livre le **moteur LOCAL de réservation** : verrou `SELECT … FOR UPDATE`, quota par service, empreinte HMAC versionnée, primitives d'état C1 — **aucun appel réseau, aucun endpoint, aucun branchement live**, exécuté **uniquement sur une base de test isolée**.
+
+### Périmètre livré (C1 seulement)
+- [x] `reserveSlot` (1 transaction) : verrou de ligne sur `HostingService` avec `id` + `userId` (0 ligne → 404, jamais 403) ; rejeu idempotent par clé dérivée **serveur** `direct:v1:<user>:<service>:<uuid v4>` + vérification d'empreinte → MÊME allocation, **jamais de 2ᵉ ligne**, aucun re-comptage au rejeu, `RELEASED` terminal même au rejeu, rejeu possible sur service entre-temps suspendu ; création = `ACTIVE` **seul** + quota (`maxAppsSnapshot null` = illimité, `0` = refus) → `RESERVED`.
+- [x] Empreinte `fp:v1:<hex>` : canonical déterministe (clés triées récursivement) + **HMAC-SHA256 versionné** (jamais de SHA-256 brut), keyring `HOSTING_FP_KEYS` (JSON versionné) / `HOSTING_FP_ACTIVE` avec fallback dérivé `ENCRYPTION_KEY` (même contrat que `CryptoService`), comparaison `timingSafeEqual`, **version/clé inconnue → refus explicite sans aucun repli**, configuration absente → refus **à l'appel** (503) sans casser le démarrage de l'API.
+- [x] Primitives locales (chacune sous verrou d'allocation ; ordre `HostingService → HostingServiceAllocation → Deployment`) : `markProviderIntent` (marqueur **irréversible**, jamais sur `RELEASED`, résultat explicite), `releasePreProvider` (exige `RESERVED` + intention NULL + `deploymentId` NULL), `markBound` (preuve `providerProven` exigée — 412, idempotent sur le même déploiement, ownership service **et** déploiement, `RELEASING → BOUND` **interdit**), `startReleasing` (`RESERVED|BOUND → RELEASING`, idempotent), `completeRelease` (preuve `providerCleanupProven` + `deploymentId` NULL → `RELEASED`).
+- [x] `HostingModule` créé mais **NON branché** dans `AppModule` (aucun parcours live ne traverse le moteur).
+- [x] Hors périmètre explicite (C2–C4) : lease / `claimUntil` / `claimSeq`, découverte d'identité provider, reprise de création, branchement des parcours.
+
+### Fichiers créés
+- `apps/api/src/hosting/hosting-fingerprint.ts` (canonique + HMAC keyring + clé directe), `hosting-fingerprint.spec.ts` (11 tests), `hosting.module.ts`.
+- `apps/api/prisma/migrations/20260926000000_add_allocation_fingerprint/migration.sql` (2 `ALTER TABLE … ADD COLUMN` NULL).
+- `apps/api/test/hosting-allocation-reservation.e2e-spec.ts` (19 tests, **2 passages de matrice concurrente**), `apps/api/test/hosting-reservation.fixture.ts`.
+
+### Fichiers modifiés
+- `apps/api/src/hosting/hosting-services.service.ts` (`reserve`/`bind` naïfs → moteur C1 transactionnel + 5 primitives), `hosting-services.service.spec.ts` (appels adaptés + **13 tests C1**), `apps/api/prisma/schema.prisma` (+ `requestFingerprint`, `providerIntentAt`), `apps/api/test/hosting-service-foundation.e2e-spec.ts` (appels C1 ; services mis en `ACTIVE` avant réservation, invariants B1 conservés).
+
+### Base de données
+- [x] Base de test **isolée** `icode_host_pro_c1_test` créée dans `icode-postgres` : **46/46 migrations** appliquées, `prisma migrate status` = à jour, **drift `prisma migrate diff` = « No difference detected »**.
+- [x] **`icode_host_pro` (live) NON modifiée** : 0 `HostingService`, 0 allocation, 15 déploiements legacy intacts, colonnes de `HostingServiceAllocation` toujours au nombre de 10 (sans les 2 nouvelles) → `migrate status` live = **1 migration en attente** (`20260926000000_add_allocation_fingerprint`), à appliquer lors d'un déploiement validé.
+
+### Tests/validation (tous PASS)
+- [x] Unit API : **856/856 PASS (51 suites)**.
+- [x] e2e fondation B1 (base de test) : **23/23 PASS**.
+- [x] e2e C1 (base de test, concurrence réelle, 2 passages de matrice) : **19/19 PASS**.
+- [x] `prisma generate` + `prisma validate` OK ; `tsc --noEmit` OK ; `nest build` OK.
+- [x] Runtime : API `GET /api/health` → **200** (`database=ok`) après redémarrage ; Web `GET /` → **200**.
+- [x] Lint : ESLint toujours absent du checkout (dette préexistante, inchangée).
+
+### Garde-fous respectés
+- [x] **Aucun commit, aucune poussée** : HEAD = origin/main = `a96684f`, divergence `0/0`, working tree sale = ce lot uniquement.
+- [x] Aucun appel provider/DNS/GitHub, aucun endpoint ni frontend, `app.module.ts` inchangé, `.env` inchangé (clés de test **synthétiques** uniquement, aucun secret réel), aucune ligne live créée ni modifiée.
+- [x] Tests B1 : fixtures propres nettoyées, `srv_metrics_*` et `AuditLog` non touchés.
+
+### Suivis
+- Revue du diff par le propriétaire, puis décision sur le commit.
+- L'API locale a été arrêtée le temps de `prisma generate` (EPERM sur le query engine détenu par le process en cours), puis redémarrée (`pnpm run start`, health 200).
+
+--------------------------------------------------------------------
+## 2026-09-26 — 17B.4F-C1 : REVUE ET COMPLÉMENT DE VALIDATION (concurrence déterministe) — REVUE FAITE + CORRIGÉE (non commité, non poussé)
+
+### État réel vérifié (avant travaux)
+- [x] HEAD = origin/main = `a96684f`, divergence `0/0`, stash vide, index vide, **11 chemins exacts** (5 modifiés + 6 nouveaux), `git diff --check` = **0**, aucune ligne hors lot.
+- [x] **Migrations B1 inchangées** : `git diff --stat -- apps/api/prisma/migrations/` vide (hash connu `20260925150000` = `2BB65E2B…` inchangé) ; seule la migration C1 `20260926000000_add_allocation_fingerprint` est neuve.
+- [x] **Live `icode_host_pro` non modifiée** : 0 `HostingService`, 0 allocation, 15 déploiements, `HostingServiceAllocation` = **10 colonnes**, `migrate status` = **1 migration en attente** (C1), runner reconcile **désactivé** (`ReconcileSetting.enabled = NULL` → défaut `false` dans `reconcile-settings.ts:32`, pas de `RECONCILE_ENABLED` dans `.env`).
+- [x] Grep de sécurité : **aucun** `console.*`/`Logger`/`JSON.stringify` de payload dans `src/hosting` ; **aucun** appelant `.reserve(`/`.bind(` hors specs ; **aucun** branchement live (le seul mot « branchement » est un commentaire de doc) ; HostingModule toujours non branché dans `AppModule`.
+
+### Constats de revue et corrections (strictement dans le périmètre C1)
+- [x] **Écart de verrouillage corrigé** : `lockAllocation` ne verrouillait que l'allocation (`FOR UPDATE OF a`), jamais `HostingService` → réécrite en **2 instructions déterministes** : ① `SELECT s."userId" FROM "HostingService" … WHERE s."id" = (sous-requête allocation) FOR UPDATE` (ownership vérifié **sous** le verrou service) puis ② `SELECT a.* … FOR UPDATE OF a`.
+- [x] `markBound` : ajout d'un verrou ③ `SELECT d."userId" FROM "Deployment" … FOR UPDATE` (remplace `findUnique` sans verrou), ownership dérivé de `allocation.ownerUserId` ; `tx.hostingService.findUnique` redondant retiré.
+- [x] Specs adaptés : helper `lockMocks()` (dispatch SQL par instruction), tests 7(e)/14/20 convertis, **+2 tests unitaires** : **C1.14** (ordre de verrous `HostingService → HostingServiceAllocation → Deployment`, 3 SQL `FOR UPDATE` observés) et **C1.15** (idempotence `RELEASING` même déploiement : aucune transition `BOUND`, aucune écriture).
+- [x] **Points de revue consignés (non modifiés, comportement voulu)** : rejeu avant quota (lookup clé existante antérieur aux contrôles statut/quota) ; ownership `reserveSlot` (`id`+`userId` → 404) ; `RELEASED` terminal / `RELEASING → BOUND` interdit (gardes `markBound`) ; empreinte couvre `business` + `environment` ; version **stockée** utilisée à la vérification (`fp:<v>:`) ; keyring fourni invalide → `FingerprintConfigError` sans repli (fallback `sha256(ENCRYPTION_KEY)` = **dérivation de clé HMAC uniquement**, jamais d'empreinte SHA-256 brute) ; aucune fuite de payload/clé/env.
+
+### Complément de validation concurrent (base de test, PostgreSQL réel) — 50+ appels
+- [x] **A. 50 appels identiques simultanés** → 1 allocation unique, **50/50 succès** la référençant, 0 erreur technique.
+- [x] **B. 50 clés distinctes simultanées (quota 5)** → **5 créations, 45 refus `ForbiddenException` (« Quota de slots atteint »), 0 erreur technique**.
+- [x] **C. Quota exactement plein** → rejeu identique renvoyé (succès), nouvelle clé refusée, aucun re-comptage.
+- [x] **D1/D2. Course intention/compensation DÉTERMINISTE** (teneur `FOR UPDATE` confirmé → contendants lancés un par un et confirmés en attente via `pg_stat_activity` (`wait_event_type='Lock'`) → relâche ; file FIFO PostgreSQL) : D1 intention d'abord → `{applied:true}` puis `{released:false, reason:'intent_present'}` ; D2 compensation d'abord → `{released:true}` puis `{applied:false, reason:'terminal'}`. Aucun état incohérent dans les deux ordres.
+- [x] e2e C1 complet relancé : **24/24 PASS** (19 d'origine + A + B + C + D1 + D2 ; 2 passages de matrice 8× conservés).
+
+### Validations finales (tous PASS)
+- [x] Unit API complet : **858/858 PASS (51 suites)** (+2 C1.14/C1.15).
+- [x] e2e fondation B1 (base de test) : **23/23 PASS**.
+- [x] `tsc --noEmit` = 0 ; `nest build` = 0 ; `prisma validate` = 0.
+- [x] Runtime sur code final : API **redémarrée**, `GET /api/health` → **200** ; Web `GET http://localhost:3000/` → **200**.
+- [x] Bases : test `icode_host_pro_c1_test` = 46/46, nettoyée (0/0) ; live inchangée (0/0/15, 10 colonnes, 1 migration C1 en attente, runner désactivé).
+- [x] Lint : ESLint toujours absent (dette préexistante inchangée).
+
+### Garde-fous respectés
+- [x] **Aucun commit, aucune poussée, aucune migration live, aucun appel provider** ; 11 chemins inchangés en nombre (script de debug `dbg-race.js` créé puis **supprimé**) ; fixtures/`AuditLog`/`srv_metrics_*` non touchés ; `.env` inchangé.
+- [x] Aucun code hors C1 modifié : seuls `hosting-services.service.ts`, `hosting-services.service.spec.ts` et `hosting-allocation-reservation.e2e-spec.ts` ont bougé depuis la première saisie de C1.
+
+### Suivis
+- Revue du propriétaire sur ce lot complet (11 chemins), puis décision sur le commit de C1 (+ éventuellement la revue et le complément ci-dessus).

@@ -936,6 +936,18 @@ model HostingServiceAllocation {
   reservedAt     DateTime @default(now())
   boundAt        DateTime?
   releasedAt     DateTime?
+
+  // ── 17B.4F-C1 (additif) ───────────────────────────────────────────────────
+  // Empreinte HMAC versionnée du payload EXACT de réservation
+  // (`fp:v1:<hex>`, cf. hosting-fingerprint.ts) : un rejeu avec la même clé
+  // mais un payload différent est REFUSÉ. Jamais journalisée.
+  requestFingerprint String?
+  // Marqueur local IRRÉVOCABLE : « l'intention d'appel provider a été
+  // committée avant toute écriture réseau » — écriture atomique, jamais
+  // effacée, jamais posée sur RELEASED. Ne prouve NI un résultat provider NI
+  // une reprise distante (contrats C2–C4).
+  providerIntentAt   DateTime?
+
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
 

@@ -5,15 +5,22 @@ import { AppModule } from './../src/app.module';
 import { PrismaService } from './../src/prisma/prisma.service';
 import { GlobalPrefix } from './../src/config/constants';
 import { HostingServicesService } from './../src/hosting/hosting-services.service';
+import {
+  installFingerprintEnv,
+  newClientRequestId,
+  removeFingerprintEnv,
+  samplePayload,
+} from './hosting-reservation.fixture';
 
 /**
- * 17B.4F-B1 — fondation HostingService / HostingServiceAllocation sur Prisma RÉEL.
+ * 17B.4F-B1+C1 — fondation HostingService / HostingServiceAllocation sur Prisma
+ * RÉEL (moteur de réservation C1 : verrou FOR UPDATE, empreinte, quota).
  *
  * Fixtures isolées (suffixe horodaté) et intégralement nettoyées. Aucun appel
- * Coolify / Cloudflare / Hestia : uniquement des lectures/écritures Prisma locale.
- * La suite prouve aussi le caractère STRICTEMENT ADDITIF de la migration :
- * 0 HostingService créé, 0 allocation créée, toutes les lignes legacy à
- * hostingServiceId = NULL.
+ * Coolify / Cloudflare / Hestia : uniquement des lectures/écritures Prisma
+ * locale. La suite prouve aussi le caractère STRICTEMENT ADDITIF de la
+ * migration : 0 HostingService créé, 0 allocation créée, toutes les lignes
+ * legacy à hostingServiceId = NULL.
  */
 const MIGRATION_NAME = '20260925150000_add_hosting_service_foundation';
 
@@ -64,6 +71,7 @@ describe('HostingService foundation (e2e)', () => {
   }
 
   beforeAll(async () => {
+    installFingerprintEnv();
     const moduleRef = await Test.createTestingModule({ imports: [AppModule] }).compile();
     app = moduleRef.createNestApplication();
     app.setGlobalPrefix(GlobalPrefix);
@@ -160,6 +168,7 @@ describe('HostingService foundation (e2e)', () => {
   afterAll(async () => {
     await cleanup();
     await app.close();
+    removeFingerprintEnv();
   });
 
   it('1. migration applicable : aucune ligne live créée, legacy tout à NULL', async () => {
@@ -247,46 +256,64 @@ describe('HostingService foundation (e2e)', () => {
     ).rejects.toMatchObject({ code: 'P2002' });
   });
 
-  it('6. la clé d’idempotence de réservation est unique', async () => {
-    const key = `${marker}-res`;
-    const allocation = await hosting.reserve({
+  it('6. clé de réservation dérivée SERVEUR unique + rejeu idempotent (C1)', async () => {
+    // le moteur C1 n'accepte que les services ACTIVE : activation explicite
+    await prisma.hostingService.update({
+      where: { id: ids.service1 },
+      data: { status: HostingServiceStatus.ACTIVE },
+    });
+    const args = {
       hostingServiceId: ids.service1,
       actorUserId: ids.user1,
-      idempotencyKey: key,
-    });
-    ids.allocation1 = allocation.id;
-    expect(allocation.status).toBe(HostingServiceAllocationStatus.RESERVED);
+      clientRequestId: newClientRequestId(),
+      payload: samplePayload(),
+    };
 
-    // retry avec la même clé → 409 métier, jamais une 2e ligne
-    await expect(
-      hosting.reserve({ hostingServiceId: ids.service1, actorUserId: ids.user1, idempotencyKey: key }),
-    ).rejects.toBeInstanceOf(ConflictException);
+    const first = await hosting.reserveSlot(args);
+    ids.allocation1 = first.allocation.id;
+    expect(first.replayed).toBe(false);
+    expect(first.allocation.status).toBe(HostingServiceAllocationStatus.RESERVED);
+    expect(first.allocation.idempotencyKey).toMatch(/^direct:v1:/);
+    expect(first.allocation.requestFingerprint).toMatch(/^fp:v1:[0-9a-f]{64}$/);
+
+    // rejeu identique (même clé + même payload) → MÊME allocation, jamais 2e ligne
+    const replay = await hosting.reserveSlot(args);
+    expect(replay.replayed).toBe(true);
+    expect(replay.allocation.id).toBe(first.allocation.id);
+    expect(
+      await prisma.hostingServiceAllocation.count({ where: { hostingServiceId: ids.service1 } }),
+    ).toBe(1);
+
+    // l'unicité de la clé reste garantie en base (P2002), clé dérivée comprise
     await expect(
       prisma.hostingServiceAllocation.create({
-        data: { hostingServiceId: ids.service1, idempotencyKey: key },
+        data: { hostingServiceId: ids.service1, idempotencyKey: first.allocation.idempotencyKey },
       }),
     ).rejects.toMatchObject({ code: 'P2002' });
   });
 
   it('7. un Deployment ne peut être lié qu’à une seule allocation (P2002)', async () => {
-    const bound = await hosting.bind({
+    const bound = await hosting.markBound({
       allocationId: ids.allocation1,
       actorUserId: ids.user1,
       deploymentId: ids.deployment,
+      proof: { providerProven: true },
     });
     expect(bound.status).toBe(HostingServiceAllocationStatus.BOUND);
     expect(bound.deploymentId).toBe(ids.deployment);
     expect(bound.boundAt).not.toBeNull();
 
-    const other = await hosting.reserve({
+    const second = await hosting.reserveSlot({
       hostingServiceId: ids.service1,
       actorUserId: ids.user1,
-      idempotencyKey: `${marker}-res-2`,
+      clientRequestId: newClientRequestId(),
+      payload: samplePayload(),
     });
-    ids.allocation2 = other.id;
+    ids.allocation2 = second.allocation.id;
+    expect(second.replayed).toBe(false);
     await expect(
       prisma.hostingServiceAllocation.update({
-        where: { id: other.id },
+        where: { id: second.allocation.id },
         data: { deploymentId: ids.deployment },
       }),
     ).rejects.toMatchObject({ code: 'P2002' });
@@ -376,10 +403,11 @@ describe('HostingService foundation (e2e)', () => {
       data: { status: HostingServiceStatus.CANCELLED },
     });
     await expect(
-      hosting.reserve({
+      hosting.reserveSlot({
         hostingServiceId: ids.service2,
         actorUserId: ids.user1,
-        idempotencyKey: `${marker}-cancelled`,
+        clientRequestId: newClientRequestId(),
+        payload: samplePayload(),
       }),
     ).rejects.toThrow();
     expect(await prisma.hostingServiceAllocation.count({ where: { hostingServiceId: ids.service2 } })).toBe(0);
@@ -416,17 +444,22 @@ describe('HostingService foundation (e2e)', () => {
   it('15. supprimer un service portant une allocation est refusé (FK RESTRICT)', async () => {
     const service4 = await hosting.create(ids.user1, { packId: ids.pack, snapshots: snap });
     ids.service4 = service4.id;
-    const allocation = await hosting.reserve({
+    await prisma.hostingService.update({
+      where: { id: service4.id },
+      data: { status: HostingServiceStatus.ACTIVE },
+    });
+    const allocation = await hosting.reserveSlot({
       hostingServiceId: service4.id,
       actorUserId: ids.user1,
-      idempotencyKey: `${marker}-restricted-alloc`,
+      clientRequestId: newClientRequestId(),
+      payload: samplePayload(),
     });
-    ids.allocationRestricted = allocation.id;
+    ids.allocationRestricted = allocation.allocation.id;
 
     await expect(prisma.hostingService.delete({ where: { id: service4.id } })).rejects.toMatchObject({ code: 'P2003' });
     expect(await prisma.hostingService.findUnique({ where: { id: service4.id } })).not.toBeNull();
     expect(
-      (await prisma.hostingServiceAllocation.findUniqueOrThrow({ where: { id: allocation.id } })).hostingServiceId,
+      (await prisma.hostingServiceAllocation.findUniqueOrThrow({ where: { id: allocation.allocation.id } })).hostingServiceId,
     ).toBe(service4.id);
   });
 
