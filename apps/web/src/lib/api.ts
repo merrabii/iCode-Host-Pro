@@ -1661,8 +1661,31 @@ export const createDeployment = (
     publishDirectory?: string;
     functionsDirectory?: string;
     environment?: Record<string, string>;
+    /** 17B.4F-C2 — identité d'intention (UUID v4) : envoyée TEL QUEL par le
+     *  frontend sur le parcours hébergement, conservée sur retry/timeout/
+     *  double-clic, régénérée seulement si le payload change. Garde serveur
+     *  OFF ⇒ ignorée (contrat historique inchangé). */
+    clientRequestId?: string;
+    /** 17B.4F-C2 — service hébergement sélectionné (cuid) ; le serveur revérifie
+     *  ownership/statut/compatibilité — jamais une autorité côté client. */
+    hostingServiceId?: string;
   },
 ) => apiJson('/api/client/deployments', t, { method: 'POST', body: JSON.stringify(dto) });
+
+/** 17B.4F-C2 — option du sélecteur de service hébergement (jeton seul). */
+export interface HostingServiceOption {
+  id: string;
+  status: string;
+  packNameSnapshot: string | null;
+  maxAppsSnapshot: number | null;
+  /** true = ACTIF + pack/module identiques à la cible courante. */
+  compatible: boolean;
+}
+/** Services hébergement sélectionnables. Garde OFF ⇒ { enabled:false, services:[] }. */
+export const listHostingServices = (t: string) =>
+  apiJson('/api/client/hosting-services', t) as Promise<
+    ApiResult<{ enabled: boolean; services: HostingServiceOption[] }>
+  >;
 
 /** Racines gratuites proposées au client pour un sous-domaine (choix affiché). */
 export const listFreeDomains = (t: string) => apiJson('/api/client/domains', t);

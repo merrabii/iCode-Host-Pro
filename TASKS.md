@@ -1213,3 +1213,80 @@ Suite de 17B.4F-B1 (fondation `HostingService` / `HostingServiceAllocation`, com
 
 ### Suivis
 - Revue du propriétaire sur ce lot complet (11 chemins), puis décision sur le commit de C1 (+ éventuellement la revue et le complément ci-dessus).
+
+--------------------------------------------------------------------
+## 2026-09-26 — 17B.4F-C2 : branchement du moteur C1 sur `POST /api/client/deployments` (garde OFF) — IMPLEMENTED + VALIDATED (non commité, non poussé)
+
+### Contexte
+Suite de 17B.4F-C1 (moteur de réservation transactionnel, revue faite, non committé). Cette étape **branche** le moteur sur le parcours de création de déploiement, derrière la garde **`HOSTING_C2_ENABLED` OFF par défaut** (activation = valeur explicite `'true'` lue **à chaque appel**, jamais en import de module), **sans aucun appel provider réel** (intention simulée), sur **base de test isolée uniquement**. Revue du propriétaire demandée avant tout commit.
+
+### Périmètre livré (C2 seulement)
+- [x] Garde : `apps/api/src/hosting/c2-flag.ts` (`HOSTING_C2_ENABLED_ENV`, `HOSTING_C2_ENABLED_VALUE='true'`, `isHostingC2Enabled()`) ; première instruction de `create()` ; OFF → **contrat historique strict** (POST sans `clientRequestId` OK, zéro accès moteur/C1, `GET /api/client/hosting-services` → `{enabled:false,services:[]}` sans requête BDD).
+- [x] DTO : `clientRequestId?` (string =64, chaîne seule, jamais castée en UUID) et `hostingServiceId?` sur `CreateDeploymentDto`.
+- [x] Orchestration `create()` (ON) : résolution pack (`resolvePackTarget` + **1 abonnement** pris dans la cible) → **classification du service demandé** (0 ligne `HostingService` tous statuts = legacy prouvé ; étranger → 404 ; suspendu/incompatible/non rattaché → **409, jamais de repli**) → `reserveSlot` → **rejeu par empreinte** retourné **avant** B0 → B0 seulement opération **nouvelle** (compensation `trigger:'quota'` sur échec) → `provision()`.
+- [x] Empreinte = **intention reçue brute** (`branch` absente = `null` ≠ `"main"`) ; intention provider simulée **avant** `createProject` et `createGitApp` ; `markBound(uuid = preuve locale)` juste après `createGitApp`.
+- [x] Compensation pré-provider conservée : `deleteMany {status:PENDING, coolifyUuid:null}` **puis** `releasePreProvider` (si suppression échoue → row `FAILED` + slot conservé) ; échec **post-intention** → jamais de release, row `FAILED` + 502.
+- [x] Audits : `deploy.c2.rollback` (compensations), `deploy.create` / `deploy.failed` + marqueur `c2` (`{hostingServiceId, allocationId, clientRequestId}` | `'legacy_no_service'` | absent si OFF).
+- [x] Endpoint `GET /api/client/hosting-services` (controller) : `enabled` = garde, `services` = compatibles du jeton (vide si OFF, sans BDD) ; module `HostingModule` référencé par `DeploymentsModule`.
+- [x] Frontend : `listHostingServices` + champ enrichi dans `api.ts` ; helper partagé `apps/web/src/lib/intent.ts` (`newIntentUuid`, `intentFor`) ; `client/page.tsx` (`deploy`, `deployUrl`) et `client/project/page.tsx` (`deploy`) : **UUID v4 stable par payload** (regénéré si payload modifié, remis à zéro après succès, **conservé** sur échec/409), **garde anti-double-clic** (`depBusy`/`deploying`), sélecteur de service (auto si 1 compatible, `Select` si >1, aucun id si 0 → le serveur décide), boutons désactivés pendant l'envoi/choix manquant.
+
+### Fichiers créés
+- `apps/api/src/hosting/c2-flag.ts` + `c2-flag.spec.ts` (14 tests), `apps/api/test/deployments-c2.e2e-spec.ts` (19 tests), `apps/web/src/lib/intent.ts`.
+
+### Fichiers modifiés
+- API : `deployments.service.ts` (orchestration + `provision()` + helpers classification/compensation/replay/listHostingServices + 8e dep `HostingServicesService`), `deployments.service.spec.ts` (110 tests, mock 8e arg), `dto/create-deployment.dto.ts`, `deployments.controller.ts`, `deployments.module.ts`, `hosting.module.ts` (doc).
+- Web : `lib/api.ts` (dto + `HostingServiceOption` + `listHostingServices`), `app/client/page.tsx`, `app/client/project/page.tsx`.
+
+### Base de données
+- [x] Tests exécutés sur la base **isolée** `icode_host_pro_c1_test` (tables complètes vérifiées) ; **aucune migration créée ni appliquée**, `schema.prisma` inchangé, aucun `prisma generate`.
+
+### Tests/validation (tous PASS)
+- [x] Unit API complet : **896/896 PASS (52 suites)** (dont `c2-flag` 14/14, `deployments.service` 110/110).
+- [x] e2e C2 (base de test) : **19/19 PASS × 2 passages consécutifs** (inertie OFF, contrat OFF, UUID absent/non-UUID 400, étranger 404, suspendu/incompatible/non rattaché 409, legacy `c2:'legacy_no_service'`, heureux BOUND + fingerprint + audit c2, rejeu identique sans appel provider, rejeu payload différent 409, `branch` absente ≠ `"main"`, double POST concurrent 1/1/1, refus GitHub → 400 + rollback `pre_intent`, échec provider → 502 + slot conservé + retry 409, B0 plein 5/5 → rejeu OK + nouvelle clé 403 sans slot).
+- [x] Non-régression e2e : `deployments` + `hosting-service-foundation` + `hosting-allocation-reservation` = **71/71 PASS** ; spec C1 conserve ses **2 passages de matrice**.
+- [x] `tsc --noEmit` API = 0 ; `tsc --noEmit` Web = 0 ; `next build` Web = 0.
+- [x] Runtime : API `GET /api/health` → **200** (`database=ok`) ; Web `GET /` → **200**.
+- [x] Un échec isolé observé **1 fois** dans un run complet (`panel-transport.factory.spec`, contamination de run parallèle) : **isolé 35/35, rerun complet vert**.
+
+### Garde-fous respectés
+- [x] **Aucun commit, aucune poussée** : HEAD = origin/main = `4a54fcd6e048…`, divergence `0/0`, `git diff --check` = **0**, **13 chemins** (9 modifiés + 4 nouveaux) = ce lot uniquement, migrations intouchées.
+- [x] **Live `icode_host_pro` non modifiée** : `HostingService` 0, allocations 0, déploiements 15, `_prisma_migrations` 45/46 dossiers → **1 migration en attente** (C1, non appliquée), runner reconcile **désactivé**.
+- [x] Aucun `.env` modifié (aucune valeur `HOSTING_C2_ENABLED` posée), garde OFF vérifiée par test, **0 appel provider/DNS/GitHub réel**, aucun branchement Store, aucun cleanup C4, `Deployment.hostingServiceId` non renseigné (lien = `allocation.deploymentId`).
+
+### Suivis
+- Revue du propriétaire sur ce lot (13 chemins), puis décision de commit.
+- Limites assumées : multi-abonnement non géré (1 abonnement par cible), sélection détaillée rattachée en phase **D**, C3 (intention réelle provider) et C4 (release/cleanup) toujours à venir.
+
+--------------------------------------------------------------------
+## 2026-09-26 — 17B.4F-C2 : REVUE FINALE AVANT COMMIT — REVUE FAITE + TESTS AJOUTÉS (non commité, non poussé)
+
+### Périmètre vérifié (14 chemins, diff/contenu lus intégralement)
+- Modifiés : `TASKS.md` (2 sections C2 ajoutées, 0 ligne supprimée), `deployments.controller.ts` (+9), `deployments.module.ts` (+5/-1), `deployments.service.spec.ts` (+563/-2), `deployments.service.ts` (+596/-87), `create-deployment.dto.ts` (+21), `hosting.module.ts` (+5/-4), `client/page.tsx` (+96/-20), `client/project/page.tsx` (+63/-11), `lib/api.ts` (+23) ; créés : `c2-flag.ts` (28 l.), `c2-flag.spec.ts` (47 l.), `deployments-c2.e2e-spec.ts` (729 l.), `lib/intent.ts` (37 l.).
+- [x] **Migrations, `.env`, `package.json` et lockfiles inchangés** (`git diff` vide sur `prisma/` + manifests ; aucun `.env` dans le statut ; `HOSTING_C2_ENABLED` absent de TOUS les `.env` runtime → garde OFF). `git diff --check` = 0 ; HEAD = origin/main = `4a54fcd`.
+
+### §2 — Intention durable (vérifié en code + tests)
+- `markProviderIntent` = `UPDATE "Allocation"."providerIntentAt"` sous verrou `lockAllocation` (Service → Allocation) dans une `$transaction` Prisma **committée à la résolution de l'await**, AVANT `resolveProject`/`createProject` (C2 diffère ce dernier APRÈS le marqueur) et `createGitApp` (deployments.service.ts:512-541).
+- `applied=false` → `ConflictException` AVANT toute mutation distante ; **écriture qui LÈVE** → `intentPossessed` reste faux → compensation pré-provider + erreur propagée (aucun appel provider).
+- Tests : unit (ordre d'appel `markProviderIntent < createGitApp` et `< createProject`, module B) ; e2e PG réels : 502 provider → `providerIntentAt` NON NULL relu en base + retry 409 « incertitude » ; refus GitHub → rollback `pre_intent` (intention jamais posée) ; **+1 test unitaire ajouté en revue** : écriture de l'intention qui échoue → `deleteMany{PENDING,uuid:null}` + `releasePreProvider` + audit `pre_intent`, `createProject`/`createGitApp`/`markBound` NON appelés.
+
+### §3 — Compensation (2 transactions SÉQUENTIELLES, NON atomiques — états intermédiaires documentés)
+- `deleteMany{id, status:PENDING, coolifyUuid:null}` : `rowId` = `row.id` créée dans CETTE invocation avec `userId=actor.sub` (provenance exacte, jamais de saisie utilisateur) ; exécuté dans sa propre écriture (verrou libéré au commit) **puis** `releasePreProvider` (transaction dédiée : verrous Service → Allocation).
+- États intermédiaires sûrs et audités (`deploy.c2.rollback` avec `rowCleared/released/releaseReason`) : ① OK+OK → nettoyé ; ② row OK + release échoue/refusée → **slot CONSERVÉ** (« row absente + slot réservé », rejeu → 409, reprise **C4**) ; ③ delete échoue → row bascule FAILED et release **non tentée** (`row_kept`) ; ④ les deux échouent → état PENDING conservé, audité. Aucun cycle de verrous possible (rien ne détient un verrou en attendant l'autre ; compensation uniquement **préalable à l'intention** = zéro mutation distante).
+- Jamais de suppression d'un Deployment lié : la compensation n'existe que si `intentPossessed=false` (donc AVANT `markBound`), en plus des gardes `PENDING`+`coolifyUuid null`.
+
+### §4 — DÉCISION : `Deployment.hostingServiceId` reste NULL sur les nouveaux déploiements C2 (aucun backfill)
+- **Ce n'est pas le report du backfill** : c'est un **invariant B1 TESTÉ** — `hosting-service-foundation.e2e` #7 **lie** `ids.deployment` via `markBound` puis #10 exige `hostingServiceId === null` → le binding N'écrit PAS ce champ (schéma : « le lien se pose via l'allocation, jamais par écriture directe opportuniste »).
+- Le lien **atomique** existe déjà : `allocation.deploymentId` est écrit **dans la transaction `markBound`** (verrous ①②③, ownership croisé, preuve provider) — écriture de `Deployment.hostingServiceId` dans cette transaction reviendrait à réécrire l'invariant B1 #10.
+- Fail-closed préservé : toute app C2 a ≥1 allocation (`hostingServiceId NOT NULL + onDelete Restrict`) → la **suppression du service reste bloquée** sans passer par le champ Deployment.
+- Conséquences : **ownership** = vérifié à `markBound` (deployment.userId = service.userId) + requêtes par service via `allocation.hostingServiceId` (indexé) ; **classification** = lit `HostingService` par userId du jeton (indépendant) ; **suppression** = `remove()` inchangé, FK SetNull B1 (l'allocation survit, slot compté jusqu'à C4) ; **C3/C4** = tout l'état (intention, statut, lien) vit sur l'allocation — aucun lecteur de production de `Deployment.hostingServiceId` (grep : seulement des tests). Backfill phase D = dénormalisation optionnelle, sans sémantique nouvelle.
+
+### §5 — Frontend + validations ajoutées
+- Helper `intent.ts` **exécuté réellement** (compilé depuis le fichier livré, assertions Node) : **9/9** — UUID v4, identité stable sur payload identique (5×), valeurs env/commands/subdomain préservées EXACTEMENT, **pas de nouvel UUID après échec simulé**, nouvel UUID si payload modifié, **branche absente ≠ "main"**, `undefined` omis, reset post-succès.
+- Garde réentrée : `depBusy`/`deploying` posés **synchrone** dans les 3 soumissions + boutons désactivés ; filet dur = dédup serveur (e2e double POST : 1 row/1 alloc/1 exécution).
+- **Vérifications navigateur : AUCUNE exécution** — ni playwright/puppeteer/cypress dans le repo, ni écriture live autorisée (parcours live = garde OFF + base live interdite) ; attestation UI = code (gardes synchrone) + helper Node 9/9 + e2e HTTP.
+- +1 assertion : `GET hosting-services` → `findMany({ where: { userId } })` (liste limitée au jeton).
+- **Correction du point ciblé de clôture** : `listHostingServices.compatible` ajoute le **RATTACHEMENT** à la cible — `compatible = ACTIVE + pack/module identiques + isAttachedToTarget(s, subscription)`, le **même critère** que le POST (signature élargie `Pick<HostingService,'subscriptionId'|'orderId'>` : UN SEUL critère pour la ligne partielle du sélecteur et la row complète de la classification) ; `subscriptionId`/`orderId` ajoutés au `select`, `target.subscription` capturée. Test unique ajouté : service **ACTIF + même pack mais non rattaché ⇒ `compatible:false` + POST → 409 sans repli** (`reserveSlot`/`deployment.create` jamais appelés). Le POST conserve son contrôle autoritaire (404/409 sans repli legacy).
+- **Validations après revue** : `deployments.service.spec` **112/112** (suite affectée, relancée) ; **e2e C2 19/19 relancé APRÈS la correction** ; `tsc --noEmit` = 0 ; **`nest build` = 0** ; `next build` = 0 (web inchangé) ; unit complet précédent **897/897 (52 suites)** (non relancé : correction isolée à `listHostingServices`/`isAttachedToTarget`, typage validé par tsc) ; e2e non-régression antérieurs **71/71** ; API health **200**, web **200** ; live inchangée (0/0/15, migrations 45/46 → 1 en attente C1).
+
+### État final
+- **ARRÊT avant staging/commit** : 14 chemins modifiés/non suivis, aucun staging, HEAD = origin/main = `4a54fcd`, garde `HOSTING_C2_ENABLED` OFF partout, zéro écriture live, zéro provider réel, aucun changement C3/C4.

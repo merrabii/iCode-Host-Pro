@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import {
   apiError,
@@ -14,6 +14,7 @@ import {
   githubLinkStatus,
   listFreeDomains,
   listGithubRepos,
+  listHostingServices,
   previewBuildConfig,
   type BuildConfig,
   type BuildPack,
@@ -21,8 +22,10 @@ import {
   type DetectResult,
   type GithubLinkStatus,
   type GithubRepo,
+  type HostingServiceOption,
   type Me,
 } from '@/lib/api';
+import { intentFor } from '@/lib/intent';
 import { AppShell } from '@/components/app-shell';
 import { CLIENT_NAV } from '@/config/nav';
 import { useToast } from '@/components/toast';
@@ -97,6 +100,11 @@ export default function ClientProjectPage() {
   const [freeDomains, setFreeDomains] = useState<{ id: string; name: string }[]>([]);
   const [domainId, setDomainId] = useState('');
   const [deploying, setDeploying] = useState(false);
+  // 17B.4F-C2 — sélecteur de service hébergement (inerte si garde OFF) +
+  // identité d'intention du déploiement (UUID stable par payload).
+  const [hsOptions, setHsOptions] = useState<HostingServiceOption[]>([]);
+  const [hsChoice, setHsChoice] = useState('');
+  const depIntent = useRef<{ id: string; key: string } | null>(null);
 
   useEffect(() => {
     (async () => {
@@ -136,6 +144,9 @@ export default function ClientProjectPage() {
       // Racines gratuites proposées (choix du domaine du sous-domaine).
       const dms = await listFreeDomains(t);
       if (dms.ok) setFreeDomains((dms.data as { id: string; name: string }[]) ?? []);
+      // 17B.4F-C2 — services hébergement : garde OFF ⇒ liste vide (aucun champ).
+      const hs = await listHostingServices(t);
+      if (hs.ok) setHsOptions(hs.data?.services ?? []);
     })();
   }, [router]);
 
@@ -243,15 +254,30 @@ export default function ClientProjectPage() {
     setEnvRows((rows) => rows.filter((_, idx) => idx !== i));
   }
 
+  // ── 17B.4F-C2 — service hébergement + intention d'idempotence ─────────────
+  /** Services COMPATIBLES avec la cible courante (jeton seul, vérifié serveur). */
+  const compatibleServices = hsOptions.filter((s) => s.compatible);
+
+  /** Id envoyé : auto si UN SEUL compatible, choix explicite si plusieurs,
+   *  absent sinon (le serveur décide — legacy prouvé ou refus 4xx). */
+  function selectedHostingServiceId(): string | undefined {
+    if (compatibleServices.length === 1) return compatibleServices[0]!.id;
+    if (compatibleServices.length > 1) return hsChoice || undefined;
+    return undefined;
+  }
+
+  /** Vrai si un choix de service est requis mais pas encore fait. */
+  const hsMissing = compatibleServices.length > 1 && !hsChoice;
+
   async function deploy() {
-    if (!repoFullName) return;
+    if (!repoFullName || deploying || hsMissing) return;
     setDeploying(true);
     const environment: Record<string, string> = {};
     for (const row of envRows) {
       const k = row.key.trim();
       if (k) environment[k] = row.value;
     }
-    const r = await createDeployment(token, {
+    const body = {
       // Un lien collé (mode URL) : envoyer `repoUrl` pour que le serveur reste en
       // mode URL (aucun compte GitHub requis) — `repoFullName` forcerait le mode
       // GitHub lié (decryptToken → « Aucun compte GitHub lié »).
@@ -267,14 +293,23 @@ export default function ClientProjectPage() {
       environment: Object.keys(environment).length ? environment : undefined,
       subdomain: subdomain.trim() || undefined,
       domainId: domainId || undefined,
-    });
-    setDeploying(false);
-    if (!r.ok) {
-      toast.error(apiError(r, 'Déploiement impossible.'));
-      return;
+      hostingServiceId: selectedHostingServiceId(),
+    };
+    // Même identifiant sur retry/timeout/double-clic ; nouveau si payload modifié.
+    const clientRequestId = intentFor(depIntent, body);
+    try {
+      const r = await createDeployment(token, { ...body, clientRequestId });
+      // Échec (dont 409 rejeu) ⇒ identité CONSERVÉE : aucun nouvel envoi auto.
+      if (!r.ok) {
+        toast.error(apiError(r, 'Déploiement impossible.'));
+        return;
+      }
+      depIntent.current = null; // intention aboutie → prochaine = nouvelle
+      toast.ok('Projet créé — déploiement en cours.');
+      router.push('/client');
+    } finally {
+      setDeploying(false);
     }
-    toast.ok('Projet créé — déploiement en cours.');
-    router.push('/client');
   }
 
   if (phase === 'loading') {
@@ -522,6 +557,23 @@ export default function ClientProjectPage() {
                     })()}
                   </Field>
 
+                  {/* 17B.4F-C2 — sélecteur affiché seulement si plusieurs services compatibles */}
+                  {compatibleServices.length > 1 && (
+                    <Field
+                      label="Service hébergement"
+                      hint="Service qui accueillera cette application (vérifié côté serveur)."
+                    >
+                      <Select value={hsChoice} disabled={isImp} onChange={(e) => setHsChoice(e.target.value)}>
+                        <option value="">Choisir un service…</option>
+                        {compatibleServices.map((s) => (
+                          <option key={s.id} value={s.id}>
+                            {s.packNameSnapshot ?? 'Service'} — {s.id.slice(-6)}
+                          </option>
+                        ))}
+                      </Select>
+                    </Field>
+                  )}
+
                   {/* Variables d'environnement de build */}
                   <div>
                     <div className="section-title" style={{ marginBottom: 4 }}>
@@ -578,7 +630,7 @@ export default function ClientProjectPage() {
                   </span>
                   <Button
                     onClick={deploy}
-                    disabled={isImp || deploying || blockDeploy}
+                    disabled={isImp || deploying || blockDeploy || hsMissing}
                   >
                     <IconPlus /> {deploying ? 'Déploiement…' : 'Déployer'}
                   </Button>

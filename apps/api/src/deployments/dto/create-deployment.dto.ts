@@ -103,4 +103,25 @@ export class CreateDeploymentDto {
   @IsOptional()
   @IsObject()
   environment?: Record<string, string>;
+
+  // ── 17B.4F-C2 — identité d'intention du parcours sous garde. ──────────────
+  // OPTIONNEL au niveau du DTO : la validation globale (whitelist) précède
+  // create() et ne doit JAMAIS casser les anciens POST quand la garde est OFF.
+  // Sur le parcours C2 (garde ON), le service EXIGE un UUID v4 valide et refuse
+  // (400) toute valeur absente/malformée. Le frontend livré avec C2 l'envoie
+  // toujours, conservé tel quel sur retry/timeout/double-clic.
+  @IsOptional()
+  @IsString()
+  @MaxLength(64)
+  clientRequestId?: string;
+
+  // Sélecteur de service hébergement (17B.4F-C2) — JAMAIS une autorité : le
+  // serveur revérifie ownership (`id` + `userId` du jeton), statut et
+  // compatibilité pack/module, et refuse tout repli legacy. Format réel =
+  // `cuid()` Prisma (PAS un UUID) : chaîne bornée, la preuve d'appartenance est
+  // le lookup strict en base.
+  @IsOptional()
+  @IsString()
+  @MaxLength(64)
+  hostingServiceId?: string;
 }

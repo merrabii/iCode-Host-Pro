@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import {
   addTicketMessage,
@@ -21,6 +21,7 @@ import {
   getSupportCodeStatus,
   githubLinkStatus,
   listGithubRepos,
+  listHostingServices,
   listMyDeployments,
   listMySubscriptions,
   listMyTickets,
@@ -33,12 +34,14 @@ import {
   type DetectResult,
   type GithubLinkStatus,
   type GithubRepo,
+  type HostingServiceOption,
   type Me,
   type ProductRef,
   type PublicProduct,
   type Subscription,
   type Ticket,
 } from '@/lib/api';
+import { intentFor } from '@/lib/intent';
 import { AppShell, ImpersonationBanner } from '@/components/app-shell';
 import { CLIENT_NAV } from '@/config/nav';
 import { useToast } from '@/components/toast';
@@ -178,6 +181,12 @@ export default function ClientPage() {
   // Suppression d'une app (confirmation en deux temps) + mise à niveau du plan.
   const [confirmDel, setConfirmDel] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
+  // 17B.4F-C2 — sélecteur de service hébergement (inerte si garde OFF),
+  // garde anti-double-clic et identité d'intention du déploiement.
+  const [hsOptions, setHsOptions] = useState<HostingServiceOption[]>([]);
+  const [hsChoice, setHsChoice] = useState('');
+  const [depBusy, setDepBusy] = useState(false);
+  const depIntent = useRef<{ id: string; key: string } | null>(null);
 
   const load = useCallback(
     async (t: string) => {
@@ -214,6 +223,13 @@ export default function ClientPage() {
     const [ls, r] = await Promise.all([githubLinkStatus(t), listGithubRepos(t)]);
     if (ls.ok) setGithub((ls.data as GithubLinkStatus) ?? null);
     if (r.ok) setRepos((r.data as GithubRepo[]) ?? []);
+  }, []);
+
+  // 17B.4F-C2 — services hébergement sélectionnables. Garde OFF ⇒ réponse
+  // inerte { enabled:false, services:[] } (aucun champ n'apparaît alors).
+  const loadHostingServices = useCallback(async (t: string) => {
+    const r = await listHostingServices(t);
+    if (r.ok) setHsOptions(r.data?.services ?? []);
   }, []);
 
   // Déploiements + rafraîchissement live des statuts en cours + quota du pack (Phase 13).
@@ -265,9 +281,10 @@ export default function ClientPage() {
         setDeployEnabled(true);
         void loadGithub(t);
         void loadDeployments(t);
+        void loadHostingServices(t);
       }
     })();
-  }, [router, load, loadCodeStatus, loadTickets, loadGithub, loadDeployments]);
+  }, [router, load, loadCodeStatus, loadTickets, loadGithub, loadDeployments, loadHostingServices]);
 
   // Auto-poll : tant qu'un déploiement est en cours, re-sonde toutes les 8 s.
   useEffect(() => {
@@ -350,17 +367,62 @@ export default function ClientPage() {
     setDepBranch(repo?.defaultBranch ?? '');
   }
 
+  // ── 17B.4F-C2 — service hébergement + intention d'idempotence ─────────────
+  /** Services COMPATIBLES avec la cible courante (jeton seul, vérifié serveur). */
+  const compatibleServices = hsOptions.filter((s) => s.compatible);
+
+  /** Id envoyé : auto si UN SEUL compatible, choix explicite si plusieurs,
+   *  absent sinon (le serveur décide alors — legacy prouvé ou refus 4xx). */
+  function selectedHostingServiceId(): string | undefined {
+    if (compatibleServices.length === 1) return compatibleServices[0]!.id;
+    if (compatibleServices.length > 1) return hsChoice || undefined;
+    return undefined;
+  }
+
+  /** Sélecteur affiché UNIQUEMENT quand plusieurs services sont compatibles. */
+  function serviceSelect() {
+    if (compatibleServices.length <= 1) return null;
+    return (
+      <Field
+        label="Service hébergement"
+        hint="Service qui accueillera cette application (vérifié côté serveur)."
+      >
+        <Select value={hsChoice} disabled={isImp} onChange={(e) => setHsChoice(e.target.value)}>
+          <option value="">Choisir un service…</option>
+          {compatibleServices.map((s) => (
+            <option key={s.id} value={s.id}>
+              {s.packNameSnapshot ?? 'Service'} — {s.id.slice(-6)}
+            </option>
+          ))}
+        </Select>
+      </Field>
+    );
+  }
+
+  /** Vrai si un choix de service est requis mais pas encore fait. */
+  const hsMissing = compatibleServices.length > 1 && !hsChoice;
+
   async function deploy() {
-    if (!depRepo) return;
-    const branch = depBranch.trim() || 'main';
-    const r = await createDeployment(token, {
+    if (!depRepo || depBusy || hsMissing) return;
+    const body = {
       repoFullName: depRepo,
-      branch,
+      branch: depBranch.trim() || 'main',
       subdomain: depSubdomain.trim() || undefined,
-    });
-    if (!r.ok) return toast.error(apiError(r, 'Déploiement impossible.'));
-    toast.ok('Déploiement déclenché — statut en direct ci-dessous.');
-    void loadDeployments(token);
+      hostingServiceId: selectedHostingServiceId(),
+    };
+    // Même identifiant sur retry/timeout/double-clic ; nouveau si payload modifié.
+    const clientRequestId = intentFor(depIntent, body);
+    setDepBusy(true);
+    try {
+      const r = await createDeployment(token, { ...body, clientRequestId });
+      // Échec (dont 409 rejeu) ⇒ identité CONSERVÉE : aucun nouvel envoi auto.
+      if (!r.ok) return toast.error(apiError(r, 'Déploiement impossible.'));
+      depIntent.current = null; // intention aboutie → prochaine = nouvelle
+      toast.ok('Déploiement déclenché — statut en direct ci-dessous.');
+      void loadDeployments(token);
+    } finally {
+      setDepBusy(false);
+    }
   }
 
   // Mode URL collée (Phase 10bis.5) : Détecter → préremplit la branche + le
@@ -385,17 +447,26 @@ export default function ClientPage() {
   }
 
   async function deployUrl() {
-    if (!detected?.repoUrl) return;
-    const r = await createDeployment(token, {
+    if (!detected?.repoUrl || depBusy || hsMissing) return;
+    const body = {
       repoUrl: detected.repoUrl,
       branch: detected.defaultBranch, // branche auto (non éditée dans l'UI)
       buildPack: depBuildPack,
       appName: depAppName.trim() || undefined,
       subdomain: depSubdomain.trim() || undefined,
-    });
-    if (!r.ok) return toast.error(apiError(r, 'Déploiement impossible.'));
-    toast.ok('Déploiement déclenché — statut en direct ci-dessous.');
-    void loadDeployments(token);
+      hostingServiceId: selectedHostingServiceId(),
+    };
+    const clientRequestId = intentFor(depIntent, body);
+    setDepBusy(true);
+    try {
+      const r = await createDeployment(token, { ...body, clientRequestId });
+      if (!r.ok) return toast.error(apiError(r, 'Déploiement impossible.'));
+      depIntent.current = null;
+      toast.ok('Déploiement déclenché — statut en direct ci-dessous.');
+      void loadDeployments(token);
+    } finally {
+      setDepBusy(false);
+    }
   }
 
   /**
@@ -625,8 +696,9 @@ export default function ClientPage() {
                           onChange={(e) => setDepSubdomain(e.target.value)}
                         />
                       </Field>
-                      <Button disabled={isImp || !depRepo} onClick={deploy}>
-                        <IconPlus /> Déployer
+                      {serviceSelect()}
+                      <Button disabled={isImp || !depRepo || depBusy || hsMissing} onClick={deploy}>
+                        <IconPlus /> {depBusy ? 'Déploiement…' : 'Déployer'}
                       </Button>
                     </div>
                   ) : (
@@ -709,8 +781,12 @@ export default function ClientPage() {
                                 onChange={(e) => setDepSubdomain(e.target.value)}
                               />
                             </Field>
-                            <Button disabled={isImp || !detected.repoUrl} onClick={deployUrl}>
-                              <IconPlus /> Déployer
+                            {serviceSelect()}
+                            <Button
+                              disabled={isImp || !detected.repoUrl || depBusy || hsMissing}
+                              onClick={deployUrl}
+                            >
+                              <IconPlus /> {depBusy ? 'Déploiement…' : 'Déployer'}
                             </Button>
                           </div>
                         </div>

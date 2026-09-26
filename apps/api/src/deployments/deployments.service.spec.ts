@@ -1,4 +1,4 @@
-import { BadGatewayException, BadRequestException, ForbiddenException, NotFoundException } from '@nestjs/common';
+import { BadGatewayException, BadRequestException, ConflictException, ForbiddenException, NotFoundException } from '@nestjs/common';
 import { DeploymentsService, mapCoolifyStatus } from './deployments.service';
 import { DeploymentStatus } from '@prisma/client';
 
@@ -15,7 +15,16 @@ describe('DeploymentsService', () => {
     subscription: { findFirst: jest.fn() },
     deploymentModule: { findFirst: jest.fn() },
     clientProject: { findUnique: jest.fn(), create: jest.fn() },
-    deployment: { create: jest.fn(), count: jest.fn(), findMany: jest.fn(), findFirst: jest.fn(), update: jest.fn() },
+    deployment: {
+      create: jest.fn(),
+      count: jest.fn(),
+      findMany: jest.fn(),
+      findFirst: jest.fn(),
+      update: jest.fn(),
+      // 17B.4F-C2 — compensation pré-provider (suppression GARDEE PENDING).
+      deleteMany: jest.fn(),
+    },
+    hostingService: { findMany: jest.fn() }, // 17B.4F-C2 — classification locale
     cloudflareSetting: { findFirst: jest.fn(), create: jest.fn(), update: jest.fn(), updateMany: jest.fn() },
     domain: { findFirst: jest.fn(), findUnique: jest.fn() },
     clientSubdomain: { findFirst: jest.fn(), create: jest.fn() },
@@ -50,6 +59,14 @@ describe('DeploymentsService', () => {
     deleteApplication: jest.fn(),
   };
   const mockPanelFactory = { create: jest.fn(() => mockTransport) };
+
+  // 17B.4F-C2 — moteur de réservation C1 (jamais appelé quand la garde OFF).
+  const mockHosting = {
+    reserveSlot: jest.fn(),
+    markProviderIntent: jest.fn(),
+    releasePreProvider: jest.fn(),
+    markBound: jest.fn(),
+  };
 
   // Transaction simulée pour remove() — les deux écritures locales y sont faites.
   const mockTx = {
@@ -116,6 +133,47 @@ describe('DeploymentsService', () => {
     ...over,
   });
 
+  // 17B.4F-C2 — ligne `HostingService` (cuid, PAS un UUID) rattachée à
+  // l'abonnement actif `sub-act` et au pack/module de la cible.
+  const hostingServiceRow = (over: Record<string, unknown> = {}) => ({
+    id: 'hs1',
+    userId: 'u1',
+    orderId: null,
+    subscriptionId: 'sub-act',
+    productId: 'prod1',
+    packId: 'pack1',
+    deploymentModuleId: 'modA',
+    status: 'ACTIVE',
+    maxAppsSnapshot: null,
+    ramMbSnapshot: 512,
+    cpuCoresSnapshot: 1,
+    storageLimitGbSnapshot: null,
+    packNameSnapshot: 'Starter 1 Go',
+    productNameSnapshot: null,
+    createdAt: new Date('2026-09-01T10:00:00Z'),
+    updatedAt: new Date('2026-09-01T10:00:00Z'),
+    ...over,
+  });
+
+  const allocationRow = (over: Record<string, unknown> = {}) => ({
+    id: 'alloc1',
+    hostingServiceId: 'hs1',
+    status: 'RESERVED',
+    idempotencyKey: 'direct:v1:u1:hs1:cid',
+    requestFingerprint: 'fp:v1:0000',
+    deploymentId: null,
+    providerIntentAt: null,
+    reservedAt: new Date('2026-09-26T10:00:00Z'),
+    releasedAt: null,
+    boundAt: null,
+    createdAt: new Date('2026-09-26T10:00:00Z'),
+    updatedAt: new Date('2026-09-26T10:00:00Z'),
+    ...over,
+  });
+
+  // UUID v4 valide exigé par `normalizeClientRequestId` (parcours C2).
+  const CID = 'f47ac10b-58cc-4372-a567-0e02b2c3d479';
+
   // Bloc 4 — cible AUTO : la table Service a été supprimée, la cible est un
   // abonnement ACTIVE → pack ACTIVE → module Coolify connecté (serverRow).
   const autoModule = (over: Record<string, unknown> = {}) => ({
@@ -170,8 +228,12 @@ describe('DeploymentsService', () => {
       mockGithub as never,
       mockPanelFactory as never,
       mockCloudflare as never,
+      mockHosting as never,
     );
     jest.clearAllMocks();
+    // 17B.4F-C2 — garde OFF par défaut (contrat historique préservé). Les
+    // tests du parcours C2 l'activent explicitement (valeur exacte 'true').
+    delete process.env.HOSTING_C2_ENABLED;
     // Aucun domaine racine configuré par défaut → flux inchangé (Phase 3 best-effort).
     mockCloudflare.findActiveRootDomain.mockResolvedValue(null);
     mockSettings.isDeployEnabled.mockResolvedValue(true);
@@ -203,6 +265,21 @@ describe('DeploymentsService', () => {
     );
     mockTransport.deleteApplication.mockResolvedValue(undefined);
     mockCloudflare.deleteDnsRecord.mockResolvedValue({ id: 'rec-1' });
+    // 17B.4F-C2 — défauts du moteur C1 (non utilisés tant que la garde OFF).
+    mockHosting.reserveSlot.mockResolvedValue({
+      allocation: allocationRow(),
+      replayed: false,
+    });
+    mockHosting.markProviderIntent.mockResolvedValue({
+      applied: true,
+      providerIntentAt: new Date('2026-09-26T10:00:00Z'),
+    });
+    mockHosting.releasePreProvider.mockResolvedValue({ released: true });
+    mockHosting.markBound.mockResolvedValue(
+      allocationRow({ status: 'BOUND', deploymentId: 'dep1' }),
+    );
+    mockPrisma.hostingService.findMany.mockResolvedValue([]);
+    mockPrisma.deployment.deleteMany.mockResolvedValue({ count: 1 });
   });
 
   describe('create()', () => {
@@ -1278,6 +1355,490 @@ describe('DeploymentsService', () => {
         where: { deploymentId: 'dep1' },
       });
       expect(mockTx.deployment.delete).toHaveBeenCalledWith({ where: { id: 'dep1' } });
+    });
+  });
+
+  // ── 17B.4F-C2 — garde HOSTING_C2_ENABLED (OFF par défaut) + parcours sous
+  // garde : classification locale, réservation/rejeu, ordre intention provider,
+  // compensation pré-provider, liaison allocation → déploiement. ─────────────
+  describe('17B.4F-C2 — garde + parcours sous garde', () => {
+    const enableC2 = () => {
+      process.env.HOSTING_C2_ENABLED = 'true';
+    };
+    afterEach(() => {
+      delete process.env.HOSTING_C2_ENABLED;
+    });
+
+    // Fixtures de flow heureux (row PENDING → app → DEPLOYING).
+    const happyProvider = () => {
+      mockPrisma.deployment.create.mockResolvedValue(
+        deploymentRow({ status: 'PENDING', coolifyUuid: null }),
+      );
+      mockTransport.createGitApp.mockResolvedValue({ uuid: 'app-1' });
+      mockTransport.deployApp.mockResolvedValue(undefined);
+      mockPrisma.deployment.update.mockResolvedValue(deploymentRow());
+    };
+
+    const dto = (over: Record<string, unknown> = {}) => ({
+      repoFullName: 'owner/repo',
+      ...over,
+    });
+
+    it('OFF (défaut) : contrat historique — POST sans clientRequestId accepté, ZÉRO accès au moteur hosting', async () => {
+      happyProvider();
+      const out = await service.create(dto(), actor);
+      expect(out.id).toBe('dep1');
+      expect(mockPrisma.hostingService.findMany).not.toHaveBeenCalled();
+      expect(mockHosting.reserveSlot).not.toHaveBeenCalled();
+      expect(mockHosting.markProviderIntent).not.toHaveBeenCalled();
+      expect(mockPrisma.deployment.create).toHaveBeenCalledTimes(1);
+    });
+
+    it('OFF : GET hosting-services inerte {enabled:false,services:[]} sans accès BDD', async () => {
+      const res = await service.listHostingServices(actor);
+      expect(res).toEqual({ enabled: false, services: [] });
+      expect(mockPrisma.hostingService.findMany).not.toHaveBeenCalled();
+    });
+
+    it('ON + legacy PROUVÉ (0 ligne HostingService) : parcours historique, audit c2=legacy_no_service, aucun slot', async () => {
+      enableC2();
+      happyProvider();
+      const out = await service.create(dto(), actor); // pas de clientRequestId : legacy exempt
+      expect(out.id).toBe('dep1');
+      expect(mockPrisma.hostingService.findMany).toHaveBeenCalledTimes(1);
+      expect(mockHosting.reserveSlot).not.toHaveBeenCalled();
+      expect(mockAudit.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'deploy.create',
+          details: expect.objectContaining({ c2: 'legacy_no_service' }),
+        }),
+      );
+    });
+
+    it('ON : clientRequestId absent → 400, aucune réservation', async () => {
+      enableC2();
+      mockPrisma.hostingService.findMany.mockResolvedValue([hostingServiceRow()]);
+      await expect(service.create(dto(), actor)).rejects.toBeInstanceOf(BadRequestException);
+      expect(mockHosting.reserveSlot).not.toHaveBeenCalled();
+      expect(mockPrisma.deployment.create).not.toHaveBeenCalled();
+    });
+
+    it('ON : clientRequestId non-UUID → 400 (validation stricte v4), aucune réservation', async () => {
+      enableC2();
+      mockPrisma.hostingService.findMany.mockResolvedValue([hostingServiceRow()]);
+      await expect(
+        service.create(dto({ clientRequestId: 'pas-un-uuid' }), actor),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(mockHosting.reserveSlot).not.toHaveBeenCalled();
+    });
+
+    it('ON : hostingServiceId étranger/introuvable → 404, JAMAIS de repli legacy', async () => {
+      enableC2();
+      mockPrisma.hostingService.findMany.mockResolvedValue([hostingServiceRow({ id: 'hs-other' })]);
+      await expect(
+        service.create(dto({ clientRequestId: CID, hostingServiceId: 'hs-foreign' }), actor),
+      ).rejects.toBeInstanceOf(NotFoundException);
+      expect(mockHosting.reserveSlot).not.toHaveBeenCalled();
+      expect(mockPrisma.deployment.create).not.toHaveBeenCalled();
+    });
+
+    it('ON : service suspendu → 409, aucun repli legacy (aucune row, aucun slot)', async () => {
+      enableC2();
+      mockPrisma.hostingService.findMany.mockResolvedValue([
+        hostingServiceRow({ status: 'SUSPENDED' }),
+      ]);
+      await expect(
+        service.create(dto({ clientRequestId: CID }), actor),
+      ).rejects.toBeInstanceOf(ConflictException);
+      expect(mockHosting.reserveSlot).not.toHaveBeenCalled();
+      expect(mockPrisma.deployment.create).not.toHaveBeenCalled();
+    });
+
+    it('ON : service ACTIF mais pack/module incompatibles → 409 (provenance), aucun repli', async () => {
+      enableC2();
+      mockPrisma.hostingService.findMany.mockResolvedValue([
+        hostingServiceRow({ packId: 'other-pack' }),
+      ]);
+      await expect(
+        service.create(dto({ clientRequestId: CID }), actor),
+      ).rejects.toBeInstanceOf(ConflictException);
+      expect(mockHosting.reserveSlot).not.toHaveBeenCalled();
+      expect(mockPrisma.deployment.create).not.toHaveBeenCalled();
+    });
+
+    it('ON : services existants mais NON rattachés à l’abonnement actif → 409, aucun repli', async () => {
+      enableC2();
+      mockPrisma.hostingService.findMany.mockResolvedValue([
+        hostingServiceRow({ subscriptionId: null, orderId: null }),
+      ]);
+      await expect(
+        service.create(dto({ clientRequestId: CID }), actor),
+      ).rejects.toBeInstanceOf(ConflictException);
+      expect(mockHosting.reserveSlot).not.toHaveBeenCalled();
+      expect(mockPrisma.deployment.create).not.toHaveBeenCalled();
+    });
+
+    it('ON heureux : réservation → intention AVANT création app → markBound(uuid) → audit c2 lié', async () => {
+      enableC2();
+      mockPrisma.hostingService.findMany.mockResolvedValue([hostingServiceRow()]);
+      happyProvider();
+
+      const out = await service.create(dto({ clientRequestId: CID, branch: 'main' }), actor);
+
+      expect(out.id).toBe('dep1');
+      expect(mockHosting.reserveSlot).toHaveBeenCalledWith({
+        hostingServiceId: 'hs1',
+        actorUserId: 'u1',
+        clientRequestId: CID,
+        payload: expect.objectContaining({
+          business: expect.objectContaining({ repoFullName: 'owner/repo', branch: 'main' }),
+          environment: {},
+        }),
+      });
+      expect(mockHosting.markProviderIntent).toHaveBeenCalledWith({
+        allocationId: 'alloc1',
+        actorUserId: 'u1',
+      });
+      expect(mockHosting.markBound).toHaveBeenCalledWith({
+        allocationId: 'alloc1',
+        actorUserId: 'u1',
+        deploymentId: 'dep1',
+        proof: { providerProven: true },
+      });
+      // Ordre : intention provider AVANT la création d'app, liaison APRÈS.
+      expect(mockHosting.markProviderIntent.mock.invocationCallOrder[0]).toBeLessThan(
+        mockTransport.createGitApp.mock.invocationCallOrder[0]!,
+      );
+      expect(mockHosting.markBound.mock.invocationCallOrder[0]).toBeGreaterThan(
+        mockTransport.createGitApp.mock.invocationCallOrder[0]!,
+      );
+      expect(mockAudit.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'deploy.create',
+          details: expect.objectContaining({
+            c2: { hostingServiceId: 'hs1', allocationId: 'alloc1', clientRequestId: CID },
+          }),
+        }),
+      );
+    });
+
+    it('ON : empreinte sur valeurs REÇUES brutes (absente ≠ « main ») — réservation AVANT lecture GitHub', async () => {
+      enableC2();
+      mockPrisma.hostingService.findMany.mockResolvedValue([hostingServiceRow()]);
+      happyProvider();
+
+      await service.create(dto({ clientRequestId: CID }), actor); // branche ABSENTE
+
+      const first = mockHosting.reserveSlot.mock.calls[0]![0] as {
+        payload: { business: Record<string, unknown>; environment: Record<string, string> };
+      };
+      expect(first.payload.business.branch).toBeNull(); // absente ⇒ null, jamais 'main'
+      expect(mockHosting.reserveSlot.mock.invocationCallOrder[0]).toBeLessThan(
+        mockGithub.readBuildConfig.mock.invocationCallOrder[0]!,
+      );
+      expect(mockHosting.reserveSlot.mock.invocationCallOrder[0]).toBeLessThan(
+        mockGithub.repoExists.mock.invocationCallOrder[0]!,
+      );
+    });
+
+    it('ON : empreinte « main » explicite distincte + environnement REÇU préservé tel quel', async () => {
+      enableC2();
+      mockPrisma.hostingService.findMany.mockResolvedValue([hostingServiceRow()]);
+      happyProvider();
+
+      await service.create(
+        dto({
+          clientRequestId: CID,
+          branch: 'main',
+          environment: { 'A Key': ' spaced value ' },
+        }),
+        actor,
+      );
+
+      const call = mockHosting.reserveSlot.mock.calls[0]![0] as {
+        payload: { business: Record<string, unknown>; environment: Record<string, string> };
+      };
+      expect(call.payload.business.branch).toBe('main');
+      expect(call.payload.environment).toEqual({ 'A Key': ' spaced value ' });
+    });
+
+    it('ON rejeu BOUND : renvoie l’opération existante — SANS B0, SANS appel provider', async () => {
+      enableC2();
+      mockPrisma.hostingService.findMany.mockResolvedValue([hostingServiceRow()]);
+      mockHosting.reserveSlot.mockResolvedValue({
+        allocation: allocationRow({ status: 'BOUND', deploymentId: 'dep1' }),
+        replayed: true,
+      });
+      mockPrisma.deployment.findFirst.mockResolvedValue(deploymentRow());
+
+      const out = await service.create(dto({ clientRequestId: CID }), actor);
+
+      expect(out.id).toBe('dep1');
+      expect(mockPrisma.deployment.findMany).not.toHaveBeenCalled(); // B0 sauté
+      expect(mockTransport.createGitApp).not.toHaveBeenCalled();
+      expect(mockHosting.markProviderIntent).not.toHaveBeenCalled();
+      expect(mockPrisma.deployment.create).not.toHaveBeenCalled();
+    });
+
+    it('ON rejeu BOUND : opération renvoyée MÊME si le quota B0 serait plein', async () => {
+      enableC2();
+      mockPrisma.subscription.findFirst.mockResolvedValue(autoTarget({ maxApps: 1 }));
+      mockPrisma.hostingService.findMany.mockResolvedValue([hostingServiceRow()]);
+      mockHosting.reserveSlot.mockResolvedValue({
+        allocation: allocationRow({ status: 'BOUND', deploymentId: 'dep1' }),
+        replayed: true,
+      });
+      mockPrisma.deployment.findFirst.mockResolvedValue(deploymentRow());
+      mockPrisma.deployment.findMany.mockResolvedValue([{}]); // quota plein si appelé
+
+      const out = await service.create(dto({ clientRequestId: CID }), actor);
+
+      expect(out.id).toBe('dep1');
+      expect(mockPrisma.deployment.findMany).not.toHaveBeenCalled();
+    });
+
+    it('ON rejeu RESERVED en cours → 409, JAMAIS de takeover ni de 2ᵉ exécution', async () => {
+      enableC2();
+      mockPrisma.hostingService.findMany.mockResolvedValue([hostingServiceRow()]);
+      mockHosting.reserveSlot.mockResolvedValue({
+        allocation: allocationRow({ providerIntentAt: null }),
+        replayed: true,
+      });
+      await expect(
+        service.create(dto({ clientRequestId: CID }), actor),
+      ).rejects.toBeInstanceOf(ConflictException);
+      expect(mockTransport.createGitApp).not.toHaveBeenCalled();
+      expect(mockHosting.markProviderIntent).not.toHaveBeenCalled();
+      expect(mockPrisma.deployment.create).not.toHaveBeenCalled();
+    });
+
+    it('ON rejeu RESERVED avec intention déjà posée (incertitude) → 409 explicite', async () => {
+      enableC2();
+      mockPrisma.hostingService.findMany.mockResolvedValue([hostingServiceRow()]);
+      mockHosting.reserveSlot.mockResolvedValue({
+        allocation: allocationRow({ providerIntentAt: new Date('2026-09-26T10:00:00Z') }),
+        replayed: true,
+      });
+      await expect(
+        service.create(dto({ clientRequestId: CID }), actor),
+      ).rejects.toBeInstanceOf(ConflictException);
+      expect(mockTransport.createGitApp).not.toHaveBeenCalled();
+    });
+
+    it('ON : empreinte différente sur même clientRequestId → 409 du moteur, aucune row', async () => {
+      enableC2();
+      mockPrisma.hostingService.findMany.mockResolvedValue([hostingServiceRow()]);
+      mockHosting.reserveSlot.mockRejectedValue(
+        new ConflictException('Rejeu refusé : empreinte de réservation différente.'),
+      );
+      await expect(
+        service.create(dto({ clientRequestId: CID }), actor),
+      ).rejects.toBeInstanceOf(ConflictException);
+      expect(mockPrisma.deployment.create).not.toHaveBeenCalled();
+      expect(mockTransport.createGitApp).not.toHaveBeenCalled();
+    });
+
+    it('ON : B0 plein APRÈS réservation → libération pré-provider, AUCUNE row créée', async () => {
+      enableC2();
+      mockPrisma.subscription.findFirst.mockResolvedValue(autoTarget({ maxApps: 1 }));
+      mockPrisma.hostingService.findMany.mockResolvedValue([hostingServiceRow()]);
+      mockPrisma.deployment.findMany.mockResolvedValue([{}]); // 1/1 → quota plein
+      await expect(
+        service.create(dto({ clientRequestId: CID }), actor),
+      ).rejects.toBeInstanceOf(ForbiddenException);
+      expect(mockHosting.releasePreProvider).toHaveBeenCalledWith({
+        allocationId: 'alloc1',
+        actorUserId: 'u1',
+      });
+      expect(mockPrisma.deployment.create).not.toHaveBeenCalled();
+      expect(mockAudit.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'deploy.c2.rollback',
+          resourceId: 'alloc1',
+          details: expect.objectContaining({ trigger: 'quota', rowCleared: true, released: true }),
+        }),
+      );
+    });
+
+    it('ON : refus GitHub APRÈS réservation → libération pré-provider, AUCUNE row', async () => {
+      enableC2();
+      mockPrisma.hostingService.findMany.mockResolvedValue([hostingServiceRow()]);
+      mockGithub.repoExists.mockResolvedValue(false);
+      await expect(
+        service.create(dto({ clientRequestId: CID }), actor),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(mockHosting.releasePreProvider).toHaveBeenCalledWith({
+        allocationId: 'alloc1',
+        actorUserId: 'u1',
+      });
+      expect(mockPrisma.deployment.create).not.toHaveBeenCalled();
+    });
+
+    it('ON : intention provider REFUSÉE après création row → suppression GARDEE de la row + libération + erreur propagée', async () => {
+      enableC2();
+      mockPrisma.hostingService.findMany.mockResolvedValue([hostingServiceRow()]);
+      mockPrisma.deployment.create.mockResolvedValue(
+        deploymentRow({ status: 'PENDING', coolifyUuid: null }),
+      );
+      mockHosting.markProviderIntent.mockResolvedValue({
+        applied: false,
+        reason: 'invalid_state',
+      });
+      mockPrisma.deployment.deleteMany.mockResolvedValue({ count: 1 });
+
+      await expect(
+        service.create(dto({ clientRequestId: CID }), actor),
+      ).rejects.toBeInstanceOf(ConflictException);
+
+      expect(mockPrisma.deployment.deleteMany).toHaveBeenCalledWith({
+        where: { id: 'dep1', status: DeploymentStatus.PENDING, coolifyUuid: null },
+      });
+      expect(mockHosting.releasePreProvider).toHaveBeenCalledWith({
+        allocationId: 'alloc1',
+        actorUserId: 'u1',
+      });
+      expect(mockTransport.createGitApp).not.toHaveBeenCalled();
+    });
+
+    it("ON : écriture de l'intention ÉCHOUÉE (erreur DB) → compensation locale, AUCUNE mutation distante", async () => {
+      // `applied=false` est couvert ci-dessus ; ici c'est l'ÉCRITURE elle-même
+      // qui échoue : l'intention n'est JAMAIS réputée committée, la compensation
+      // pré-provider s'exécute (row PENDING nettoyée, slot libéré) et AUCUN
+      // appel provider (projet ni app) n'a lieu — l'erreur d'origine propagée.
+      enableC2();
+      mockPrisma.hostingService.findMany.mockResolvedValue([hostingServiceRow()]);
+      mockPrisma.deployment.create.mockResolvedValue(
+        deploymentRow({ status: 'PENDING', coolifyUuid: null }),
+      );
+      mockHosting.markProviderIntent.mockRejectedValue(new Error('écriture intention impossible'));
+      mockPrisma.deployment.deleteMany.mockResolvedValue({ count: 1 });
+
+      await expect(service.create(dto({ clientRequestId: CID }), actor)).rejects.toThrow(
+        'écriture intention impossible',
+      );
+
+      expect(mockPrisma.deployment.deleteMany).toHaveBeenCalledWith({
+        where: { id: 'dep1', status: DeploymentStatus.PENDING, coolifyUuid: null },
+      });
+      expect(mockHosting.releasePreProvider).toHaveBeenCalledWith({
+        allocationId: 'alloc1',
+        actorUserId: 'u1',
+      });
+      expect(mockTransport.createProject).not.toHaveBeenCalled(); // 1ʳᵉ mutation distante couverte
+      expect(mockTransport.createGitApp).not.toHaveBeenCalled();
+      expect(mockHosting.markBound).not.toHaveBeenCalled();
+      expect(mockAudit.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'deploy.c2.rollback',
+          details: expect.objectContaining({ trigger: 'pre_intent', rowCleared: true }),
+        }),
+      );
+    });
+
+    it('ON : échec createGitApp APRÈS intention → JAMAIS de libération, ligne FAILED, 502', async () => {
+      enableC2();
+      mockPrisma.hostingService.findMany.mockResolvedValue([hostingServiceRow()]);
+      mockPrisma.deployment.create.mockResolvedValue(
+        deploymentRow({ status: 'PENDING', coolifyUuid: null }),
+      );
+      mockHosting.markProviderIntent.mockResolvedValue({
+        applied: true,
+        providerIntentAt: new Date(),
+      });
+      mockTransport.createGitApp.mockRejectedValue(new Error('panel indisponible'));
+      mockPrisma.deployment.update.mockResolvedValue(deploymentRow({ status: 'FAILED' }));
+
+      await expect(
+        service.create(dto({ clientRequestId: CID }), actor),
+      ).rejects.toBeInstanceOf(BadGatewayException);
+
+      expect(mockHosting.markProviderIntent).toHaveBeenCalledTimes(1);
+      expect(mockHosting.releasePreProvider).not.toHaveBeenCalled(); // jamais après intention
+      expect(mockHosting.markBound).not.toHaveBeenCalled();
+      expect(mockPrisma.deployment.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 'dep1' },
+          data: expect.objectContaining({ status: DeploymentStatus.FAILED }),
+        }),
+      );
+    });
+
+    it('ON module B : intention provider AVANT createProject (1ʳʳ mutation distante couverte)', async () => {
+      enableC2();
+      mockPrisma.subscription.findFirst.mockResolvedValue(
+        autoTarget({
+          deploymentModule: autoModule({ kind: 'PER_CLIENT_PROJECT', sharedProjectUuid: null }),
+        }),
+      );
+      mockPrisma.hostingService.findMany.mockResolvedValue([hostingServiceRow()]);
+      mockPrisma.deployment.create.mockResolvedValue(
+        deploymentRow({ status: 'PENDING', coolifyUuid: null }),
+      );
+      mockHosting.markProviderIntent.mockResolvedValue({
+        applied: true,
+        providerIntentAt: new Date(),
+      });
+      mockPrisma.clientProject.findUnique.mockResolvedValue(null);
+      mockTransport.createProject.mockRejectedValue(new Error('création projet échouée'));
+      mockPrisma.deployment.update.mockResolvedValue(deploymentRow({ status: 'FAILED' }));
+
+      await expect(
+        service.create(dto({ clientRequestId: CID }), actor),
+      ).rejects.toBeInstanceOf(BadGatewayException);
+
+      expect(mockHosting.markProviderIntent.mock.invocationCallOrder[0]).toBeLessThan(
+        mockTransport.createProject.mock.invocationCallOrder[0]!,
+      );
+      expect(mockHosting.releasePreProvider).not.toHaveBeenCalled(); // intention posée
+    });
+
+    it('ON : GET hosting-services actif — service du jeton + compatibilité pack/module', async () => {
+      enableC2();
+      mockPrisma.hostingService.findMany.mockResolvedValue([hostingServiceRow()]);
+
+      const res = await service.listHostingServices(actor);
+
+      expect(res.enabled).toBe(true);
+      // §5 revue C2 — liste STRICTEMENT limitée au porteur du jeton.
+      expect(mockPrisma.hostingService.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { userId: actor.sub } }),
+      );
+      expect(res.services).toEqual([
+        {
+          id: 'hs1',
+          status: 'ACTIVE',
+          packNameSnapshot: 'Starter 1 Go',
+          maxAppsSnapshot: null,
+          compatible: true,
+        },
+      ]);
+    });
+
+    it('ON : GET hosting-services — service hors pack courant signalé compatible:false', async () => {
+      enableC2();
+      mockPrisma.hostingService.findMany.mockResolvedValue([
+        hostingServiceRow({ packId: 'other-pack', status: 'ACTIVE' }),
+      ]);
+
+      const res = await service.listHostingServices(actor);
+
+      expect(res.services[0]).toMatchObject({ id: 'hs1', compatible: false });
+    });
+
+    it('ON : ACTIF + même pack mais RATTACHEMENT absent → compatible:false, POST 409 sans repli', async () => {
+      enableC2();
+      mockPrisma.hostingService.findMany.mockResolvedValue([
+        hostingServiceRow({ subscriptionId: null, orderId: null }),
+      ]);
+
+      const res = await service.listHostingServices(actor);
+      expect(res.services[0]).toMatchObject({ id: 'hs1', status: 'ACTIVE', compatible: false });
+
+      await expect(
+        service.create(dto({ clientRequestId: CID }), actor),
+      ).rejects.toBeInstanceOf(ConflictException);
+      expect(mockHosting.reserveSlot).not.toHaveBeenCalled();
+      expect(mockPrisma.deployment.create).not.toHaveBeenCalled();
     });
   });
 });

@@ -1,6 +1,7 @@
 import {
   BadGatewayException,
   BadRequestException,
+  ConflictException,
   ForbiddenException,
   Injectable,
   NotFoundException,
@@ -11,11 +12,16 @@ import {
   DeploymentModuleKind,
   DeploymentStatus,
   HostingPack,
+  HostingService,
+  HostingServiceAllocation,
+  HostingServiceAllocationStatus,
+  HostingServiceStatus,
   LimitsStatus,
   PackStatus,
   Prisma,
   Server,
   ServerPanelProvider,
+  Subscription,
   SubscriptionStatus,
 } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
@@ -23,6 +29,9 @@ import { AuditService } from '../audit/audit.service';
 import { CryptoService } from '../crypto/crypto.service';
 import { SecuritySettingsService } from '../auth/security/security-settings.service';
 import { Actor } from '../users/users.service';
+import { isHostingC2Enabled } from '../hosting/c2-flag';
+import { HostingServicesService } from '../hosting/hosting-services.service';
+import { ReservationPayload, normalizeClientRequestId } from '../hosting/hosting-fingerprint';
 import {
   CoolifyAppLimits,
   PanelKind,
@@ -73,6 +82,17 @@ export interface ClientDeployQuota {
 export interface ClientDeploymentsPayload {
   deployments: DeploymentView[];
   quota: ClientDeployQuota | null;
+}
+
+/** Sélecteur de service hébergement (17B.4F-C2) — métadonnées brutes du jeton
+ *  + indicateur de compatibilité avec la cible pack/module courante. Jamais de
+ *  transport/panel, jamais de secret. */
+export interface HostingServiceOption {
+  id: string;
+  status: HostingServiceStatus;
+  packNameSnapshot: string | null;
+  maxAppsSnapshot: number | null;
+  compatible: boolean;
 }
 
 type DeploymentWithRefs = Deployment & {
@@ -128,6 +148,9 @@ export class DeploymentsService {
     private readonly github: GithubService,
     private readonly panelFactory: PanelTransportFactory,
     private readonly cloudflare: CloudflareService,
+    // 17B.4F-C2 — moteur de réservation C1. Jamais appelé quand la garde
+    // `HOSTING_C2_ENABLED` est OFF (aucun accès aux colonnes C1 non migrées).
+    private readonly hosting: HostingServicesService,
   ) {}
 
   private async requireDeployEnabled(): Promise<void> {
@@ -276,11 +299,28 @@ export class DeploymentsService {
   // ── Déploiement (N) ────────────────────────────────────────────────────────
 
   /**
-   * Flow : deployEnabled ? + (mode GitHub lié : token + dépôt possédé | mode
-   * URL collée : URL assainie + détection auto) + Service ACTIVE du client sur
-   * un serveur Coolify connecté ⇒ crée l'app Coolify → déclenche le déploiement
-   * → ligne Deployment (DEPLOYING). Toute erreur Coolify laisse une ligne FAILED
-   * + audit, et remonte en 502 (message clair à l'UI).
+   * Flow (garde OFF = contrat HTTP historique inchangé) : deployEnabled ? +
+   * (mode GitHub lié : token + dépôt possédé | mode URL collée : URL assainie +
+   * détection auto) + cible pack/module/serveur résolue en base ⇒ crée l'app
+   * Coolify → déclenche le déploiement → ligne Deployment (DEPLOYING). Toute
+   * erreur Coolify laisse une ligne FAILED + audit, et remonte en 502.
+   *
+   * 17B.4F-C2 (garde ON, `HOSTING_C2_ENABLED` lu À L'APPEL) :
+   *  ① garde en tout premier — OFF ⇒ contrat identique, zéro accès au moteur
+   *    hosting, zéro lecture des colonnes C1 (`requestFingerprint`,
+   *    `providerIntentAt`) ;
+   *  ② classification LOCALE (aucun réseau) : legacy PRÉUVÉ = zéro ligne
+   *    `HostingService` sur le compte (tous statuts) ; service fourni mais
+   *    étranger/invalide → 404 ; existant mais non rattaché / suspendu /
+   *    annulé / incompatible → 4xx SANS JAMAIS de repli legacy ;
+   *  ③ réservation idempotente C1 sur le service (empreinte = intentions
+   *    reçues BRUTES, sans lecture GitHub) ;
+   *  ④ rejeu → retourne l'opération existante (ou 409 explicite) AVANT B0 ;
+   *  ⑤ B0 (quota pack) UNIQUEMENT pour une nouvelle opération, avec
+   *    compensation pré-provider en cas d'échec ;
+   *  ⑥ `provision()` — même corps que le parcours historique, augmenté de
+   *    l'intention provider AVANT toute mutation distante (`createProject`
+   *    compris) et de la liaison allocation juste après la création de l'app.
    */
   async create(dto: CreateDeploymentDto, actor: Actor): Promise<DeploymentView> {
     await this.requireDeployEnabled();
@@ -290,93 +330,214 @@ export class DeploymentsService {
       );
     }
 
-    // B0.5 — VALIDATION AVANT TOUTE ACTION EXTERNE : pack/module/serveur
-    // résolus en base (aucune écriture, aucun appel GitHub, aucun appel
-    // provider) puis quota contrôlé (fail-closed B0.3). Rien n'est créé — ni
-    // row, ni DNS, ni projet provider, ni appel réseau — si le compte n'a pas
-    // de pack actif ou si le quota est refusé / indéterminable.
-    const { server, pack, module } = await this.resolvePackTarget(actor.sub);
-    await this.assertUnderPackQuota(actor.sub, pack, module);
+    // B0.5 — VALIDATION AVANT TOUTE ACTION EXTERNE : pack/module/serveur +
+    // abonnement résolus en base (aucune écriture, aucun appel GitHub, aucun
+    // appel provider). Rien n'est créé — ni row, ni DNS, ni projet provider,
+    // ni appel réseau — sans cible valide.
+    const target = await this.resolvePackTarget(actor.sub);
+    const c2Enabled = isHostingC2Enabled();
 
-    // ── Résolution du dépôt : mode GitHub lié (token + propriété) ou URL. ─────
-    let repoUrl: string;
-    let repoFullName: string;
-    let suggestedBuildPack: string | undefined;
-    let detectedBranch: string | undefined;
-    if (dto.repoUrl) {
-      // Mode URL (10bis.5) : AUCUN token GitHub requis — détection best-effort.
-      const detected = await this.github.detectRepo(dto.repoUrl);
-      repoUrl = detected.repoUrl;
-      repoFullName = detected.repoFullName ?? this.github.deriveRepoFullName(repoUrl) ?? 'depot';
-      detectedBranch = detected.defaultBranch;
-      suggestedBuildPack = detected.suggestedBuildPack;
-    } else {
-      // Mode GitHub lié : token + propriété du dépôt re-vérifiée à la volée.
-      const githubToken = await this.requireGithubToken(actor);
-      repoFullName = dto.repoFullName!;
-      if (!(await this.github.repoExists(githubToken, repoFullName))) {
-        throw new BadRequestException('Dépôt GitHub inaccessible ou non possédé.');
-      }
-      repoUrl = `https://github.com/${repoFullName}.git`;
+    // ── ① Garde OFF : contrat historique préservé, AUCUN accès hosting. ──────
+    if (!c2Enabled) {
+      await this.assertUnderPackQuota(actor.sub, target.pack, target.module);
+      return this.provision(dto, actor, { ...target, c2Enabled: false, c2: null });
     }
 
-    // Phase 13 — projet provider (module A partagé / B dédié), résolu UNIQUEMENT
-    // après la validation pack + quota (B0.5 : aucune ressource externe avant).
-    const { projectUuid, clientProjectId } = await this.resolveProject(
-      module,
-      server,
-      actor.sub,
-    );
+    // ── ② Classification locale (aucun réseau, ownership stricte du jeton). ──
+    const hostingServiceId = await this.classifyHostingService(actor.sub, dto, target);
+    if (!hostingServiceId) {
+      // Legacy PROUVÉ : zéro ligne HostingService ⇒ parcours historique, avec
+      // marqueur d'audit explicite (B0 — jamais de B1, aucun slot consommé).
+      await this.assertUnderPackQuota(actor.sub, target.pack, target.module);
+      return this.provision(dto, actor, { ...target, c2Enabled: true, c2: null });
+    }
 
-    const branch = dto.branch?.trim() ? dto.branch.trim() : (detectedBranch ?? 'main');
-
-    // Phase 16 — build « file-based » : on PRÉFÈRE les valeurs explicites du
-    // client (page de build), sinon les valeurs lues de codediali.toml /
-    // netlify.toml (best-effort), sinon la détection auto existante. Le serveur
-    // re-sane et borne : un fichier malformé ne casse jamais le déploiement.
-    const buildFromFile = await this.github
-      .readBuildConfig(repoFullName, branch, dto.repoUrl ? null : await this.tryGithubToken(actor))
-      .catch(() => null);
-    const conn = this.resolveBuildConnection(dto, buildFromFile);
-    // Fix 503 « no available server » — SPA Vite. On NE force PAS build_pack
-    // "static" : le pack static de Coolify NE BUILDE pas (clone frais ⇒ dist
-    // absent ⇒ sert la racine source ⇒ page vide). Recette validée voie store :
-    // garder le build stack (nixpacks → produit dist/) et poser isStatic + /dist
-    // pour que Coolify serve la sortie de build statiquement (port 80).
-    const packed = dto.buildPack ?? buildFromFile?.pack ?? suggestedBuildPack ?? 'nixpacks';
-    const appName = dto.appName?.trim()
-      ? dto.appName.trim()
-      : (repoFullName.split('/')[1] ?? 'mon-app');
-    const target = this.buildTarget(server);
-    const transport = this.panelFactory.create();
-
-    const row = await this.prisma.deployment.create({
-      data: {
-        userId: actor.sub,
-        serverId: server.id,
-        repoFullName,
-        repoUrl: dto.repoUrl ? repoUrl : null,
-        buildPack: packed,
-        appName,
-        branch,
-        status: DeploymentStatus.PENDING,
-        // Phase 16 — build file-based persisté pour un re-déploiement déterministe.
-        baseDirectory: conn.baseDirectory,
-        buildCommand: conn.buildCommand,
-        installCommand: conn.installCommand,
-        publishDirectory: conn.publishDirectory,
-        functionsDirectory: conn.functionsDirectory,
-        environment: Object.keys(conn.environment).length ? conn.environment : Prisma.JsonNull,
-        // Phase 13 — traçabilité du projet/module qui héberge l'app.
-        coolifyProjectUuid: projectUuid,
-        moduleId: module?.id ?? null,
-        clientProjectId: clientProjectId ?? null,
-        // Phase 17 (3c/3d) — pack à l'origine de la création (quota per-pack + tracking).
-        packId: pack?.id ?? null,
-      },
+    // ── ③ Réservation C1 (empreinte sur l'intention reçue, brute). ──────────
+    if (!dto.clientRequestId?.trim()) {
+      throw new BadRequestException('clientRequestId requis (UUID v4 attendu).');
+    }
+    let clientRequestId: string;
+    try {
+      clientRequestId = normalizeClientRequestId(dto.clientRequestId);
+    } catch (error) {
+      throw new BadRequestException((error as Error).message);
+    }
+    const reserved = await this.hosting.reserveSlot({
+      hostingServiceId,
+      actorUserId: actor.sub,
+      clientRequestId,
+      payload: this.reservationPayloadFromIntent(dto),
     });
 
+    // ── ④ Rejeu : l'opération existante revient AVANT B0 (aucun contrôle de
+    //    quota, aucune exécution provider, aucun takeover). ──────────────────
+    if (reserved.replayed) {
+      return this.replayView(reserved.allocation, actor);
+    }
+
+    // ── ⑤ B0 — quota UNIQUEMENT pour une nouvelle opération. Échec ⇒
+    //    compensation pré-provider (aucune row, slot libéré si intension nulle). ─
     try {
+      await this.assertUnderPackQuota(actor.sub, target.pack, target.module);
+    } catch (error) {
+      await this.compensatePreProvider(actor, reserved.allocation.id, {
+        rowId: null,
+        reason: 'quota',
+      });
+      throw error;
+    }
+
+    return this.provision(dto, actor, {
+      ...target,
+      c2Enabled: true,
+      c2: { allocationId: reserved.allocation.id, hostingServiceId, clientRequestId },
+    });
+  }
+
+  /** Contexte du corps de création partagé garde OFF / parcours C2. */
+  private async provision(
+    dto: CreateDeploymentDto,
+    actor: Actor,
+    ctx: {
+      server: Server;
+      pack: HostingPack;
+      module: DeploymentModule;
+      subscription: Subscription;
+      c2Enabled: boolean;
+      c2: { allocationId: string; hostingServiceId: string; clientRequestId: string } | null;
+    },
+  ): Promise<DeploymentView> {
+    const { server, pack, module, c2, c2Enabled } = ctx;
+    // La row et l'intention sont suivies pour la compensation : toute erreur
+    // SURVENANT AVANT que l'intention provider ne soit posée ne peut PAS avoir
+    // touché au réseau (createProject résolu plus bas, après le marqueur).
+    let row: Deployment | null = null;
+    let intentPossessed = false;
+    // Variables du flow visibles du catch (audit `deploy.failed` — contrat
+    // historique conservé). Toutes assignées avant la création de la row.
+    let repoUrl = '';
+    let repoFullName = '';
+    let suggestedBuildPack: string | undefined;
+    let detectedBranch: string | undefined;
+    let branch = '';
+    let packed = '';
+    let appName = '';
+    try {
+      // ── Résolution du dépôt : mode GitHub lié (token + propriété) ou URL. ─────
+      if (dto.repoUrl) {
+        // Mode URL (10bis.5) : AUCUN token GitHub requis — détection best-effort.
+        const detected = await this.github.detectRepo(dto.repoUrl);
+        repoUrl = detected.repoUrl;
+        repoFullName = detected.repoFullName ?? this.github.deriveRepoFullName(repoUrl) ?? 'depot';
+        detectedBranch = detected.defaultBranch;
+        suggestedBuildPack = detected.suggestedBuildPack;
+      } else {
+        // Mode GitHub lié : token + propriété du dépôt re-vérifiée à la volée.
+        const githubToken = await this.requireGithubToken(actor);
+        repoFullName = dto.repoFullName!;
+        if (!(await this.github.repoExists(githubToken, repoFullName))) {
+          throw new BadRequestException('Dépôt GitHub inaccessible ou non possédé.');
+        }
+        repoUrl = `https://github.com/${repoFullName}.git`;
+      }
+
+      // Phase 13 — projet provider (module A partagé / B dédié). Historique
+      // (garde OFF, et chemin legacy sous garde ON) : résolu ICI, après quota
+      // (B0.5) et avant la row. C2 : DÉFÉRÉ plus bas — `createProject` est une
+      // mutation distante et doit être couverte par l'intention provider déjà
+      // posée juste après la création de la row.
+      let projectUuid: string | undefined;
+      let clientProjectId: string | undefined;
+      if (!c2) {
+        ({ projectUuid, clientProjectId } = await this.resolveProject(
+          module,
+          server,
+          actor.sub,
+        ));
+      }
+
+      branch = dto.branch?.trim() ? dto.branch.trim() : (detectedBranch ?? 'main');
+
+      // Phase 16 — build « file-based » : on PRÉFÈRE les valeurs explicites du
+      // client (page de build), sinon les valeurs lues de codediali.toml /
+      // netlify.toml (best-effort), sinon la détection auto existante. Le serveur
+      // re-sane et borne : un fichier malformé ne casse jamais le déploiement.
+      const buildFromFile = await this.github
+        .readBuildConfig(repoFullName, branch, dto.repoUrl ? null : await this.tryGithubToken(actor))
+        .catch(() => null);
+      const conn = this.resolveBuildConnection(dto, buildFromFile);
+      // Fix 503 « no available server » — SPA Vite. On NE force PAS build_pack
+      // "static" : le pack static de Coolify NE BUILDE pas (clone frais ⇒ dist
+      // absent ⇒ sert la racine source ⇒ page vide). Recette validée voie store :
+      // garder le build stack (nixpacks → produit dist/) et poser isStatic + /dist
+      // pour que Coolify serve la sortie de build statiquement (port 80).
+      packed = dto.buildPack ?? buildFromFile?.pack ?? suggestedBuildPack ?? 'nixpacks';
+      appName = dto.appName?.trim()
+        ? dto.appName.trim()
+        : (repoFullName.split('/')[1] ?? 'mon-app');
+      const target = this.buildTarget(server);
+      const transport = this.panelFactory.create();
+
+      row = await this.prisma.deployment.create({
+        data: {
+          userId: actor.sub,
+          serverId: server.id,
+          repoFullName,
+          repoUrl: dto.repoUrl ? repoUrl : null,
+          buildPack: packed,
+          appName,
+          branch,
+          status: DeploymentStatus.PENDING,
+          // Phase 16 — build file-based persisté pour un re-déploiement déterministe.
+          baseDirectory: conn.baseDirectory,
+          buildCommand: conn.buildCommand,
+          installCommand: conn.installCommand,
+          publishDirectory: conn.publishDirectory,
+          functionsDirectory: conn.functionsDirectory,
+          environment: Object.keys(conn.environment).length ? conn.environment : Prisma.JsonNull,
+          // Phase 13 — traçabilité du projet/module qui héberge l'app.
+          // C2 : projectUuid reste NULL tant que l'intention n'est pas posée.
+          coolifyProjectUuid: projectUuid,
+          moduleId: module?.id ?? null,
+          clientProjectId: clientProjectId ?? null,
+          // Phase 17 (3c/3d) — pack à l'origine de la création (quota per-pack + tracking).
+          packId: pack?.id ?? null,
+        },
+      });
+
+      // ── C2 : intention provider DURCIE AVANT toute mutation distante ────────
+      // (`createProject` du module B inclus — résolu juste après ce marqueur).
+      // Elle ne prouve NI un résultat provider NI une reprise distante : juste
+      // « l'intention d'appel était committée » le moment de la 1ʳᵉ écriture.
+      if (c2) {
+        const intent = await this.hosting.markProviderIntent({
+          allocationId: c2.allocationId,
+          actorUserId: actor.sub,
+        });
+        if (!intent.applied) {
+          // État contradictoire sur une réservation fraîche. `already_present` :
+          // l'intention existe déjà → on ne libère JAMAIS (jamais de RELEASED
+          // après intention possible). `invalid_state`/`terminal` : la
+          // libération se refuse d'elle-même (moteur), ligne nettoyée ci-dessous.
+          if (intent.reason === 'already_present') intentPossessed = true;
+          throw new ConflictException(
+            `Intention provider non applicable (${intent.reason}) : réservation conservée, aucune reprise automatique.`,
+          );
+        }
+        intentPossessed = true;
+        // 1ʳᵉ mutation distante couverte par l'intention : projet provider.
+        const proj = await this.resolveProject(module, server, actor.sub);
+        projectUuid = proj.projectUuid;
+        clientProjectId = proj.clientProjectId;
+        await this.prisma.deployment.update({
+          where: { id: row.id },
+          data: {
+            coolifyProjectUuid: projectUuid ?? null,
+            clientProjectId: clientProjectId ?? null,
+          },
+        });
+      }
+
       const app = await transport.createGitApp(target, {
         repoUrl,
         branch,
@@ -393,6 +554,18 @@ export class DeploymentsService {
         // Fix 503 — SPA Vite : transmet is_static:true à Coolify.
         isStatic: conn.isStatic,
       });
+      if (c2) {
+        // ── Liaison allocation → déploiement. L'uuid est une preuve LOCALE de
+        // création d'app (JAMAIS une réussite de déploiement : le run n'est même
+        // pas déclenché à ce stade). `markBound` exige ownership croisé (row du
+        // MÊME propriétaire que le service) et est idempotent sur CETTE row.
+        await this.hosting.markBound({
+          allocationId: c2.allocationId,
+          actorUserId: actor.sub,
+          deploymentId: row.id,
+          proof: { providerProven: Boolean(app.uuid) },
+        });
+      }
       // Phase 16 — variables d'environnement de BUILD (best-effort : un échec
       // est tracé en warn et n'annule jamais le déploiement).
       if (Object.keys(conn.environment).length) {
@@ -550,10 +723,35 @@ export class DeploymentsService {
           coolifyUuid: app.uuid,
           moduleId: module?.id ?? null,
           projectUuid: projectUuid ?? null,
+          // 17B.4F-C2 — preuve d'audit du chemin emprunté : opération C2
+          // liée, legacy PROUVÉ (sous garde ON), ou garde OFF (champ absent).
+          ...(c2Enabled
+            ? c2
+              ? {
+                  c2: {
+                    hostingServiceId: c2.hostingServiceId,
+                    allocationId: c2.allocationId,
+                    clientRequestId: c2.clientRequestId,
+                  },
+                }
+              : { c2: 'legacy_no_service' }
+            : {}),
         },
       });
       return this.toView(updated);
     } catch (err) {
+      // ── Fenêtre PRÉ-provider (intention non posée) : compensation locale
+      // sûre — row PENDING sans uuid supprimée (GARDEE), slot libéré SEULEMENT
+      // si la row est bien nettoyée — puis erreur d'origine préservée (le
+      // contrat HTTP historique : pas de FAILED artificiel avant la row). ────
+      if (c2 && !intentPossessed) {
+        await this.compensatePreProvider(actor, c2.allocationId, {
+          rowId: row?.id ?? null,
+          reason: 'pre_intent',
+        });
+        throw err;
+      }
+      if (!row) throw err; // échecs avant row : propagation inchangée (legacy)
       const message = err instanceof Error ? err.message : String(err);
       const failed = await this.prisma.deployment.update({
         where: { id: row.id },
@@ -565,10 +763,317 @@ export class DeploymentsService {
         action: 'deploy.failed',
         resourceType: 'deployment',
         resourceId: row.id,
-        details: { repoFullName, branch, buildPack: packed, appName, message },
+        details: {
+          repoFullName,
+          branch,
+          buildPack: packed,
+          appName,
+          message,
+          ...(c2Enabled
+            ? c2
+              ? {
+                  c2: {
+                    hostingServiceId: c2.hostingServiceId,
+                    allocationId: c2.allocationId,
+                    clientRequestId: c2.clientRequestId,
+                  },
+                }
+              : { c2: 'legacy_no_service' }
+            : {}),
+        },
       });
+      // ── Post-intention (C2) : JAMAIS de libération automatique (jamais de
+      // RELEASED après intention possible) — reprise = C4, jamais de 2ᵉ appel
+      // provider aveugle. Contrat 502 inchangé pour le parcours historique. ──
       throw new BadGatewayException(`Échec du déploiement : ${message}`);
     }
+  }
+
+  // ── 17B.4F-C2 — parcours sous garde ────────────────────────────────────────
+
+  /**
+   * Classification LOCALE (aucun réseau, ownership stricte du jeton) :
+   *  • aucun `hostingServiceId` fourni + ZÉRO ligne `HostingService` sur le
+   *    compte (tous statuts) ⇒ `null` = legacy PROUVÉ (seul chemin legacy
+   *    autorisé sous garde ON) ;
+   *  • `hostingServiceId` fourni mais introuvable / étranger ⇒ 404 (on ne fuit
+   *    jamais l'existence d'un service d'autrui) ;
+   *  • ligne(s) existante(s) mais non rattachée(s) à l'abonnement actif,
+   *    suspendue, annulée ou incompatible pack/module ⇒ 4xx explicite,
+   *    JAMAIS de repli legacy ;
+   *  • plusieurs services rattachés ⇒ 409 (préciser `hostingServiceId`).
+   * Limite assumée : la cible vient de `resolvePackTarget` (abonnement ACTIVE
+   * le plus récent) — la sélection multi-abonnement n'est pas résolue par le
+   * code existant (signalée en revue).
+   */
+  private async classifyHostingService(
+    userId: string,
+    dto: CreateDeploymentDto,
+    target: { pack: HostingPack; module: DeploymentModule; subscription: Subscription },
+  ): Promise<string | null> {
+    const services = await this.prisma.hostingService.findMany({
+      where: { userId },
+      orderBy: { createdAt: 'asc' },
+    });
+    if (dto.hostingServiceId) {
+      const selected = services.find((s) => s.id === dto.hostingServiceId);
+      if (!selected) {
+        throw new NotFoundException('Service hébergement introuvable.');
+      }
+      this.assertServiceUsable(selected, target);
+      return selected.id;
+    }
+    // Legacy PROUVÉ : absence totale de ligne, quels que soient les statuts.
+    if (services.length === 0) return null;
+    const attached = services.filter((s) => this.isAttachedToTarget(s, target.subscription));
+    if (attached.length === 0) {
+      throw new ConflictException(
+        "Des services hébergement existent sur votre compte mais aucun n'est rattaché à votre abonnement actif : sélectionnez un service valide (aucun repli sur l'ancien parcours).",
+      );
+    }
+    if (attached.length > 1) {
+      throw new ConflictException(
+        'Plusieurs services hébergement correspondent à cet abonnement : précisez hostingServiceId.',
+      );
+    }
+    this.assertServiceUsable(attached[0]!, target);
+    return attached[0]!.id;
+  }
+
+  /** Rattachement à l'abonnement courant : `subscriptionId` OU `orderId`.
+   *  `Pick` : accepte la row partielle du sélecteur C2 ET la row complète de
+   *  la classification — UN SEUL critère pour les deux chemins. */
+  private isAttachedToTarget(
+    service: Pick<HostingService, 'subscriptionId' | 'orderId'>,
+    subscription: Subscription,
+  ): boolean {
+    if (service.subscriptionId && subscription.id && service.subscriptionId === subscription.id) {
+      return true;
+    }
+    if (service.orderId && subscription.orderId && service.orderId === subscription.orderId) {
+      return true;
+    }
+    return false;
+  }
+
+  /** Refus explicites (jamais de repli legacy) : statut, rattachement,
+   *  compatibilité pack/module (provenance de la réservation). */
+  private assertServiceUsable(
+    service: HostingService,
+    target: { pack: HostingPack; module: DeploymentModule; subscription: Subscription },
+  ): void {
+    if (service.status !== HostingServiceStatus.ACTIVE) {
+      throw new ConflictException(
+        service.status === HostingServiceStatus.CANCELLED
+          ? 'Service hébergement annulé : aucune création possible (aucun repli).'
+          : 'Service hébergement non actif : aucune création possible (aucun repli).',
+      );
+    }
+    if (!this.isAttachedToTarget(service, target.subscription)) {
+      throw new ConflictException(
+        "Service hébergement non rattaché à votre abonnement actif (provenance ambiguë) : aucune création possible (aucun repli).",
+      );
+    }
+    if (service.packId !== target.pack.id || service.deploymentModuleId !== target.module.id) {
+      throw new ConflictException(
+        'Service hébergement incompatible avec le pack/module de déploiement actif (provenance différente) : aucune création possible (aucun repli).',
+      );
+    }
+  }
+
+  /**
+   * Intention reçue → payload d'empreinte : VALEURS BRUTES du DTO, AUCUNE
+   * transformation (pas de trim, pas de casse, pas de défaut), AUCUNE lecture
+   * GitHub. Une `branch` absente (`null`) est DISTINCTE d'une branche explicite
+   * `"main"`. Les valeurs résolues après lecture (branche détectée, valeurs de
+   * codediali.toml, pack déduit) sont persistées sur la row `Deployment` et
+   * associées à l'opération via `allocation.deploymentId` — JAMAIS recalculées
+   * pour un rejeu. Limite C1 assumée (documentée en revue) : l'empreinte couvre
+   * l'intention reçue, pas la résolution réseau effectuée à la 1ʳᵉ exécution.
+   */
+  private reservationPayloadFromIntent(dto: CreateDeploymentDto): ReservationPayload {
+    const v = (value: string | undefined): string | null => value ?? null;
+    return {
+      business: {
+        repoFullName: v(dto.repoFullName),
+        repoUrl: v(dto.repoUrl),
+        branch: v(dto.branch),
+        buildPack: v(dto.buildPack),
+        appName: v(dto.appName),
+        subdomain: v(dto.subdomain),
+        domainId: v(dto.domainId),
+        baseDirectory: v(dto.baseDirectory),
+        buildCommand: v(dto.buildCommand),
+        installCommand: v(dto.installCommand),
+        publishDirectory: v(dto.publishDirectory),
+        functionsDirectory: v(dto.functionsDirectory),
+      },
+      environment: (dto.environment ?? {}) as ReservationPayload['environment'],
+    };
+  }
+
+  /**
+   * Rejeu idempotent : renvoie l'opération EXISTANTE (aucune exécution
+   * provider, aucun contrôle B0, aucune écriture) ou un refus 409 explicite —
+   * JAMAIS de takeover d'une réservation en cours, JAMAIS de 2ᵉ exécution.
+   */
+  private async replayView(
+    allocation: HostingServiceAllocation,
+    actor: Actor,
+  ): Promise<DeploymentView> {
+    if (
+      allocation.status === HostingServiceAllocationStatus.BOUND &&
+      allocation.deploymentId
+    ) {
+      const dep = await this.prisma.deployment.findFirst({
+        where: { id: allocation.deploymentId, userId: actor.sub },
+        include: { server: { select: { id: true, name: true } } },
+      });
+      if (dep) return this.toView(dep);
+      throw new ConflictException(
+        'Demande déjà traitée mais le déploiement associé est introuvable : contactez le support.',
+      );
+    }
+    if (allocation.status === HostingServiceAllocationStatus.RESERVED) {
+      throw new ConflictException(
+        allocation.providerIntentAt
+          ? 'Création en incertitude pour cette demande (intention provider déjà enregistrée) : reprise par le support, aucune nouvelle création automatique.'
+          : 'Création déjà en cours pour cette demande.',
+      );
+    }
+    throw new ConflictException(
+      'Demande déjà traitée (libération en cours ou terminée) : aucune nouvelle création.',
+    );
+  }
+
+  /**
+   * Compensation PRÉ-provider (aucune mutation distante possible tant que
+   * l'intention n'est pas posée) :
+   *  • row créée dans la fenêtre [row, intention] : suppression GARDEE
+   *    (`status=PENDING` + `coolifyUuid` NULL) AVANT libération — JAMAIS de
+   *    slot libéré laissant un Deployment orphelin ;
+   *  • suppression impossible ⇒ la row bascule FAILED (état explicite) et le
+   *    slot est CONSERVÉ (releaseRefusé volontairement) ;
+  *  • libération refusée/échouée ⇒ trace d'audit explicite, état conservé —
+   *    aucune écriture SQL manuelle (reprise = C4, jamais de lease/takeover).
+   */
+  private async compensatePreProvider(
+    actor: Actor,
+    allocationId: string,
+    opts: { rowId: string | null; reason: string },
+  ): Promise<void> {
+    const rowCleared = opts.rowId ? await this.clearUnprovisionedRow(opts.rowId) : true;
+    let released = false;
+    let releaseReason: string | null = null;
+    if (rowCleared) {
+      try {
+        const res = await this.hosting.releasePreProvider({
+          allocationId,
+          actorUserId: actor.sub,
+        });
+        released = res.released;
+        releaseReason = res.released ? null : res.reason;
+      } catch {
+        releaseReason = 'release_error'; // classe locale, jamais de message brut (B0.8)
+      }
+    } else {
+      releaseReason = 'row_kept';
+    }
+    await this.audit.record({
+      actorId: actor.sub,
+      actorEmail: actor.email,
+      action: 'deploy.c2.rollback',
+      resourceType: 'hosting-allocation',
+      resourceId: allocationId,
+      details: {
+        trigger: opts.reason,
+        rowCleared,
+        released,
+        ...(releaseReason ? { releaseReason } : {}),
+      },
+    });
+  }
+
+  /** Suppression GARDEE de la row PENDING sans app provider. false = row
+   *  conservée en FAILED (état explicite) → le slot N'EST PAS libéré. */
+  private async clearUnprovisionedRow(rowId: string): Promise<boolean> {
+    try {
+      const res = await this.prisma.deployment.deleteMany({
+        where: { id: rowId, status: DeploymentStatus.PENDING, coolifyUuid: null },
+      });
+      if (res.count === 1) return true;
+    } catch {
+      // → état explicite ci-dessous
+    }
+    try {
+      await this.prisma.deployment.update({
+        where: { id: rowId },
+        data: {
+          status: DeploymentStatus.FAILED,
+          detail: 'Échec local avant intention provider : ligne conservée en état explicite (slot non libéré).',
+        },
+      });
+    } catch {
+      // audité par l'appelant (rowCleared=false)
+    }
+    return false;
+  }
+
+  /**
+   * Sélecteur de services du client (17B.4F-C2) — métadonnées du jeton
+   * uniquement, aucun transport/panel, aucun secret. Garde OFF : réponse FIXE
+   * inerte `{ enabled: false, services: [] }` — AUCUN accès BDD.
+   * `compatible` = service ACTIF + pack/module IDENTIQUES + RATTACHÉ à la
+   * cible courante — les mêmes critères locaux que le POST (qui garde son
+   * contrôle autoritaire en 4xx, jamais de repli legacy).
+   */
+  async listHostingServices(
+    actor: Actor,
+  ): Promise<{ enabled: boolean; services: HostingServiceOption[] }> {
+    if (!isHostingC2Enabled()) {
+      return { enabled: false, services: [] };
+    }
+    const rows = await this.prisma.hostingService.findMany({
+      where: { userId: actor.sub },
+      select: {
+        id: true,
+        status: true,
+        packNameSnapshot: true,
+        maxAppsSnapshot: true,
+        packId: true,
+        deploymentModuleId: true,
+        subscriptionId: true,
+        orderId: true,
+      },
+      orderBy: { createdAt: 'asc' },
+    });
+    let pack: HostingPack | null = null;
+    let module: DeploymentModule | null = null;
+    let subscription: Subscription | null = null;
+    try {
+      const target = await this.resolvePackTarget(actor.sub);
+      pack = target.pack;
+      module = target.module;
+      subscription = target.subscription;
+    } catch {
+      // Aucune cible active : rien de compatible (fail-safe, pas de blocage).
+    }
+    return {
+      enabled: true,
+      services: rows.map((s) => ({
+        id: s.id,
+        status: s.status,
+        packNameSnapshot: s.packNameSnapshot,
+        maxAppsSnapshot: s.maxAppsSnapshot,
+        compatible:
+          s.status === HostingServiceStatus.ACTIVE &&
+          !!pack &&
+          !!subscription &&
+          s.packId === pack.id &&
+          s.deploymentModuleId === (module?.id ?? null) &&
+          this.isAttachedToTarget(s, subscription),
+      })),
+    };
   }
 
   /** Les déploiements du client (service + nom de serveur inclus) + le quota
@@ -797,6 +1302,8 @@ export class DeploymentsService {
    * A/B → serveur Coolify connecté. AUCUNE action externe ici (le projet
    * provider est résolu séparément par `resolveProject`, après quota).
    * Sert de gate de validation : sans pack actif → 403.
+   * 17B.4F-C2 : renvoie aussi l'`subscription` ACTIVE (rattachement du service
+   * hébergement : `subscriptionId`/`orderId`).
    */
   private async resolvePackTarget(
     userId: string,
@@ -804,6 +1311,7 @@ export class DeploymentsService {
     server: Server;
     pack: HostingPack;
     module: DeploymentModule;
+    subscription: Subscription;
   }> {
     const subscription = await this.prisma.subscription.findFirst({
       where: { userId, status: SubscriptionStatus.ACTIVE },
@@ -832,7 +1340,8 @@ export class DeploymentsService {
       );
     }
     const server = this.requireCoolifyServer(module.server);
-    return { server, pack, module };
+    // pack issu de subscription ⇒ non-null ici (le gate ci-dessus l'a prouvé).
+    return { server, pack, module, subscription: subscription! };
   }
 
   /** Vérifie que le serveur est Coolify + connecté (panelOk + credentials). */

@@ -59,6 +59,15 @@ export class DeploymentsController {
     return this.deployments.checkRepoEmpty(dto.repoFullName, dto.branch, actor);
   }
 
+  @Get('hosting-services')
+  @ApiOperation({
+    summary:
+      'My selectable hosting services — inert {enabled:false,services:[]} when the C2 guard is OFF (17B.4F-C2)',
+  })
+  listHostingServices(@CurrentUser() actor: JwtPayload) {
+    return this.deployments.listHostingServices(actor);
+  }
+
   @Get('domains')
   @ApiOperation({ summary: 'Free root domains available to this client for a subdomain (Phase 16)' })
   listFreeDomains(@CurrentUser() actor: JwtPayload) {
