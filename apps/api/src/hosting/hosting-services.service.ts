@@ -788,6 +788,97 @@ export class HostingServicesService {
   }
 
   /**
+   * Variante C4 `…InTx` de `startReleasing` (même contrat, aucun réseau) :
+   * s'exécute dans LA transaction fournie (T-release du protocole C4) — verrous
+   * ordonnés HostingService → HostingServiceAllocation, AUCUNE `$transaction`
+   * imbriquée.
+   */
+  async startReleasingInTx(
+    tx: Prisma.TransactionClient,
+    params: {
+      allocationId: string;
+      actorUserId: string;
+    },
+  ): Promise<HostingServiceAllocation> {
+    const allocation = await this.lockAllocation(tx, params.allocationId, params.actorUserId);
+    if (allocation.status === HostingServiceAllocationStatus.RELEASED) {
+      throw new ForbiddenException('Allocation déjà libérée.');
+    }
+    if (allocation.status === HostingServiceAllocationStatus.RELEASING) {
+      return tx.hostingServiceAllocation.findUniqueOrThrow({ where: { id: allocation.id } });
+    }
+    if (
+      allocation.status !== HostingServiceAllocationStatus.RESERVED &&
+      allocation.status !== HostingServiceAllocationStatus.BOUND
+    ) {
+      throw new ForbiddenException('Transition vers RELEASING refusée.');
+    }
+    return tx.hostingServiceAllocation.update({
+      where: { id: allocation.id },
+      data: { status: HostingServiceAllocationStatus.RELEASING },
+    });
+  }
+
+  /**
+   * Contrat LOCAL d'une libération C4 : preuve STRUCTURÉE de nettoyage (jamais
+   * un booléen `providerCleanupProven` en entrée, jamais une valeur d'entrée
+   * fournie par un chemin HTTP). Les ressources doivent être renseignées et
+   * concluantes ; `deploymentId` doit être NULL (détachement effectué).
+   */
+  private assertC4Evidence(evidence: {
+    appOutcome?: unknown;
+    dnsOutcome?: unknown;
+    [k: string]: unknown;
+  }): void {
+    const allowed = new Set(['DELETED', 'ABSENT', 'NOT_CREATED']);
+    if (
+      typeof evidence?.appOutcome !== 'string' ||
+      !allowed.has(evidence.appOutcome) ||
+      typeof evidence?.dnsOutcome !== 'string' ||
+      !allowed.has(evidence.dnsOutcome)
+    ) {
+      throw new PreconditionFailedException(
+        'Preuve de libération C4 invalide (issues app/DNS conclusionnes requises).',
+      );
+    }
+  }
+
+  /**
+   * Variante C4 `…InTx` de `completeRelease` (libération finale sous preuve
+   * STRUCTURÉE, contrat C4) : `RELEASING → RELEASED`, déploiement détaché,
+   * preuve exigée et validée (issues conclusionnes), `RELEASED` idempotent.
+   * La preuve durable (`C4ReleaseEvidence`) est écrite par le orchestrateur C4
+   * dans LA MÊME transaction (unicité par allocation = une seule libération).
+   */
+  async completeReleaseInTx(
+    tx: Prisma.TransactionClient,
+    params: {
+      allocationId: string;
+      actorUserId: string;
+      evidence: { appOutcome: string; dnsOutcome: string; [k: string]: unknown };
+    },
+  ): Promise<HostingServiceAllocation> {
+    this.assertC4Evidence(params.evidence);
+    const allocation = await this.lockAllocation(tx, params.allocationId, params.actorUserId);
+    if (allocation.status === HostingServiceAllocationStatus.RELEASED) {
+      return tx.hostingServiceAllocation.findUniqueOrThrow({ where: { id: allocation.id } });
+    }
+    if (allocation.status !== HostingServiceAllocationStatus.RELEASING) {
+      throw new ForbiddenException('Seule une libération en cours peut être finalisée.');
+    }
+    if (allocation.deploymentId) {
+      throw new ConflictException('Le déploiement doit être détaché avant la libération.');
+    }
+    return tx.hostingServiceAllocation.update({
+      where: { id: allocation.id },
+      data: {
+        status: HostingServiceAllocationStatus.RELEASED,
+        releasedAt: new Date(),
+      },
+    });
+  }
+
+  /**
    * Comptage des slots CONSOMMANTS d'un service (futur quota par
    * hostingServiceId). N'utilise JAMAIS un simple count(*) Deployment.
    */

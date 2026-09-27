@@ -229,6 +229,9 @@ describe('DeploymentsService', () => {
       mockPanelFactory as never,
       mockCloudflare as never,
       mockHosting as never,
+      {} as never,
+      { assertOperational: jest.fn().mockResolvedValue(undefined) } as never,
+      {} as never,
     );
     jest.clearAllMocks();
     // 17B.4F-C2 — garde OFF par défaut (contrat historique préservé). Les
@@ -1277,7 +1280,7 @@ describe('DeploymentsService', () => {
         where: { deploymentId: 'dep1' },
       });
       expect(mockTx.deployment.delete).toHaveBeenCalledWith({ where: { id: 'dep1' } });
-      expect(out).toEqual({ removed: true, appName: 'mon-app', partial: false });
+      expect(out).toEqual({ removed: true, appName: 'mon-app', partial: false, freedQuota: false });
     });
 
     it('B0.1 : échec provider non-absent ⇒ 502 et AUCUNE suppression locale (fail-closed)', async () => {
@@ -1304,7 +1307,7 @@ describe('DeploymentsService', () => {
 
       const out = await service.remove('dep1', actor);
 
-      expect(out).toEqual({ removed: true, appName: 'mon-app', partial: false });
+      expect(out).toEqual({ removed: true, appName: 'mon-app', partial: false, freedQuota: false });
       expect(mockTx.deployment.delete).toHaveBeenCalledWith({ where: { id: 'dep1' } });
       expect(mockCloudflare.deleteDnsRecord).toHaveBeenCalled();
     });
@@ -1329,7 +1332,7 @@ describe('DeploymentsService', () => {
       expect(mockCloudflare.deleteDnsRecord).not.toHaveBeenCalled();
       expect(mockTx.clientSubdomain.deleteMany).not.toHaveBeenCalled();
       expect(mockTx.deployment.delete).toHaveBeenCalledWith({ where: { id: 'dep1' } });
-      expect(out).toEqual({ removed: true, appName: 'mon-app', partial: false });
+      expect(out).toEqual({ removed: true, appName: 'mon-app', partial: false, freedQuota: false });
     });
 
     it('B0.2 : échec DNS non-absent ⇒ row CS conservée + partial=true, app supprimée', async () => {
@@ -1338,7 +1341,7 @@ describe('DeploymentsService', () => {
 
       const out = await service.remove('dep1', actor);
 
-      expect(out).toEqual({ removed: true, appName: 'mon-app', partial: true });
+      expect(out).toEqual({ removed: true, appName: 'mon-app', partial: true, freedQuota: false });
       expect(mockTx.clientSubdomain.deleteMany).not.toHaveBeenCalled();
       expect(mockTx.deployment.delete).toHaveBeenCalledWith({ where: { id: 'dep1' } });
       expect(JSON.stringify(mockAudit.record.mock.calls)).not.toContain('CF_TOKEN=xyz789');
@@ -1350,7 +1353,7 @@ describe('DeploymentsService', () => {
 
       const out = await service.remove('dep1', actor);
 
-      expect(out).toEqual({ removed: true, appName: 'mon-app', partial: false });
+      expect(out).toEqual({ removed: true, appName: 'mon-app', partial: false, freedQuota: false });
       expect(mockTx.clientSubdomain.deleteMany).toHaveBeenCalledWith({
         where: { deploymentId: 'dep1' },
       });

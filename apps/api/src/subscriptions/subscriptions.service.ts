@@ -5,6 +5,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import {
+  HostingServiceAllocationStatus,
   PackStatus,
   Prisma,
   ProductStatus,
@@ -198,9 +199,60 @@ export class SubscriptionsService {
         `Annulation impossible : ${linked} application(s) hébergée(s) sont encore rattachées à cette souscription. Supprimez-les d'abord depuis votre espace client.`,
       );
     }
-    const updated = await this.prisma.subscription.update({
-      where: { id },
-      data: { status: SubscriptionStatus.CANCELLED },
+
+    // ── 17B.4F-C4 (D10) — gate d'annulation ATOMIQUE ──────────────────────
+    // Aucune écriture (ni transition Subscription) tant qu'une allocation est
+    // consommante (RESERVED/BOUND/RELEASING) ou qu'un service hébergement de
+    // cette souscription n'est pas terminé (CANCELLED). Verrous dans l'ordre
+    // global User → HostingService (le checkout et les réservations prennent
+    // le verrou Service avant les allocations → pas de fenêtre concurrente).
+    // Zéro nettoyage silencieux. La transition Subscription vit dans la MÊME
+    // TX : sous OFF/C3, la table `HostingServiceAllocation` absente ⇒ skip
+    // silencieux (compat pré-C1, contrat historique inchangé).
+    const updated = await this.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT "id" FROM "User" WHERE "id" = ${actor.sub} FOR UPDATE`;
+      const tables = await tx.$queryRaw<Array<{ exists: boolean }>>`
+        SELECT EXISTS (
+          SELECT 1 FROM information_schema.tables
+          WHERE table_schema = current_schema() AND table_name = 'HostingServiceAllocation'
+        ) AS "exists"`;
+      if (tables[0]?.exists) {
+        const services = await tx.$queryRaw<Array<{ id: string; status: string }>>`
+          SELECT "id", "status" FROM "HostingService"
+          WHERE "subscriptionId" = ${sub.id} OR "orderId" = ${sub.orderId ?? ''}
+          FOR UPDATE`;
+        if (services.length > 0) {
+          const consuming = await tx.hostingServiceAllocation.count({
+            where: {
+              hostingServiceId: { in: services.map((s) => s.id) },
+              status: {
+                in: [
+                  HostingServiceAllocationStatus.RESERVED,
+                  HostingServiceAllocationStatus.BOUND,
+                  HostingServiceAllocationStatus.RELEASING,
+                ],
+              },
+            },
+          });
+          if (consuming > 0) {
+            throw new ConflictException(
+              `Annulation impossible : ${consuming} slot(s) d'hébergement encore consommant(s) sur cette souscription. Libérez-les d'abord (suppression des apps ou support).`,
+            );
+          }
+          const nonTerminal = services.filter(
+            (s) => s.status !== 'CANCELLED',
+          ).length;
+          if (nonTerminal > 0) {
+            throw new ConflictException(
+              `Annulation impossible : ${nonTerminal} service(s) hébergement non terminé(s) sur cette souscription. Laissez la libération aboutir (ou contactez le support).`,
+            );
+          }
+        }
+      }
+      return tx.subscription.update({
+        where: { id },
+        data: { status: SubscriptionStatus.CANCELLED },
+      });
     });
     await this.audit.record({
       actorId: actor.sub,

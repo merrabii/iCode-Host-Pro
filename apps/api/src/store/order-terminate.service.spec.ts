@@ -110,6 +110,9 @@ describe('OrderCancelService.terminateActiveService (17B.4E-E2-B)', () => {
       crypto as never,
       cloudflare as never,
       panelFactory as never,
+      {} as never,
+      { assertOperational: jest.fn().mockResolvedValue(undefined) } as never,
+      {} as never,
     );
 
     prisma.$transaction.mockImplementation(async (cb: (t: typeof tx) => Promise<unknown>) =>

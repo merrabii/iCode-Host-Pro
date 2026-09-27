@@ -4,12 +4,21 @@ import {
   Logger,
   NotFoundException,
 } from '@nestjs/common';
-import { InvoiceStatus, OrderStatus, SubscriptionStatus } from '@prisma/client';
+import { InvoiceStatus, OrderStatus, Prisma, SubscriptionStatus, HostingServiceAllocationStatus, HostingServiceStatus } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuditService } from '../audit/audit.service';
 import { CryptoService } from '../crypto/crypto.service';
 import { CloudflareService } from '../cloudflare/cloudflare.service';
 import { PanelKind, PanelTarget, PanelTransportFactory } from '../servers/panel-transport.factory';
+import { isHostingC4Enabled } from '../hosting/c4-flag';
+import { C4CapabilityService } from '../hosting/c4-capability.service';
+import { C4ProtocolService, C4Scope } from '../hosting/c4-protocol.service';
+import {
+  C4AppOutcome,
+  C4DnsOutcome,
+  C4ReleaseService,
+  C4ReleaseResult,
+} from '../hosting/c4-release.service';
 
 /** Résultat d'une opération externe (provider ou DNS) sur cancel/terminate. */
 export type ExternalCleanup = 'deleted' | 'absent' | 'skipped' | 'failed' | 'unknown';
@@ -37,6 +46,18 @@ export interface CancelProvisioningResult {
   invoice: string;
   subscription: 'cancelled' | 'already_cancelled' | 'absent';
   partial: boolean;
+  /** 17B.4F-C4 (sous ON uniquement) : état du service + libérations d'allocations. */
+  c4?: C4CancelC4;
+}
+
+/** Synthèse C4 d'un cancel/terminate (additive, absente sous OFF). */
+export interface C4CancelC4 {
+  serviceStatus: string | null;
+  releases: Array<{
+    allocationId: string;
+    status: C4ReleaseResult['status'];
+    blockedReason?: string;
+  }>;
 }
 
 /**
@@ -57,6 +78,8 @@ export interface TerminateActiveServiceResult {
   subscription: 'cancelled' | 'already_cancelled' | 'absent';
   project: 'retained';
   partial: boolean;
+  /** 17B.4F-C4 (sous ON uniquement) : état du service + libérations d'allocations. */
+  c4?: C4CancelC4;
 }
 
 interface CancelActor {
@@ -95,6 +118,11 @@ interface CleanupOutcome {
   invoiceLabel: string;
   ownership: CsOwnership;
   partial: boolean;
+  /** 17B.4F-C4 : un recordId existait-il au moment du run (DNS créé) ? */
+  dnsHadRecord: boolean;
+  /** 17B.4F-C4 : identifiants connus AVANT nettoyage (preuve par ressource). */
+  appIdentifier: string | null;
+  dnsIdentifier: string | null;
 }
 
 /**
@@ -145,6 +173,9 @@ export class OrderCancelService {
     private readonly crypto: CryptoService,
     private readonly cloudflare: CloudflareService,
     private readonly panelFactory: PanelTransportFactory,
+    private readonly c4: C4ProtocolService,
+    private readonly c4c: C4CapabilityService,
+    private readonly c4r: C4ReleaseService,
   ) {}
 
   async cancelProvisioning(
@@ -153,6 +184,11 @@ export class OrderCancelService {
     actor: CancelActor,
   ): Promise<CancelProvisioningResult> {
     const trimmed = this.assertReason(reason);
+
+    // 17B.4F-C4 : prérequis LIVE sous ON (503 avant toute mutation) + garde
+    // relue à l'appel (OFF = contrat historique strictement inchangé).
+    await this.c4c.assertOperational();
+    const c4Enabled = isHostingC4Enabled();
 
     // ── Phase 0 : lecture gate (aucune mutation) ──
     const order = await this.loadOrderGate(orderId);
@@ -173,6 +209,10 @@ export class OrderCancelService {
           data: { status: OrderStatus.CANCELLED },
         });
         if (won.count === 1) {
+          // 17B.4F-C4 : arrêt (scopes Order/Service/Allocation/Deployment) +
+          // service → CANCELLATION_PENDING sous verrous, DANS LA MÊME tx que
+          // le CAS, AVANT le moindre dispatch de nettoyage.
+          if (c4Enabled) await this.c4MarkStops(tx, orderId, trimmed, actor.sub);
           await tx.orderStatusHistory.create({
             data: {
               orderId,
@@ -191,7 +231,8 @@ export class OrderCancelService {
         // CAS perdu : relecture DANS la transaction.
         const re = await this.readGateInTx(tx, orderId);
         if (re.status === OrderStatus.CANCELLED) {
-          // Rejeu idempotent : neutralise aussi l'éligibilité runner.
+          // Rejeu idempotent : neutralise aussi l'éligibilité runner + arrêts.
+          if (c4Enabled) await this.c4MarkStops(tx, orderId, trimmed, actor.sub);
           await tx.deployment.updateMany({
             where: { orderId },
             data: { reconcileNextAt: null },
@@ -212,13 +253,32 @@ export class OrderCancelService {
     } else {
       // Déjà CANCELLED au gate : neutralisation idempotente avant rejeu cleanup.
       alreadyCancelled = true;
-      await this.prisma.deployment.updateMany({
-        where: { orderId },
-        data: { reconcileNextAt: null },
-      });
+      if (c4Enabled) {
+        await this.prisma.$transaction(async (tx) => {
+          await this.c4MarkStops(tx, orderId, trimmed, actor.sub);
+          await tx.deployment.updateMany({
+            where: { orderId },
+            data: { reconcileNextAt: null },
+          });
+        });
+      } else {
+        await this.prisma.deployment.updateMany({
+          where: { orderId },
+          data: { reconcileNextAt: null },
+        });
+      }
     }
 
     const cleanup = await this.performCleanup(orderGate, actor, 'cancel');
+
+    // ── 17B.4F-C4 : libérations d'allocations sous preuves suffisantes + ────
+    //    terminal CANCELLED du service (seul si TOUTES les allocations sont
+    //    RELEASED et le nettoyage concluant) ; sinon CANCELLATION_PENDING.
+    let c4Summary: C4CancelC4 | undefined;
+    if (c4Enabled) {
+      c4Summary = await this.c4AttemptReleases(orderId, actor, cleanup);
+      if (c4Summary.releases.some((r) => r.status === 'blocked')) cleanup.partial = true;
+    }
 
     // ── Phase 6 : audit (détails métier contrôlés — pas d'exception brute) ──
     await this.audit.record({
@@ -227,20 +287,21 @@ export class OrderCancelService {
       action: 'order.cancel_provisioning',
       resourceType: 'order',
       resourceId: orderId,
-      details: {
-        reason: trimmed,
-        orderJustCancelled: !alreadyCancelled,
-        alreadyCancelled,
-        provider: cleanup.provider,
-        dns: cleanup.dns,
-        deployment: cleanup.deploymentLocal,
-        clientSubdomain: cleanup.csLocal,
-        csOwnership: cleanup.ownership,
-        invoice: cleanup.invoiceLabel,
-        invoicePolicy: 'no_auto_change_b1',
-        subscription: cleanup.subscription,
-        partial: cleanup.partial,
-      },
+        details: {
+          reason: trimmed,
+          orderJustCancelled: !alreadyCancelled,
+          alreadyCancelled,
+          provider: cleanup.provider,
+          dns: cleanup.dns,
+          deployment: cleanup.deploymentLocal,
+          clientSubdomain: cleanup.csLocal,
+          csOwnership: cleanup.ownership,
+          invoice: cleanup.invoiceLabel,
+          invoicePolicy: 'no_auto_change_b1',
+          subscription: cleanup.subscription,
+          partial: cleanup.partial,
+          ...(c4Summary ? { c4: c4Summary } : {}),
+        } as unknown as Prisma.InputJsonValue,
     });
 
     return {
@@ -254,6 +315,7 @@ export class OrderCancelService {
       invoice: cleanup.invoiceLabel,
       subscription: cleanup.subscription,
       partial: cleanup.partial,
+      ...(c4Summary ? { c4: c4Summary } : {}),
     };
   }
 
@@ -290,6 +352,11 @@ export class OrderCancelService {
   ): Promise<TerminateActiveServiceResult> {
     const trimmed = this.assertReason(reason);
 
+    // 17B.4F-C4 : prérequis LIVE sous ON (503 avant toute mutation) + garde
+    // relue à l'appel (OFF = contrat historique strictement inchangé).
+    await this.c4c.assertOperational();
+    const c4Enabled = isHostingC4Enabled();
+
     // ── Phase 0 : gate (lecture seule) ──
     const order = await this.loadOrderGate(orderId);
     if (order.status === OrderStatus.PROVISIONING) {
@@ -314,6 +381,9 @@ export class OrderCancelService {
           data: { status: OrderStatus.CANCELLED },
         });
         if (won.count === 1) {
+          // 17B.4F-C4 : arrêt + service → CANCELLATION_PENDING sous verrous,
+          // DANS LA MÊME tx que le CAS, AVANT le moindre dispatch de nettoyage.
+          if (c4Enabled) await this.c4MarkStops(tx, orderId, trimmed, actor.sub);
           await tx.orderStatusHistory.create({
             data: {
               orderId,
@@ -333,6 +403,7 @@ export class OrderCancelService {
         const re = await this.readGateInTx(tx, orderId);
         if (re.status === OrderStatus.CANCELLED) {
           // Concurrent terminate a gagné → rejeu idempotent, zéro 2e history.
+          if (c4Enabled) await this.c4MarkStops(tx, orderId, trimmed, actor.sub);
           await tx.deployment.updateMany({
             where: { orderId },
             data: { reconcileNextAt: null },
@@ -353,13 +424,30 @@ export class OrderCancelService {
     } else {
       // Déjà CANCELLED au gate : rejeu idempotent.
       alreadyTerminated = true;
-      await this.prisma.deployment.updateMany({
-        where: { orderId },
-        data: { reconcileNextAt: null },
-      });
+      if (c4Enabled) {
+        await this.prisma.$transaction(async (tx) => {
+          await this.c4MarkStops(tx, orderId, trimmed, actor.sub);
+          await tx.deployment.updateMany({
+            where: { orderId },
+            data: { reconcileNextAt: null },
+          });
+        });
+      } else {
+        await this.prisma.deployment.updateMany({
+          where: { orderId },
+          data: { reconcileNextAt: null },
+        });
+      }
     }
 
     const cleanup = await this.performCleanup(orderGate, actor, 'terminate');
+
+    // ── 17B.4F-C4 : libérations sous preuves + terminal CANCELLED du service ─
+    let c4Summary: C4CancelC4 | undefined;
+    if (c4Enabled) {
+      c4Summary = await this.c4AttemptReleases(orderId, actor, cleanup);
+      if (c4Summary.releases.some((r) => r.status === 'blocked')) cleanup.partial = true;
+    }
 
     // ── Audit append-only (un par appel — ADR-019) ──
     await this.audit.record({
@@ -368,21 +456,22 @@ export class OrderCancelService {
       action: 'order.terminate_active_service',
       resourceType: 'order',
       resourceId: orderId,
-      details: {
-        reason: trimmed,
-        orderJustTerminated: !alreadyTerminated,
-        alreadyTerminated,
-        provider: cleanup.provider,
-        dns: cleanup.dns,
-        deployment: cleanup.deploymentLocal,
-        clientSubdomain: cleanup.csLocal,
-        csOwnership: cleanup.ownership,
-        invoice: cleanup.invoiceLabel,
-        invoicePolicy: 'no_auto_refund_e2b',
-        subscription: cleanup.subscription,
-        project: 'retained',
-        partial: cleanup.partial,
-      },
+        details: {
+          reason: trimmed,
+          orderJustTerminated: !alreadyTerminated,
+          alreadyTerminated,
+          provider: cleanup.provider,
+          dns: cleanup.dns,
+          deployment: cleanup.deploymentLocal,
+          clientSubdomain: cleanup.csLocal,
+          csOwnership: cleanup.ownership,
+          invoice: cleanup.invoiceLabel,
+          invoicePolicy: 'no_auto_refund_e2b',
+          subscription: cleanup.subscription,
+          project: 'retained',
+          partial: cleanup.partial,
+          ...(c4Summary ? { c4: c4Summary } : {}),
+        } as unknown as Prisma.InputJsonValue,
     });
 
     return {
@@ -397,6 +486,7 @@ export class OrderCancelService {
       subscription: cleanup.subscription,
       project: 'retained',
       partial: cleanup.partial,
+      ...(c4Summary ? { c4: c4Summary } : {}),
     };
   }
 
@@ -504,6 +594,19 @@ export class OrderCancelService {
     });
     const resolved = await this.resolveClientSubdomain(orderGate, deployment);
 
+    // ── 17B.4F-C4 : allocation liée (portée des tentatives DELETE) + ────────
+    //    identifiants connus AVANT nettoyage (preuves par ressource).
+    const c4Enabled = isHostingC4Enabled();
+    const allocation = c4Enabled && deployment
+      ? await this.prisma.hostingServiceAllocation.findFirst({
+          where: { deploymentId: deployment.id },
+          select: { id: true },
+        })
+      : null;
+    const appIdentifier = deployment?.coolifyUuid ?? null;
+    const dnsHadRecord = !!resolved.cs?.recordId;
+    const dnsIdentifier = resolved.cs?.fqdn ?? null;
+
     // ── Phase 3 : externe provider (PanelTransport, resourceId opaque) ──
     let provider: ExternalCleanup = 'skipped';
     let providerConfirmed = true;
@@ -519,19 +622,46 @@ export class OrderCancelService {
         server.panelProvider &&
         server.panelProvider.length > 0;
       if (canCall) {
-        try {
+        if (c4Enabled) {
+          // Tentative DELETE durable + consignation (identité : actor.sub) ;
+          // refus de dispatch (arrêt déjà couvert, créateur non résolu) ⇒
+          // AUCUN appel réseau, issue « unknown », ressource conservée.
           const target = this.buildTarget(server!);
-          await this.panelFactory.create().deleteApplication(target, deployment.coolifyUuid);
-          provider = 'deleted';
-          providerConfirmed = true;
-        } catch (e) {
-          if (isAbsentExternalError(e)) {
-            provider = 'absent';
-            providerConfirmed = true;
-          } else {
-            provider = 'failed';
-            providerConfirmed = false;
+          const uuid = deployment.coolifyUuid;
+          const issue = await this.c4TrackedDelete(
+            {
+              nature: 'DELETE',
+              scope: { type: 'DEPLOYMENT', id: deployment.id },
+              allocationId: allocation?.id ?? null,
+              orderId,
+              holder: actor.sub,
+              targetIntent: { type: 'application', serverId: server!.id, uuid },
+            },
+            () => this.panelFactory.create().deleteApplication(target, uuid),
+          );
+          provider = issue;
+          providerConfirmed = issue === 'deleted' || issue === 'absent';
+          if (!providerConfirmed && issue === 'failed') {
             this.log.warn(`${logPrefix}: suppression provider échouée — ressource conservée`);
+          }
+          if (issue === 'unknown') {
+            this.log.warn(`${logPrefix}: delete provider non résolu — ressource conservée`);
+          }
+        } else {
+          try {
+            const target = this.buildTarget(server!);
+            await this.panelFactory.create().deleteApplication(target, deployment.coolifyUuid);
+            provider = 'deleted';
+            providerConfirmed = true;
+          } catch (e) {
+            if (isAbsentExternalError(e)) {
+              provider = 'absent';
+              providerConfirmed = true;
+            } else {
+              provider = 'failed';
+              providerConfirmed = false;
+              this.log.warn(`${logPrefix}: suppression provider échouée — ressource conservée`);
+            }
           }
         }
       } else {
@@ -554,18 +684,42 @@ export class OrderCancelService {
       dns = 'unknown';
       dnsConfirmed = false;
     } else if (resolved.cs.domainId && resolved.cs.recordId) {
-      try {
-        await this.cloudflare.deleteDnsRecord(resolved.cs.domainId, resolved.cs.recordId, actor);
-        dns = 'deleted';
-        dnsConfirmed = true;
-      } catch (e) {
-        if (isAbsentExternalError(e)) {
-          dns = 'absent';
-          dnsConfirmed = true;
-        } else {
-          dns = 'failed';
-          dnsConfirmed = false;
+      if (c4Enabled) {
+        const target = {
+          domainId: resolved.cs.domainId,
+          recordId: resolved.cs.recordId,
+          fqdn: resolved.cs.fqdn,
+        };
+        const issue = await this.c4TrackedDelete(
+          {
+            nature: 'DELETE',
+            scope: { type: 'ORDER', id: orderId },
+            allocationId: allocation?.id ?? null,
+            orderId,
+            holder: actor.sub,
+            targetIntent: { type: 'dns', ...target },
+          },
+          () => this.cloudflare.deleteDnsRecord(target.domainId, target.recordId, actor),
+        );
+        dns = issue;
+        dnsConfirmed = issue === 'deleted' || issue === 'absent';
+        if (issue === 'failed') {
           this.log.warn(`${logPrefix}: suppression DNS échouée — enregistrement conservé`);
+        }
+      } else {
+        try {
+          await this.cloudflare.deleteDnsRecord(resolved.cs.domainId, resolved.cs.recordId, actor);
+          dns = 'deleted';
+          dnsConfirmed = true;
+        } catch (e) {
+          if (isAbsentExternalError(e)) {
+            dns = 'absent';
+            dnsConfirmed = true;
+          } else {
+            dns = 'failed';
+            dnsConfirmed = false;
+            this.log.warn(`${logPrefix}: suppression DNS échouée — enregistrement conservé`);
+          }
         }
       }
     } else {
@@ -661,7 +815,203 @@ export class OrderCancelService {
       invoiceLabel,
       ownership,
       partial,
+      dnsHadRecord,
+      appIdentifier,
+      dnsIdentifier,
     };
+  }
+
+  // ─────────────────────────── 17B.4F-C4 (sous ON) ──────────────────────────
+
+  /**
+   * 17B.4F-C4 — émission d'un ARRÊT + bascule du service en
+   * `CANCELLATION_PENDING`, DANS LA TRANSACTION du caller (le caller détient
+   * déjà le verrou Order ; verrous ordonnés Order → HostingService →
+   * Allocation → Deployment). Idempotent (upsert stop + CAS borné) — aucun
+   * terminal n'est régressé, aucun marqueur n'est effacé.
+   */
+  private async c4MarkStops(
+    tx: Prisma.TransactionClient,
+    orderId: string,
+    reason: string,
+    actorId: string,
+  ): Promise<void> {
+    // Verrou de LIGNE Order (si le caller ne le détient pas déjà) — l'ordre
+    // global reste Order → HostingService → Allocation → Deployment.
+    await tx.$queryRaw`SELECT "id" FROM "Order" WHERE "id" = ${orderId} FOR UPDATE`;
+    const scopes: C4Scope[] = [{ type: 'ORDER', id: orderId }];
+    const svcs = await tx.$queryRaw<Array<{ id: string }>>`
+      SELECT "id" FROM "HostingService" WHERE "orderId" = ${orderId} FOR UPDATE`;
+    for (const s of svcs) {
+      scopes.push({ type: 'SERVICE', id: s.id });
+      const allocs = await tx.$queryRaw<Array<{ id: string }>>`
+        SELECT "id" FROM "HostingServiceAllocation" WHERE "hostingServiceId" = ${s.id} FOR UPDATE`;
+      for (const a of allocs) scopes.push({ type: 'ALLOCATION', id: a.id });
+      // Résiliation demandée : ni PROVISIONING/ACTIVE/SUSPENDED → aucun CAS ;
+      // un service déjà terminal (CANCELLED) n'est JAMAIS régressé.
+      await tx.hostingService.updateMany({
+        where: {
+          id: s.id,
+          status: {
+            in: [
+              HostingServiceStatus.PROVISIONING,
+              HostingServiceStatus.ACTIVE,
+              HostingServiceStatus.SUSPENDED,
+            ],
+          },
+        },
+        data: { status: HostingServiceStatus.CANCELLATION_PENDING },
+      });
+    }
+    const deps = await tx.deployment.findMany({ where: { orderId }, select: { id: true } });
+    for (const d of deps) scopes.push({ type: 'DEPLOYMENT', id: d.id });
+    for (const scope of scopes) {
+      await this.c4.requestStopInTx(tx, { scope, reason, actorId });
+    }
+  }
+
+  /**
+   * 17B.4F-C4 — delete distant TRACKÉ : tentative durable émise dans sa propre
+   * transaction (refus ⇒ ZÉRO appel réseau), exécution réseau HORS
+   * transaction, consignation du retour dans sa propre transaction.
+   * Retour : `deleted`/`absent` (conclusifs), `failed` (appel en erreur,
+   * retryable), `unknown` (dispatch refusé — incertitude conservée).
+   */
+  private async c4TrackedDelete(
+    params: {
+      nature: 'DELETE';
+      scope: { type: 'DEPLOYMENT' | 'ORDER'; id: string };
+      allocationId: string | null;
+      orderId: string;
+      holder: string;
+      targetIntent: Record<string, unknown>;
+    },
+    call: () => Promise<unknown>,
+  ): Promise<'deleted' | 'absent' | 'failed' | 'unknown'> {
+    let ticket: { attemptId: string; targetIntentHash: string | null };
+    try {
+      ticket = await this.c4.beginDispatchStandalone(params);
+    } catch {
+      // Arrêt / créateur non résolu / tentative de création ouverte : AUCUN
+      // appel réseau, l'incertitude est conservée (ressource non touchée).
+      return 'unknown';
+    }
+    try {
+      await call();
+    } catch (e) {
+      const absent = isAbsentExternalError(e);
+      await this.c4.settleStandalone({
+        attemptId: ticket.attemptId,
+        holder: params.holder,
+        outcome: absent ? 'ABSENT' : 'FAILED_RETRYABLE',
+        targetIntentHash: ticket.targetIntentHash,
+        returnedIdentifiers: absent ? { absent: true } : { error: 'provider_error' },
+      });
+      return absent ? 'absent' : 'failed';
+    }
+    await this.c4.settleStandalone({
+      attemptId: ticket.attemptId,
+      holder: params.holder,
+      outcome: 'DELETED',
+      targetIntentHash: ticket.targetIntentHash,
+      returnedIdentifiers: { deleted: true },
+    });
+    return 'deleted';
+  }
+
+  /**
+   * 17B.4F-C4 — libération de TOUTES les allocations du service après cleanup,
+   * sous preuves suffisantes (par ressource), puis terminal `CANCELLED` du
+   * service UNIQUEMENT si toutes les allocations sont RELEASED ET le
+   * nettoyage concluant ; sinon le service reste `CANCELLATION_PENDING`.
+   */
+  private async c4AttemptReleases(
+    orderId: string,
+    actor: CancelActor,
+    cleanup: CleanupOutcome,
+  ): Promise<C4CancelC4> {
+    const service = await this.prisma.hostingService.findUnique({
+      where: { orderId },
+      select: { id: true, status: true, userId: true },
+    });
+    if (!service) {
+      return { serviceStatus: null, releases: [] };
+    }
+    const allocations = await this.prisma.hostingServiceAllocation.findMany({
+      where: { hostingServiceId: service.id },
+      select: { id: true, status: true },
+    });
+
+    const app: C4AppOutcome =
+      cleanup.provider === 'deleted'
+        ? 'deleted'
+        : cleanup.provider === 'absent'
+          ? 'absent'
+          : cleanup.provider === 'failed'
+            ? 'failed'
+            : 'unknown';
+    const dns: C4DnsOutcome =
+      cleanup.dns === 'deleted'
+        ? 'deleted'
+        : cleanup.dns === 'absent'
+          ? 'absent'
+          : cleanup.dns === 'skipped'
+            ? 'not_created'
+            : cleanup.dns === 'failed'
+              ? 'failed'
+              : 'unknown';
+
+    const releases: C4CancelC4['releases'] = [];
+    for (const alloc of allocations) {
+      if (alloc.status === HostingServiceAllocationStatus.RELEASED) {
+        releases.push({ allocationId: alloc.id, status: 'already_released' });
+        continue;
+      }
+      try {
+        const res = await this.c4r.releaseAfterCleanup({
+          allocationId: alloc.id,
+          actorUserId: service.userId,
+          orderId,
+          app,
+          dns,
+          dnsHadRecord: cleanup.dnsHadRecord,
+          appIdentifier: cleanup.appIdentifier,
+          dnsIdentifier: cleanup.dnsIdentifier,
+        });
+        releases.push({
+          allocationId: alloc.id,
+          status: res.status,
+          ...(res.blockedReason ? { blockedReason: res.blockedReason } : {}),
+        });
+      } catch {
+        // Conflit sous verrou (recheck) : incertitude conservée, jamais libéré.
+        releases.push({
+          allocationId: alloc.id,
+          status: 'blocked',
+          blockedReason: 'call_uncertain',
+        });
+      }
+    }
+
+    // Terminal CANCELLED : TOUTES les allocations libérées + nettoyage concluant
+    // (provider et DNS sans incertitude) — sans quoi CANCELLATION_PENDING reste.
+    const allReleased = releases.every(
+      (r) => r.status === 'released' || r.status === 'already_released' || r.status === 'pre_provider_released',
+    );
+    const cleanupConclusive =
+      (cleanup.provider === 'deleted' || cleanup.provider === 'absent' || cleanup.provider === 'skipped') &&
+      (cleanup.dns === 'deleted' || cleanup.dns === 'absent' || cleanup.dns === 'skipped');
+    if (allReleased && cleanupConclusive) {
+      await this.prisma.hostingService.updateMany({
+        where: { id: service.id, status: HostingServiceStatus.CANCELLATION_PENDING },
+        data: { status: HostingServiceStatus.CANCELLED },
+      });
+    }
+    const fresh = await this.prisma.hostingService.findUnique({
+      where: { id: service.id },
+      select: { status: true },
+    });
+    return { serviceStatus: fresh?.status ?? service.status, releases };
   }
 
   /**

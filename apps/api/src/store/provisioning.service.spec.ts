@@ -55,6 +55,8 @@ describe('ProvisioningService — syncAppLimits', () => {
       { isServed: jest.fn() } as never,
       {} as never,
       { resolveTracking: jest.fn(), operational: jest.fn().mockResolvedValue(false) } as never,
+      {} as never,
+      { assertOperational: jest.fn().mockResolvedValue(undefined) } as never,
     );
     jest.clearAllMocks();
     mockDecrypt.mockReturnValue('tok');
@@ -248,6 +250,8 @@ describe('ProvisioningService — actionCreateApp (choix du projet A/B voie stor
       mockHttp as never,
       {} as never,
       { resolveTracking: jest.fn(), operational: jest.fn().mockResolvedValue(false) } as never,
+      {} as never,
+      { assertOperational: jest.fn().mockResolvedValue(undefined) } as never,
     );
     jest.clearAllMocks();
     mockDecrypt.mockReturnValue('tok');
@@ -1021,6 +1025,8 @@ describe('ProvisioningService — actionConfigureDns (Phase 4, gel racine)', () 
       { isServed: jest.fn() } as never,
       {} as never,
       { resolveTracking: jest.fn(), operational: jest.fn().mockResolvedValue(false) } as never,
+      {} as never,
+      { assertOperational: jest.fn().mockResolvedValue(undefined) } as never,
     );
     jest.clearAllMocks();
     mockDecrypt.mockReturnValue('tok');
@@ -1228,6 +1234,8 @@ describe('ProvisioningService — activateOrderAfterProof (17B.3B)', () => {
       { isServed: jest.fn() } as never,
       {} as never,
       { resolveTracking: jest.fn(), operational: jest.fn().mockResolvedValue(false) } as never,
+      {} as never,
+      { assertOperational: jest.fn().mockResolvedValue(undefined) } as never,
     );
     jest.clearAllMocks();
     prisma.$transaction.mockImplementation(async (cb) => cb(tx));
@@ -1579,6 +1587,8 @@ describe('ProvisioningService — scheduleInitialReconcile (17B.3C)', () => {
       { isServed: jest.fn() } as never,
       {} as never,
       { resolveTracking: jest.fn(), operational: jest.fn().mockResolvedValue(false) } as never,
+      {} as never,
+      { assertOperational: jest.fn().mockResolvedValue(undefined) } as never,
     );
     deploymentRow = { present: true, status: 'DEPLOYING', reconcileNextAt: null };
     jest.clearAllMocks();

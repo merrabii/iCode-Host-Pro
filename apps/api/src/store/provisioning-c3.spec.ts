@@ -292,6 +292,8 @@ describe('provisionC3 / routage C3 (17B.4F-C3)', () => {
       { isServed: jest.fn() } as never,
       hosting as never,
       { resolveTracking: jest.fn(), operational: jest.fn() } as never,
+      {} as never,
+      { assertOperational: jest.fn().mockResolvedValue(undefined) } as never,
     );
     jest.spyOn(svc as never as { awaitAppReady: () => Promise<boolean> }, 'awaitAppReady').mockResolvedValue(true);
   };

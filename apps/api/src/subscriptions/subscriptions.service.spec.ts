@@ -19,14 +19,38 @@ describe('SubscriptionsService', () => {
     },
     deployment: { count: jest.fn() },
     server: { findUnique: jest.fn() },
+    hostingServiceAllocation: { count: jest.fn() },
+    $transaction: jest.fn(),
   };
   const mockAudit = { record: jest.fn() };
   const mockProvisioning = { syncAppLimits: jest.fn() };
   const user = { sub: 'u1', email: 'user@example.com' };
   const admin = { sub: 'a1', email: 'admin@example.com' };
 
+  /** TX simulée du gate D10 : `$queryRaw` = verrou User, sonde de table,
+   *  puis SELECT services. Par défaut : table absente (skip silencieux). */
+  const stubGateTx = (
+    probe: Array<{ exists: boolean }> = [{ exists: false }],
+    services: Array<{ id: string; status: string }> = [],
+  ) => {
+    const tx = {
+      $queryRaw: jest.fn(),
+      subscription: mockPrisma.subscription,
+      hostingServiceAllocation: mockPrisma.hostingServiceAllocation,
+    };
+    tx.$queryRaw
+      .mockResolvedValueOnce([]) // verrou User (résultat ignoré)
+      .mockResolvedValueOnce(probe) // sonde HostingServiceAllocation
+      .mockResolvedValue(services); // SELECT HostingService FOR UPDATE
+    mockPrisma.$transaction.mockImplementation(
+      async (cb: (t: typeof tx) => Promise<unknown>) => cb(tx),
+    );
+    return tx;
+  };
+
   beforeEach(() => {
     jest.clearAllMocks();
+    stubGateTx();
     service = new SubscriptionsService(
       mockPrisma as never,
       mockAudit as never,
@@ -130,6 +154,67 @@ describe('SubscriptionsService', () => {
       await expect(service.cancelMySubscription('s1', user)).resolves.toMatchObject({
         status: 'CANCELLED',
       });
+    });
+
+    // ── 17B.4F-C4 (D10) — gate d'annulation atomique ────────────────────────
+    it('D10 : allocation consommante ⇒ 409, AUCUNE transition Subscription', async () => {
+      mockPrisma.subscription.findFirst.mockResolvedValue({
+        id: 's1',
+        status: 'ACTIVE',
+        productId: 'p1',
+        orderId: 'ord-1',
+      });
+      mockPrisma.product.findUnique.mockResolvedValue({ packId: null });
+      mockPrisma.deployment.count.mockResolvedValue(0);
+      stubGateTx([{ exists: true }], [{ id: 'hs1', status: 'CANCELLED' }]);
+      mockPrisma.hostingServiceAllocation.count.mockResolvedValue(2);
+
+      await expect(service.cancelMySubscription('s1', user)).rejects.toBeInstanceOf(
+        ConflictException,
+      );
+      expect(mockPrisma.hostingServiceAllocation.count).toHaveBeenCalled();
+      expect(mockPrisma.subscription.update).not.toHaveBeenCalled();
+      expect(mockAudit.record).not.toHaveBeenCalled();
+    });
+
+    it('D10 : service hébergement non terminé ⇒ 409, AUCUNE transition Subscription', async () => {
+      mockPrisma.subscription.findFirst.mockResolvedValue({
+        id: 's1',
+        status: 'ACTIVE',
+        productId: 'p1',
+        orderId: 'ord-1',
+      });
+      mockPrisma.product.findUnique.mockResolvedValue({ packId: null });
+      mockPrisma.deployment.count.mockResolvedValue(0);
+      stubGateTx([{ exists: true }], [{ id: 'hs1', status: 'ACTIVE' }]);
+      mockPrisma.hostingServiceAllocation.count.mockResolvedValue(0);
+
+      await expect(service.cancelMySubscription('s1', user)).rejects.toBeInstanceOf(
+        ConflictException,
+      );
+      expect(mockPrisma.subscription.update).not.toHaveBeenCalled();
+      expect(mockAudit.record).not.toHaveBeenCalled();
+    });
+
+    it('D10 : services terminés + zéro allocation consommante ⇒ annulation autorisée', async () => {
+      mockPrisma.subscription.findFirst.mockResolvedValue({
+        id: 's1',
+        status: 'ACTIVE',
+        productId: 'p1',
+        orderId: 'ord-1',
+      });
+      mockPrisma.product.findUnique.mockResolvedValue({ packId: null });
+      mockPrisma.deployment.count.mockResolvedValue(0);
+      stubGateTx([{ exists: true }], [{ id: 'hs1', status: 'CANCELLED' }]);
+      mockPrisma.hostingServiceAllocation.count.mockResolvedValue(0);
+      mockPrisma.subscription.update.mockResolvedValue({ id: 's1', status: 'CANCELLED' });
+
+      await expect(service.cancelMySubscription('s1', user)).resolves.toMatchObject({
+        status: 'CANCELLED',
+      });
+      expect(mockAudit.record).toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'subscription.cancel' }),
+      );
     });
   });
 

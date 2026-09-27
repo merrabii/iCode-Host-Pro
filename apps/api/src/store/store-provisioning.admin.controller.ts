@@ -9,6 +9,7 @@ import { ProvisioningService } from './provisioning.service';
 import { OrderCancelService } from './order-cancel.service';
 import { CancelProvisioningDto } from './dto/cancel-provisioning.dto';
 import { TerminateActiveServiceDto } from './dto/terminate-active-service.dto';
+import { FinalizeOrderDto } from './dto/finalize-order.dto';
 import { PrismaService } from '../prisma/prisma.service';
 import { NotFoundException } from '@nestjs/common';
 
@@ -79,6 +80,24 @@ export class StoreProvisioningAdminController {
     @CurrentUser() actor: AdminActor,
   ) {
     return this.orderCancel.terminateActiveService(id, dto.reason, actor);
+  }
+
+  /**
+   * 17B.4F-C4 — finalisation ADMIN bornée (T-fen) : preuve provider relue
+   * côté serveur (jamais fournie par l'entrée), aucun « force », action
+   * authentifiée/autorisée/auditée. Sert aussi de reprise locale après une
+   * fenêtre « bind committé + activation échouée ».
+   */
+  @Post('orders/:id/finalize')
+  @ApiOperation({
+    summary: 'Finaliser C4 une commande C3 prête (preuve provider relue)',
+  })
+  async finalizeOrder(
+    @Param('id') id: string,
+    @Body() dto: FinalizeOrderDto,
+    @CurrentUser() actor: AdminActor,
+  ) {
+    return this.provisioning.finalizeProvisioning(id, dto.reason, actor);
   }
 
   /**

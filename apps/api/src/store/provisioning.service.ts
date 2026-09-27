@@ -33,9 +33,13 @@ import {
 } from '../servers/panel-transport.factory';
 import { resolveBuildPackPortContract } from '../servers/runtime-port-contract';
 import { isHostingC3Enabled } from '../hosting/c3-flag';
+import { isHostingC4Enabled } from '../hosting/c4-flag';
 import { C3CapabilityService } from '../hosting/c3-capability.service';
+import { C4CapabilityService } from '../hosting/c4-capability.service';
+import { C4ProtocolService } from '../hosting/c4-protocol.service';
 import { HostingServicesService } from '../hosting/hosting-services.service';
 import { ReservationPayload, storeIdempotencyKey } from '../hosting/hosting-fingerprint';
+import { isAbsentExternalError } from './order-cancel.service';
 
 /**
  * 17B.4F-C3 — garde d'écriture du parcours C3 : TOUTE écriture métier d'une
@@ -46,6 +50,18 @@ import { ReservationPayload, storeIdempotencyKey } from '../hosting/hosting-fing
  * l'écriture directement sur le client (auto-commit, contrat inchangé).
  */
 export type StoreWriteGuard = <R>(fn: (tx: Prisma.TransactionClient) => Promise<R>) => Promise<R>;
+
+/**
+ * 17B.4F-C4 — contexte de tentatives provider d'une run C3 : identité du
+ * worker (`holder` = claimToken) + allocation/portée couvertes par le
+ * protocole. Présent UNIQUEMENT sous `HOSTING_C4_ENABLED === 'true'`.
+ */
+export interface C4RunCtx {
+  holder: string;
+  allocationId: string;
+  orderId: string;
+  serviceId: string;
+}
 
 /**
  * Refus d'écriture du garde C3 (worker obsolète / lease non renouvelable).
@@ -122,6 +138,8 @@ export class ProvisioningService {
     private readonly httpAvailability: HttpAvailabilityService,
     private readonly hosting: HostingServicesService,
     private readonly c3: C3CapabilityService,
+    private readonly c4: C4ProtocolService,
+    private readonly c4c: C4CapabilityService,
   ) {}
 
   /** Écriture directe legacy (auto-commit) — le contrat historique inchangé. */
@@ -181,6 +199,9 @@ export class ProvisioningService {
           'Provisioning C3 activé mais schéma indisponible (migration C1/C3 requise).',
         );
       }
+      // 17B.4F-C4 : sous garde C4, prérequis des 5 tables + contraintes
+      // vérifiés LIVE avant toute mutation (no-op sous OFF).
+      await this.c4c.assertOperational();
       const tracked = await this.c3.resolveTracking(orderId);
       if (tracked) {
         return this.provisionC3(order, tracked as { intent: unknown }, opts);
@@ -355,10 +376,20 @@ export class ProvisioningService {
   private c3Guard(orderId: string, token: string): StoreWriteGuard {
     return async <R>(fn: (tx: Prisma.TransactionClient) => Promise<R>): Promise<R> => {
       return this.prisma.$transaction(async (tx) => {
-        const orders = await tx.$queryRaw<Array<{ id: string }>>`
-          SELECT "id" FROM "Order" WHERE "id" = ${orderId} FOR UPDATE`;
+        const orders = await tx.$queryRaw<Array<{ id: string; status: OrderStatus }>>`
+          SELECT "id", "status" FROM "Order" WHERE "id" = ${orderId} FOR UPDATE`;
         if (!orders[0]) {
           throw new C3WorkerGuardError('Commande introuvable (worker obsolète).');
+        }
+        // 17B.4F-C4 — garde anti-résurrection : sous garde, un Order terminal
+        // (CANCELLED/REFUNDED) ne reçoit AUCUNE écriture métier du worker
+        // (après l'arrêt, seule la consignation des tentatives — hors garde —
+        // reste autorisée).
+        if (
+          orders[0].status === OrderStatus.CANCELLED ||
+          orders[0].status === OrderStatus.REFUNDED
+        ) {
+          throw new C3WorkerGuardError('Commande annulée — écriture worker refusée.');
         }
         const trs = await tx.$queryRaw<Array<{ claimToken: string | null; leaseUntil: Date | null }>>`
           SELECT "claimToken", "leaseUntil" FROM "OrderProvisioningTracking"
@@ -651,6 +682,20 @@ export class ProvisioningService {
 
     const guard = this.c3Guard(order.id, claim.token);
 
+    // ── 17B.4F-C4 : contexte de tentatives + scopes d'arrêt de la run ──────
+    const c4Enabled = isHostingC4Enabled();
+    const c4Run: C4RunCtx | undefined = c4Enabled
+      ? {
+          holder: claim.token,
+          allocationId: claim.allocationId,
+          orderId: order.id,
+          serviceId: service.id,
+        }
+      : undefined;
+    const c4StopScopes = c4Enabled
+      ? C4ProtocolService.scopesFor({ order: order.id, service: service.id, allocation: claim.allocationId })
+      : [];
+
     // ── TX-C : row Deployment créée AVANT le 1ᵉʳ appel provider (statut
     //    PENDING, miroir du parcours C2) ; `actionCreateApp` la retrouve et y
     //    pose l'uuid + DEPLOYING après succès provider.
@@ -718,14 +763,26 @@ export class ProvisioningService {
     let fqdn: string | null = order.domainValue ?? null;
     let appUuid: string | null = null;
     let stepFailed = false;
+    let c4Stopped = false;
 
     for (const action of actions) {
       const stepName = this.stepName(action);
       const logId = await this.openStep(order.id, stepName, guard);
       try {
-        const out = await this.runAction(action, { order, method, fqdn, appUuid, guard });
+        const out = await this.runAction(action, { order, method, fqdn, appUuid, guard, c4: c4Run });
         if (out.fqdn) fqdn = out.fqdn;
         if (out.appUuid) appUuid = out.appUuid;
+        // 17B.4F-C4 — après un ARRÊT, consignation seule : aucune écriture
+        // métier supplémentaire (la clôture d'étape est best-effort bookkeeping).
+        c4Stopped = c4Enabled && (await this.c4.hasStop(c4StopScopes));
+        if (c4Stopped) {
+          try {
+            await this.closeStep(logId, ProvisioningStepStatus.SUCCESS, out.message ?? null, guard);
+          } catch {
+            // commande déjà CANCELLED : la garde refuse — état laissé tel quel.
+          }
+          break;
+        }
         await this.closeStep(logId, ProvisioningStepStatus.SUCCESS, out.message ?? null, guard);
         await this.audit.record({
           action: `provision.${stepName}`,
@@ -736,7 +793,13 @@ export class ProvisioningService {
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
         this.log.warn(`provision(C3) ${stepName} order=${order.id}: ${msg}`);
-        await this.closeStep(logId, ProvisioningStepStatus.FAILED, msg, guard);
+        c4Stopped = c4Enabled && (await this.c4.hasStop(c4StopScopes));
+        try {
+          await this.closeStep(logId, ProvisioningStepStatus.FAILED, msg, guard);
+        } catch (e2) {
+          if (!(e2 instanceof C3WorkerGuardError)) throw e2;
+          c4Stopped = true;
+        }
         await this.audit.record({
           action: `provision.${stepName}`,
           resourceType: 'order',
@@ -746,6 +809,20 @@ export class ProvisioningService {
         stepFailed = true;
         break;
       }
+    }
+
+    // 17B.4F-C4 — barrière post-boucle : un arrêt arrivé pendant la dernière
+    // action gèle TOUTE écriture métier ultérieure (aucune transition, aucun
+    // bind, aucune activation — seule la consignation a eu lieu dans l'action).
+    if (!c4Stopped && c4Enabled) {
+      c4Stopped = await this.c4.hasStop(c4StopScopes);
+    }
+    if (c4Stopped) {
+      const fresh = await this.prisma.order.findUnique({
+        where: { id: order.id },
+        select: { status: true, domainValue: true },
+      });
+      return this.finalResult(order.id, fresh?.status ?? order.status, fresh?.domainValue ?? fqdn);
     }
 
     // Persiste le fqdn livré sur l'Order (garde token/lease, jamais le hostname Coolify).
@@ -1256,6 +1333,292 @@ export class ProvisioningService {
   }
 
   /**
+   * 17B.4F-C4 — finalisation ADMIN bornée d'une commande C3 (T-fen).
+   *
+   * Contrat consolidé (règle GO 1) :
+   *  - Seul canal READY = preuve POSITIVE identity-bound
+   *    `deploymentStatus(uuid)` sur le provider/serveur EXACTS de la cible →
+   *    `mapCoolifyStatus == ACTIVE`. `ABSENT`/`FAILED`/`PRESENT non ACTIVE`/
+   *    `UNAVAILABLE` (même si le FQDN répond) ⇒ refus, AUCUN ACTIVE ; le
+   *    HTTP du FQDN est EXCLU d'ici. Lectures réseau HORS transaction.
+   *  - TX finale (verrous `Order → Tracking → HostingService → Allocation →
+   *    Deployment`) : revérifie cible exacte (uuid), états, absence d'arrêt et
+   *    d'essais ouverts, fraîcheur de la preuve PENDANT la transaction, puis
+   *    CAS `activateOrderInTx` + flip service (COMPTANT, jamais confiance à la
+   *    lecture pré-TX). Course avec une annulation ⇒ refus (aucune écriture).
+   *  - Rejeu après succès = retour de l'état existant après cohérence locale,
+   *    SANS nouvel audit de transition ni transport.
+   *  - `HOSTING_C4_ENABLED` strictement requis ; sous ON, prérequis C4 vérifiés
+   *    LIVE avant toute mutation (503 si schéma absent).
+   */
+  async finalizeProvisioning(
+    orderId: string,
+    reason: string,
+    actor: { sub: string; email: string },
+  ): Promise<{
+    orderId: string;
+    status: string;
+    replay: boolean;
+    proof: { observedAt: string; providerStatus: string | null } | null;
+  }> {
+    const trimmed = (reason ?? '').trim();
+    if (trimmed.length < 8) {
+      throw new ConflictException('Le motif de finalisation doit faire au moins 8 caractères.');
+    }
+    if (!isHostingC4Enabled()) {
+      throw new ConflictException('Finalisation C4 indisponible (protocole désactivé).');
+    }
+    await this.c4c.assertOperational();
+
+    const order = await this.prisma.order.findUnique({
+      where: { id: orderId },
+      select: { id: true, status: true, domainValue: true },
+    });
+    if (!order) throw new NotFoundException('Commande introuvable.');
+
+    // Commande C3 uniquement : sans tracking, la finalisation C4 n'a pas de
+    // périmètre (ancien achat → chemin historique).
+    const tracked = await this.c3.resolveTracking(orderId);
+    if (!tracked) {
+      throw new ConflictException('Finalisation C4 réservée aux commandes du parcours C3.');
+    }
+
+    // ── Rejeu idempotent : commande déjà ACTIVE ⇒ cohérence locale UNIQUEMENT
+    //    (0 transport, 0 audit de transition, 0 écriture).
+    if (order.status === OrderStatus.ACTIVE) {
+      const dep = await this.prisma.deployment.findUnique({ where: { orderId } });
+      const proof = await this.prisma.c4ReadinessProof.findUnique({ where: { orderId } });
+      const coherent =
+        dep?.status === DeploymentStatus.ACTIVE &&
+        !!dep.coolifyUuid &&
+        (await this.prisma.hostingServiceAllocation.count({
+          where: { deploymentId: dep.id, status: HostingServiceAllocationStatus.BOUND },
+        })) === 1;
+      if (!coherent) {
+        throw new ConflictException('Commande ACTIVE mais état local incohérent — support requis.');
+      }
+      return {
+        orderId,
+        status: OrderStatus.ACTIVE,
+        replay: true,
+        proof: proof
+          ? { observedAt: proof.observedAt.toISOString(), providerStatus: proof.providerStatus }
+          : null,
+      };
+    }
+    if (order.status !== OrderStatus.PROVISIONING) {
+      throw new ConflictException(
+        `Finalisation impossible depuis le statut ${order.status} (PROVISIONING uniquement).`,
+      );
+    }
+
+    // ── Cible exacte : Deployment de CETTE commande + uuid + serveur ────────
+    const dep = await this.prisma.deployment.findUnique({
+      where: { orderId },
+      include: { server: true },
+    });
+    if (!dep) {
+      throw new ConflictException('Aucun déploiement pour cette commande — finalisation impossible.');
+    }
+    if (!dep.coolifyUuid) {
+      throw new ConflictException('Aucun identifiant provider pour cette commande — support requis.');
+    }
+    if (dep.status === DeploymentStatus.FAILED || dep.status === DeploymentStatus.PENDING) {
+      throw new ConflictException(
+        `Déploiement ${dep.status} — finalisation impossible sans build en cours.`,
+      );
+    }
+    if (dep.status !== DeploymentStatus.DEPLOYING && dep.status !== DeploymentStatus.ACTIVE) {
+      throw new ConflictException(`Déploiement ${dep.status} — finalisation refusée.`);
+    }
+    const server = dep.server;
+    if (
+      !server ||
+      server.panelProvider !== 'COOLIFY' ||
+      !server.apiBaseUrl ||
+      !server.apiTokenEnc
+    ) {
+      throw new ConflictException('Serveur provider indisponible — finalisation refusée.');
+    }
+
+    const allocation = await this.prisma.hostingServiceAllocation.findFirst({
+      where: { deploymentId: dep.id },
+      select: { id: true, status: true, hostingServiceId: true },
+    });
+    if (!allocation || allocation.status !== HostingServiceAllocationStatus.BOUND) {
+      throw new ConflictException(
+        'Allocation non liée (BOUND) à ce déploiement — finalisation refusée.',
+      );
+    }
+
+    // ── LECTURE réseau HORS transaction : preuve identity-bound ─────────────
+    let providerStatus: string;
+    try {
+      const res = await this.panelFactory
+        .create()
+        .deploymentStatus(
+          this.buildTarget(server as Parameters<ProvisioningService['buildTarget']>[0]),
+          dep.coolifyUuid,
+        );
+      providerStatus = res.rawStatus;
+    } catch (e) {
+      // ABSENT (404) comme erreur réseau générique ⇒ refus ; AUCUN repli HTTP.
+      throw new ConflictException(
+        isAbsentExternalError(e)
+          ? 'Application absente chez le provider — finalisation refusée.'
+          : 'Provider injoignable — finalisation refusée (unavailable).',
+      );
+    }
+    const mapped = mapCoolifyStatus(providerStatus);
+    if (mapped === DeploymentStatus.FAILED) {
+      throw new ConflictException('Build en échec chez le provider — finalisation refusée.');
+    }
+    if (mapped !== DeploymentStatus.ACTIVE) {
+      throw new ConflictException(
+        `Application non prête chez le provider (${providerStatus}) — finalisation refusée.`,
+      );
+    }
+
+    // ── TX finale : verrous ordonnés + revérifications + CAS ────────────────
+    const outcome = await this.prisma.$transaction(async (tx) => {
+      const orders = await tx.$queryRaw<
+        Array<{ id: string; status: OrderStatus }>
+      >`SELECT "id", "status" FROM "Order" WHERE "id" = ${orderId} FOR UPDATE`;
+      if (!orders[0]) throw new NotFoundException('Commande introuvable.');
+      if (orders[0].status === OrderStatus.CANCELLED || orders[0].status === OrderStatus.REFUNDED) {
+        throw new ConflictException('Course perdue avec une annulation — finalisation refusée.');
+      }
+      if (orders[0].status !== OrderStatus.PROVISIONING) {
+        throw new ConflictException(
+          `Statut concurrent ${orders[0].status} — finalisation refusée.`,
+        );
+      }
+      const trs = await tx.$queryRaw<Array<{ orderId: string }>>`
+        SELECT "orderId" FROM "OrderProvisioningTracking" WHERE "orderId" = ${orderId} FOR UPDATE`;
+      if (!trs[0]) {
+        throw new ConflictException('Tracking C3 absent — finalisation refusée.');
+      }
+      const svcs = await tx.$queryRaw<Array<{ id: string; status: HostingServiceStatus }>>`
+        SELECT "id", "status" FROM "HostingService" WHERE "orderId" = ${orderId} FOR UPDATE`;
+      const svc = svcs[0];
+      if (!svc) throw new ConflictException('Service hébergement absent — support requis.');
+      const allocs = await tx.$queryRaw<
+        Array<{ id: string; status: string; deploymentId: string | null; providerIntentAt: Date | null }>
+      >`
+        SELECT "id", "status", "deploymentId", "providerIntentAt"
+        FROM "HostingServiceAllocation" WHERE "id" = ${allocation.id} FOR UPDATE`;
+      const alloc = allocs[0];
+      if (!alloc || alloc.status !== 'BOUND' || alloc.deploymentId !== dep.id) {
+        throw new ConflictException('Allocation détachée entre-temps — finalisation refusée.');
+      }
+      const deps = await tx.$queryRaw<
+        Array<{ id: string; status: string; coolifyUuid: string | null }>
+      >`
+        SELECT "id", "status", "coolifyUuid" FROM "Deployment" WHERE "id" = ${dep.id} FOR UPDATE`;
+      const depLock = deps[0];
+      if (
+        !depLock ||
+        depLock.status !== 'DEPLOYING' ||
+        depLock.coolifyUuid !== dep.coolifyUuid
+      ) {
+        throw new ConflictException('Déploiement modifié entre-temps — finalisation refusée.');
+      }
+      if (!dep.coolifyUuid) {
+        // Pas d'identité provider ⇒ pas de preuve identity-bound possible.
+        throw new ConflictException('Identifiant provider absent — finalisation refusée.');
+      }
+      // Arrêt / tentative ouverte : aucun ACTIVE.
+      const stopScopes = C4ProtocolService.scopesFor({
+        order: orderId,
+        service: svc.id,
+        allocation: alloc.id,
+        deployment: dep.id,
+      });
+      if (await this.c4.hasStopInTx(tx, stopScopes)) {
+        throw new ConflictException('Arrêt demandé — finalisation refusée.');
+      }
+      if ((await this.c4.unresolvedCreativeInTx(tx, alloc.id)) > 0) {
+        throw new ConflictException('Tentative provider non résolue — finalisation refusée.');
+      }
+      // Preuve durable identity-bound (fraîcheur = observée pour CETTE cible).
+      await tx.c4ReadinessProof.upsert({
+        where: { orderId },
+        create: {
+          orderId,
+          deploymentId: dep.id,
+          coolifyUuid: dep.coolifyUuid,
+          serverId: server.id,
+          providerStatus,
+          evidence: {
+            channel: 'deploymentStatus',
+            identityBound: true,
+            mapped,
+            observedAt: new Date().toISOString(),
+          },
+        },
+        update: {
+          deploymentId: dep.id,
+          coolifyUuid: dep.coolifyUuid,
+          serverId: server.id,
+          providerStatus,
+          observedAt: new Date(),
+          evidence: {
+            channel: 'deploymentStatus',
+            identityBound: true,
+            mapped,
+            observedAt: new Date().toISOString(),
+          },
+        },
+      });
+      // CAS d'activation + flip service (comptants, dans la MÊME tx).
+      const act = await this.activateOrderInTx(tx, orderId);
+      if (!act.orderIsActive || !act.deploymentIsActive) {
+        throw new ConflictException(
+          `Activation impossible (${act.reason ?? 'cas'}) — finalisation refusée.`,
+        );
+      }
+      if (
+        svc.status === HostingServiceStatus.PROVISIONING &&
+        act.orderActivated &&
+        act.deploymentActivated
+      ) {
+        const flip = await tx.hostingService.updateMany({
+          where: { id: svc.id, status: HostingServiceStatus.PROVISIONING },
+          data: { status: HostingServiceStatus.ACTIVE },
+        });
+        if (flip.count !== 1) {
+          throw new ConflictException('Service modifié entre-temps — finalisation refusée.');
+        }
+      }
+      return act;
+    });
+
+    await this.postActivationEffects(orderId, outcome);
+    try {
+      await this.audit.record({
+        actorId: actor.sub,
+        actorEmail: actor.email,
+        action: 'provision.finalize.c4',
+        resourceType: 'order',
+        resourceId: orderId,
+        details: { reason: trimmed, providerStatus, activated: !outcome.noop },
+      });
+    } catch (e) {
+      this.log.warn(`finalize audit order=${orderId} failed: ${String(e)}`);
+    }
+
+    const proof = await this.prisma.c4ReadinessProof.findUnique({ where: { orderId } });
+    return {
+      orderId,
+      status: outcome.orderIsActive ? OrderStatus.ACTIVE : OrderStatus.PROVISIONING,
+      replay: false,
+      proof: proof
+        ? { observedAt: proof.observedAt.toISOString(), providerStatus: proof.providerStatus }
+        : null,
+    };
+  }
+
+  /**
    * 17B.3C - planifie la PREMIERE reconciliation persistee d'un deploiement reste
    * DEPLOYING apres l expiration normale du proof-gate. Idempotente et atomique :
    * updateMany ne touche QUE le Deployment de la commande encore DEPLOYING ET
@@ -1444,6 +1807,8 @@ export class ProvisioningService {
       appUuid: string | null;
       /** 17B.4F-C3 : garde token/lease des écritures C3 (absente = legacy direct). */
       guard?: StoreWriteGuard;
+      /** 17B.4F-C4 : contexte de tentatives provider (absente = C4 OFF). */
+      c4?: C4RunCtx;
     },
   ): Promise<{ fqdn?: string; appUuid?: string; message?: string }> {
     switch (action) {
@@ -1469,6 +1834,7 @@ export class ProvisioningService {
     fqdn: string | null;
     appUuid: string | null;
     guard?: StoreWriteGuard;
+    c4?: C4RunCtx;
   }): Promise<{ appUuid?: string; message?: string }> {
     const write = ctx.guard ?? this.directWrite;
     // On tente de créer l'app Coolify si le module a un serveur configuré.
@@ -1572,18 +1938,112 @@ export class ProvisioningService {
       appUuid = existingUuid;
       this.log.log(`provision order=${ctx.order.id}: réutilisation de l'app existante ${appUuid}`);
     } else {
-      const created = await transport.createGitApp(target, {
-        repoUrl,
-        branch,
-        serviceName: appName,
-        buildPack,
-        appName,
-        projectUuid,
-        serverUuid: await this.resolveCoolifyServerUuid(server, transport),
-        publishDirectory,
-        isStatic,
-      });
+      // ── 17B.4F-C4 : tentative CREATE durable émise DANS la garde (même TX
+      //    que la 1ʳᵉ tentative), commitée AVANT le réseau : takeover du
+      //    périmètre + arrêt + créateur non résolu sont opposables au dispatch.
+      let attempt: { attemptId: string; targetIntentHash: string | null } | null = null;
+      if (ctx.c4 && ctx.guard) {
+        attempt = await ctx.guard((tx) =>
+          this.c4.beginDispatch(tx, {
+            nature: 'CREATE',
+            scope: { type: 'ORDER', id: ctx.order.id },
+            allocationId: ctx.c4!.allocationId,
+            orderId: ctx.order.id,
+            holder: ctx.c4!.holder,
+            targetIntent: {
+              type: 'application',
+              serverId: server.id,
+              appName,
+              repoUrl,
+              branch,
+              buildPack,
+              projectUuid: projectUuid ?? null,
+            },
+          }),
+        );
+      }
+      let created: { uuid: string };
+      try {
+        created = await transport.createGitApp(target, {
+          repoUrl,
+          branch,
+          serviceName: appName,
+          buildPack,
+          appName,
+          projectUuid,
+          serverUuid: await this.resolveCoolifyServerUuid(server, transport),
+          publishDirectory,
+          isStatic,
+        });
+      } catch (err) {
+        if (attempt && ctx.c4) {
+          // Timeout/5xx ambigu ⇒ UNKNOWN (« non sûr », jamais SETTLED) — le
+          // créateur reste non résolu : aucune reprise de création, aucun
+          // nettoyage automatique sur cette allocation.
+          // TX dédiée (jamais `ctx.guard`) : la consignation doitaboutir même
+          // si l'Order est passée CANCELLED entre-temps (« aucun perdu d'un
+          // UUID reçu après bascule » — une annulation n'efface jamais une
+          // consignation déjà reçue).
+          try {
+            await this.c4.settleStandalone({
+              attemptId: attempt.attemptId,
+              holder: ctx.c4.holder,
+              outcome: 'UNKNOWN',
+              targetIntentHash: attempt.targetIntentHash,
+            });
+          } catch {
+            // Persistance impossible ⇒ incertitude conservée (l'attempt reste
+            // ouvert/UNSETTLED) : aucun identifiant prétendu enregistré.
+          }
+        }
+        throw err;
+      }
       appUuid = created.uuid;
+      if (attempt && ctx.c4) {
+        const attemptId = attempt.attemptId;
+        const holder = ctx.c4.holder;
+        const hash = attempt.targetIntentHash;
+        const orderId = ctx.order.id;
+        const uuid = appUuid;
+        // Consignation + persistance ATOMIQUE de l'identifiant retourné (même
+        // tx que la vérification d'identité) — si la persistance échoue, le
+        // rollback conserve l'incertitude (aucun identifiant prétendu enregistré).
+        // TX dédiée hors garde Order (voir ci-dessus) : la consignation de
+        // l'UUID retourné est une VÉRITÉ qui survit à l'annulation.
+        await this.c4.settleStandalone({
+          attemptId,
+          holder,
+          outcome: 'SUCCESS',
+          targetIntentHash: hash,
+          returnedIdentifiers: { uuid },
+          persist: async (ptx) => {
+            await ptx.deployment.updateMany({
+              where: { orderId },
+              data: { coolifyUuid: uuid },
+            });
+          },
+        });
+      }
+    }
+
+    // ── 17B.4F-C4 — barrière post-appel : un ARRÊT survenu pendant la création
+    //    (ou présent avant la réutilisation) n'autorise QUE la consignation
+    //    déjà effectuée : aucune opération réseau supplémentaire, aucun flip de
+    //    statut (les limites/domaines/déploiement sont gelés).
+    if (ctx.c4 && ctx.guard) {
+      const stopped = await this.c4.hasStop(
+        C4ProtocolService.scopesFor({
+          order: ctx.order.id,
+          service: ctx.c4.serviceId,
+          allocation: ctx.c4.allocationId,
+        }),
+      );
+      if (stopped) {
+        return {
+          appUuid,
+          message: 'Consignation tardive (arrêt demandé) — aucune opération supplémentaire.',
+        };
+      }
     }
     // Sécurité serveur partagé (Bloc 3) — l'application des limites du pack est
     // OBLIGATOIRE : jamais une app sans plafond sur un box partagé. Si le pack
@@ -1809,9 +2269,59 @@ export class ProvisioningService {
     fqdn: string | null;
     appUuid: string | null;
     guard?: StoreWriteGuard;
+    c4?: C4RunCtx;
   }): Promise<{ fqdn?: string; message?: string }> {
     const write = ctx.guard ?? this.directWrite;
     if (ctx.fqdn) return { fqdn: ctx.fqdn, message: `Sous-domaine déjà alloué : https://${ctx.fqdn}` };
+
+    // ── 17B.4F-C4 : émission/consignation de la tentative CONFIGURE (DNS) ───
+    const c4Emit = async (
+      intent: Record<string, unknown>,
+    ): Promise<{ attemptId: string; targetIntentHash: string | null } | null> => {
+      if (!ctx.c4 || !ctx.guard) return null;
+      return ctx.guard((tx) =>
+        this.c4.beginDispatch(tx, {
+          nature: 'CONFIGURE',
+          scope: { type: 'ORDER', id: ctx.order.id },
+          allocationId: ctx.c4!.allocationId,
+          orderId: ctx.order.id,
+          holder: ctx.c4!.holder,
+          targetIntent: { type: 'dns', ...intent },
+        }),
+      );
+    };
+    const c4Settle = async (
+      ticket: { attemptId: string; targetIntentHash: string | null } | null,
+      outcome: 'SUCCESS' | 'UNKNOWN',
+      identifiers: Record<string, unknown>,
+    ): Promise<void> => {
+      if (!ticket || !ctx.c4) return;
+      // TX dédiée hors garde Order : la consignation (vérité reçue du réseau,
+      // fqdn/uuid) survit à une annulation survenue pendant l'appel.
+      await this.c4.settleStandalone({
+        attemptId: ticket.attemptId,
+        holder: ctx.c4.holder,
+        outcome,
+        targetIntentHash: ticket.targetIntentHash,
+        returnedIdentifiers: identifiers,
+      });
+    };
+    const allocWithC4 = async (
+      intent: Record<string, unknown>,
+      fn: () => Promise<{ subdomain: string; fqdn: string }>,
+    ): Promise<{ subdomain: string; fqdn: string }> => {
+      const ticket = await c4Emit(intent);
+      let result: { subdomain: string; fqdn: string };
+      try {
+        result = await fn();
+      } catch (err) {
+        await c4Settle(ticket, 'UNKNOWN', {});
+        throw err;
+      }
+      await c4Settle(ticket, 'SUCCESS', { fqdn: result.fqdn });
+      return result;
+    };
+
     const fullOrder = await this.prisma.order.findUnique({
       where: { id: ctx.order.id },
       include: {
@@ -1880,21 +2390,29 @@ export class ProvisioningService {
         }
       } else {
         // `requested` déjà certifié disponible au checkout → allocation effective.
-        alloc = await this.cloudflare.allocateClientSubdomain({
-          root,
-          seed,
-          fallbackHost,
-          requested: fullOrder.requestedSubdomain,
-          ...(existingDeployment ? { deploymentId: existingDeployment.id } : {}),
-        });
+        alloc = await allocWithC4(
+          { rootId: root.id, requested: fullOrder.requestedSubdomain, fallbackHost, seed },
+          () =>
+            this.cloudflare.allocateClientSubdomain({
+              root,
+              seed,
+              fallbackHost,
+              requested: fullOrder.requestedSubdomain ?? undefined,
+              ...(existingDeployment ? { deploymentId: existingDeployment.id } : {}),
+            }),
+        );
       }
     } else {
-      alloc = await this.cloudflare.allocateClientSubdomain({
-        root,
-        seed,
-        fallbackHost,
-        ...(existingDeployment ? { deploymentId: existingDeployment.id } : {}),
-      });
+      alloc = await allocWithC4(
+        { rootId: root.id, fallbackHost, seed },
+        () =>
+          this.cloudflare.allocateClientSubdomain({
+            root,
+            seed,
+            fallbackHost,
+            ...(existingDeployment ? { deploymentId: existingDeployment.id } : {}),
+          }),
+      );
     }
     // Si la row n'existait pas au moment de l'alloc (CREATE_APP après DNS),
     // on la lie dès maintenant (D3 : ownership via racine figée root.id).

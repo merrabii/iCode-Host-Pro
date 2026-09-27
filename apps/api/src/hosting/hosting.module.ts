@@ -2,6 +2,9 @@ import { Module } from '@nestjs/common';
 import { PrismaModule } from '../prisma/prisma.module';
 import { HostingServicesService } from './hosting-services.service';
 import { C3CapabilityService } from './c3-capability.service';
+import { C4CapabilityService } from './c4-capability.service';
+import { C4ProtocolService } from './c4-protocol.service';
+import { C4ReleaseService } from './c4-release.service';
 
 /**
  * 17B.4F — module métier hébergement (service `HostingServicesService`).
@@ -19,7 +22,7 @@ import { C3CapabilityService } from './c3-capability.service';
  */
 @Module({
   imports: [PrismaModule],
-  providers: [HostingServicesService, C3CapabilityService],
-  exports: [HostingServicesService, C3CapabilityService],
+  providers: [HostingServicesService, C3CapabilityService, C4CapabilityService, C4ProtocolService, C4ReleaseService],
+  exports: [HostingServicesService, C3CapabilityService, C4CapabilityService, C4ProtocolService, C4ReleaseService],
 })
 export class HostingModule {}

@@ -104,6 +104,9 @@ describe('OrderCancelService (17B.4E-D-B1)', () => {
       crypto as never,
       cloudflare as never,
       panelFactory as never,
+      {} as never,
+      { assertOperational: jest.fn().mockResolvedValue(undefined) } as never,
+      {} as never,
     );
 
     prisma.$transaction.mockImplementation(async (cb: (t: typeof tx) => Promise<unknown>) =>
@@ -451,6 +454,9 @@ describe('OrderCancelService (17B.4E-D-B1)', () => {
         crypto as never,
         cloudflare as never,
         panelFactory as never,
+        {} as never,
+        { assertOperational: jest.fn().mockResolvedValue(undefined) } as never,
+        {} as never,
       );
       prisma.$transaction.mockImplementation(async (cb: (t: typeof tx) => Promise<unknown>) =>
         cb(tx),

@@ -30,6 +30,10 @@ import { CryptoService } from '../crypto/crypto.service';
 import { SecuritySettingsService } from '../auth/security/security-settings.service';
 import { Actor } from '../users/users.service';
 import { isHostingC2Enabled } from '../hosting/c2-flag';
+import { isHostingC4Enabled } from '../hosting/c4-flag';
+import { C4CapabilityService } from '../hosting/c4-capability.service';
+import { C4ProtocolService } from '../hosting/c4-protocol.service';
+import { C4ReleaseResult, C4ReleaseService } from '../hosting/c4-release.service';
 import { HostingServicesService } from '../hosting/hosting-services.service';
 import { ReservationPayload, normalizeClientRequestId } from '../hosting/hosting-fingerprint';
 import {
@@ -151,6 +155,10 @@ export class DeploymentsService {
     // 17B.4F-C2 — moteur de réservation C1. Jamais appelé quand la garde
     // `HOSTING_C2_ENABLED` est OFF (aucun accès aux colonnes C1 non migrées).
     private readonly hosting: HostingServicesService,
+    // 17B.4F-C4 — protocole de tentatives/libération (no-op sous OFF).
+    private readonly c4: C4ProtocolService,
+    private readonly c4c: C4CapabilityService,
+    private readonly c4r: C4ReleaseService,
   ) {}
 
   private async requireDeployEnabled(): Promise<void> {
@@ -1188,13 +1196,31 @@ export class DeploymentsService {
    *     reste gérable côté panneau, jamais d'app orpheline) ;
    *   • DNS : ownership STRICT — l'enregistrement n'est touché QUE si la row
    *     ClientSubdomain prouve appartenir à CETTE app (`deploymentId === id`) ;
-   *     échec non-absent ⇒ row conservée (partial=true) et re-nettoyable ;
+   *     échec non-absent ⇒ rows conservées (partial=true) et re-nettoyables ;
+   *   • D6 (sous ON, avec allocation) : les preuves réseau d'abord, PUIS
+   *     suppression locale + preuve unique + RELEASED dans UNE transaction ;
+   *     DNS non concluant ⇒ AUCUNE écriture locale : Deployment+ClientSubdomain
+   *     restent en place (état adressable) et le rejeu de la même demande
+   *     rejoue app/DNS puis conclut — slot toujours consommé en attendant ;
    *   • B0.8 : aucun message brut du provider dans l'audit ni dans la réponse.
    */
   async remove(
     id: string,
     actor: Actor,
-  ): Promise<{ removed: true; appName: string | null; partial: boolean }> {
+  ): Promise<{
+    removed: true;
+    appName: string | null;
+    partial: boolean;
+    /** D9 : true SEULEMENT si une libération RELEASED a réellement été committée. */
+    freedQuota: boolean;
+    /** 17B.4F-C4 (sous ON uniquement) : issue de la tentative de libération. */
+    c4?: { release: C4ReleaseResult };
+  }> {
+    // 17B.4F-C4 : prérequis LIVE sous ON (503 avant toute mutation), garde
+    // relue à l'appel (OFF = contrat historique strictement inchangé).
+    await this.c4c.assertOperational();
+    const c4Enabled = isHostingC4Enabled();
+
     const row = await this.prisma.deployment.findFirst({
       where: { id, userId: actor.sub },
       include: { server: true, clientSubdomain: { include: { domain: true } } },
@@ -1202,6 +1228,23 @@ export class DeploymentsService {
     if (!row) {
       throw new NotFoundException('Déploiement introuvable.');
     }
+
+    // Allocation C1 liée : portée des tentatives DELETE + libération sous preuve.
+    const allocation = c4Enabled
+      ? await this.prisma.hostingServiceAllocation.findFirst({
+          where: { deploymentId: id },
+          select: { id: true, status: true },
+        })
+      : null;
+    if (c4Enabled && allocation && (await this.c4.unresolvedCreative(allocation.id)) > 0) {
+      // Règle GO 4 — DELETE interdit tant qu'un créateur non résolu existe.
+      throw new ConflictException(
+        'Créateur non résolu sur cette allocation — suppression refusée (incertitude conservée).',
+      );
+    }
+
+    // Issue du delete provider tracké (null = non exécuté / non exécutable).
+    let providerIssue: 'deleted' | 'absent' | 'failed' | 'unknown' | null = null;
 
     // 1. Provider — suppression SÛRE (B0.1).
     if (
@@ -1211,34 +1254,101 @@ export class DeploymentsService {
       row.server.apiBaseUrl &&
       row.server.apiTokenEnc
     ) {
-      try {
-        await this.panelFactory
-          .create()
-          .deleteApplication(this.buildTarget(row.server), row.coolifyUuid);
-        await this.audit.record({
-          actorId: actor.sub,
-          actorEmail: actor.email,
-          action: 'deploy.delete.coolify',
-          resourceType: 'deployment',
-          resourceId: id,
-          details: { coolifyUuid: row.coolifyUuid, appName: row.appName, outcome: 'deleted' },
-        });
-      } catch (err) {
-        // Jamais de message d'exception dans l'audit (B0.8) : uniquement la
-        // classe de sortie, déterminée par la classification 404 générique.
-        const outcome = isAbsentExternalError(err) ? 'absent' : 'failed';
-        await this.audit.record({
-          actorId: actor.sub,
-          actorEmail: actor.email,
-          action: outcome === 'absent' ? 'deploy.delete.coolify' : 'deploy.delete.coolify.warn',
-          resourceType: 'deployment',
-          resourceId: id,
-          details: { coolifyUuid: row.coolifyUuid, outcome },
-        });
-        if (outcome === 'failed') {
-          throw new BadGatewayException(
-            "Suppression de l'application impossible sur l'hébergement : aucune suppression locale effectuée. Réessayez plus tard ou contactez le support.",
+      if (c4Enabled) {
+        const target = this.buildTarget(row.server);
+        const uuid = row.coolifyUuid;
+        let ticket: { attemptId: string; targetIntentHash: string | null } | null = null;
+        try {
+          ticket = await this.c4.beginDispatchStandalone({
+            nature: 'DELETE',
+            scope: { type: 'DEPLOYMENT', id },
+            allocationId: allocation?.id ?? null,
+            orderId: row.orderId,
+            holder: actor.sub,
+            targetIntent: { type: 'application', serverId: row.server.id, uuid },
+          });
+        } catch {
+          ticket = null;
+        }
+        if (!ticket) {
+          throw new ConflictException(
+            'Suppression refusée — tentative de création non résolue (incertitude conservée).',
           );
+        }
+        try {
+          await this.panelFactory.create().deleteApplication(target, uuid);
+          providerIssue = 'deleted';
+          await this.c4.settleStandalone({
+            attemptId: ticket.attemptId,
+            holder: actor.sub,
+            outcome: 'DELETED',
+            targetIntentHash: ticket.targetIntentHash,
+            returnedIdentifiers: { deleted: true },
+          });
+          await this.audit.record({
+            actorId: actor.sub,
+            actorEmail: actor.email,
+            action: 'deploy.delete.coolify',
+            resourceType: 'deployment',
+            resourceId: id,
+            details: { coolifyUuid: row.coolifyUuid, appName: row.appName, outcome: 'deleted' },
+          });
+        } catch (err) {
+          const absent = isAbsentExternalError(err);
+          providerIssue = absent ? 'absent' : 'failed';
+          await this.c4.settleStandalone({
+            attemptId: ticket.attemptId,
+            holder: actor.sub,
+            outcome: absent ? 'ABSENT' : 'FAILED_RETRYABLE',
+            targetIntentHash: ticket.targetIntentHash,
+            returnedIdentifiers: absent ? { absent: true } : { error: 'provider_error' },
+          });
+          // Jamais de message d'exception dans l'audit (B0.8) : uniquement la
+          // classe de sortie, déterminée par la classification 404 générique.
+          await this.audit.record({
+            actorId: actor.sub,
+            actorEmail: actor.email,
+            action: absent ? 'deploy.delete.coolify' : 'deploy.delete.coolify.warn',
+            resourceType: 'deployment',
+            resourceId: id,
+            details: { coolifyUuid: row.coolifyUuid, outcome: absent ? 'absent' : 'failed' },
+          });
+          if (!absent) {
+            throw new BadGatewayException(
+              "Suppression de l'application impossible sur l'hébergement : aucune suppression locale effectuée. Réessayez plus tard ou contactez le support.",
+            );
+          }
+        }
+      } else {
+        try {
+          await this.panelFactory
+            .create()
+            .deleteApplication(this.buildTarget(row.server), row.coolifyUuid);
+          await this.audit.record({
+            actorId: actor.sub,
+            actorEmail: actor.email,
+            action: 'deploy.delete.coolify',
+            resourceType: 'deployment',
+            resourceId: id,
+            details: { coolifyUuid: row.coolifyUuid, appName: row.appName, outcome: 'deleted' },
+          });
+        } catch (err) {
+          // Jamais de message d'exception dans l'audit (B0.8) : uniquement la
+          // classe de sortie, déterminée par la classification 404 générique.
+          const outcome = isAbsentExternalError(err) ? 'absent' : 'failed';
+          await this.audit.record({
+            actorId: actor.sub,
+            actorEmail: actor.email,
+            action: outcome === 'absent' ? 'deploy.delete.coolify' : 'deploy.delete.coolify.warn',
+            resourceType: 'deployment',
+            resourceId: id,
+            details: { coolifyUuid: row.coolifyUuid, outcome },
+          });
+          if (outcome === 'failed') {
+            throw new BadGatewayException(
+              "Suppression de l'application impossible sur l'hébergement : aucune suppression locale effectuée. Réessayez plus tard ou contactez le support.",
+            );
+          }
         }
       }
     }
@@ -1247,34 +1357,159 @@ export class DeploymentsService {
     const cs = row.clientSubdomain;
     const ownsCs = Boolean(cs) && cs!.deploymentId === id;
     let dnsFailed = false;
+    let dnsIssue: 'deleted' | 'absent' | 'failed' | 'unknown' | null = null;
     if (ownsCs && cs!.recordId && cs!.domainId) {
-      try {
-        await this.cloudflare.deleteDnsRecord(cs!.domainId, cs!.recordId, actor);
-      } catch (err) {
-        if (!isAbsentExternalError(err)) {
-          dnsFailed = true;
-          await this.audit.record({
-            actorId: actor.sub,
-            actorEmail: actor.email,
-            action: 'deploy.delete.dns.warn',
-            resourceType: 'deployment',
-            resourceId: id,
-            details: { fqdn: cs!.fqdn, outcome: 'failed' },
+      if (c4Enabled) {
+        let ticket: { attemptId: string; targetIntentHash: string | null } | null = null;
+        try {
+          ticket = await this.c4.beginDispatchStandalone({
+            nature: 'DELETE',
+            scope: { type: 'DEPLOYMENT', id },
+            allocationId: allocation?.id ?? null,
+            orderId: row.orderId,
+            holder: actor.sub,
+            targetIntent: {
+              type: 'dns',
+              domainId: cs!.domainId,
+              recordId: cs!.recordId,
+              fqdn: cs!.fqdn,
+            },
           });
+        } catch {
+          ticket = null;
+        }
+        if (!ticket) {
+          dnsIssue = 'unknown';
+          dnsFailed = true;
+        } else {
+          try {
+            await this.cloudflare.deleteDnsRecord(cs!.domainId, cs!.recordId, actor);
+            dnsIssue = 'deleted';
+            await this.c4.settleStandalone({
+              attemptId: ticket.attemptId,
+              holder: actor.sub,
+              outcome: 'DELETED',
+              targetIntentHash: ticket.targetIntentHash,
+              returnedIdentifiers: { deleted: true },
+            });
+          } catch (err) {
+            const absent = isAbsentExternalError(err);
+            dnsIssue = absent ? 'absent' : 'failed';
+            dnsFailed = !absent;
+            await this.c4.settleStandalone({
+              attemptId: ticket.attemptId,
+              holder: actor.sub,
+              outcome: absent ? 'ABSENT' : 'FAILED_RETRYABLE',
+              targetIntentHash: ticket.targetIntentHash,
+              returnedIdentifiers: absent ? { absent: true } : { error: 'provider_error' },
+            });
+            if (!absent) {
+              await this.audit.record({
+                actorId: actor.sub,
+                actorEmail: actor.email,
+                action: 'deploy.delete.dns.warn',
+                resourceType: 'deployment',
+                resourceId: id,
+                details: { fqdn: cs!.fqdn, outcome: 'failed' },
+              });
+            }
+          }
+        }
+      } else {
+        try {
+          await this.cloudflare.deleteDnsRecord(cs!.domainId, cs!.recordId, actor);
+        } catch (err) {
+          if (!isAbsentExternalError(err)) {
+            dnsFailed = true;
+            await this.audit.record({
+              actorId: actor.sub,
+              actorEmail: actor.email,
+              action: 'deploy.delete.dns.warn',
+              resourceType: 'deployment',
+              resourceId: id,
+              details: { fqdn: cs!.fqdn, outcome: 'failed' },
+            });
+          }
         }
       }
     }
 
-    // 3. Rows locales (ordre respectant les FK). Ownership strict (B0.2) :
-    //    sans row appartenant à CETTE app, aucun ClientSubdomain n'est supprimé.
-    //    DNS non confirmé ⇒ row conservée (partial) pour re-nettoyage.
-    await this.prisma.$transaction(async (tx) => {
-      if (ownsCs && !dnsFailed) {
-        await tx.clientSubdomain.deleteMany({ where: { deploymentId: id } });
-      }
-      await tx.deployment.delete({ where: { id } });
-    });
+    // 3. Rows locales + libération C4 — parcours DIFFÉRENCIÉ (D6 révisé) :
+    //    • OFF (ou sans allocation) : contrat historique STRICTEMENT inchangé —
+    //      suppression locale immédiate, CS conservée si DNS non concluant ;
+    //    • ON avec allocation : preuves réseau d'abord, PUIS une UNE
+    //      transaction (T-release) supprime CS+Deployment, écrit la preuve
+    //      unique et passe RELEASED (atomicité exigée) ; preuves non
+    //      concluantes (ex. DNS échoué) ⇒ AUCUNE écriture locale — les rows
+    //      restent en place (état ADRESSABLE, rejeu de la même demande) et le
+    //      slot reste consommé.
+    let c4Release: C4ReleaseResult | undefined;
 
+    const localCleanupTx = async (removeClientSubdomain: boolean, idempotent = false) => {
+      await this.prisma.$transaction(async (tx) => {
+        // Ownership strict (B0.2) : sans row appartenant à CETTE app, aucun
+        // ClientSubdomain n'est supprimé ; DNS non confirmé ⇒ row conservée.
+        if (removeClientSubdomain && ownsCs) {
+          await tx.clientSubdomain.deleteMany({ where: { deploymentId: id } });
+        }
+        if (idempotent) {
+          await tx.deployment.deleteMany({ where: { id } }); // rejeu : jamais P2025
+        } else {
+          await tx.deployment.delete({ where: { id } });
+        }
+      });
+    };
+
+    if (!c4Enabled || !allocation) {
+      await localCleanupTx(!dnsFailed);
+    } else {
+      try {
+        c4Release = await this.c4r.releaseAfterCleanup({
+          allocationId: allocation.id,
+          actorUserId: row.userId,
+          orderId: row.orderId,
+          app: providerIssue ?? 'unknown',
+          dns: dnsIssue ?? (ownsCs ? 'unknown' : 'not_created'),
+          dnsHadRecord: !!(cs?.recordId),
+          appIdentifier: row.coolifyUuid,
+          dnsIdentifier: cs?.fqdn ?? null,
+          cleanup: {
+            deploymentId: id,
+            removeClientSubdomain: ownsCs && !dnsFailed,
+            actorUserId: row.userId,
+          },
+        });
+      } catch {
+        // Échec/rollback de la T-release : RIEN n'a été écrit localement
+        // (rollback conjoint) — état adressable conservé, rejeu possible.
+        c4Release = {
+          status: 'blocked',
+          allocationId: allocation.id,
+          blockedReason: 'call_uncertain',
+        };
+      }
+      if (
+        c4Release.status === 'already_released' ||
+        c4Release.status === 'pre_provider_released'
+      ) {
+        // Chemins structurels sans T-release : nettoyage local séparé,
+        // idempotent (le rejeu d'une demande déjà conclue ne doit jamais
+        // échouer sur une row déjà supprimée), jamais au-delà des preuves DNS.
+        await localCleanupTx(!dnsFailed, true);
+      }
+      // 'blocked' (dont dns_not_conclusive) : AUCUNE écriture locale —
+      // Deployment+CS restent inplace (état adressable, re-nettoyable).
+    }
+    let freedQuota = false;
+    if (allocation) {
+      const fresh = await this.prisma.hostingServiceAllocation.findUnique({
+        where: { id: allocation.id },
+        select: { status: true },
+      });
+      freedQuota = fresh?.status === HostingServiceAllocationStatus.RELEASED;
+    }
+
+    const releaseBlocked = c4Release?.status === 'blocked';
     await this.audit.record({
       actorId: actor.sub,
       actorEmail: actor.email,
@@ -1287,11 +1522,18 @@ export class DeploymentsService {
         hadCoolifyApp: Boolean(row.coolifyUuid),
         hadSubdomain: Boolean(cs),
         dnsOutcome: dnsFailed ? 'failed' : ownsCs ? 'deleted' : 'absent',
-        partial: dnsFailed,
-        freedQuota: true,
-      },
+        partial: dnsFailed || releaseBlocked,
+        freedQuota,
+        ...(c4Release ? { c4Release } : {}),
+      } as unknown as Prisma.InputJsonValue,
     });
-    return { removed: true, appName: row.appName, partial: dnsFailed };
+    return {
+      removed: true,
+      appName: row.appName,
+      partial: dnsFailed || releaseBlocked,
+      freedQuota,
+      ...(c4Release ? { c4: { release: c4Release } } : {}),
+    };
   }
 
   // ── Internes ───────────────────────────────────────────────────────────────

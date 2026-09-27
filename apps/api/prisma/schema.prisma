@@ -1501,8 +1501,125 @@ model BillingSetting {
   companyEmail        String?
   legalMentions       Json? // mentions complémentaires (lignes de pied de facture)
   invoiceSequence     Int      @default(1) // prochain n° — format « YYYY-<seq> »
-  dunningReminderDays Int      @default(3) // rappel avant échéance (J-3)
+  dunningReminderDays Int      @default(3) // rappel avant échéance J-3
   dunningGraceDays    Int      @default(14) // délai avant suspension (J+14)
   createdAt           DateTime @default(now())
   updatedAt           DateTime @updatedAt
+}
+
+// ── 17B.4F-C4 — tables dédiées du protocole de reprise sûre ──────────────────
+// 5 tables STRICTEMENT ADDITIVES, SANS relation/FK vers C1/C3 (décision
+// figée) : aucune colonne n'est ajoutée à "HostingServiceAllocation" ni à
+// "OrderProvisioningTracking". Le protocole s'appuie sur des identifiants
+// copiés (allocationId/orderId en TEXT), jamais sur des clés étrangères.
+//
+//   • C4ProviderAttempt  : suivi DURABLE d'une tentative provider (dispatch →
+//     retour), avec identité de tentative (holder + targetIntentHash) et
+//     outcome terminal immuable (jamais global « SETTLED » : l'incertitude est
+//     par ressource/tentative).
+//   • C4Takeover         : premier dispatch du périmètre (CREATE/CONFIGURE) —
+//     doit être committé AVANT le 1er appel réseau.
+//   • C4StopRequest      : marqueur d'arrêt (annulation/terminaison) opposable
+//     à tout nouveau dispatch ; jamais effacé par un changement de flag.
+//   • C4ReleaseEvidence  : preuve DURABLE structurée de libération (unique par
+//     allocation — une seule libération locale, H5).
+//   • C4ReadinessProof   : preuve positive identity-bound du finalize (cible
+//     exacte provider/serveur, jamais un booléen, jamais le HTTP du FQDN).
+
+enum C4AttemptNature {
+  CREATE
+  CONFIGURE
+  DELETE
+  READ
+}
+
+enum C4AttemptPhase {
+  DISPATCHED
+  RETURNED
+}
+
+enum C4AttemptOutcome {
+  SUCCESS
+  REFUSED
+  DELETED
+  ABSENT
+  FAILED_RETRYABLE
+  PERMANENT_FAILURE
+  PRESENT
+  UNAVAILABLE
+  UNKNOWN
+}
+
+enum C4ScopeType {
+  ORDER
+  SERVICE
+  ALLOCATION
+  DEPLOYMENT
+}
+
+model C4ProviderAttempt {
+  id                  String              @id @default(cuid())
+  nature              C4AttemptNature
+  phase               C4AttemptPhase      @default(DISPATCHED)
+  scopeType           C4ScopeType
+  scopeId             String
+  allocationId        String?
+  orderId             String?
+  holder              String
+  targetIntent        Json?
+  targetIntentHash    String?
+  outcome             C4AttemptOutcome?
+  returnedIdentifiers Json?
+  dispatchedAt        DateTime            @default(now())
+  returnedAt          DateTime?
+
+  @@index([orderId])
+  @@index([allocationId, nature])
+  @@index([scopeType, scopeId])
+}
+
+model C4Takeover {
+  id           String       @id @default(cuid())
+  scopeType    C4ScopeType
+  scopeId      String
+  targetIntent Json?
+  takenAt      DateTime     @default(now())
+
+  @@unique([scopeType, scopeId])
+}
+
+model C4StopRequest {
+  id        String      @id @default(cuid())
+  scopeType C4ScopeType
+  scopeId   String
+  reason    String?
+  actorId   String?
+  createdAt DateTime    @default(now())
+
+  @@unique([scopeType, scopeId])
+}
+
+model C4ReleaseEvidence {
+  id            String    @id @default(cuid())
+  allocationId  String    @unique
+  orderId       String?
+  ownerUserId   String?
+  appIdentifier String?
+  dnsIdentifier String?
+  appOutcome    String?
+  dnsOutcome    String?
+  attemptIds    Json?
+  details       Json?
+  releasedAt    DateTime  @default(now())
+}
+
+model C4ReadinessProof {
+  id            String   @id @default(cuid())
+  orderId       String   @unique
+  deploymentId  String
+  coolifyUuid   String
+  serverId      String?
+  providerStatus String?
+  evidence      Json
+  observedAt    DateTime @default(now())
 }
