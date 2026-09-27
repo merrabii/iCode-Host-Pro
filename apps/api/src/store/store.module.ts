@@ -4,6 +4,7 @@ import { CloudflareModule } from '../cloudflare/cloudflare.module';
 import { HttpAvailabilityService } from '../common/http-availability.service';
 import { CryptoModule } from '../crypto/crypto.module';
 import { DeploymentsModule } from '../deployments/deployments.module';
+import { HostingModule } from '../hosting/hosting.module';
 import { MailModule } from '../mail/mail.module';
 import { ProductsModule } from '../products/products.module';
 import { PanelTransportFactory } from '../servers/panel-transport.factory';
@@ -30,9 +31,11 @@ import { StoreSubdomainController } from './store-subdomain.controller';
  * 17B.4B — ajoute le moteur de réconciliation asynchrone (ReconcileService, pas
  * de boucle : scanOnce est appelé explicitement, le timer 17B.4C viendra après),
  * la couche évidence et le connecteur Coolify enregistré dans le registre DI.
+ * 17B.4F-C3 — importe `HostingModule` (réservation store C1 + capability
+ * C3) : sans cycle (HostingModule n'importe que PrismaModule).
  */
 @Module({
-  imports: [AuthModule, CloudflareModule, CryptoModule, DeploymentsModule, MailModule, ProductsModule],
+  imports: [AuthModule, CloudflareModule, CryptoModule, DeploymentsModule, HostingModule, MailModule, ProductsModule],
   controllers: [
     PaymentMethodsController,
     BillingPaymentAdminController,

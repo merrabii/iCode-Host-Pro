@@ -1,8 +1,18 @@
-import { ConflictException, Injectable, Logger, NotFoundException } from '@nestjs/common';
+import {
+  ConflictException,
+  Injectable,
+  Logger,
+  NotFoundException,
+  ServiceUnavailableException,
+} from '@nestjs/common';
+import { randomUUID } from 'crypto';
 import {
   DeploymentStatus,
+  HostingServiceAllocationStatus,
+  HostingServiceStatus,
   LimitsStatus,
   OrderStatus,
+  Prisma,
   ProvisioningStepStatus,
   ProvisionAction,
 } from '@prisma/client';
@@ -22,6 +32,34 @@ import {
   PanelTransport,
 } from '../servers/panel-transport.factory';
 import { resolveBuildPackPortContract } from '../servers/runtime-port-contract';
+import { isHostingC3Enabled } from '../hosting/c3-flag';
+import { C3CapabilityService } from '../hosting/c3-capability.service';
+import { HostingServicesService } from '../hosting/hosting-services.service';
+import { ReservationPayload, storeIdempotencyKey } from '../hosting/hosting-fingerprint';
+
+/**
+ * 17B.4F-C3 — garde d'écriture du parcours C3 : TOUTE écriture métier d'une
+ * commande trackéee passe par cette fonction, qui ouvre sa propre transaction,
+ * verrouille Order → OrderProvisioningTracking, vérifie le `claimToken` du
+ * worker PUIS le lease (deux contrôles SÉPARÉS), exécute l'écriture et commit.
+ * Le parcours legacy n'utilise jamais ce type : `directWrite` exécute
+ * l'écriture directement sur le client (auto-commit, contrat inchangé).
+ */
+export type StoreWriteGuard = <R>(fn: (tx: Prisma.TransactionClient) => Promise<R>) => Promise<R>;
+
+/**
+ * Refus d'écriture du garde C3 (worker obsolète / lease non renouvelable).
+ * ConflictException : HTTP 409 explicite, JAMAIS avalé par le best-effort
+ * legacy (seul ce sous-type est re-propagé par `linkClientSubdomainToDeployment`).
+ */
+export class C3WorkerGuardError extends ConflictException {
+  constructor(message: string) {
+    super(message);
+  }
+}
+
+/** Lease du claim C3 — renouvelé à CHAQUE écriture gardée (CAS token+expiré). */
+export const C3_LEASE_MS = 5 * 60_000;
 
 /**
  * Résultat d'une tentative d'activation atomique post-preuve (17B.3B).
@@ -82,7 +120,13 @@ export class ProvisioningService {
     private readonly panelFactory: PanelTransportFactory,
     private readonly deployments: DeploymentsService,
     private readonly httpAvailability: HttpAvailabilityService,
+    private readonly hosting: HostingServicesService,
+    private readonly c3: C3CapabilityService,
   ) {}
+
+  /** Écriture directe legacy (auto-commit) — le contrat historique inchangé. */
+  private readonly directWrite: StoreWriteGuard = (fn) =>
+    fn(this.prisma as unknown as Prisma.TransactionClient);
 
   /**
    * Provisionne une commande payée. Idempotent : si l'Order est déjà
@@ -115,6 +159,34 @@ export class ProvisioningService {
       throw new ConflictException(
         `Commande ${order.status} — provisioning impossible (utiliser cancel-provisioning pour le nettoyage).`,
       );
+    }
+
+    // ── 17B.4F-C3 — routage C3 (AVANT l'idempotent-return et avant force) ────
+    if (!isHostingC3Enabled()) {
+      // OFF : le tracking est résolu par sonde LIVE de la table dédiée (jamais
+      // depuis un cache négatif). Une commande C3 ne bascule JAMAIS en legacy
+      // quand la garde est OFF : refus explicite, aucun appel provider.
+      const tracked = await this.c3.resolveTracking(orderId);
+      if (tracked) {
+        throw new ConflictException(
+          'Commande du parcours C3 — provisioning suspendu tant que C3 est désactivé (aucun repli legacy).',
+        );
+      }
+      // Pas de table / pas de ligne → parcours legacy historique inchangé.
+    } else {
+      // ON : capability C1+C3 vérifiée LIVE avant toute écriture métier.
+      // Indisponible (migration non appliquée) → 503 fail-closed.
+      if (!(await this.c3.operational())) {
+        throw new ServiceUnavailableException(
+          'Provisioning C3 activé mais schéma indisponible (migration C1/C3 requise).',
+        );
+      }
+      const tracked = await this.c3.resolveTracking(orderId);
+      if (tracked) {
+        return this.provisionC3(order, tracked as { intent: unknown }, opts);
+      }
+      // Absence de tracking = ancien achat (ou produit sans pack) → legacy
+      // sécurisé (capability prouvée), comportement historique inchangé.
     }
 
     if (
@@ -270,6 +342,537 @@ export class ProvisioningService {
     return this.finalResult(orderId, simpleNext, fqdn);
   }
 
+  // ── 17B.4F-C3 — orchestration du provisioning des commandes trackéees ─────
+
+  /**
+   * Garde d'écriture C3 : ouvre SA transaction, verrouille Order →
+   * OrderProvisioningTracking (ordre global), vérifie l'IDENTITÉ du worker
+   * (`claimToken`) puis, SÉPARÉMENT, le lease (expiration → renouvellement
+   * CAS `token + expiré` ; `count ≠ 1` → refus). Une écriture n'est jamais
+   * exécutée si l'un des deux contrôles échoue ; l'expiration seule n'autorise
+   * JAMAIS une autre ressource à écrire (aucun takeover après intention).
+   */
+  private c3Guard(orderId: string, token: string): StoreWriteGuard {
+    return async <R>(fn: (tx: Prisma.TransactionClient) => Promise<R>): Promise<R> => {
+      return this.prisma.$transaction(async (tx) => {
+        const orders = await tx.$queryRaw<Array<{ id: string }>>`
+          SELECT "id" FROM "Order" WHERE "id" = ${orderId} FOR UPDATE`;
+        if (!orders[0]) {
+          throw new C3WorkerGuardError('Commande introuvable (worker obsolète).');
+        }
+        const trs = await tx.$queryRaw<Array<{ claimToken: string | null; leaseUntil: Date | null }>>`
+          SELECT "claimToken", "leaseUntil" FROM "OrderProvisioningTracking"
+          WHERE "orderId" = ${orderId} FOR UPDATE`;
+        const tracking = trs[0];
+        // Contrôle 1 — IDENTITÉ (token du claim) : tout autre worker est refusé.
+        if (!tracking || tracking.claimToken !== token) {
+          throw new C3WorkerGuardError('Worker obsolète — écriture refusée.');
+        }
+        // Contrôle 2 — LEASE (séparé) : expiré → renouvellement CAS ; un refus
+        // ici n'est jamais contourné (pas de « juste cette écriture »).
+        if (tracking.leaseUntil && tracking.leaseUntil.getTime() <= Date.now()) {
+          const renewed = await tx.orderProvisioningTracking.updateMany({
+            where: { orderId, claimToken: token, leaseUntil: { lte: new Date() } },
+            data: { leaseUntil: new Date(Date.now() + C3_LEASE_MS) },
+          });
+          if (renewed.count !== 1) {
+            throw new C3WorkerGuardError('Lease non renouvelable — worker obsolète.');
+          }
+        }
+        return fn(tx);
+      });
+    };
+  }
+
+  /**
+   * B0 du parcours C3 — validations LOCALES (aucun réseau) exigées AVANT
+   * l'intention provider. `null` = conforme ; sinon motif d'abandon
+   * (compensation pré-provider, Order reste PAID, aucun appel provider).
+   */
+  private c3B0Failure(order: {
+    product: {
+      provisionModule: { actions: unknown } | null;
+      moduleParams?: unknown;
+      pack?: { deploymentModule?: { server?: { panelProvider?: string; apiBaseUrl?: string | null; apiTokenEnc?: string | null } | null } | null } | null;
+    };
+  }): string | null {
+    const method = order.product.provisionModule;
+    const actions = (method?.actions as ProvisionAction[] | null | undefined) ?? [];
+    if (!method || actions.length === 0) {
+      return 'Aucune action de provisioning configurée.';
+    }
+    if (!actions.includes(ProvisionAction.CREATE_APP)) {
+      return 'Produit sans CREATE_APP — non provisionnable en C3.';
+    }
+    const params = (order.product.moduleParams ?? {}) as Record<string, unknown>;
+    if (typeof params.repoUrl !== 'string' || !params.repoUrl.trim()) {
+      return 'Produit sans repoUrl — création Coolify impossible.';
+    }
+    const server = order.product.pack?.deploymentModule?.server;
+    if (!server || server.panelProvider !== 'COOLIFY' || !server.apiBaseUrl || !server.apiTokenEnc) {
+      return 'Aucun serveur Coolify configuré pour ce produit.';
+    }
+    return null;
+  }
+
+  /**
+   * 17B.4F-C3 — provisioning d'une commande trackéee (`OrderProvisioningTracking`).
+   *
+   * TX-A (locale, ZÉRO réseau) : ① verrou Order → ② verrou Tracking → ③
+   * relecture autoritaire (allocation `store:v1:<orderId>`, Deployment) → ④a
+   * décisions sur états existants AVANT toute écriture de token (terminal /
+   * bound / uncertain / releasing / busy / noop → restitués en lecture seule
+   * ou 409, JAMAIS de takeover) → ④b/⑤ claim (token+lease) → ⑥ réservation
+   * → ⑦ B0 (échec ⇒ libération + annotation + commit, Order reste PAID) →
+   * ⑧ Order→PROVISIONING → ⑨ intention DERNIÈRE → COMMIT.
+   * Puis : TX-C (row Deployment, statut PENDING, avant le 1ᵉʳ appel provider),
+   * boucle d'actions (chaque écriture sous garde token/lease ; un échec STOPPE
+   * la suite — aucun appel provider après un résultat incertain), TX-E
+   * `markBound`, preuve (lecture seule), TX-B activation (token + CAS sur le
+   * MÊME tx). `force` n'accélère rien : l'état décide, jamais le takeover.
+   */
+  private async provisionC3(
+    order: {
+      id: string;
+      status: OrderStatus;
+      domainValue: string | null;
+      customerEmail: string;
+      customerName: string;
+      productId: string;
+      product: {
+        name: string;
+        moduleParams?: unknown;
+        provisionModule: { name: string; actions: unknown } | null;
+        pack?: {
+          id?: string;
+          ramMb?: number;
+          cpuCores?: number;
+          storageLimit?: number | null;
+          deploymentModule?: {
+            id?: string;
+            kind?: string;
+            overrideRamMb: number | null;
+            overrideCpuCores: number | null;
+            overrideStorageLimit: number | null;
+            server?: {
+              id?: string;
+              panelProvider?: string;
+              apiBaseUrl?: string | null;
+              apiTokenEnc?: string | null;
+            } | null;
+          } | null;
+        } | null;
+      };
+      customer: { userId: string | null } | null;
+    },
+    tracked: { intent: unknown },
+    _opts?: { force?: boolean },
+  ): Promise<{
+    orderId: string;
+    status: string;
+    fqdn: string | null;
+    steps: { step: string; status: string; message: string | null }[];
+  }> {
+    // Service hébergement né au checkout (invariant C3) — lu avant la TX-A
+    // (échec = état incohérent, aucun appel provider).
+    const service = await this.prisma.hostingService.findUnique({
+      where: { orderId: order.id },
+    });
+    if (!service) {
+      throw new ConflictException(
+        'Service hébergement absent pour cette commande C3 (état incohérent) — support requis.',
+      );
+    }
+
+    const claim = await this.prisma.$transaction(async (tx) => {
+      // ① verrou de LIGNE Order (ordre global : Order → Tracking →
+      //    HostingService → HostingServiceAllocation → Deployment).
+      const orders = await tx.$queryRaw<
+        Array<{ id: string; status: OrderStatus; domainValue: string | null }>
+      >`
+        SELECT "id", "status", "domainValue" FROM "Order" WHERE "id" = ${order.id} FOR UPDATE`;
+      if (!orders[0]) throw new NotFoundException('Commande introuvable.');
+      const liveStatus = orders[0].status;
+      const liveFqdn = orders[0].domainValue;
+      if (liveStatus === OrderStatus.CANCELLED || liveStatus === OrderStatus.REFUNDED) {
+        throw new ConflictException(
+          `Commande ${liveStatus} — provisioning impossible (utiliser cancel-provisioning pour le nettoyage).`,
+        );
+      }
+
+      // ② verrou de LIGNE Tracking — fail-closed : table/ligne disparue sous
+      //    ON = aucune écriture, aucun repli.
+      const trs = await tx.$queryRaw<
+        Array<{ intent: unknown; claimToken: string | null; leaseUntil: Date | null }>
+      >`
+        SELECT "intent", "claimToken", "leaseUntil" FROM "OrderProvisioningTracking"
+        WHERE "orderId" = ${order.id} FOR UPDATE`;
+      const tracking = trs[0];
+      if (!tracking) {
+        throw new ServiceUnavailableException(
+          'Tracking C3 absent sous garde ON — provisioning refusé (fail-closed).',
+        );
+      }
+
+      // ③ relecture autoritaire sous verrou : allocation + Deployment.
+      const key = storeIdempotencyKey(order.id);
+      const alloc = await tx.hostingServiceAllocation.findUnique({
+        where: { idempotencyKey: key },
+      });
+
+      // ④a décisions sur états existants — AVANT toute écriture de token/lease.
+      if (alloc) {
+        if (alloc.status === HostingServiceAllocationStatus.RELEASED) {
+          // Terminal (ex. compensation B0 committée) : état réel, 0 appel, 0 écriture.
+          return { kind: 'terminal' as const, status: liveStatus, fqdn: liveFqdn };
+        }
+        if (alloc.providerIntentAt) {
+          if (alloc.status === HostingServiceAllocationStatus.BOUND && alloc.deploymentId) {
+            // Fenêtre « bind committé + activation échouée » : ÉTAT RÉEL en lecture
+            // seule (jamais ACTIVE forcé, 0 appel provider, 0 écriture) — la
+            // finalisation appartient au support/C4 (T-fen.1).
+            return { kind: 'bound' as const, status: liveStatus, fqdn: liveFqdn };
+          }
+          // Intention engagée sans résultat connu : AUCUN takeover, jamais.
+          return { kind: 'uncertain' as const };
+        }
+        if (alloc.status === HostingServiceAllocationStatus.RELEASING) {
+          return { kind: 'releasing' as const };
+        }
+        // RESERVED/BOUND sans intention : reprise UNIQUEMENT si lease libre
+        // (reprise pré-intention — le seul cas où le token peut changer).
+      } else if (liveStatus === OrderStatus.ACTIVE) {
+        // Commande C3 ACTIVE sans allocation : état réel, 0 appel, 0 écriture.
+        return { kind: 'noop' as const, status: liveStatus, fqdn: liveFqdn };
+      }
+
+      // Lease encore valide → worker en cours : jamais de double claim,
+      // jamais de takeover (même avant intention, même lease expirée plus bas
+      // seule la reprise pré-intention est permise).
+      if (tracking.claimToken && tracking.leaseUntil && tracking.leaseUntil.getTime() > Date.now()) {
+        return { kind: 'busy' as const };
+      }
+
+      // ④b claim (frais ou reprise pré-intention à lease expiré) → ⑤ token/lease.
+      const token = randomUUID();
+      await tx.orderProvisioningTracking.update({
+        where: { orderId: order.id },
+        data: { claimToken: token, leaseUntil: new Date(Date.now() + C3_LEASE_MS) },
+      });
+
+      // ⑥ réservation C1 (création SEULE — une allocation existante est classée ④a).
+      let allocationId: string;
+      if (alloc) {
+        allocationId = alloc.id;
+      } else {
+        const reserved = await this.hosting.reserveForOrderInTx(tx, {
+          orderId: order.id,
+          hostingServiceId: service.id,
+          actorUserId: service.userId,
+          payload: tracking.intent as unknown as ReservationPayload,
+        });
+        allocationId = reserved.allocation.id;
+      }
+
+      // ⑦ B0 — échec ⇒ libération pré-provider + annotation + COMMIT
+      //    (Order reste PAID ; aucune intention n'a été posée).
+      const b0Failure = this.c3B0Failure(order);
+      if (b0Failure) {
+        await this.hosting.releasePreProviderInTx(tx, {
+          allocationId,
+          actorUserId: service.userId,
+        });
+        await tx.orderProvisioningTracking.update({
+          where: { orderId: order.id },
+          data: { claimToken: null, leaseUntil: null },
+        });
+        await tx.orderStatusHistory.create({
+          data: {
+            orderId: order.id,
+            status: liveStatus,
+            note: `Provisioning C3 abandonné (B0) : ${b0Failure}`,
+          },
+        });
+        return { kind: 'b0' as const, reason: b0Failure, status: liveStatus, fqdn: liveFqdn };
+      }
+
+      // ⑧ Order → PROVISIONING (la commande payée entre dans le parcours).
+      if (liveStatus !== OrderStatus.PROVISIONING && liveStatus !== OrderStatus.ACTIVE) {
+        await tx.order.update({
+          where: { id: order.id },
+          data: { status: OrderStatus.PROVISIONING },
+        });
+        await tx.orderStatusHistory.create({
+          data: {
+            orderId: order.id,
+            status: OrderStatus.PROVISIONING,
+            note: `Provisioning C3 lancé (${order.product.provisionModule?.name ?? 'module'}).`,
+          },
+        });
+      }
+
+      // ⑨ intention provider — DERNIÈRE étape avant commit (aucune écriture
+      //    réseau n'a eu lieu ; échec ⇒ rollback COMplet, retry possible).
+      const intentRes = await this.hosting.markIntentInTx(tx, {
+        allocationId,
+        actorUserId: service.userId,
+      });
+      if (!intentRes.applied) {
+        throw new ConflictException(
+          `Intention provider non applicable (${intentRes.reason}) : réservation conservée, aucune reprise automatique.`,
+        );
+      }
+      return { kind: 'claimed' as const, token, allocationId };
+    });
+
+    // ── Décisions non-gagnées : lecture seule ou refus explicite (0 provider) ─
+    if (claim.kind !== 'claimed') {
+      switch (claim.kind) {
+        case 'uncertain':
+          throw new ConflictException(
+            'Intention provider déjà engagée — aucune reprise automatique (support requis).',
+          );
+        case 'releasing':
+          throw new ConflictException(
+            'Libération en cours sur cette commande — reprise refusée (support requis).',
+          );
+        case 'busy':
+          throw new ConflictException('Provisioning C3 déjà en cours sur cette commande.');
+        case 'terminal':
+        case 'bound':
+        case 'noop':
+        case 'b0':
+          // État réel restitué en LECTURE SEULE : 0 appel provider, 0 écriture.
+          return this.finalResult(order.id, claim.status, claim.fqdn);
+        default:
+          throw new ConflictException('État de provisioning C3 non reconnu — support requis.');
+      }
+    }
+
+    const guard = this.c3Guard(order.id, claim.token);
+
+    // ── TX-C : row Deployment créée AVANT le 1ᵉʳ appel provider (statut
+    //    PENDING, miroir du parcours C2) ; `actionCreateApp` la retrouve et y
+    //    pose l'uuid + DEPLOYING après succès provider.
+    await guard(async (tx) => {
+      const existing = await tx.deployment.findUnique({
+        where: { orderId: order.id },
+        select: { id: true },
+      });
+      if (existing) return;
+      const userId = order.customer?.userId ?? null;
+      const server = order.product.pack?.deploymentModule?.server ?? null;
+      if (!userId || !server?.id) return; // B0 a déjà validé (défense)
+      const params = (order.product.moduleParams ?? {}) as Record<string, unknown>;
+      const repoUrl = typeof params.repoUrl === 'string' ? params.repoUrl : null;
+      if (!repoUrl) return; // B0 a déjà validé (défense)
+      const branch =
+        typeof params.branch === 'string' && params.branch.trim() ? String(params.branch).trim() : 'main';
+      const buildPack = typeof params.buildPack === 'string' ? String(params.buildPack) : 'nixpacks';
+      const publishDirectory =
+        typeof params.publishDirectory === 'string' && params.publishDirectory.trim()
+          ? String(params.publishDirectory).trim()
+          : null;
+      const appName =
+        typeof params.appName === 'string' && params.appName.trim()
+          ? String(params.appName).trim()
+          : order.product.name;
+      const mod = order.product.pack?.deploymentModule ?? null;
+      const effStore = resolveEffectiveLimits(
+        order.product.pack as
+          | { ramMb: number; cpuCores: number; storageLimit: number | null; id?: string }
+          | null
+          | undefined,
+        mod,
+      );
+      await tx.deployment.create({
+        data: {
+          userId,
+          serverId: server.id,
+          repoFullName: this.deriveRepoFullName(repoUrl) ?? appName,
+          repoUrl,
+          buildPack,
+          appName,
+          branch,
+          publishDirectory,
+          status: DeploymentStatus.PENDING,
+          orderId: order.id,
+          moduleId: (mod as { id?: string } | null)?.id ?? null,
+          packId: (order.product.pack as { id?: string } | null)?.id ?? null,
+          // Limites tracées, statut non tenté : `actionCreateApp` le passe à
+          // APPLIED sur son update (après `applyAppLimits` réussi) quand il est null.
+          limitsRamMb: effStore?.ramMb ?? null,
+          limitsCpu: effStore?.cpuCores ?? null,
+        },
+      });
+    });
+
+    // ── Boucle d'actions : chaque ÉCRITURE passe par la garde (token/lease) ;
+    //    un échec STOPPE la suite (aucun appel provider après un échec/incertitude).
+    const method = order.product.provisionModule;
+    if (!method) {
+      // Inatteignable sous C3 (B0 exige une méthode + CREATE_APP avant claim).
+      throw new ConflictException('Méthode de provisioning absente — support requis.');
+    }
+    const actions: ProvisionAction[] = (method.actions as ProvisionAction[] | null | undefined) ?? [];
+    let fqdn: string | null = order.domainValue ?? null;
+    let appUuid: string | null = null;
+    let stepFailed = false;
+
+    for (const action of actions) {
+      const stepName = this.stepName(action);
+      const logId = await this.openStep(order.id, stepName, guard);
+      try {
+        const out = await this.runAction(action, { order, method, fqdn, appUuid, guard });
+        if (out.fqdn) fqdn = out.fqdn;
+        if (out.appUuid) appUuid = out.appUuid;
+        await this.closeStep(logId, ProvisioningStepStatus.SUCCESS, out.message ?? null, guard);
+        await this.audit.record({
+          action: `provision.${stepName}`,
+          resourceType: 'order',
+          resourceId: order.id,
+          details: { step: stepName, status: 'SUCCESS', fqdn, message: out.message ?? undefined },
+        });
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        this.log.warn(`provision(C3) ${stepName} order=${order.id}: ${msg}`);
+        await this.closeStep(logId, ProvisioningStepStatus.FAILED, msg, guard);
+        await this.audit.record({
+          action: `provision.${stepName}`,
+          resourceType: 'order',
+          resourceId: order.id,
+          details: { step: stepName, status: 'FAILED', message: msg },
+        });
+        stepFailed = true;
+        break;
+      }
+    }
+
+    // Persiste le fqdn livré sur l'Order (garde token/lease, jamais le hostname Coolify).
+    if (fqdn && fqdn !== order.domainValue) {
+      await guard((tx) =>
+        tx.order.update({
+          where: { id: order.id },
+          data: { domainType: 'FREE_SUBDOMAIN', domainValue: fqdn, domainStatus: 'READY' },
+        }),
+      );
+    }
+
+    // ── TX-E : liaison allocation → déploiement sous garde (preuve locale =
+    //    uuid Coolify persisté ; idempotent sur CETTE row, ownership croisé).
+    if (appUuid) {
+      await guard(async (tx) => {
+        const dep = await tx.deployment.findUnique({
+          where: { orderId: order.id },
+          select: { id: true, coolifyUuid: true },
+        });
+        if (!dep?.coolifyUuid) return;
+        await this.hosting.markBoundInTx(tx, {
+          allocationId: claim.allocationId,
+          actorUserId: service.userId,
+          deploymentId: dep.id,
+          proof: { providerProven: true },
+        });
+      });
+    }
+
+    const logs = await this.prisma.provisioningLog.findMany({
+      where: { orderId: order.id },
+      orderBy: { createdAt: 'asc' },
+    });
+    const hasCreateAction = actions.includes(ProvisionAction.CREATE_APP);
+
+    // Échec d'étape : Order reste PROVISIONING, AUCUNE reprise automatique.
+    if (stepFailed) {
+      const reason = 'Étape de provisioning échouée — aucune reprise automatique (support requis).';
+      await this.setOrderStatus(order.id, OrderStatus.PROVISIONING, reason, guard);
+      await this.audit.record({
+        action: 'provision.app_not_created',
+        resourceType: 'order',
+        resourceId: order.id,
+        details: { fqdn, ok: false, reason },
+      });
+      return this.finalResult(order.id, OrderStatus.PROVISIONING, fqdn);
+    }
+
+    // Même garde que le legacy : sans app créée, JAMAIS ACTIVE.
+    if (hasCreateAction && !appUuid) {
+      const reason = 'Aucune application créée — relance requise (support).';
+      await this.setOrderStatus(order.id, OrderStatus.PROVISIONING, reason, guard);
+      await this.audit.record({
+        action: 'provision.app_not_created',
+        resourceType: 'order',
+        resourceId: order.id,
+        details: { fqdn, ok: false, reason },
+      });
+      return this.finalResult(order.id, OrderStatus.PROVISIONING, fqdn);
+    }
+
+    if (hasCreateAction && appUuid) {
+      // Preuve de mise en ligne (poll + HTTP : LECTURES seule, hors transaction).
+      const serverId =
+        (order.product.pack?.deploymentModule?.server as { id?: string } | null | undefined)?.id ??
+        null;
+      const ready = await this.awaitAppReady({ coolifyUuid: appUuid, serverId }, fqdn);
+      if (ready) {
+        // TX-B : activation DANS la transaction qui vient de vérifier le token
+        // (garde token/lease + CAS Order/Deployment sur le MÊME tx). Le verrou
+        // HostingService est pris AVANT les CAS Order/Deployment (ordre global
+        // Order → Tracking → HostingService → Allocation → Deployment) ; le
+        // service ne passe à ACTIVE qu'une fois les preuves FINALES obtenues
+        // (Order + Deployment actifs) — jamais sur échec ni succès partiel,
+        // jamais sur service annulé/hors parcours.
+        const act = await guard(async (tx) => {
+          const svcRows = await tx.$queryRaw<Array<{ id: string; status: HostingServiceStatus }>>`
+            SELECT "id", "status" FROM "HostingService" WHERE "orderId" = ${order.id} FOR UPDATE`;
+          const outcome = await this.activateOrderInTx(tx, order.id);
+          const svc = svcRows[0];
+          if (
+            svc &&
+            svc.status === HostingServiceStatus.PROVISIONING &&
+            outcome.orderIsActive &&
+            outcome.deploymentIsActive
+          ) {
+            const flip = await tx.hostingService.updateMany({
+              where: { id: svc.id, status: HostingServiceStatus.PROVISIONING },
+              data: { status: HostingServiceStatus.ACTIVE },
+            });
+            if (flip.count !== 1) {
+              throw new Error(`activateOrderAfterProof lost race hostingService=${svc.id}`);
+            }
+          }
+          return outcome;
+        });
+        const outcome = await this.postActivationEffects(order.id, act);
+        const status = outcome.orderIsActive ? OrderStatus.ACTIVE : OrderStatus.PROVISIONING;
+        return this.finalResult(order.id, status, fqdn);
+      }
+      await this.setOrderStatus(
+        order.id,
+        OrderStatus.PROVISIONING,
+        'Build en cours — confirmation différée jusqu’à la mise en ligne effective.',
+        guard,
+      );
+      await this.scheduleInitialReconcile(order.id, new Date(), guard);
+      return this.finalResult(order.id, OrderStatus.PROVISIONING, fqdn);
+    }
+
+    // Défense (B0 impose CREATE_APP sous C3) — parité legacy.
+    const hasFailedCritical = logs.some((l) => l.status === ProvisioningStepStatus.FAILED);
+    const simpleNext =
+      hasFailedCritical && !fqdn ? OrderStatus.PROVISIONING : OrderStatus.ACTIVE;
+    await this.setOrderStatus(
+      order.id,
+      simpleNext,
+      simpleNext === OrderStatus.ACTIVE ? 'Provisioning terminé.' : 'Provisioning partiel — relance requise.',
+      guard,
+    );
+    if (fqdn && simpleNext === OrderStatus.ACTIVE) {
+      await this.deliverEmail(order.customerEmail, order.customerName, fqdn, order.id);
+    }
+    return this.finalResult(order.id, simpleNext, fqdn);
+  }
+
   /** Recharge les provisioning logs et renvoie le résultat final d'une run. */
   private async finalResult(
     orderId: string,
@@ -305,6 +908,7 @@ export class ProvisioningService {
     knownDeploymentId?: string | null,
     knownDomainId?: string | null,
     knownCsId?: string | null,
+    guard?: StoreWriteGuard,
   ): Promise<void> {
     try {
       if (!fqdn && !knownCsId) return;
@@ -383,11 +987,17 @@ export class ProvisioningService {
       if (domainIds.length === 0) return;
       if (!domainIds.includes(cs.domainId)) return;
 
-      await this.prisma.clientSubdomain.update({
-        where: { id: cs.id },
-        data: { deploymentId },
-      });
-    } catch {
+      await (guard ?? this.directWrite)((tx) =>
+        tx.clientSubdomain.update({
+          where: { id: cs.id },
+          data: { deploymentId },
+        }),
+      );
+    } catch (e) {
+      // 17B.4F-C3 : le refus du garde token/lease n'est JAMAIS avalé par le
+      // best-effort (le worker obsolète doit s'arrêter — le prochain openStep
+      // gardé lèverait de toute façon, sans appel provider supplémentaire).
+      if (e instanceof C3WorkerGuardError) throw e;
       // Best-effort : message STATIQUE — jamais String(e)/message/name (D5).
       this.log.warn('provision: liaison ClientSubdomain impossible');
     }
@@ -474,20 +1084,39 @@ export class ProvisioningService {
     }
   }
 
-  private async openStep(orderId: string, step: string): Promise<string> {
-    const row = await this.prisma.provisioningLog.create({
-      data: { orderId, step, status: ProvisioningStepStatus.RUNNING },
-    });
+  private async openStep(orderId: string, step: string, guard?: StoreWriteGuard): Promise<string> {
+    const write = guard ?? this.directWrite;
+    const row = await write((tx) =>
+      tx.provisioningLog.create({
+        data: { orderId, step, status: ProvisioningStepStatus.RUNNING },
+      }),
+    );
     return row.id;
   }
 
-  private async closeStep(id: string, status: ProvisioningStepStatus, message: string | null): Promise<void> {
-    await this.prisma.provisioningLog.update({ where: { id }, data: { status, message } });
+  private async closeStep(
+    id: string,
+    status: ProvisioningStepStatus,
+    message: string | null,
+    guard?: StoreWriteGuard,
+  ): Promise<void> {
+    const write = guard ?? this.directWrite;
+    await write((tx) => tx.provisioningLog.update({ where: { id }, data: { status, message } }));
   }
 
-  private async setOrderStatus(orderId: string, status: OrderStatus, note: string): Promise<void> {
-    await this.prisma.order.update({ where: { id: orderId }, data: { status } });
-    await this.prisma.orderStatusHistory.create({ data: { orderId, status, note } });
+  private async setOrderStatus(
+    orderId: string,
+    status: OrderStatus,
+    note: string,
+    guard?: StoreWriteGuard,
+  ): Promise<void> {
+    const write = guard ?? this.directWrite;
+    // TX-A C3 : écrit DANS la transaction du claim (Order verrouillé) — hors
+    // TX-A : legacy auto-commit inchangé.
+    await write(async (tx) => {
+      await tx.order.update({ where: { id: orderId }, data: { status } });
+      await tx.orderStatusHistory.create({ data: { orderId, status, note } });
+    });
   }
 
   /**
@@ -513,67 +1142,87 @@ export class ProvisioningService {
   async activateOrderAfterProof(orderId: string): Promise<ActivationResult> {
     let outcome: ActivationResult;
     try {
-      outcome = await this.prisma.$transaction(async (tx) => {
-        const ord = await tx.order.findUnique({ where: { id: orderId }, select: { status: true } });
-        if (!ord) {
-          return { orderIsActive: false, deploymentIsActive: false, orderActivated: false, deploymentActivated: false, noop: true, reason: 'order_absent' };
-        }
-        if (ord.status !== OrderStatus.PROVISIONING && ord.status !== OrderStatus.ACTIVE) {
-          return { orderIsActive: false, deploymentIsActive: false, orderActivated: false, deploymentActivated: false, noop: true, reason: `order_status_${ord.status}` };
-        }
-        const dep = await tx.deployment.findFirst({ where: { orderId }, select: { status: true } });
-        if (!dep) {
-          return { orderIsActive: false, deploymentIsActive: false, orderActivated: false, deploymentActivated: false, noop: true, reason: 'deployment_missing' };
-        }
-        if (dep.status !== DeploymentStatus.DEPLOYING && dep.status !== DeploymentStatus.ACTIVE) {
-          return { orderIsActive: false, deploymentIsActive: false, orderActivated: false, deploymentActivated: false, noop: true, reason: `deployment_status_${dep.status}` };
-        }
-
-        const orderUpdateNeeded = ord.status === OrderStatus.PROVISIONING;
-        const deploymentUpdateNeeded = dep.status === DeploymentStatus.DEPLOYING;
-        if (!orderUpdateNeeded && !deploymentUpdateNeeded) {
-          return { orderIsActive: true, deploymentIsActive: true, orderActivated: false, deploymentActivated: false, noop: true, reason: 'already_active' };
-        }
-
-        const orderRes = orderUpdateNeeded
-          ? await tx.order.updateMany({
-              where: { id: orderId, status: OrderStatus.PROVISIONING },
-              data: { status: OrderStatus.ACTIVE },
-            })
-          : { count: 0 as const };
-        if (orderUpdateNeeded && orderRes.count !== 1) {
-          throw new Error(`activateOrderAfterProof lost race order=${orderId}`);
-        }
-        const depRes = deploymentUpdateNeeded
-          ? await tx.deployment.updateMany({
-              where: { orderId, status: DeploymentStatus.DEPLOYING },
-              data: { status: DeploymentStatus.ACTIVE },
-            })
-          : { count: 0 as const };
-        if (deploymentUpdateNeeded && depRes.count !== 1) {
-          throw new Error(`activateOrderAfterProof lost race deployment=${orderId}`);
-        }
-
-        const orderActivated = orderUpdateNeeded && orderRes.count === 1;
-        const deploymentActivated = deploymentUpdateNeeded && depRes.count === 1;
-        if (orderActivated) {
-          await tx.orderStatusHistory.create({
-            data: { orderId, status: OrderStatus.ACTIVE, note: 'Application en ligne — mise en place confirmée.' },
-          });
-        }
-        return {
-          orderIsActive: orderActivated || !orderUpdateNeeded,
-          deploymentIsActive: deploymentActivated || !deploymentUpdateNeeded,
-          orderActivated,
-          deploymentActivated,
-          noop: false,
-        };
-      });
+      outcome = await this.prisma.$transaction((tx) => this.activateOrderInTx(tx, orderId));
     } catch (e) {
       this.log.warn(`activateOrderAfterProof order=${orderId} rollback: ${String(e)}`);
       throw e;
     }
+    return this.postActivationEffects(orderId, outcome);
+  }
 
+  /**
+   * Corps ATOMIQUE d'activation (17B.3B) exécuté dans le `tx` FOURNI — sans
+   * `$transaction` imbriquée. Réutilisé par `activateOrderAfterProof`
+   * (transaction dédiée, comportement inchangé) et par le parcours C3 (TX-B :
+   * activation DANS la transaction qui vient de vérifier le `claimToken` du
+   * worker, garde token + CAS sur le MÊME tx).
+   */
+  private async activateOrderInTx(
+    tx: Prisma.TransactionClient,
+    orderId: string,
+  ): Promise<ActivationResult> {
+    const ord = await tx.order.findUnique({ where: { id: orderId }, select: { status: true } });
+    if (!ord) {
+      return { orderIsActive: false, deploymentIsActive: false, orderActivated: false, deploymentActivated: false, noop: true, reason: 'order_absent' };
+    }
+    if (ord.status !== OrderStatus.PROVISIONING && ord.status !== OrderStatus.ACTIVE) {
+      return { orderIsActive: false, deploymentIsActive: false, orderActivated: false, deploymentActivated: false, noop: true, reason: `order_status_${ord.status}` };
+    }
+    const dep = await tx.deployment.findFirst({ where: { orderId }, select: { status: true } });
+    if (!dep) {
+      return { orderIsActive: false, deploymentIsActive: false, orderActivated: false, deploymentActivated: false, noop: true, reason: 'deployment_missing' };
+    }
+    if (dep.status !== DeploymentStatus.DEPLOYING && dep.status !== DeploymentStatus.ACTIVE) {
+      return { orderIsActive: false, deploymentIsActive: false, orderActivated: false, deploymentActivated: false, noop: true, reason: `deployment_status_${dep.status}` };
+    }
+
+    const orderUpdateNeeded = ord.status === OrderStatus.PROVISIONING;
+    const deploymentUpdateNeeded = dep.status === DeploymentStatus.DEPLOYING;
+    if (!orderUpdateNeeded && !deploymentUpdateNeeded) {
+      return { orderIsActive: true, deploymentIsActive: true, orderActivated: false, deploymentActivated: false, noop: true, reason: 'already_active' };
+    }
+
+    const orderRes = orderUpdateNeeded
+      ? await tx.order.updateMany({
+          where: { id: orderId, status: OrderStatus.PROVISIONING },
+          data: { status: OrderStatus.ACTIVE },
+        })
+      : { count: 0 as const };
+    if (orderUpdateNeeded && orderRes.count !== 1) {
+      throw new Error(`activateOrderAfterProof lost race order=${orderId}`);
+    }
+    const depRes = deploymentUpdateNeeded
+      ? await tx.deployment.updateMany({
+          where: { orderId, status: DeploymentStatus.DEPLOYING },
+          data: { status: DeploymentStatus.ACTIVE },
+        })
+      : { count: 0 as const };
+    if (deploymentUpdateNeeded && depRes.count !== 1) {
+      throw new Error(`activateOrderAfterProof lost race deployment=${orderId}`);
+    }
+
+    const orderActivated = orderUpdateNeeded && orderRes.count === 1;
+    const deploymentActivated = deploymentUpdateNeeded && depRes.count === 1;
+    if (orderActivated) {
+      await tx.orderStatusHistory.create({
+        data: { orderId, status: OrderStatus.ACTIVE, note: 'Application en ligne — mise en place confirmée.' },
+      });
+    }
+    return {
+      orderIsActive: orderActivated || !orderUpdateNeeded,
+      deploymentIsActive: deploymentActivated || !deploymentUpdateNeeded,
+      orderActivated,
+      deploymentActivated,
+      noop: false,
+    };
+  }
+
+  /**
+   * Effets APRÈS commit de l'activation (audit + email de livraison
+   * best-effort) : partagés par `activateOrderAfterProof` et la TX-B C3.
+   * Un échec audit/email ne rejette JAMAIS la couture ni le résultat.
+   */
+  private async postActivationEffects(orderId: string, outcome: ActivationResult): Promise<ActivationResult> {
     if (!outcome.noop) {
       if (outcome.deploymentActivated) {
         try {
@@ -619,12 +1268,19 @@ export class ProvisioningService {
    * Aucun worker n est cree ni demarre (17B.4+). now est injectable pour des
    * tests deterministes (horloge controlee, sans fake timers).
    */
-  private async scheduleInitialReconcile(orderId: string, now: Date = new Date()): Promise<{ count: number }> {
+  private async scheduleInitialReconcile(
+    orderId: string,
+    now: Date = new Date(),
+    guard?: StoreWriteGuard,
+  ): Promise<{ count: number }> {
     const nextAt = new Date(now.getTime() + INITIAL_RECONCILE_DELAY_MS);
-    return this.prisma.deployment.updateMany({
-      where: { orderId, status: DeploymentStatus.DEPLOYING, reconcileNextAt: null },
-      data: { reconcileNextAt: nextAt },
-    });
+    const write = guard ?? this.directWrite;
+    return write((tx) =>
+      tx.deployment.updateMany({
+        where: { orderId, status: DeploymentStatus.DEPLOYING, reconcileNextAt: null },
+        data: { reconcileNextAt: nextAt },
+      }),
+    );
   }
 
   /**
@@ -786,6 +1442,8 @@ export class ProvisioningService {
       method: { name: string };
       fqdn: string | null;
       appUuid: string | null;
+      /** 17B.4F-C3 : garde token/lease des écritures C3 (absente = legacy direct). */
+      guard?: StoreWriteGuard;
     },
   ): Promise<{ fqdn?: string; appUuid?: string; message?: string }> {
     switch (action) {
@@ -810,7 +1468,9 @@ export class ProvisioningService {
     };
     fqdn: string | null;
     appUuid: string | null;
+    guard?: StoreWriteGuard;
   }): Promise<{ appUuid?: string; message?: string }> {
+    const write = ctx.guard ?? this.directWrite;
     // On tente de créer l'app Coolify si le module a un serveur configuré.
     // moduleParams peut porter repoUrl/branch/buildPack/appName (produit GitHub).
     const fullOrder = await this.prisma.order.findUnique({
@@ -881,18 +1541,24 @@ export class ProvisioningService {
     // Désormais : une commande = une app = une row ; retry/relance idempotent par
     // `orderId` (et par `coolifyUuid` pour une relance au sein de la MÊME exécution).
     let row:
-      | { id: string; coolifyUuid: string | null; detail: string | null; status: string }
+      | {
+          id: string;
+          coolifyUuid: string | null;
+          detail: string | null;
+          status: string;
+          limitsStatus: string | null;
+        }
       | null = null;
     if (ctx.appUuid) {
       row = await this.prisma.deployment.findFirst({
         where: { coolifyUuid: ctx.appUuid },
-        select: { id: true, coolifyUuid: true, detail: true, status: true },
+        select: { id: true, coolifyUuid: true, detail: true, status: true, limitsStatus: true },
       });
     }
     if (!row && ctx.order?.id) {
       row = await this.prisma.deployment.findFirst({
         where: { orderId: ctx.order.id },
-        select: { id: true, coolifyUuid: true, detail: true, status: true },
+        select: { id: true, coolifyUuid: true, detail: true, status: true, limitsStatus: true },
       });
     }
 
@@ -998,26 +1664,41 @@ export class ProvisioningService {
 
     // Row Deployment : création (nouvelle app) ou mise à jour du déploiement.
     const deployDetail = ctx.fqdn ? `App : https://${ctx.fqdn}` : 'Déploiement déclenché sur Coolify.';
+    // Limites effectives (overrides module prioritaires) — partagées entre la
+    // création et la mise à jour (row C3 créée en TX-C AVANT appel provider :
+    // ses limites sont tracées mais `limitsStatus` reste null jusqu'ici).
+    const effStore = resolveEffectiveLimits(
+      fullOrder?.product.pack as { ramMb: number; cpuCores: number; storageLimit: number | null } | null | undefined,
+      mod,
+    );
     if (row && userId) {
-      await this.prisma.deployment.update({
-        where: { id: row.id },
-        data: {
-          status: DeploymentStatus.DEPLOYING,
-          detail: deployDetail,
-          coolifyUuid: appUuid,
-          orderId: ctx.order?.id ?? null,
-          // Rafraîchit la traçabilité du projet/module (une row réutilisée par
-          // idempotence pouvait conserver l'ancien projet — ex. projet serveur).
-          coolifyProjectUuid: projectUuid ?? null,
-          clientProjectId,
-          moduleId: mod?.id ?? null,
-          packId: fullOrder?.product.pack?.id ?? null,
-          ...(ctx.fqdn ? { fqdn: ctx.fqdn } : {}),
-        },
-      });
+      await write((tx) =>
+        tx.deployment.update({
+          where: { id: row.id },
+          data: {
+            status: DeploymentStatus.DEPLOYING,
+            detail: deployDetail,
+            coolifyUuid: appUuid,
+            orderId: ctx.order?.id ?? null,
+            // Rafraîchit la traçabilité du projet/module (une row réutilisée par
+            // idempotence pouvait conserver l'ancien projet — ex. projet serveur).
+            coolifyProjectUuid: projectUuid ?? null,
+            clientProjectId,
+            moduleId: mod?.id ?? null,
+            packId: fullOrder?.product.pack?.id ?? null,
+            // Row C3 (TX-C, limites non tentées) : `applyAppLimits` vient de
+            // réussir (échec = throw) → APPLIED. Row legacy déjà renseignée :
+            // aucun changement (conditions strictes, contrat 17 inchangé).
+            ...(row.limitsStatus === null && effStore
+              ? { limitsStatus: LimitsStatus.APPLIED }
+              : {}),
+            ...(ctx.fqdn ? { fqdn: ctx.fqdn } : {}),
+          },
+        }),
+      );
       // 17B.4E-D-B1 (fix H) — re-lie le ClientSubdomain si la row venait d'être
       // créée/renouvelée (retry idempotent).
-      await this.linkClientSubdomainToDeployment(ctx.order.id, ctx.fqdn, row.id);
+      await this.linkClientSubdomainToDeployment(ctx.order.id, ctx.fqdn, row.id, undefined, undefined, ctx.guard);
       await this.audit.record({
         actorId: userId,
         actorEmail: fullOrder.customerEmail,
@@ -1031,37 +1712,35 @@ export class ProvisioningService {
       // limites effectives (overrides module) sur l'app store aussi. Ici l'échec
       // d'application des limites est FATAL (policy serveur partagé) : si on arrive à
       // la création, les limites ont été appliquées → APPLIED (ou null si pas de pack).
-      const effStore = resolveEffectiveLimits(
-        fullOrder?.product.pack as { ramMb: number; cpuCores: number; storageLimit: number | null } | null | undefined,
-        mod,
+      const createdRow = await write((tx) =>
+        tx.deployment.create({
+          data: {
+            userId,
+            serverId: server.id,
+            repoFullName: repoFullName ?? appName,
+            repoUrl,
+            buildPack,
+            appName,
+            branch,
+            coolifyUuid: appUuid,
+            orderId: ctx.order?.id ?? null,
+            status: DeploymentStatus.DEPLOYING,
+            detail: deployDetail,
+            publishDirectory,
+            coolifyProjectUuid: projectUuid ?? null,
+            clientProjectId,
+            moduleId: mod?.id ?? null,
+            packId: fullOrder?.product.pack?.id ?? null,
+            limitsStatus: effStore ? LimitsStatus.APPLIED : null,
+            limitsRamMb: effStore?.ramMb ?? null,
+            limitsCpu: effStore?.cpuCores ?? null,
+            ...(ctx.fqdn ? { fqdn: ctx.fqdn } : {}),
+          },
+        }),
       );
-      const createdRow = await this.prisma.deployment.create({
-        data: {
-          userId,
-          serverId: server.id,
-          repoFullName: repoFullName ?? appName,
-          repoUrl,
-          buildPack,
-          appName,
-          branch,
-          coolifyUuid: appUuid,
-          orderId: ctx.order?.id ?? null,
-          status: DeploymentStatus.DEPLOYING,
-          detail: deployDetail,
-          publishDirectory,
-          coolifyProjectUuid: projectUuid ?? null,
-          clientProjectId,
-          moduleId: mod?.id ?? null,
-          packId: fullOrder?.product.pack?.id ?? null,
-          limitsStatus: effStore ? LimitsStatus.APPLIED : null,
-          limitsRamMb: effStore?.ramMb ?? null,
-          limitsCpu: effStore?.cpuCores ?? null,
-          ...(ctx.fqdn ? { fqdn: ctx.fqdn } : {}),
-        },
-      });
       // 17B.4E-D-B1 (fix H) — lie le ClientSubdomain à la row DÈS sa création
       // (quel que soit l'ordre CREATE_APP / CONFIGURE_DNS).
-      await this.linkClientSubdomainToDeployment(ctx.order.id, ctx.fqdn, createdRow.id);
+      await this.linkClientSubdomainToDeployment(ctx.order.id, ctx.fqdn, createdRow.id, undefined, undefined, ctx.guard);
       await this.audit.record({
         actorId: userId,
         actorEmail: fullOrder.customerEmail,
@@ -1129,7 +1808,9 @@ export class ProvisioningService {
     order: { id: string; customerName: string };
     fqdn: string | null;
     appUuid: string | null;
+    guard?: StoreWriteGuard;
   }): Promise<{ fqdn?: string; message?: string }> {
+    const write = ctx.guard ?? this.directWrite;
     if (ctx.fqdn) return { fqdn: ctx.fqdn, message: `Sous-domaine déjà alloué : https://${ctx.fqdn}` };
     const fullOrder = await this.prisma.order.findUnique({
       where: { id: ctx.order.id },
@@ -1158,10 +1839,12 @@ export class ProvisioningService {
     // GEL de la racine AVANT toute allocation DNS (#8/#16) — la « fenêtre de panne »
     // (racine résolue → DNS créé → crash avant persistence) ne peut plus JAMAIS faire
     // re-sélectionner une autre racine au retry : effectiveDomainId est figé d'abord.
-    await this.prisma.order.update({
-      where: { id: ctx.order.id },
-      data: { effectiveDomainId: root.id },
-    });
+    await write((tx) =>
+      tx.order.update({
+        where: { id: ctx.order.id },
+        data: { effectiveDomainId: root.id },
+      }),
+    );
 
     // Récupération d'une allocation partielle antérieure (crash entre DNS et persist) :
     // si un enregistrement SOUS CETTE RACINE porte déjà le sous-domaine demandé, on le
@@ -1192,6 +1875,7 @@ export class ProvisioningService {
             existingDeployment.id,
             root.id,
             existing.id,
+            ctx.guard,
           );
         }
       } else {
@@ -1219,6 +1903,8 @@ export class ProvisioningService {
       alloc.fqdn,
       existingDeployment?.id ?? null,
       root.id,
+      undefined,
+      ctx.guard,
     );
 
     // Si l'app a déjà été créée, on pose le domaine dessus puis on redéploie
@@ -1236,10 +1922,12 @@ export class ProvisioningService {
     }
     // On persiste via domainValue (Order), pas via Deployment. DNS et Coolify utilisent
     // la MÊME racine/FQDN (#16 : la racine effective a été figée et réutilisée partout).
-    await this.prisma.order.update({
-      where: { id: ctx.order.id },
-      data: { domainType: 'FREE_SUBDOMAIN', domainValue: alloc.fqdn, domainStatus: 'READY' },
-    });
+    await write((tx) =>
+      tx.order.update({
+        where: { id: ctx.order.id },
+        data: { domainType: 'FREE_SUBDOMAIN', domainValue: alloc.fqdn, domainStatus: 'READY' },
+      }),
+    );
     return { fqdn: alloc.fqdn, message: `Sous-domaine alloué : https://${alloc.fqdn}` };
   }
 

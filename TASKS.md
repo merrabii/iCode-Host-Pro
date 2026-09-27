@@ -1290,3 +1290,104 @@ Suite de 17B.4F-C1 (moteur de réservation transactionnel, revue faite, non comm
 
 ### État final
 - **ARRÊT avant staging/commit** : 14 chemins modifiés/non suivis, aucun staging, HEAD = origin/main = `4a54fcd`, garde `HOSTING_C2_ENABLED` OFF partout, zéro écriture live, zéro provider réel, aucun changement C3/C4.
+
+## 2026-09-27 — 17B.4F-C3 : table `OrderProvisioningTracking` + checkout/intention figée + orchestration store — IMPLEMENTED + VALIDATED (non commité, non poussé)
+
+### Périmètre (GO : nouveaux achats uniquement ; base `957df90`)
+- **Modifiés (9)** : `schema.prisma` (+relation `Order.provisioningTracking` + `model OrderProvisioningTracking`), `hosting-fingerprint.ts` (+`STORE_KEY_VERSION`/`storeIdempotencyKey` = `store:v1:<orderId>`), `hosting-services.service.ts` (helpers `lockServiceForUpdate`/`reserveInTx` recâblé, +`reserveForOrderInTx`/`markIntentInTx`/`releasePreProviderInTx`/`markBoundInTx`), `hosting.module.ts` (+`C3CapabilityService`), `store.module.ts` (+import `HostingModule`), `checkout.service.ts` (garde ON), `provisioning.service.ts` (routage + `provisionC3` + `c3Guard` + `c3B0Failure` + garde token threadée `openStep/closeStep/setOrderStatus/scheduleInitialReconcile/runAction/action*/link` + split `activateOrderInTx`/`postActivationEffects` + `limitsStatus null → APPLIED`), 2 specs existantes (instanciations constructeur +2 deps).
+- **Créés (7)** : migration additive `20260927000000_add_order_provisioning_tracking` (`CREATE TABLE` + FK Cascade, **jamais appliquée en live**), `c3-flag.ts` (clone strict C2), `c3-capability.service.ts`, `c3-flag.spec.ts`, `c3-capability.service.spec.ts`, `provisioning-c3.spec.ts`, `checkout-c3.spec.ts`. Aucune colonne ajoutée à `Order` (relation inverse uniquement).
+
+### Contrats implémentés (décisions GO honorées)
+- **Garde `HOSTING_C3_ENABLED` stricte** (valeur exactement `true`, relue à l'appel). OFF : tracking résolu par **sonde live** (`resolveTracking`) — commande trackée ⇒ **409, aucun repli legacy, 0 appel provider** ; sinon legacy byte-identique. ON : `operational()` (C1 ∧ C3 live) sinon **503 fail-closed avant toute écriture** ; trackée ⇒ `provisionC3`, sinon legacy sécurisé.
+- **Capability** : cache positif sticky ; **cache négatif jamais seul fondement** (re-sonde live à chaque appel, T-corr.1) ; erreur DB propagée (jamais de classement legacy).
+- **Checkout ON** (après rejeu pré-tx — « rejeu avant refus ») : 503 capability ; 409 non-`CREATE_APP` (avec actions) ; 409 pack absent ; 409 upgrade (`packId` ∧ abonnement actif, pré-tx **et** recheck in-tx) ; in-tx : verrou `User FOR UPDATE` → rejeu par clé (`CheckoutReplaySignal` renvoie, jamais de refus) → recheck abonnement → écritures **Customer → User → Order → `OrderProvisioningTracking` (intention figée business/environment) → `HostingService` (snapshots pack) → Invoice/History/Subscription** dans **UNE transaction**. OFF : zéro appel `c3`, zéro écriture C3.
+- **`provisionC3`** : `HostingService` absent ⇒ 409 ; TX-A (verrous **Order → Tracking → HostingService → Allocation → Deployment**) avec décisions AVANT token : terminal (RELEASED)/bound (T-fen.1)/uncertain(409)/releasing(409)/busy(lease valide → 409)/noop(ACTIVE sans alloc)/CANCELLED(409)/tracking absent(503) ; claim `randomUUID` + lease 5 min ; réservation C1 via `reserveForOrderInTx` (clé `store:v1:<orderId>`) ; **B0 avant intention** (échec ⇒ `releasePreProviderInTx` + token effacé + note history + commit, Order reste PAID, 0 appel) ; Order→PROVISIONING ; **intention `markIntentInTx` DERNIÈRE** ; TX-C row `Deployment` **PENDING avant le 1ᵉʳ appel provider** (limites tracées, `limitsStatus` null → `actionCreateApp` passe à `APPLIED` après `applyAppLimits`) ; boucle d'actions **stop au 1ᵉʳ échec** (aucun appel suivant) ; TX-E `markBoundInTx` si `appUuid` ; preuve `awaitAppReady` lecture seule ; TX-B `activateOrderInTx` **dans la garde token** + `postActivationEffects` après commit. `force` n'accélère rien.
+- **`c3Guard`** : identité `claimToken` (refus 409 `C3WorkerGuardError`) **séparée** du lease (expiration ⇒ renouvellement CAS `token + expiré`, `count ≠ 1` ⇒ refus) ; écritures legacy via `directWrite` inchangé (auto-commit).
+
+### Validations exécutées (chiffres réels)
+- `npx prisma generate` ✓ ; **`tsc --noEmit` = 0** ; **`nest build` = 0** ; **`npm run lint` indisponible : binaire `eslint` absent du workspace (pré-existant, script orphelin — aucun lint supplémenté ; tsc + tests font foi)**.
+- **Unit complet : 964/964, 56 suites, 0 échec** (non-régression 898/898 antérieure inchangée + **+66 tests C3 neufs** : 5 flag, 12 capability, 16 orchestration/routage/garde, 11 checkout, 2 divers).
+- **Base de test isolée** : `icode_host_pro_c3test` créée dans `icode-postgres`, **identité vérifiée** (`SELECT current_database()` = `icode_host_pro_c3test`), `migrate deploy` avec `DATABASE_URL` **inline en variable d'env** (`.env` inchangé) → **47/47 migrations appliquées**, dont `20260926000000` (C1) et `20260927000000` (C3) ; table `OrderProvisioningTracking` + colonnes C1 **présentes sur la base test**.
+- **Live non touchée** (lecture seule) : `migrate status` = 2 en attente (C1 + C3) ; `OrderProvisioningTracking` = **0** ; colonnes C1 = **0** ; aucun `.env` modifié ; zéro provider réel.
+- **e2e affectés sur base test migrée : 8/8 suites, 139 tests, 0 échec** — `store-checkout-domains` + `store-cancel-provisioning` + `store-order-status` + `store-terminate-active-service` (49 tests) ; `hosting-service-foundation` + `hosting-allocation-reservation` + `deployments-c2` + `deployments` (90 tests) — tous sous garde OFF.
+
+### Limites / risques documentés (volontaires)
+- **`BillingSetting` hors périmètre** : `claimInvoiceSequence` (UPDATE `invoiceSequence+1`) sans contrainte unique — collision `Invoice.number` possible sous forte concurrence → **échec d'achat (P2002), pas seulement cosmétique** ; risque pré-existant non aggravé, sans `ensure` ajouté.
+- **Fencing = `claimToken` + lease (5 min)** : pas de token numériquement monotone ; nettoyage/`release` des intentions orphelines = **C4** (non démarré). **T-fen.3 (fenêtre ouverte bornée) différée** par le GO — T-fen.1 (bound → lecture seule) et T-fen.2/4 (refus) couverts en unit.
+- **ON refuse les non-pack avec actions sans `CREATE_APP`** (ex. produits DNS-seuls type `store-checkout-domains`) → 409 à l'achat ; les e2e existants restent **OFF** (périmètre C3 = nouveaux achats pack CREATE_APP).
+- **Upgrades refusés sous ON** (limite C4 documentée) ; **`HostingService.status` reste `PROVISIONING` après activation** (non prévu au plan, aucun flip ajouté sans revue).
+- Aucun e2e ON dédié (couverture ON = specs unit) ; `awaitAppReady`/provider simulés (zéro appel réseau réel).
+
+### État final
+- **ARRÊT POUR REVUE** : 16 chemins (9 modifiés + 7 créés), aucun staging, HEAD = origin/main = `957df90`, garde `HOSTING_C3_ENABLED` absente de tous les `.env` (OFF partout), zéro écriture live, zéro provider réel, base test `icode_host_pro_c3test` créée (à conserver ou supprimer selon la revue).
+
+## 2026-09-27 — REVUE 17B.4F-C3 : corrections + tests PostgreSQL isolé + revue de diff — IMPLEMENTED + VALIDATED (non commité, non poussé)
+
+### 1) Cycle de vie `HostingService` (point de revue n°1) — CORRIGÉ
+- **Fix** : la TX-B de `provisionC3` verrouille désormais `HostingService` (`SELECT … FOR UPDATE`, **AVANT** les CAS Order/Deployment — ordre global `Order → Tracking → HostingService → Allocation → Deployment` préservé) et pose `PROVISIONING → ACTIVE` **uniquement** quand `orderIsActive && deploymentIsActive` (preuves FINALES, CAS `count = 1`) — jamais sur échec, jamais sur succès partiel, jamais sur service annulé. Le no-op `already_active` (retry après crash) converge aussi (flip idempotent).
+- **Tests unit** (`provisioning-c3.spec.ts`, +3 → 29) : parcours complet ⇒ flip appelé avec `{status: ACTIVE}` ; échec d'étape / preuve absente / état final partiel ⇒ **zéro flip** ; retry déjà actif ⇒ flip idempotent.
+- **Tests PG isolé** (e2e `c3-provisioning`) : service réellement `ACTIVE` en fin de parcours ; **utilisable** (réservation directe C1 acceptée jusqu'au quota) avec **quota maxApps toujours respecté** (refus `Quota de slots atteint`, 1 seule allocation) ; contrôle négatif : service non provisionné ⇒ refus `service non actif` (le « utilisable » vient bien du flip, pas d'une omission).
+
+### 2) Matrice scénarios critiques ↔ tests (noms exacts)
+| Scénario | Test | Fichier | Réel/Mocké |
+|---|---|---|---|
+| Cycle de vie complet C3 | `checkout C3 → provisioning → Order/Deployment ACTIFS, allocation BOUND, HostingService ACTIVE` | `test/c3-provisioning.e2e-spec.ts` | PG réel (`icode_host_pro_c3test`) ; panel/mail mockés |
+| Service utilisable + quota | `service ACTIF ⇒ réservation directe utilisable, avec quota maxApps TOUJOURS respecté` + `contrôle : service encore PROVISIONING ⇒ … « non actif »` | idem | PG réel |
+| Double-clic, même clé | `double-clic (2 checkouts SIMULTANÉS, même clé) → UNE commande, UNE séquence provider` | idem | PG réel (concurrence tx réelle) |
+| Même user, clés différentes | `même utilisateur, clés DIFFÉRENTES → jamais de rejeu croisé (409 C4, aucune écriture parasite)` (règle C4 ON : 2ᵉ achat pack refusé) + rejeu identique `B6` en legacy (`store-checkout-domains`) | idem / `test/store-checkout-domains.e2e-spec.ts` | PG réel |
+| 2 provisionings concurrents = 1 séquence provider | `deux provisionOrder CONCURRENTS (même commande) → un seul claim, une seule séquence provider` | `c3-provisioning` | PG réel (verrous `FOR UPDATE`) |
+| Intention durable + lease expiré : 0 takeover, token préservé | `bind KO → états réellement atteints ; retry ⇒ 409, token préservé, ZÉRO nouveau provider (même lease expiré)` | `c3-provisioning` | PG réel ; `markBoundInTx` mocké 1× (injection d'échec persistance) |
+| Provider OK / persistance KO | même test (phase 1 : `createGitApp` +1, alloc `RESERVED` + `providerIntentAt`, token présent) | `c3-provisioning` | PG réel |
+| Bind OK / activation KO (T-fen.1) | `preuve absente → états réels (BOUND, DEPLOYING, PROVISIONING) ; retry ⇒ lecture seule, 0 provider, 0 flip` | `c3-provisioning` | PG réel ; `awaitAppReady` mocké `false` |
+| OFF, cache absent, commande C3 créée par un autre processus | `OFF + instance fraîche (cache absent) + commande C3 créée ailleurs ⇒ 409, 0 provider, commande intacte` + `contrôle : … flag ON à la volée ⇒ routage C3` | `test/c3-off-fallback.e2e-spec.ts` | PG réel (2 instances Nest successives) |
+| OFF sur base sans migrations C1/C3 | `OFF + table tracking absente ⇒ sonde tolérante, parcours LEGACY complet (Order ACTIVE)` | `test/c3-premig.e2e-spec.ts` | PG réel, base dédiée `icode_host_pro_c3premig` (43/47 migrations ; `to_regclass` = null) |
+| ON sur base sans migrations ⇒ 503 | `ON + migrations absentes ⇒ 503 fail-closed AVANT toute écriture métier` | idem | idem |
+| **Cache négatif complet (A négatif → migration + C3 via B → A avant TTL)** | `cache négatif sur A → migration + commande C3 via B → A avant TTL ⇒ détection live, 409 OFF, 0 repli/provider` | idem (3ᵉ test) | idem ; SQL de migration appliqué puis `DROP TABLE` de restauration en `finally` |
+| Routage/flag/503/capability/claim/garde/B0/ordre TX/stop-échec (unit) | 29 tests `provisionC3 / routage C3` ; 11 checkout ; 5 flag ; 12 capability | `provisioning-c3.spec.ts`, `checkout-c3.spec.ts`, `c3-*.spec.ts` | mocks |
+| Contrats C1/C2 (historiques) | `hosting-service-foundation`, `hosting-allocation-reservation`, `deployments`, `deployments-c2`, `store-*` (139 tests) | e2e existants (OFF) | PG réel, OFF — **non-régression uniquement, pas une preuve C3** |
+
+### 3) Revue ciblée du diff (point n°3) — verdict
+- **Même `TransactionClient` pour token + écritures protégées** : `c3Guard` ouvre UNE `$transaction`, y verrouille Order → Tracking, y vérifie l'identité puis le lease, et n'exécute `fn(tx)` que si les deux passent ; le flip `HostingService` de la TX-B est DANS cette même transaction.
+- **Ordre des verrous** : `Order → Tracking → HostingService → Allocation → Deployment` partout (nouveau verrou HostingService positionné avant les CAS Deployment) ; **aucun appel réseau sous verrou** (preuve unit `providerTxDepth` = 0 sur tous les appels provider).
+- **Contrats C1/C2 préservés** : `directWrite` legacy intact, e2e historiques 8/8 verts, unit 966/966.
+- **Migration additive uniquement** : `migration.sql` = 1 `CREATE TABLE` + 1 FK Cascade ; aucune autre migration modifiée (`git status` : seul le dossier C3 est neuf) ; aucune colonne ajoutée à `Order`.
+- **Aucune récupération C4 ajoutée** : seul `releasePreProviderInTx` (échec B0 AVANT provider) + `markIntentInTx` (dernière étape TX-A) ; zéro release/cleanup après intention.
+
+### 4) Chiffres finaux (point n°4)
+- **`npx prisma validate` = schéma valide** ; **`tsc --noEmit` = 0** ; **`nest build` = 0** ; **`git diff --check` = 0** ; **staging vide** (`git diff --cached` = 0) ; HEAD = `957df90`.
+- **Chemins : 20** (10 modifiés dont `TASKS.md` + 10 créés = 7 C3 + 3 e2e de revue). `git diff --numstat` : `TASKS.md` 101/0 · `schema.prisma` 30/0 · `hosting-fingerprint` 18/0 · `hosting-services` 281/139 · `hosting.module` 13/7 · `checkout.service.spec` 2/0 · `checkout.service` 234/0 · `provisioning.service.spec` 10/0 · `provisioning.service` 819/131 · `store.module` 4/1 (+10 fichiers créés non suivis).
+- **Unit : 966/966 (56 suites)** — +2 tests revue sur `provisioning-c3` (29).
+- **e2e sur base isolée** : 10 suites / 149 tests verts via batterie (`store-*`, foundation, allocation, `deployments*`, `c3-provisioning` 8, `c3-off-fallback` 2) + `c3-premig` **3/3** sur sa base dédiée (2 initiaux + 1 scénario « cache négatif » ajouté aux vérifications finales) → **11 suites / 152 tests verts** (chaque suite sur SA base : `c3test` vs `c3premig` — `c3-premig` exige `DATABASE_URL=…/icode_host_pro_c3premig`, il échoue à dessein sur `c3test` puisque le schéma y est complet).
+- **Live `icode_host_pro` intacte** (lecture seule) : table `OrderProvisioningTracking` **absente** (`to_regclass` = null), `HostingService` = 0 écriture de notre fait, 22 commandes existantes inchangées, `.env` non modifié, zéro provider réel.
+- Bases de test utilisées (à conserver/supprimer selon décision) : `icode_host_pro_c3test` (47/47, sèche après nettoyage : 0 service/0 user/0 order/0 allocation/0 deployment) et `icode_host_pro_c3premig` (43/47, scratch).
+- **Écarts restants assumés** : `npm run lint` toujours indisponible (eslint absent, pré-existant) ; T-fen.3 et cleanup des intentions orphelines = C4 non démarrés ; produits non-pack ON → 409 (documenté).
+
+### État final (post-revue)
+- **ARRÊT POUR DÉCISION DE COMMIT** : 20 chemins, aucun staging, aucun commit, HEAD = origin/main = `957df90`, garde OFF partout, zéro écriture live. Les 4 vérifications finales (API/Web relancés, FK `CASCADE` justifiée, scénario cache négatif ajouté et vert, chiffres git à jour) sont tracées en section 5 ci-dessous.
+
+### 5) Vérifications finales avant décision de commit (4 demandes — 2026-09-27)
+
+**V1 — API locale + Web (relance, runner OFF, sans migration live)**
+- API `apps/api` **relancée** : `npm run dev` (`nest start --watch`, console PID 26116, process Nest 42752) sur le working tree C2/C3 courant. `HOSTING_C2_ENABLED` / `HOSTING_C3_ENABLED` **absents** de `.env` **et** de l'environnement shell → runner **OFF** ; `main.ts` n'exécute **aucune** migration au boot ; aucun `@Cron`/`setInterval` dans `src` → zéro écriture métier périodique.
+- `GET http://localhost:3001/api/health` → `{"status":"ok","database":"ok","timestamp":"2026-09-27T06:15:49.555Z"}` (sonde `SELECT 1` seule, ADR-014).
+- Web `apps/web` déjà en service (`next start`, PID 16916, port 3000) → `GET http://localhost:3000` = **HTTP 200**. Les deux restent verts en fin de session.
+
+**V2 — Écart `RESTRICT` (plan) vs `ON DELETE CASCADE` (migration) — ÉCART JUSTIFIÉ, aucune correction**
+- SQL exact (`apps/api/prisma/migrations/20260927000000_add_order_provisioning_tracking/migration.sql`, L33) :
+  `ALTER TABLE "OrderProvisioningTracking" ADD CONSTRAINT "OrderProvisioningTracking_orderId_fkey" FOREIGN KEY ("orderId") REFERENCES "Order"("id") ON DELETE CASCADE ON UPDATE CASCADE;`
+- **Précédents FK vers `Order` (migrations existantes)** : `OrderStatusHistory` → **CASCADE**, `ProvisioningLog` → **CASCADE** (les 2 autres tables d'audit ordre-scopées, modèle identique) ; `Invoice`, `Subscription`, `Deployment`, `HostingService` → `SET NULL` (enfants « porteurs » : l'ordre survit). **Aucune FK existante vers `Order` n'est `Restrict`.**
+- **Suppressions réelles** : **zéro** `order.delete*` / `customer.delete*` en production (grep `src/**/*.ts` vide) ; `Order.customer → onDelete: Cascade` — un `Restrict` sur le tracking **casserait cette cascade existante** ainsi que les nettoyages de tests (les suites suppriment leurs orders alors que des lignes de tracking existent sur `c3test`).
+- **Rôle durable du tracking** : la ligne naît avec l'Order et n'a de sens que tant que l'Order existe (PK `orderId` 1:1 ; schema : « l'état est restauré depuis Order/Allocation/Deployment ») ; aucune écriture métier ne la supprime jamais. La cascade **ne perd aucune protection nécessaire** : (a) la disparition de la commande sous le worker est couverte par la garde TX-A (`commande disparue` → refus explicite, testé) ; (b) détection OFF et refus 409 ne dépendent pas du FK. Les 7 seuls `Restrict` du schéma protègent des invariants d'enfant NOT NULL (allocation→service, pack, produit, ownership) — pas des tables d'audit.
+- **Décision : `CASCADE` conservé, `migration.sql` inchangé** (condition « si la cascade perd une protection → corriger et éprouver » **non déclenchée**). Jamais appliquée en live.
+
+**V3 — Scénario « cache négatif » complet — SCÉNARIO MANQUANT AJOUTÉ**
+- Nouveau 3ᵉ test de `test/c3-premig.e2e-spec.ts` : `cache négatif sur A → migration + commande C3 via B → A avant TTL ⇒ détection live, 409 OFF, 0 repli/provider`.
+- Séquence : (1) A (`C3CapabilityService`) sonde l'absence → `resolveTracking = null` + `negativeCacheAgeMs() ≠ null` (**cache négatif amorcé**) ; (2) « B » applique la migration `20260927000000` (2 statements SQL lus depuis le fichier) **puis** écrit la commande C3 (insertion directe des écrits qu'aurait faits un checkout ON concurrent) ; (3) A rappelé alors que `negativeCacheAgeMs() < 60 000 ms` (**avant expiration du TTL négatif**) → `resolveTracking` **détecte la ligne** (sonde LIVE) ; (4) `provisionOrder` OFF → **409** `provisioning suspendu tant que C3 est désactivé`, `createGitApp` **0 appel** (baseline figée avant l'appel), Order **PAID** (jamais legacy ACTIVE), 0 deployment, 0 log, `claimToken`/`leaseUntil` **null** ; (5) `finally` → `DROP TABLE "OrderProvisioningTracking"` (état pré-migratoire restauré) + auto-guérison `DROP IF EXISTS` en `beforeAll` après garde d'identité `current_database() = icode_host_pro_c3premig` (le DROP ne peut jamais toucher une autre base).
+- **3/3 verts** sur `icode_host_pro_c3premig` ; résidus 0 (table absente, 0 order/customer/product `premig-%`) ; `tsc --noEmit` = 0.
+- Précision : il n'existe **aucun TTL fonctionnel** (les négatifs ne servent jamais de fondement — re-sonde `information_schema` à chaque appel, `c3-capability.service.ts`) ; l'assertion `age < 60 s` matérialise « avant expiration » : le négatif est encore frais au moment du routage et la détection a quand même eu lieu (preuve que le cache négatif n'est jamais un fondement).
+
+**V4 — État git + chiffres finaux**
+- HEAD = `957df90` = `origin/main` ; **divergence 0/0** ; **staging vide** ; `git diff --check` = **0** (seulement des avertissements LF→CRLF, pas d'erreur).
+- **20 chemins** (10 modifiés + 10 créés). `git diff --numstat` : `TASKS.md` 101/0 · `schema.prisma` 30/0 · `hosting-fingerprint` 18/0 · `hosting-services` 281/139 · `hosting.module` 13/7 · `checkout.service.spec` 2/0 · `checkout.service` 234/0 · `provisioning.service.spec` 10/0 · `provisioning.service` 819/131 · `store.module` 4/1.
+- Créés (lignes complètes) : `migration.sql` 33 · `c3-capability.service.spec.ts` 138 · `c3-capability.service.ts` 108 · `c3-flag.spec.ts` 57 · `c3-flag.ts` 30 · `checkout-c3.spec.ts` 389 · `provisioning-c3.spec.ts` 694 · `c3-off-fallback.e2e-spec.ts` 241 · `c3-premig.e2e-spec.ts` 263 · `c3-provisioning.e2e-spec.ts` 636 (total 2 589 lignes non suivies).
+- Validations **relancées uniquement sur les éléments affectés** (seul fichier touché : `test/c3-premig.e2e-spec.ts`) : `tsc --noEmit` = 0 · `nest build` = 0 · suite `c3-premig` = **3/3** ; unit 966/966 et les 10 autres suites e2e **non relancés** (src inchangé) → total e2e **11 suites / 152 tests** (151 + le nouveau scénario).

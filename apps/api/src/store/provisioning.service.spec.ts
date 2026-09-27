@@ -53,6 +53,8 @@ describe('ProvisioningService — syncAppLimits', () => {
       mockPanelFactory as never,
       mockDeployments as never,
       { isServed: jest.fn() } as never,
+      {} as never,
+      { resolveTracking: jest.fn(), operational: jest.fn().mockResolvedValue(false) } as never,
     );
     jest.clearAllMocks();
     mockDecrypt.mockReturnValue('tok');
@@ -244,6 +246,8 @@ describe('ProvisioningService — actionCreateApp (choix du projet A/B voie stor
       panelFactory as never,
       deployments as never,
       mockHttp as never,
+      {} as never,
+      { resolveTracking: jest.fn(), operational: jest.fn().mockResolvedValue(false) } as never,
     );
     jest.clearAllMocks();
     mockDecrypt.mockReturnValue('tok');
@@ -1015,6 +1019,8 @@ describe('ProvisioningService — actionConfigureDns (Phase 4, gel racine)', () 
       panelFactory as never,
       deployments as never,
       { isServed: jest.fn() } as never,
+      {} as never,
+      { resolveTracking: jest.fn(), operational: jest.fn().mockResolvedValue(false) } as never,
     );
     jest.clearAllMocks();
     mockDecrypt.mockReturnValue('tok');
@@ -1220,6 +1226,8 @@ describe('ProvisioningService — activateOrderAfterProof (17B.3B)', () => {
       {} as never,
       {} as never,
       { isServed: jest.fn() } as never,
+      {} as never,
+      { resolveTracking: jest.fn(), operational: jest.fn().mockResolvedValue(false) } as never,
     );
     jest.clearAllMocks();
     prisma.$transaction.mockImplementation(async (cb) => cb(tx));
@@ -1569,6 +1577,8 @@ describe('ProvisioningService — scheduleInitialReconcile (17B.3C)', () => {
       { create: jest.fn() } as never,
       { getOrCreateClientProject: jest.fn() } as never,
       { isServed: jest.fn() } as never,
+      {} as never,
+      { resolveTracking: jest.fn(), operational: jest.fn().mockResolvedValue(false) } as never,
     );
     deploymentRow = { present: true, status: 'DEPLOYING', reconcileNextAt: null };
     jest.clearAllMocks();

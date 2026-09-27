@@ -49,6 +49,9 @@ const FINGERPRINT_DOMAIN = 'icode-hosting-allocation-fp';
 /** Format de la clé directe : `direct:v<entier>:<userId>:<serviceId>:<uuid>`. */
 const DIRECT_KEY_VERSION = 'v1';
 
+/** Format de la clé store C3 : `store:v<entier>:<orderId>`. */
+const STORE_KEY_VERSION = 'v1';
+
 const VERSION_PATTERN = /^v\d+$/;
 const STORED_PATTERN = /^fp:(v\d+):([0-9a-f]{64})$/;
 const UUID_V4_PATTERN =
@@ -243,4 +246,19 @@ export function directIdempotencyKey(
   clientRequestId: string,
 ): string {
   return `direct:${DIRECT_KEY_VERSION}:${actorUserId}:${hostingServiceId}:${clientRequestId}`;
+}
+
+/**
+ * Clé d'idempotence/réservation STORE (17B.4F-C3) : `store:v1:<orderId>`,
+ * dérivée CÔTÉ SERVEUR depuis l'identifiant de commande (jamais reçue du
+ * client). Une commande = UNE réservation `HostingServiceAllocation` (0..1),
+ * identique au premier provisioning et à chacun de ses rejeux — c'est cette
+ * clé que le parcours C3 relit sous verrou dans la TX-A.
+ */
+export function storeIdempotencyKey(orderId: string): string {
+  const value = (orderId ?? '').trim();
+  if (!value) {
+    throw new TypeError('orderId manquant pour la clé de réservation store.');
+  }
+  return `store:${STORE_KEY_VERSION}:${value}`;
 }

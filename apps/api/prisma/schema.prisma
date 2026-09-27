@@ -1373,6 +1373,12 @@ model Order {
   // uniquement (1:1 porté par HostingService.orderId) : aucun Order existant
   // n'est transformé, aucun workflow de commande n'est modifié.
   hostingServices HostingService[]
+  // 17B.4F-C3 — tracking de provisioning C3 : relation inverse UNIQUEMENT
+  // (1:1 porté par OrderProvisioningTracking.orderId). AUCUNE colonne ajoutée
+  // à "Order" : la table dédiée est créée par migration additive, OFF sans
+  // C1/C3 reste totalement opérationnel (aucune jointure n'est utilisée par le
+  // parcours legacy — résolution par probe live de la table dédiée).
+  provisioningTracking OrderProvisioningTracking?
 
   @@index([customerId])
   @@index([status])
@@ -1456,6 +1462,30 @@ model ProvisioningLog {
   createdAt DateTime               @default(now())
 
   @@index([orderId])
+}
+
+// ── 17B.4F-C3 — tracking de provisioning des commandes C3 ───────────────────
+// Table DÉDIÉE (additive, AUCUNE colonne ajoutée à "Order") portant l'intention
+// de provisioning FIGÉE au checkout + le claim/lease du worker de provisioning :
+//  • `intent`      : payload de réservation figé (ReservationPayload) — source
+//                    unique de l'empreinte `store:v1:<orderId>` (rejeu) ;
+//  • `claimToken`  : jeton du worker qui détient le claim de la commande
+//                    (contrôle d'identité sur CHAQUE écriture métier du
+//                    parcours C3, dans la MÊME transaction que l'écriture) ;
+//  • `leaseUntil`  : expiration du lease du claim (contrôle SÉPARÉ de
+//                    l'identité : expiration → renouvellement CAS, JAMAIS de
+//                    takeover, même lease expirée).
+// Présence de LIGNE = commande C3 : sous OFF elle impose un refus explicite
+// (jamais de repli legacy) ; sous ON, absence de ligne = ancien achat (legacy
+// sécurisé par capability C1+C3). Jamais supprimée : l'état est restauré
+// depuis Order/Allocation/Deployment (aucun oubli d'état sur supression).
+model OrderProvisioningTracking {
+  orderId    String    @id
+  order      Order     @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  intent     Json
+  leaseUntil DateTime?
+  claimToken String?
+  createdAt  DateTime  @default(now())
 }
 
 // ── Paramètres globaux de facturation (SINGLETON, pattern MailSetting) ─────

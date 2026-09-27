@@ -5,13 +5,16 @@ import {
   Injectable,
   Logger,
   NotFoundException,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import {
   CustomerAccountType,
+  HostingServiceStatus,
   InvoiceLineKind,
   InvoiceStatus,
   OrderStatus,
   Prisma,
+  ProvisionAction,
   SubscriptionStatus,
 } from '@prisma/client';
 import * as bcrypt from 'bcryptjs';
@@ -26,9 +29,42 @@ import { clientAreaUrl, loginUrl } from './web-links';
 import { ProductsService, PublicProduct } from '../products/products.service';
 import { CheckoutDto } from './dto/checkout.dto';
 import { ProvisioningService } from './provisioning.service';
+import { isHostingC3Enabled } from '../hosting/c3-flag';
+import { C3CapabilityService } from '../hosting/c3-capability.service';
+import { snapshotsFromPack } from '../hosting/hosting-services.service';
+import { ReservationPayload } from '../hosting/hosting-fingerprint';
 
 /** Taux appliqué quand le produit n'en référence aucun (« Exonéré 0% »). */
 const DEFAULT_TAXRATE_PERCENT = 0;
+
+/**
+ * 17B.4F-C3 — rejeu détecté DANS la transaction (double-clic concurrent sous
+ * garde ON) : renvoie la commande existante SANS refus (« rejeu avant refus »),
+ * sans double écriture. Attrapé dans le catch du checkout avant le P2002.
+ */
+export class CheckoutReplaySignal extends Error {
+  constructor(public readonly orderId: string) {
+    super('checkout_replay');
+  }
+}
+
+/** Catalogue C3 du produit (lecture dédiée sous ON — PublicProduct ne l'expose pas). */
+type C3CatalogProduct = {
+  packId: string | null;
+  provisionModuleId: string | null;
+  moduleParams: unknown;
+  provisionModule: { actions: unknown } | null;
+  pack: {
+    id: string;
+    name: string;
+    ramMb: number;
+    cpuCores: number;
+    storageLimit: number | null;
+    maxApps: number | null;
+    status: string;
+    deploymentModuleId: string | null;
+  } | null;
+};
 
 /** Réponse lisible du checkout (jamais de secret, jamais de hostname Coolify). */
 export interface CheckoutResult {
@@ -73,6 +109,7 @@ export class CheckoutService {
     private readonly mail: MailSettingsService,
     private readonly provisioning: ProvisioningService,
     private readonly cloudflare: CloudflareService,
+    private readonly c3: C3CapabilityService,
   ) {}
 
   /**
@@ -198,6 +235,48 @@ export class CheckoutService {
     // 7. Invité uniquement : pas de doublon de compte. Un membre déjà connecté ne
     //    déclenche jamais ce contrôle (c'est son propre compte). Le mot de passe
     //    temporaire n'existe que pour l'invité.
+    //
+    // ── 17B.4F-C3 (garde ON) — capability LIVE + fast-fails AVANT toute écriture.
+    // Placé APRÈS le rejeu pré-tx (point 6) : un double-clic identique renvoie sa
+    // commande existante AVANT tout refus (« rejeu avant refus »). OFF : ce bloc
+    // n'exécute AUCUN appel (zéro différence de comportement legacy).
+    let c3On = false;
+    let c3Product: C3CatalogProduct | null = null;
+    if (isHostingC3Enabled()) {
+      if (!(await this.c3.operational())) {
+        throw new ServiceUnavailableException(
+          'Provisioning C3 activé mais schéma indisponible (migration C1/C3 requise).',
+        );
+      }
+      const catalog = await this.loadC3Catalog(product.id);
+      const actions = (catalog?.provisionModule?.actions ?? []) as ProvisionAction[] | null;
+      if (actions && actions.length > 0 && !actions.includes(ProvisionAction.CREATE_APP)) {
+        throw new ConflictException(
+          'Ce produit n’est pas provisionnable en C3 (CREATE_APP requis) — commande refusée.',
+        );
+      }
+      if (product.packId) {
+        if (!catalog?.pack) {
+          throw new ConflictException('Pack produit introuvable — commande refusée (C3).');
+        }
+        // Upgrade refusé sous C3 (limite C4 documentée) : aucun pack acheté par un
+        // compte qui détient déjà un abonnement actif.
+        if (member) {
+          const activeSub = await this.prisma.subscription.findFirst({
+            where: { userId: member.userId, status: SubscriptionStatus.ACTIVE },
+            orderBy: { createdAt: 'desc' },
+          });
+          if (activeSub) {
+            throw new ConflictException(
+              'Abonnement actif existant : upgrade non pris en charge en C3 (contactez le support).',
+            );
+          }
+        }
+        c3Product = catalog;
+      }
+      c3On = true;
+    }
+
     const tempPassword = member ? null : randomBytes(12).toString('hex');
     const passwordHash = tempPassword ? await bcrypt.hash(tempPassword, 10) : null;
     if (!member) {
@@ -212,6 +291,37 @@ export class CheckoutService {
     // 8. Transaction atomique post-paiement.
     try {
       const created = await this.prisma.$transaction(async (tx) => {
+        // 17B.4F-C3 (ON) — sous garde, AVANT toute écriture :
+        // ① verrou `User` (membre) : sérialise les checkouts concurrents du même
+        //    compte (deux commandes pack simultanées → une seule gagne le recheck) ;
+        // ② rejeu par clé d'idempotence PRÉ-TX relu SOUS verrou (double-clic
+        //    concurrent ayant passé le findUnique pré-tx) → renvoie la commande
+        //    existante SANS refus ;
+        // ③ recheck autoritaire d'abonnement actif (upgrade refusé sous C3) —
+        //    le recheck pré-tx peut avoir été obsolète entre-temps.
+        if (c3On) {
+          if (member) {
+            const locked = await tx.$queryRaw<Array<{ id: string }>>`SELECT "id" FROM "User" WHERE "id" = ${member.userId} FOR UPDATE`;
+            if (!locked[0]) {
+              throw new ConflictException('Compte introuvable.');
+            }
+            const dup = await tx.order.findUnique({ where: { idempotencyKey: key } });
+            if (dup) {
+              throw new CheckoutReplaySignal(dup.id);
+            }
+            if (product.packId) {
+              const activeSub = await tx.subscription.findFirst({
+                where: { userId: member.userId, status: SubscriptionStatus.ACTIVE },
+                orderBy: { createdAt: 'desc' },
+              });
+              if (activeSub) {
+                throw new ConflictException(
+                  'Abonnement actif existant : upgrade non pris en charge en C3 (contactez le support).',
+                );
+              }
+            }
+          }
+        }
         let user: { id: string };
         let customer: { id: string };
         if (member) {
@@ -270,6 +380,40 @@ export class CheckoutService {
             requestedDomainId,
           },
         });
+
+        // 17B.4F-C3 (ON) — intention figée + service acheté : écrits DANS LA MÊME
+        // transaction que la commande (un échec ici annule tout : jamais d'Order
+        // sans tracking quand le C3 gérera la commande, jamais de service sans
+        // commande). N'ont lieu que pour un NOUVEAU achat pack (l'upgrade est
+        // refusé plus haut sous C3) : aucun autre ordre ne peut coexister avec
+        // cette écriture.
+        if (c3On && product.packId && c3Product?.pack) {
+          const intent = this.buildC3Intent(product, order, c3Product);
+          await tx.orderProvisioningTracking.create({
+            data: {
+              orderId: order.id,
+              intent: intent as unknown as Prisma.InputJsonValue,
+            },
+          });
+          const snapshots = snapshotsFromPack(c3Product.pack, { name: product.name });
+          await tx.hostingService.create({
+            data: {
+              userId: user.id,
+              orderId: order.id,
+              productId: product.id,
+              packId: product.packId,
+              deploymentModuleId: c3Product.pack.deploymentModuleId ?? null,
+              status: HostingServiceStatus.PROVISIONING,
+              maxAppsSnapshot: snapshots.maxAppsSnapshot,
+              ramMbSnapshot: snapshots.ramMbSnapshot,
+              cpuCoresSnapshot: snapshots.cpuCoresSnapshot,
+              storageLimitGbSnapshot: snapshots.storageLimitGbSnapshot,
+              packNameSnapshot: snapshots.packNameSnapshot,
+              productNameSnapshot: snapshots.productNameSnapshot,
+            },
+          });
+        }
+
         const invoice = await tx.invoice.create({
           data: {
             number: billing.invoiceNumber,
@@ -385,6 +529,25 @@ export class CheckoutService {
         nextStep: 'provisioning-pending',
       };
     } catch (e) {
+      // Double-clic concurrent détecté SOUS verrou (17B.4F-C3) : renvoie la
+      // commande existante, SANS refus (« rejeu avant refus »).
+      if (e instanceof CheckoutReplaySignal) {
+        const existing = await this.prisma.order.findUnique({
+          where: { id: e.orderId },
+        });
+        if (existing) {
+          const inv = await this.prisma.invoice.findUnique({
+            where: { orderId: existing.id },
+          });
+          return {
+            orderId: existing.id,
+            invoiceNumber: inv?.number ?? '',
+            email: receiptEmail,
+            nextStep: 'provisioning-pending',
+          };
+        }
+        throw e;
+      }
       // Double-clic / retry concurrent : la commande identique existe déjà.
       if (
         e instanceof Prisma.PrismaClientKnownRequestError &&
@@ -544,6 +707,77 @@ export class CheckoutService {
       const addon = addonMap.get(addonId)!;
       return { addonId: addon.id, addonName: addon.name, priceHtCents: addon.priceHtCents };
     });
+  }
+
+  /**
+   * 17B.4F-C3 — catalogue C3 du produit (lecture dédiée sous ON) : pack,
+   * méthode de provisioning et params d'environnement. `PublicProduct` ne les
+   * expose pas tous (packId/provisionModuleId/moduleParams), d'où cette requête
+   * ciblée. Jamais appelée sous OFF.
+   */
+  private async loadC3Catalog(productId: string): Promise<C3CatalogProduct | null> {
+    return this.prisma.product.findUnique({
+      where: { id: productId },
+      select: {
+        packId: true,
+        provisionModuleId: true,
+        moduleParams: true,
+        provisionModule: { select: { actions: true } },
+        pack: {
+          select: {
+            id: true,
+            name: true,
+            ramMb: true,
+            cpuCores: true,
+            storageLimit: true,
+            maxApps: true,
+            status: true,
+            deploymentModuleId: true,
+          },
+        },
+      },
+    });
+  }
+
+  /**
+   * 17B.4F-C3 — intention de provisioning FIGÉE au checkout (fige le contrat
+   * d'achat + l'environnement demandé, valeurs primitives uniquement : le
+   * `claimToken`/lease sont ajoutés au runtime, jamais figés ici).
+   */
+  private buildC3Intent(
+    product: PublicProduct,
+    order: {
+      id: string;
+      amountTtcCents: number;
+      currency: string;
+      requestedSubdomain: string | null;
+      requestedDomainId: string | null;
+    },
+    c3Product: C3CatalogProduct,
+  ): ReservationPayload {
+    const params = (c3Product.moduleParams ?? {}) as Record<string, unknown>;
+    const str = (v: unknown): string | null =>
+      typeof v === 'string' && v.trim() ? v : null;
+    return {
+      business: {
+        productId: product.id,
+        packId: product.packId ?? null,
+        provisionModuleId: c3Product.provisionModuleId,
+        billingCycle: String(product.billingCycle),
+        currency: order.currency,
+        amountTtcCents: order.amountTtcCents,
+        requestedSubdomain: order.requestedSubdomain,
+        requestedDomainId: order.requestedDomainId,
+      },
+      environment: {
+        repoUrl: str(params.repoUrl),
+        branch: str(params.branch),
+        buildPack: str(params.buildPack),
+        appName: str(params.appName),
+        publishDirectory: str(params.publishDirectory),
+        isStatic: typeof params.isStatic === 'boolean' ? params.isStatic : null,
+      },
+    };
   }
 
   /** Hash déterministe : adresse de facturation + slug + options + addons + moyen +

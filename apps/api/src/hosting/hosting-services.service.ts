@@ -26,6 +26,7 @@ import {
   directIdempotencyKey,
   loadKeyring,
   normalizeClientRequestId,
+  storeIdempotencyKey,
   verifyFingerprint,
 } from './hosting-fingerprint';
 
@@ -390,71 +391,164 @@ export class HostingServicesService {
     );
 
     return this.prisma.$transaction(async (tx) => {
-      // ① verrou de LIGNE sur le service, ownership inclus (→ 404 si étranger)
-      const locked = await tx.$queryRaw<HostingService[]>`
-        SELECT * FROM "HostingService"
-        WHERE "id" = ${params.hostingServiceId} AND "userId" = ${params.actorUserId}
-        FOR UPDATE`;
-      const service = locked[0];
-      if (!service) {
-        throw new NotFoundException('Service hébergement introuvable.');
-      }
-
-      // ②③ rejeu : même clé + empreinte identique → MÊME allocation
-      const existing = await tx.hostingServiceAllocation.findUnique({
-        where: { idempotencyKey },
+      const service = await this.lockServiceForUpdate(
+        tx,
+        params.hostingServiceId,
+        params.actorUserId,
+      );
+      return this.reserveInTx(tx, {
+        service,
+        idempotencyKey,
+        fingerprint,
+        payload: params.payload,
+        keyring,
+        allowedStatuses: [HostingServiceStatus.ACTIVE],
       });
-      if (existing) {
-        if (existing.hostingServiceId !== service.id) {
-          throw new ConflictException('Clé de réservation déjà utilisée.');
-        }
-        if (!this.matchesFingerprint(existing.requestFingerprint, params.payload, keyring)) {
-          throw new ConflictException('Rejeu refusé : empreinte de réservation différente.');
-        }
-        return { allocation: existing, replayed: true };
-      }
+    });
+  }
 
-      // ④ création : ACTIVE seul, puis quota, puis écriture
-      if (service.status !== HostingServiceStatus.ACTIVE) {
-        throw new ForbiddenException(
-          service.status === HostingServiceStatus.CANCELLED
-            ? 'Aucune réservation possible sur un service annulé.'
-            : 'Aucune réservation possible sur un service non actif.',
-        );
-      }
-      const consuming = await tx.hostingServiceAllocation.count({
-        where: {
-          hostingServiceId: service.id,
-          status: { in: [...CONSUMING_ALLOCATION_STATUSES] },
-        },
-      });
-      const maxApps = service.maxAppsSnapshot;
-      if (maxApps !== null && consuming + 1 > maxApps) {
-        throw new ForbiddenException('Quota de slots atteint sur ce service.');
-      }
-      try {
-        const allocation = await tx.hostingServiceAllocation.create({
-          data: {
-            hostingServiceId: service.id,
-            idempotencyKey,
-            status: HostingServiceAllocationStatus.RESERVED,
-            requestFingerprint: fingerprint,
-          },
-        });
-        return { allocation, replayed: false };
-      } catch (error) {
-        if (!this.isUniqueViolation(error)) {
-          throw error;
-        }
-        // Course défensive : un concurrent aurait créé la MÊME clé.
-        const concurrent = await tx.hostingServiceAllocation.findUnique({
-          where: { idempotencyKey },
-        });
-        if (concurrent && this.matchesFingerprint(concurrent.requestFingerprint, params.payload, keyring)) {
-          return { allocation: concurrent, replayed: true };
-        }
+  /**
+   * Verrou de LIGNE sur `HostingService` (`id` + `userId` ownership) — helper
+   * `…InTx` réutilisé par `reserveSlot`, `reserveForOrderInTx` et le parcours
+   * C3. 0 ligne → 404 (jamais 403 : aucune confirmation d'existence).
+   */
+  async lockServiceForUpdate(
+    tx: Prisma.TransactionClient,
+    hostingServiceId: string,
+    actorUserId: string,
+  ): Promise<HostingService> {
+    const locked = await tx.$queryRaw<HostingService[]>`
+      SELECT * FROM "HostingService"
+      WHERE "id" = ${hostingServiceId} AND "userId" = ${actorUserId}
+      FOR UPDATE`;
+    const service = locked[0];
+    if (!service) {
+      throw new NotFoundException('Service hébergement introuvable.');
+    }
+    return service;
+  }
+
+  /**
+   * Corps de réservation DÉJÀ SOUS VERROU service (helper `…InTx`) : rejeu par
+   * clé (empreinte identique → MÊME allocation, sans re-vérification statut/
+   * quota), statuts réservables paramétrés, quota, création `RESERVED` avec
+   * empreinte stockée, défense P2002. Contrat C1 inchangé pour le parcours
+   * direct (`allowedStatuses: [ACTIVE]`) ; le parcours store C3 autorise en
+   * plus `PROVISIONING` (service créé au checkout, avant activation).
+   */
+  async reserveInTx(
+    tx: Prisma.TransactionClient,
+    params: {
+      service: HostingService;
+      idempotencyKey: string;
+      fingerprint: string;
+      payload: ReservationPayload;
+      keyring: FingerprintKeyring;
+      allowedStatuses: HostingServiceStatus[];
+    },
+  ): Promise<ReserveSlotResult> {
+    const { service, idempotencyKey, fingerprint, payload, keyring, allowedStatuses } = params;
+
+    // ②③ rejeu : même clé + empreinte identique → MÊME allocation
+    const existing = await tx.hostingServiceAllocation.findUnique({
+      where: { idempotencyKey },
+    });
+    if (existing) {
+      if (existing.hostingServiceId !== service.id) {
         throw new ConflictException('Clé de réservation déjà utilisée.');
       }
+      if (!this.matchesFingerprint(existing.requestFingerprint, payload, keyring)) {
+        throw new ConflictException('Rejeu refusé : empreinte de réservation différente.');
+      }
+      return { allocation: existing, replayed: true };
+    }
+
+    // ④ création : statuts réservables, puis quota, puis écriture
+    if (!allowedStatuses.includes(service.status)) {
+      throw new ForbiddenException(
+        service.status === HostingServiceStatus.CANCELLED
+          ? 'Aucune réservation possible sur un service annulé.'
+          : 'Aucune réservation possible sur un service non actif.',
+      );
+    }
+    const consuming = await tx.hostingServiceAllocation.count({
+      where: {
+        hostingServiceId: service.id,
+        status: { in: [...CONSUMING_ALLOCATION_STATUSES] },
+      },
+    });
+    const maxApps = service.maxAppsSnapshot;
+    if (maxApps !== null && consuming + 1 > maxApps) {
+      throw new ForbiddenException('Quota de slots atteint sur ce service.');
+    }
+    try {
+      const allocation = await tx.hostingServiceAllocation.create({
+        data: {
+          hostingServiceId: service.id,
+          idempotencyKey,
+          status: HostingServiceAllocationStatus.RESERVED,
+          requestFingerprint: fingerprint,
+        },
+      });
+      return { allocation, replayed: false };
+    } catch (error) {
+      if (!this.isUniqueViolation(error)) {
+        throw error;
+      }
+      // Course défensive : un concurrent aurait créé la MÊME clé.
+      const concurrent = await tx.hostingServiceAllocation.findUnique({
+        where: { idempotencyKey },
+      });
+      if (concurrent && this.matchesFingerprint(concurrent.requestFingerprint, payload, keyring)) {
+        return { allocation: concurrent, replayed: true };
+      }
+      throw new ConflictException('Clé de réservation déjà utilisée.');
+    }
+  }
+
+  /**
+   * 17B.4F-C3 — réservation STORE dans LA transaction du claim (TX-A) : clé
+   * dérivée `store:v1:<orderId>`, service verrouillé + ownership + appartenance
+   * à CETTE commande, statuts réservables `PROVISIONING | ACTIVE` (service
+   * créé au checkout, avant activation). Appelée UNIQUEMENT avec un `tx` déjà
+   * verrouillé sur Order → OrderProvisioningTracking (ordre global des verrous
+   * Order → Tracking → HostingService → HostingServiceAllocation → Deployment).
+   * L'empreinte est calculée sur l'intention FIGÉE (`tracking.intent`).
+   */
+  async reserveForOrderInTx(
+    tx: Prisma.TransactionClient,
+    params: {
+      orderId: string;
+      hostingServiceId: string;
+      actorUserId: string;
+      payload: ReservationPayload;
+    },
+  ): Promise<ReserveSlotResult> {
+    const keyring = this.fingerprintKeyring();
+    let fingerprint: string;
+    try {
+      fingerprint = computeFingerprint(params.payload, keyring);
+    } catch (error) {
+      throw this.mapFingerprint(error);
+    }
+    const service = await this.lockServiceForUpdate(
+      tx,
+      params.hostingServiceId,
+      params.actorUserId,
+    );
+    if (service.orderId !== params.orderId) {
+      throw new NotFoundException('Commande introuvable.');
+    }
+    return this.reserveInTx(tx, {
+      service,
+      idempotencyKey: storeIdempotencyKey(params.orderId),
+      fingerprint,
+      payload: params.payload,
+      keyring,
+      allowedStatuses: [
+        HostingServiceStatus.PROVISIONING,
+        HostingServiceStatus.ACTIVE,
+      ],
     });
   }
 
@@ -468,27 +562,42 @@ export class HostingServicesService {
     allocationId: string;
     actorUserId: string;
   }): Promise<ProviderIntentResult> {
-    return this.prisma.$transaction(async (tx) => {
-      const allocation = await this.lockAllocation(tx, params.allocationId, params.actorUserId);
-      if (allocation.status === HostingServiceAllocationStatus.RELEASED) {
-        return { applied: false, reason: 'terminal' } as const;
-      }
-      if (allocation.providerIntentAt) {
-        return { applied: false, reason: 'already_present' } as const;
-      }
-      if (
-        allocation.status !== HostingServiceAllocationStatus.RESERVED &&
-        allocation.status !== HostingServiceAllocationStatus.BOUND
-      ) {
-        return { applied: false, reason: 'invalid_state' } as const;
-      }
-      const providerIntentAt = new Date();
-      await tx.hostingServiceAllocation.update({
-        where: { id: allocation.id },
-        data: { providerIntentAt },
-      });
-      return { applied: true, providerIntentAt } as const;
+    return this.prisma.$transaction((tx) => this.markIntentInTx(tx, params));
+  }
+
+  /**
+   * Variante `…InTx` de `markProviderIntent` (même contrat, aucun réseau) :
+   * s'exécute dans LA transaction fournie par l'appelant — utilisée par le
+   * parcours C3 pour poser l'intention EN DERNIÈRE ÉTAPE de la TX-A (après
+   * réservation, B0 et Order→PROVISIONING, avant commit), sans `$transaction`
+   * imbriquée.
+   */
+  async markIntentInTx(
+    tx: Prisma.TransactionClient,
+    params: {
+      allocationId: string;
+      actorUserId: string;
+    },
+  ): Promise<ProviderIntentResult> {
+    const allocation = await this.lockAllocation(tx, params.allocationId, params.actorUserId);
+    if (allocation.status === HostingServiceAllocationStatus.RELEASED) {
+      return { applied: false, reason: 'terminal' } as const;
+    }
+    if (allocation.providerIntentAt) {
+      return { applied: false, reason: 'already_present' } as const;
+    }
+    if (
+      allocation.status !== HostingServiceAllocationStatus.RESERVED &&
+      allocation.status !== HostingServiceAllocationStatus.BOUND
+    ) {
+      return { applied: false, reason: 'invalid_state' } as const;
+    }
+    const providerIntentAt = new Date();
+    await tx.hostingServiceAllocation.update({
+      where: { id: allocation.id },
+      data: { providerIntentAt },
     });
+    return { applied: true, providerIntentAt } as const;
   }
 
   /**
@@ -501,29 +610,42 @@ export class HostingServicesService {
     allocationId: string;
     actorUserId: string;
   }): Promise<ReleasePreProviderResult> {
-    return this.prisma.$transaction(async (tx) => {
-      const allocation = await this.lockAllocation(tx, params.allocationId, params.actorUserId);
-      if (allocation.status === HostingServiceAllocationStatus.RELEASED) {
-        return { released: false, reason: 'already_released' } as const;
-      }
-      if (allocation.providerIntentAt) {
-        return { released: false, reason: 'intent_present' } as const;
-      }
-      if (allocation.deploymentId) {
-        return { released: false, reason: 'linked' } as const;
-      }
-      if (allocation.status !== HostingServiceAllocationStatus.RESERVED) {
-        return { released: false, reason: 'invalid_state' } as const;
-      }
-      await tx.hostingServiceAllocation.update({
-        where: { id: allocation.id },
-        data: {
-          status: HostingServiceAllocationStatus.RELEASED,
-          releasedAt: new Date(),
-        },
-      });
-      return { released: true } as const;
+    return this.prisma.$transaction((tx) => this.releasePreProviderInTx(tx, params));
+  }
+
+  /**
+   * Variante `…InTx` de `releasePreProvider` (même contrat, aucun réseau) :
+   * compensation B0 du parcours C3 DANS LA transaction du claim (libération +
+   * annotation + commit, Order reste `PAID` — jamais d'intention posée).
+   */
+  async releasePreProviderInTx(
+    tx: Prisma.TransactionClient,
+    params: {
+      allocationId: string;
+      actorUserId: string;
+    },
+  ): Promise<ReleasePreProviderResult> {
+    const allocation = await this.lockAllocation(tx, params.allocationId, params.actorUserId);
+    if (allocation.status === HostingServiceAllocationStatus.RELEASED) {
+      return { released: false, reason: 'already_released' } as const;
+    }
+    if (allocation.providerIntentAt) {
+      return { released: false, reason: 'intent_present' } as const;
+    }
+    if (allocation.deploymentId) {
+      return { released: false, reason: 'linked' } as const;
+    }
+    if (allocation.status !== HostingServiceAllocationStatus.RESERVED) {
+      return { released: false, reason: 'invalid_state' } as const;
+    }
+    await tx.hostingServiceAllocation.update({
+      where: { id: allocation.id },
+      data: {
+        status: HostingServiceAllocationStatus.RELEASED,
+        releasedAt: new Date(),
+      },
     });
+    return { released: true } as const;
   }
 
   /**
@@ -541,46 +663,66 @@ export class HostingServicesService {
     if (params.proof?.providerProven !== true) {
       throw new PreconditionFailedException('Preuve provider (providerProven) requise avant liaison.');
     }
-    return this.prisma.$transaction(async (tx) => {
-      const allocation = await this.lockAllocation(tx, params.allocationId, params.actorUserId);
-      if (allocation.status === HostingServiceAllocationStatus.RELEASED) {
-        throw new ForbiddenException('Allocation déjà libérée.');
-      }
-      if (allocation.deploymentId === params.deploymentId) {
-        return tx.hostingServiceAllocation.findUniqueOrThrow({ where: { id: allocation.id } });
-      }
-      if (allocation.deploymentId) {
-        throw new ConflictException('Allocation déjà liée à un autre déploiement.');
-      }
-      if (allocation.status === HostingServiceAllocationStatus.RELEASING) {
-        throw new ForbiddenException('Libération en cours : liaison refusée.');
-      }
-      if (allocation.status !== HostingServiceAllocationStatus.RESERVED) {
-        throw new ForbiddenException('Liaison impossible depuis cet état.');
-      }
-      // ③ verrou Deployment (APRÈS Service → Allocation, ordre respecté) +
-      // ownership croisé : déploiement du MÊME propriétaire que le service
-      const deployments = await tx.$queryRaw<Array<{ userId: string }>>`
-        SELECT d."userId" FROM "Deployment" AS d
-        WHERE d."id" = ${params.deploymentId}
-        FOR UPDATE`;
-      const deployment = deployments[0];
-      if (!deployment || deployment.userId !== allocation.ownerUserId) {
-        throw new NotFoundException('Déploiement introuvable.');
-      }
-      try {
-        return await tx.hostingServiceAllocation.update({
-          where: { id: allocation.id },
-          data: {
-            deploymentId: params.deploymentId,
-            status: HostingServiceAllocationStatus.BOUND,
-            boundAt: new Date(),
-          },
-        });
-      } catch (error) {
-        throw this.mapUnique(error, 'Ce déploiement est déjà lié à une allocation.');
-      }
-    });
+    return this.prisma.$transaction((tx) => this.markBoundInTx(tx, params));
+  }
+
+  /**
+   * Variante `…InTx` de `markBound` (même contrat, preuve exigée) : s'exécute
+   * dans LA transaction fournie par l'appelant — parcours C3 (TX-E) : la
+   * liaison allocation → déploiement est posée SOUS la garde token/lease du
+   * claim (ordre des verrous Order → Tracking → Service → Allocation →
+   * Deployment respecté, aucune `$transaction` imbriquée).
+   */
+  async markBoundInTx(
+    tx: Prisma.TransactionClient,
+    params: {
+      allocationId: string;
+      actorUserId: string;
+      deploymentId: string;
+      proof: { providerProven: boolean };
+    },
+  ): Promise<HostingServiceAllocation> {
+    if (params.proof?.providerProven !== true) {
+      throw new PreconditionFailedException('Preuve provider (providerProven) requise avant liaison.');
+    }
+    const allocation = await this.lockAllocation(tx, params.allocationId, params.actorUserId);
+    if (allocation.status === HostingServiceAllocationStatus.RELEASED) {
+      throw new ForbiddenException('Allocation déjà libérée.');
+    }
+    if (allocation.deploymentId === params.deploymentId) {
+      return tx.hostingServiceAllocation.findUniqueOrThrow({ where: { id: allocation.id } });
+    }
+    if (allocation.deploymentId) {
+      throw new ConflictException('Allocation déjà liée à un autre déploiement.');
+    }
+    if (allocation.status === HostingServiceAllocationStatus.RELEASING) {
+      throw new ForbiddenException('Libération en cours : liaison refusée.');
+    }
+    if (allocation.status !== HostingServiceAllocationStatus.RESERVED) {
+      throw new ForbiddenException('Liaison impossible depuis cet état.');
+    }
+    // ③ verrou Deployment (APRÈS Service → Allocation, ordre respecté) +
+    // ownership croisé : déploiement du MÊME propriétaire que le service
+    const deployments = await tx.$queryRaw<Array<{ userId: string }>>`
+      SELECT d."userId" FROM "Deployment" AS d
+      WHERE d."id" = ${params.deploymentId}
+      FOR UPDATE`;
+    const deployment = deployments[0];
+    if (!deployment || deployment.userId !== allocation.ownerUserId) {
+      throw new NotFoundException('Déploiement introuvable.');
+    }
+    try {
+      return await tx.hostingServiceAllocation.update({
+        where: { id: allocation.id },
+        data: {
+          deploymentId: params.deploymentId,
+          status: HostingServiceAllocationStatus.BOUND,
+          boundAt: new Date(),
+        },
+      });
+    } catch (error) {
+      throw this.mapUnique(error, 'Ce déploiement est déjà lié à une allocation.');
+    }
   }
 
   /** `RESERVED | BOUND → RELEASING` (idempotent sur `RELEASING`, `RELEASED` terminal). */
