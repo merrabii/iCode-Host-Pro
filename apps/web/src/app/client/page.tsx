@@ -475,6 +475,7 @@ export default function ClientPage() {
    * quota libéré). Après suppression, le compteur d'apps du plan baisse.
    */
   async function deleteApp(d: Deployment) {
+    if (deleting) return;
     if (confirmDel !== d.id) {
       setConfirmDel(d.id);
       return;
@@ -483,8 +484,40 @@ export default function ClientPage() {
     setDeleting(true);
     const r = await deleteMyDeployment(token, d.id);
     setDeleting(false);
+    const label = d.appName ?? d.repoFullName.split('/').pop();
     if (!r.ok) return toast.error(apiError(r, 'Suppression impossible.'));
-    toast.ok(`Application « ${d.appName ?? d.repoFullName.split('/').pop()} » supprimée — quota libéré.`);
+    // Contrat honnête : la suppression LOCALE et la libération du QUOTA sont
+    // deux faits distincts — « quota libéré » n'est annoncé QUE si le serveur
+    // confirme `freedQuota === true`. Réponse absente/incomplète ≠ succès.
+    const body = (r.data ?? null) as {
+      removed?: boolean;
+      partial?: boolean;
+      freedQuota?: boolean;
+    } | null;
+    if (
+      !body ||
+      typeof body.removed !== 'boolean' ||
+      typeof body.freedQuota !== 'boolean'
+    ) {
+      toast.error(
+        `Suppression non confirmée pour « ${label} » — vérifiez l'état de l'application ou contactez le support.`,
+      );
+    } else if (body.removed === false) {
+      toast.error(
+        `Suppression non concluante : « ${label} » est conservée (quota non libéré). Réessayez plus tard ou contactez le support.`,
+      );
+    } else if (body.partial) {
+      toast.warn(
+        `« ${label} » supprimée partiellement — un résidu est conservé (réessayez pour terminer).`,
+      );
+    } else if (body.freedQuota === true) {
+      toast.ok(`Application « ${label} » supprimée — quota libéré.`);
+    } else {
+      // Suppression LOCALE prouvée, libération du quota NON prouvée.
+      toast.warn(
+        `Application « ${label} » supprimée — quota non libéré : votre compteur de slots reste inchangé.`,
+      );
+    }
     void loadDeployments(token);
   }
 

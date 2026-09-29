@@ -1271,7 +1271,9 @@ describe('17B.4F-C4 — tentatives/libération/finalize (e2e base isolée c4test
     fakeCfTransport.deleteRecord.mockRejectedValueOnce(new Error('HTTP 500 cf boom (e2e)'));
     const out1 = await deployments.remove(dep.id, actor());
     expect(out1).toEqual({
-      removed: true,
+      // D9 honnête : release bloquée ⇒ AUCUNE écriture locale ⇒ la row existe
+      // encore ⇒ `removed` false (on ne prétend pas avoir supprimé).
+      removed: false,
       appName: expect.any(String),
       partial: true,
       freedQuota: false, // D9 honnête : rien n'a été libéré
@@ -1305,7 +1307,8 @@ describe('17B.4F-C4 — tentatives/libération/finalize (e2e base isolée c4test
     try {
       fakeDeleteApplication.mockRejectedValueOnce(new Error('HTTP 404 not found'));
       const out2 = await deployments.remove(dep.id, actor());
-      expect(out2.removed).toBe(true);
+      // Rollback conjoint ⇒ row toujours présente ⇒ `removed` false (honnête).
+      expect(out2.removed).toBe(false);
       expect(out2.partial).toBe(true);
       expect(out2.freedQuota).toBe(false);
       expect(out2.c4?.release.status).toBe('blocked');

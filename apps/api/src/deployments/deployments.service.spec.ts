@@ -1,4 +1,4 @@
-import { BadGatewayException, BadRequestException, ConflictException, ForbiddenException, NotFoundException } from '@nestjs/common';
+import { BadGatewayException, BadRequestException, ConflictException, ForbiddenException, Logger, NotFoundException } from '@nestjs/common';
 import { DeploymentsService, mapCoolifyStatus } from './deployments.service';
 import { DeploymentStatus } from '@prisma/client';
 
@@ -21,10 +21,17 @@ describe('DeploymentsService', () => {
       findMany: jest.fn(),
       findFirst: jest.fn(),
       update: jest.fn(),
+      // Contrat de réponse remove() : relecture fraîche de la row (removed honnête).
+      findUnique: jest.fn(),
       // 17B.4F-C2 — compensation pré-provider (suppression GARDEE PENDING).
       deleteMany: jest.fn(),
     },
     hostingService: { findMany: jest.fn() }, // 17B.4F-C2 — classification locale
+    // 17B.4F-C2/C4 — allocation liée (remove sous garde ON) + relecture D9.
+    hostingServiceAllocation: { findFirst: jest.fn(), findUnique: jest.fn() },
+    // Repli garde C2/C3 × C4 : allocation retrouvée via la tentative de portée
+    // DEPLOYMENT quand `markBound` n'a pas encore lié la row (échec de création).
+    c4ProviderAttempt: { findFirst: jest.fn() },
     cloudflareSetting: { findFirst: jest.fn(), create: jest.fn(), update: jest.fn(), updateMany: jest.fn() },
     domain: { findFirst: jest.fn(), findUnique: jest.fn() },
     clientSubdomain: { findFirst: jest.fn(), create: jest.fn() },
@@ -55,8 +62,13 @@ describe('DeploymentsService', () => {
     createProject: jest.fn(),
     applyAppLimits: jest.fn(),
     deployApp: jest.fn(),
+    setAppEnvironment: jest.fn(),
+    setAppDomain: jest.fn(),
     deploymentStatus: jest.fn(),
     deleteApplication: jest.fn(),
+    // READ d'argument (résolution serverUuid) — déterministe par défaut :
+    // aucune UUID → `serverUuid: undefined`, identique au repli historique.
+    listServers: jest.fn(),
   };
   const mockPanelFactory = { create: jest.fn(() => mockTransport) };
 
@@ -68,10 +80,22 @@ describe('DeploymentsService', () => {
     markBound: jest.fn(),
   };
 
+  // 17B.4F-C4 — protocole de tentatives + libération sous preuves (no-op OFF).
+  const mockC4 = {
+    beginDispatchStandalone: jest.fn(),
+    settleStandalone: jest.fn(),
+    hasStop: jest.fn(),
+    unresolvedCreative: jest.fn(),
+  };
+  const mockC4r = { releaseAfterCleanup: jest.fn() };
+
   // Transaction simulée pour remove() — les deux écritures locales y sont faites.
+  // 17B.4F-C4 — étendue aux `persist` des settles (row projet + row DNS +
+  // identifiants deployment) exécutées DANS LA MÊME tx que la consignation.
   const mockTx = {
-    clientSubdomain: { deleteMany: jest.fn() },
-    deployment: { delete: jest.fn() },
+    clientSubdomain: { deleteMany: jest.fn(), create: jest.fn() },
+    deployment: { delete: jest.fn(), update: jest.fn() },
+    clientProject: { findUnique: jest.fn(), create: jest.fn() },
   };
 
   const actor = { sub: 'u1', email: 'client@example.com' };
@@ -229,14 +253,40 @@ describe('DeploymentsService', () => {
       mockPanelFactory as never,
       mockCloudflare as never,
       mockHosting as never,
-      {} as never,
+      mockC4 as never,
       { assertOperational: jest.fn().mockResolvedValue(undefined) } as never,
-      {} as never,
+      mockC4r as never,
     );
     jest.clearAllMocks();
     // 17B.4F-C2 — garde OFF par défaut (contrat historique préservé). Les
     // tests du parcours C2 l'activent explicitement (valeur exacte 'true').
     delete process.env.HOSTING_C2_ENABLED;
+    // 17B.4F-C4 — garde C4 OFF par défaut (les tests C4 l'activent explicitement).
+    delete process.env.HOSTING_C4_ENABLED;
+    // Relecture remove() : par défaut la row a disparu (nettoyage effectif) ;
+    // aucun accès hosting (aucune allocation) hors tests ON.
+    mockPrisma.deployment.findUnique.mockResolvedValue(null);
+    mockPrisma.hostingServiceAllocation.findFirst.mockResolvedValue(null);
+    mockPrisma.hostingServiceAllocation.findUnique.mockResolvedValue(null);
+    mockPrisma.c4ProviderAttempt.findFirst.mockResolvedValue(null);
+    mockC4.beginDispatchStandalone.mockResolvedValue({
+      attemptId: 'att-c4-1',
+      targetIntentHash: 'hash-c4-1',
+    });
+    // Contrairement au réel (TX dédiée), la settle simulée EXÉCUTE le `persist`
+    // fourni sur mockTx : preuve déterministe des écritures atomiques (row
+    // projet, row ClientSubdomain + identifiants deployment) sans base.
+    mockC4.settleStandalone.mockImplementation(async (params: {
+      persist?: (tx: unknown) => Promise<void>;
+    }) => {
+      if (typeof params?.persist === 'function') await params.persist(mockTx);
+    });
+    mockC4.hasStop.mockResolvedValue(false);
+    mockC4.unresolvedCreative.mockResolvedValue(0);
+    mockC4r.releaseAfterCleanup.mockResolvedValue({
+      status: 'released',
+      allocationId: 'alloc1',
+    });
     // Aucun domaine racine configuré par défaut → flux inchangé (Phase 3 best-effort).
     mockCloudflare.findActiveRootDomain.mockResolvedValue(null);
     mockSettings.isDeployEnabled.mockResolvedValue(true);
@@ -263,10 +313,19 @@ describe('DeploymentsService', () => {
     // B0.1 — transaction locale : callback exécuté sur le tx simulé.
     mockTx.clientSubdomain.deleteMany.mockResolvedValue({ count: 1 });
     mockTx.deployment.delete.mockResolvedValue({});
+    mockTx.deployment.update.mockResolvedValue(deploymentRow());
+    mockTx.clientSubdomain.create.mockResolvedValue({ id: 'cs-tx' });
+    mockTx.clientProject.findUnique.mockResolvedValue(null);
+    mockTx.clientProject.create.mockResolvedValue({ id: 'cp-1', projectUuid: 'proj-1' });
     mockPrisma.$transaction.mockImplementation(async (fn: (t: unknown) => unknown) =>
       fn(mockTx),
     );
     mockTransport.deleteApplication.mockResolvedValue(undefined);
+    mockTransport.setAppEnvironment.mockResolvedValue(undefined);
+    mockTransport.applyAppLimits.mockResolvedValue(undefined);
+    mockTransport.listServers.mockResolvedValue([]);
+    // Projet dédié : aucun par défaut (les tests module B surchargent).
+    mockPrisma.clientProject.findUnique.mockResolvedValue(null);
     mockCloudflare.deleteDnsRecord.mockResolvedValue({ id: 'rec-1' });
     // 17B.4F-C2 — défauts du moteur C1 (non utilisés tant que la garde OFF).
     mockHosting.reserveSlot.mockResolvedValue({
@@ -1842,6 +1901,1167 @@ describe('DeploymentsService', () => {
       ).rejects.toBeInstanceOf(ConflictException);
       expect(mockHosting.reserveSlot).not.toHaveBeenCalled();
       expect(mockPrisma.deployment.create).not.toHaveBeenCalled();
+    });
+
+    // ── 17B.4F — Correctifs ciblés recette C2 × C4 ─────────────────────────
+    // (couverture C2 par le protocole C4 : tentative CREATE durable, issue
+    //  UNKNOWN sur échec réseau, barrière post-appel, contrat `removed`.)
+
+    const enableC2C4 = () => {
+      enableC2();
+      process.env.HOSTING_C4_ENABLED = 'true';
+    };
+
+    it('C2+C4 : tentative CREATE durable émise AVANT createGitApp, consignée SUCCESS, liaison APRÈS', async () => {
+      enableC2C4();
+      mockPrisma.hostingService.findMany.mockResolvedValue([hostingServiceRow()]);
+      happyProvider();
+
+      const out = await service.create(dto({ clientRequestId: CID, branch: 'main' }), actor);
+
+      expect(out.id).toBe('dep1');
+      // 3 dispatches couverts : CREATE (createGitApp) + 2 CONFIGURE (limites, run).
+      expect(mockC4.beginDispatchStandalone).toHaveBeenCalledTimes(3);
+      expect(mockC4.beginDispatchStandalone.mock.calls.map((c) => (c[0] as { nature: string }).nature)).toEqual([
+        'CREATE',
+        'CONFIGURE',
+        'CONFIGURE',
+      ]);
+      expect(mockC4.beginDispatchStandalone.mock.calls[0]![0]).toEqual(
+        expect.objectContaining({
+          nature: 'CREATE',
+          scope: { type: 'DEPLOYMENT', id: 'dep1' },
+          allocationId: 'alloc1',
+          holder: 'u1',
+          targetIntent: expect.objectContaining({
+            type: 'application',
+            branch: 'main',
+            buildPack: expect.any(String),
+          }),
+        }),
+      );
+      // Ordre dur : tentative DISPATCHED committée AVANT le 1ᵉʳ appel couvert.
+      expect(mockC4.beginDispatchStandalone.mock.invocationCallOrder[0]).toBeLessThan(
+        mockTransport.createGitApp.mock.invocationCallOrder[0]!,
+      );
+      expect(mockC4.settleStandalone).toHaveBeenCalledTimes(3);
+      expect(mockC4.settleStandalone).toHaveBeenCalledWith(
+        expect.objectContaining({
+          attemptId: 'att-c4-1',
+          outcome: 'SUCCESS',
+          returnedIdentifiers: { uuid: 'app-1' },
+          persist: expect.any(Function),
+        }),
+      );
+      // Liaison allocation → déploiement UNIQUEMENT après consignation.
+      expect(mockC4.settleStandalone.mock.invocationCallOrder[0]).toBeLessThan(
+        mockHosting.markBound.mock.invocationCallOrder[0]!,
+      );
+      expect(mockHosting.markBound).toHaveBeenCalledTimes(1);
+      expect(mockHosting.releasePreProvider).not.toHaveBeenCalled();
+    });
+
+    it('C2+C4 : échec réseau pendant createGitApp → consignation UNKNOWN durable, row FAILED, 502, AUCUNE libération', async () => {
+      enableC2C4();
+      mockPrisma.hostingService.findMany.mockResolvedValue([hostingServiceRow()]);
+      mockPrisma.deployment.create.mockResolvedValue(
+        deploymentRow({ status: 'PENDING', coolifyUuid: null }),
+      );
+      mockHosting.markProviderIntent.mockResolvedValue({
+        applied: true,
+        providerIntentAt: new Date(),
+      });
+      mockTransport.createGitApp.mockRejectedValue(new Error('panel indisponible'));
+      mockPrisma.deployment.update.mockResolvedValue(deploymentRow({ status: 'FAILED' }));
+
+      await expect(
+        service.create(dto({ clientRequestId: CID }), actor),
+      ).rejects.toBeInstanceOf(BadGatewayException);
+
+      // Incertitude conservée : UNNE settle UNKNOWN, jamais de SUCCESS.
+      expect(mockC4.beginDispatchStandalone).toHaveBeenCalledTimes(1);
+      expect(mockC4.settleStandalone).toHaveBeenCalledTimes(1);
+      expect(mockC4.settleStandalone).toHaveBeenCalledWith(
+        expect.objectContaining({ attemptId: 'att-c4-1', outcome: 'UNKNOWN' }),
+      );
+      // Contrat : JAMAIS de libération après intention, JAMAIS de liaison.
+      expect(mockHosting.releasePreProvider).not.toHaveBeenCalled();
+      expect(mockHosting.markBound).not.toHaveBeenCalled();
+      expect(mockPrisma.deployment.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 'dep1' },
+          data: expect.objectContaining({ status: DeploymentStatus.FAILED }),
+        }),
+      );
+      expect(mockAudit.record).toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'deploy.failed' }),
+      );
+    });
+
+    it('C2+C4 : arrêt couvrant au dispatch → refus du begin GELÉ (aucune transition métier), AUCUN appel réseau, slot non libéré', async () => {
+      enableC2C4();
+      mockPrisma.hostingService.findMany.mockResolvedValue([hostingServiceRow()]);
+      mockPrisma.deployment.create.mockResolvedValue(
+        deploymentRow({ status: 'PENDING', coolifyUuid: null }),
+      );
+      mockHosting.markProviderIntent.mockResolvedValue({
+        applied: true,
+        providerIntentAt: new Date(),
+      });
+      // L'arrêt apparaît EXACTEMENT à la frontière du dispatch : le begin est
+      // refusé par le protocole, la barrière relue est vraie → GEL.
+      let armed = false;
+      mockC4.beginDispatchStandalone.mockImplementation(async () => {
+        armed = true;
+        throw new ConflictException('Arrêt demandé sur cette ressource — dispatch refusé.');
+      });
+      mockC4.hasStop.mockImplementation(async () => armed);
+      // Row PENDING inchangée : le gel n'écrit QUE le détail.
+      mockPrisma.deployment.update.mockResolvedValue(deploymentRow({ status: 'PENDING' }));
+
+      const out = await service.create(dto({ clientRequestId: CID }), actor);
+
+      // GEL : réponse retournée, AUCUNE transition métier (jamais FAILED),
+      // aucun audit deploy.failed, incertitude non fabriquée (0 settle).
+      expect(out.id).toBe('dep1');
+      expect(mockC4.settleStandalone).not.toHaveBeenCalled();
+      expect(mockPrisma.deployment.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 'dep1' },
+          data: expect.objectContaining({ detail: expect.stringContaining('figée') }),
+        }),
+      );
+      expect(mockPrisma.deployment.update).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ status: DeploymentStatus.FAILED }),
+        }),
+      );
+      expect(mockAudit.record).not.toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'deploy.failed' }),
+      );
+
+      // Barrière ANTI-réseau : le dispatch refusé n'appelle JAMAIS le provider.
+      expect(mockTransport.createGitApp).not.toHaveBeenCalled();
+      expect(mockHosting.releasePreProvider).not.toHaveBeenCalled(); // intention déjà posée
+      expect(mockHosting.markBound).not.toHaveBeenCalled();
+    });
+
+    it('C2+C4 : arrêt (ou garde OFF) pendant createGitApp → barrière : settle SUCCESS, identifiants conservés, AUCUNE liaison ni activation', async () => {
+      enableC2C4();
+      mockPrisma.hostingService.findMany.mockResolvedValue([hostingServiceRow()]);
+      happyProvider();
+      // L'arrêt apparaît PENDANT l'appel réseau (la barrière PRÉ-dispatch était
+      // encore verte au moment du begin).
+      let stopArmed = false;
+      mockC4.hasStop.mockImplementation(async () => stopArmed);
+      mockTransport.createGitApp.mockImplementation(async () => {
+        stopArmed = true;
+        return { uuid: 'app-1' };
+      });
+
+      const out = await service.create(dto({ clientRequestId: CID }), actor);
+
+      // La création est confirmée (SUCCESS consigné) puis TOUT est figé.
+      expect(mockC4.settleStandalone).toHaveBeenCalledWith(
+        expect.objectContaining({
+          outcome: 'SUCCESS',
+          returnedIdentifiers: { uuid: 'app-1' },
+        }),
+      );
+      expect(mockHosting.markBound).not.toHaveBeenCalled(); // pas de liaison
+      expect(mockTransport.deployApp).not.toHaveBeenCalled(); // pas d'activation
+      expect(mockPrisma.deployment.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 'dep1' },
+          data: expect.objectContaining({ detail: expect.stringContaining('figée') }),
+        }),
+      );
+      expect(out.id).toBe('dep1');
+    });
+
+    it('C2+C4 : suppression à release bloquée → `removed:false` honnête (row conservée, quota non libéré)', async () => {
+      process.env.HOSTING_C4_ENABLED = 'true';
+      mockPrisma.deployment.findFirst.mockResolvedValue({
+        ...deploymentRow({ status: 'ACTIVE', appName: 'mon-app' }),
+        server: serverRow(),
+        clientSubdomain: {
+          id: 'cs1',
+          subdomain: 'monapp',
+          domainId: 'dom1',
+          fqdn: 'monapp.example.com',
+          recordId: 'rec1',
+          deploymentId: 'dep1',
+          domain: { id: 'dom1', name: 'example.com', zoneId: 'zone1' },
+        },
+      });
+      mockPrisma.hostingServiceAllocation.findFirst.mockResolvedValue({
+        id: 'alloc1',
+        status: 'BOUND',
+      });
+      mockC4.unresolvedCreative.mockResolvedValue(0);
+      mockC4r.releaseAfterCleanup.mockResolvedValue({
+        status: 'blocked',
+        allocationId: 'alloc1',
+        blockedReason: 'dns_not_conclusive',
+      });
+      // Row TOUJOURS présente après tentative de release bloquée.
+      mockPrisma.deployment.findUnique.mockResolvedValue({ id: 'dep1' });
+
+      const out = await service.remove('dep1', actor);
+
+      expect(out).toEqual({
+        removed: false, // D9 honnête : la row existe encore
+        appName: 'mon-app',
+        partial: true,
+        freedQuota: false,
+        c4: { release: expect.objectContaining({ status: 'blocked' }) },
+      });
+      expect(mockTx.deployment.delete).not.toHaveBeenCalled(); // AUCUNE écriture locale
+      expect(mockTx.clientSubdomain.deleteMany).not.toHaveBeenCalled();
+      expect(mockAudit.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'deploy.delete',
+          details: expect.objectContaining({ removed: false, partial: true }),
+        }),
+      );
+    });
+
+    it('C2+C4 : row NON liée (échec avant markBound) → repli garde via tentative DEPLOYMENT → 409, aucune mutation', async () => {
+      process.env.HOSTING_C4_ENABLED = 'true';
+      mockPrisma.deployment.findFirst.mockResolvedValue({
+        ...deploymentRow({ status: 'FAILED', appName: 'mon-app' }),
+        server: serverRow(),
+        clientSubdomain: null,
+      });
+      // Échec de création : `markBound` n'a JAMAIS lié la row (deploymentId null).
+      mockPrisma.hostingServiceAllocation.findFirst.mockResolvedValue(null);
+      mockPrisma.c4ProviderAttempt.findFirst.mockResolvedValue({ allocationId: 'alloc1' });
+      mockC4.unresolvedCreative.mockResolvedValue(1);
+
+      await expect(service.remove('dep1', actor)).rejects.toBeInstanceOf(ConflictException);
+      expect(mockPrisma.c4ProviderAttempt.findFirst).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ scopeType: 'DEPLOYMENT', scopeId: 'dep1' }),
+        }),
+      );
+      expect(mockC4.unresolvedCreative).toHaveBeenCalledWith('alloc1');
+      expect(mockAudit.record).not.toHaveBeenCalled();
+      expect(mockTx.deployment.delete).not.toHaveBeenCalled();
+    });
+
+    // ── 17B.4F-C4 — couverture C2→C4 (projet dédié + ops de configuration) ──
+    // Tests déterministes : transports simulés, barrières contrôlées par
+    // drapeau (aucune temporisation), compteurs d'appels explicites.
+
+    it('C2+C4 module B : tentative CREATE AVANT createProject, SUCCESS + identifiants persistés DANS la settle', async () => {
+      enableC2C4();
+      mockPrisma.subscription.findFirst.mockResolvedValue(
+        autoTarget({
+          deploymentModule: autoModule({ kind: 'PER_CLIENT_PROJECT', sharedProjectUuid: null }),
+        }),
+      );
+      mockPrisma.hostingService.findMany.mockResolvedValue([hostingServiceRow()]);
+      happyProvider();
+      mockPrisma.clientProject.findUnique.mockResolvedValue(null); // 1ʳᵉ app du client
+      mockTransport.createProject.mockResolvedValue({ uuid: 'proj-1', name: 'client-u1' });
+
+      const out = await service.create(dto({ clientRequestId: CID }), actor);
+
+      expect(out.id).toBe('dep1');
+      // 4 dispatches : CREATE projet + CREATE app + 2 CONFIGURE (limites, run).
+      expect(mockC4.beginDispatchStandalone).toHaveBeenCalledTimes(4);
+      expect(mockC4.beginDispatchStandalone.mock.calls[0]![0]).toEqual(
+        expect.objectContaining({
+          nature: 'CREATE',
+          scope: { type: 'DEPLOYMENT', id: 'dep1' },
+          targetIntent: expect.objectContaining({ type: 'project', name: 'client-u1' }),
+        }),
+      );
+      // Ordres durs : intention → tentative projet → réseau projet → réseau app.
+      expect(mockHosting.markProviderIntent.mock.invocationCallOrder[0]).toBeLessThan(
+        mockTransport.createProject.mock.invocationCallOrder[0]!,
+      );
+      expect(mockC4.beginDispatchStandalone.mock.invocationCallOrder[0]).toBeLessThan(
+        mockTransport.createProject.mock.invocationCallOrder[0]!,
+      );
+      expect(mockTransport.createProject.mock.invocationCallOrder[0]).toBeLessThan(
+        mockTransport.createGitApp.mock.invocationCallOrder[0]!,
+      );
+      // Consignation SUCCESS + persist ATOMIQUE (row projet + deployment).
+      expect(mockC4.settleStandalone).toHaveBeenCalledWith(
+        expect.objectContaining({
+          outcome: 'SUCCESS',
+          returnedIdentifiers: { projectUuid: 'proj-1' },
+          persist: expect.any(Function),
+        }),
+      );
+      expect(mockTx.clientProject.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          userId: 'u1',
+          serverId: 'srv-coolify',
+          projectUuid: 'proj-1',
+        }),
+      });
+      expect(mockTx.deployment.update).toHaveBeenCalledWith({
+        where: { id: 'dep1' },
+        data: expect.objectContaining({ coolifyProjectUuid: 'proj-1', clientProjectId: 'cp-1' }),
+      });
+      // Chemin historique (getOrCreateClientProject) JAMAIS emprunté sous ON.
+      expect(mockPrisma.clientProject.create).not.toHaveBeenCalled();
+      // Flow nominal : liaison, run, DEPLOYING.
+      expect(mockHosting.markBound).toHaveBeenCalledTimes(1);
+      expect(mockTransport.deployApp).toHaveBeenCalledTimes(1);
+      expect(mockPrisma.deployment.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ status: DeploymentStatus.DEPLOYING }),
+        }),
+      );
+      expect(mockHosting.releasePreProvider).not.toHaveBeenCalled();
+    });
+
+    it('C2+C4 module B : cible unique du projet — serverUuid = coolifyServerUuid dans la tentative ET l’appel (jamais coolifyProjectUuid)', async () => {
+      enableC2C4();
+      // Les DEUX uuids du serveur sont VOLONTAIREMENT différents pour prouver
+      // que la cible n'est jamais confondue.
+      const server = {
+        ...serverRow(),
+        coolifyServerUuid: 'uuid-serveur-A',
+        coolifyProjectUuid: 'uuid-projet-B',
+      };
+      mockPrisma.subscription.findFirst.mockResolvedValue(
+        autoTarget({
+          deploymentModule: autoModule({
+            kind: 'PER_CLIENT_PROJECT',
+            sharedProjectUuid: null,
+            server,
+          }),
+        }),
+      );
+      mockPrisma.hostingService.findMany.mockResolvedValue([hostingServiceRow({ server })]);
+      happyProvider();
+      mockPrisma.clientProject.findUnique.mockResolvedValue(null);
+      mockTransport.createProject.mockResolvedValue({ uuid: 'proj-1', name: 'client-u1' });
+
+      const out = await service.create(dto({ clientRequestId: CID }), actor);
+      expect(out.id).toBe('dep1');
+
+      // Appel provider : cible = UUID du SERVEUR (A), jamais le projet (B).
+      const callArgs = mockTransport.createProject.mock.calls[0]![1] as { serverUuid?: string };
+      expect(callArgs.serverUuid).toBe('uuid-serveur-A');
+      expect(callArgs.serverUuid).not.toBe('uuid-projet-B');
+      // Tentative : la MÊME valeur exacte que celle de l'appel.
+      const intent = (mockC4.beginDispatchStandalone.mock.calls[0]![0] as {
+        targetIntent: { serverUuid?: string };
+      }).targetIntent;
+      expect(intent.serverUuid).toBe('uuid-serveur-A');
+      expect(intent.serverUuid).toBe(callArgs.serverUuid);
+    });
+
+    it('C2+C4 module B : échec réseau createProject → settle UNKNOWN durable, 502, AUCUN createGitApp ni libération', async () => {
+      enableC2C4();
+      mockPrisma.subscription.findFirst.mockResolvedValue(
+        autoTarget({
+          deploymentModule: autoModule({ kind: 'PER_CLIENT_PROJECT', sharedProjectUuid: null }),
+        }),
+      );
+      mockPrisma.hostingService.findMany.mockResolvedValue([hostingServiceRow()]);
+      mockPrisma.deployment.create.mockResolvedValue(
+        deploymentRow({ status: 'PENDING', coolifyUuid: null }),
+      );
+      mockHosting.markProviderIntent.mockResolvedValue({
+        applied: true,
+        providerIntentAt: new Date(),
+      });
+      mockPrisma.clientProject.findUnique.mockResolvedValue(null);
+      mockTransport.createProject.mockRejectedValue(new Error('création projet échouée (timeout)'));
+      mockPrisma.deployment.update.mockResolvedValue(deploymentRow({ status: 'FAILED' }));
+
+      await expect(service.create(dto({ clientRequestId: CID }), actor)).rejects.toBeInstanceOf(
+        BadGatewayException,
+      );
+
+      // Tentative CREATE projet consignée UNKNOWN : créateur non résolu durable.
+      expect(mockC4.beginDispatchStandalone).toHaveBeenCalledTimes(1);
+      expect(mockC4.beginDispatchStandalone.mock.calls[0]![0]).toEqual(
+        expect.objectContaining({
+          nature: 'CREATE',
+          targetIntent: expect.objectContaining({ type: 'project' }),
+        }),
+      );
+      expect(mockC4.settleStandalone).toHaveBeenCalledTimes(1);
+      expect(mockC4.settleStandalone).toHaveBeenCalledWith(
+        expect.objectContaining({ attemptId: 'att-c4-1', outcome: 'UNKNOWN' }),
+      );
+      // HALT : AUCUN appel suivant (createGitApp), AUCUN rejeu, AUCUNE liaison.
+      expect(mockTransport.createGitApp).not.toHaveBeenCalled();
+      expect(mockHosting.markBound).not.toHaveBeenCalled();
+      expect(mockHosting.releasePreProvider).not.toHaveBeenCalled();
+      expect(mockPrisma.deployment.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ status: DeploymentStatus.FAILED }),
+        }),
+      );
+      expect(mockAudit.record).toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'deploy.failed' }),
+      );
+    });
+
+    it('C2+C4 module B : garde OFF tombée pendant createProject → SUCCESS persisté puis GEL, AUCUN appel suivant', async () => {
+      enableC2C4();
+      mockPrisma.subscription.findFirst.mockResolvedValue(
+        autoTarget({
+          deploymentModule: autoModule({ kind: 'PER_CLIENT_PROJECT', sharedProjectUuid: null }),
+        }),
+      );
+      mockPrisma.hostingService.findMany.mockResolvedValue([hostingServiceRow()]);
+      happyProvider();
+      mockPrisma.clientProject.findUnique.mockResolvedValue(null);
+      mockTransport.createProject.mockImplementation(async () => {
+        delete process.env.HOSTING_C4_ENABLED; // garde passée OFF PENDANT l'appel
+        return { uuid: 'proj-1', name: 'client-u1' };
+      });
+
+      const out = await service.create(dto({ clientRequestId: CID }), actor);
+
+      expect(out.id).toBe('dep1');
+      // Identifiant reçu CONSERVÉ : consignation SUCCESS + persist exécuté
+      // dans LA MÊME tx de settle (mockTx), avant toute barrière.
+      expect(mockC4.settleStandalone).toHaveBeenCalledTimes(1);
+      expect(mockC4.settleStandalone).toHaveBeenCalledWith(
+        expect.objectContaining({
+          outcome: 'SUCCESS',
+          returnedIdentifiers: { projectUuid: 'proj-1' },
+          persist: expect.any(Function),
+        }),
+      );
+      expect(mockTx.clientProject.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({ projectUuid: 'proj-1' }),
+      });
+      expect(mockTx.deployment.update).toHaveBeenCalledWith({
+        where: { id: 'dep1' },
+        data: expect.objectContaining({ coolifyProjectUuid: 'proj-1', clientProjectId: 'cp-1' }),
+      });
+      // GEL : zéro appel réseau suivant, zéro liaison, zéro transition de statut.
+      expect(mockC4.beginDispatchStandalone).toHaveBeenCalledTimes(1); // seul le projet
+      expect(mockTransport.createGitApp).not.toHaveBeenCalled();
+      expect(mockTransport.deployApp).not.toHaveBeenCalled();
+      expect(mockHosting.markBound).not.toHaveBeenCalled();
+      expect(mockPrisma.deployment.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 'dep1' },
+          data: expect.objectContaining({ detail: expect.stringContaining('figée') }),
+        }),
+      );
+      expect(mockPrisma.deployment.update).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ status: DeploymentStatus.DEPLOYING }),
+        }),
+      );
+      expect(mockHosting.releasePreProvider).not.toHaveBeenCalled();
+    });
+
+    it('C2+C4 : arrêt posé entre deux ops config → 0 dispatch suivant, aucun statut DEPLOYING', async () => {
+      enableC2C4();
+      mockPrisma.hostingService.findMany.mockResolvedValue([hostingServiceRow()]);
+      happyProvider();
+      let stopArmed = false;
+      mockC4.hasStop.mockImplementation(async () => stopArmed);
+      mockTransport.applyAppLimits.mockImplementation(async () => {
+        stopArmed = true; // arrêt posé PENDANT l'opération limites
+        return undefined;
+      });
+
+      const out = await service.create(
+        dto({ clientRequestId: CID, environment: { FOO: 'bar' } }),
+        actor,
+      );
+
+      expect(out.id).toBe('dep1');
+      // 3 dispatches : CREATE app + CONFIGURE env + CONFIGURE limites (PAS de run).
+      expect(mockC4.beginDispatchStandalone).toHaveBeenCalledTimes(3);
+      expect(
+        mockC4.beginDispatchStandalone.mock.calls.slice(1).map((c) => ({
+          nature: (c[0] as { nature: string }).nature,
+          op: (c[0] as { targetIntent: { op?: string } }).targetIntent.op,
+        })),
+      ).toEqual([
+        { nature: 'CONFIGURE', op: 'set_app_environment' },
+        { nature: 'CONFIGURE', op: 'apply_app_limits' },
+      ]);
+      // Aucun dispatch ET aucun appel après l'arrêt (run sauté, gel posé).
+      expect(mockTransport.deployApp).not.toHaveBeenCalled();
+      expect(mockPrisma.deployment.update).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ status: DeploymentStatus.DEPLOYING }),
+        }),
+      );
+      expect(mockPrisma.deployment.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ detail: expect.stringContaining('figée') }),
+        }),
+      );
+      expect(mockAudit.record).not.toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'deploy.create' }),
+      );
+      // La liaison (antérieure à l'arrêt) est conservée — pas de retrait rétroactif.
+      expect(mockHosting.markBound).toHaveBeenCalledTimes(1);
+    });
+
+    it("C2+C4 : arrêt pendant l'allocation DNS → recordId/fqdn/racine conservés DANS la settle (row CS atomique), gel", async () => {
+      enableC2C4();
+      mockPrisma.hostingService.findMany.mockResolvedValue([hostingServiceRow()]);
+      happyProvider();
+      mockCloudflare.findActiveRootDomain.mockResolvedValue({
+        id: 'dom1',
+        name: 'example.com',
+        zoneId: 'zone1',
+        cnameTarget: null,
+        status: 'ACTIVE',
+      });
+      let stopArmed = false;
+      mockC4.hasStop.mockImplementation(async () => stopArmed);
+      mockCloudflare.allocateClientSubdomain.mockImplementation(async () => {
+        stopArmed = true; // arrêt posé PENDANT l'appel réseau DNS
+        return {
+          subdomain: 'monapp',
+          fqdn: 'monapp.example.com',
+          recordId: 'rec-9',
+          domainId: 'dom1',
+        };
+      });
+
+      const out = await service.create(dto({ clientRequestId: CID }), actor);
+
+      expect(out.id).toBe('dep1');
+      // Mode différé exigé sous ON : AUCUNE row écrite par CloudflareService ;
+      // la barrière READ→CREATE est DÉLÉGUÉE au helper (callback vivant).
+      expect(mockCloudflare.allocateClientSubdomain).toHaveBeenCalledWith(
+        expect.objectContaining({ deploymentId: 'dep1' }),
+        { deferRow: true, barrier: expect.any(Function) },
+      );
+      // Identifiants de tentative (dont recordId) consignés + persist ATOMIQUE
+      // dans LE MÊME appel de settle : row ClientSubdomain + champs deployment.
+      expect(mockC4.settleStandalone).toHaveBeenCalledWith(
+        expect.objectContaining({
+          outcome: 'SUCCESS',
+          returnedIdentifiers: {
+            subdomain: 'monapp',
+            fqdn: 'monapp.example.com',
+            domainId: 'dom1',
+            recordId: 'rec-9',
+          },
+          persist: expect.any(Function),
+        }),
+      );
+      expect(mockTx.clientSubdomain.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          subdomain: 'monapp',
+          fqdn: 'monapp.example.com',
+          domainId: 'dom1',
+          recordId: 'rec-9',
+          deploymentId: 'dep1',
+          status: 'CREATED',
+        }),
+      });
+      expect(mockTx.deployment.update).toHaveBeenCalledWith({
+        where: { id: 'dep1' },
+        data: expect.objectContaining({
+          subdomain: 'monapp',
+          fqdn: 'monapp.example.com',
+          domainId: 'dom1',
+        }),
+      });
+      // GEL : aucune poursuite (domaine app + run), aucun statut DEPLOYING,
+      // pas d'audit deploy.domain (la consignation en tient lieu sous ON).
+      expect(mockTransport.setAppDomain).not.toHaveBeenCalled();
+      expect(mockTransport.deployApp).not.toHaveBeenCalled();
+      expect(mockAudit.record).not.toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'deploy.domain' }),
+      );
+      expect(mockAudit.record).not.toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'deploy.create' }),
+      );
+      expect(mockPrisma.deployment.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ detail: expect.stringContaining('figée') }),
+        }),
+      );
+      expect(mockPrisma.deployment.update).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ status: DeploymentStatus.DEPLOYING }),
+        }),
+      );
+    });
+
+    it('C2+C4 : refus de beginDispatch (arrêt) sur op config → GEL, états inchangés, 0 appel réseau suivant', async () => {
+      enableC2C4();
+      mockPrisma.hostingService.findMany.mockResolvedValue([hostingServiceRow()]);
+      happyProvider();
+      // L'arrêt apparaît à la frontière du dispatch CONFIGURE : begin refusé,
+      // barrière relue VRAIE → GEL (jamais de FAILED par le catch général).
+      let armed = false;
+      mockC4.beginDispatchStandalone.mockImplementation((params: { nature: string }) => {
+        if (params.nature === 'CREATE') {
+          return Promise.resolve({ attemptId: 'att-c4-1', targetIntentHash: 'hash-c4-1' });
+        }
+        armed = true;
+        return Promise.reject(
+          new ConflictException('Arrêt demandé sur cette ressource — dispatch refusé.'),
+        );
+      });
+      mockC4.hasStop.mockImplementation(async () => armed);
+
+      const out = await service.create(dto({ clientRequestId: CID, environment: { FOO: 'bar' } }), actor);
+
+      // États inchangés : réponse retournée, statut NON transformé, aucun
+      // audit de transition métier, aucune libération.
+      expect(out.id).toBe('dep1');
+      expect(mockPrisma.deployment.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 'dep1' },
+          data: expect.objectContaining({ detail: expect.stringContaining('figée') }),
+        }),
+      );
+      expect(mockPrisma.deployment.update).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ status: DeploymentStatus.FAILED }),
+        }),
+      );
+      expect(mockAudit.record).not.toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'deploy.failed' }),
+      );
+
+      // Aucun appel réseau après le refus + aucun absorbé par un catch best-effort.
+      expect(mockTransport.setAppEnvironment).not.toHaveBeenCalled();
+      expect(mockTransport.applyAppLimits).not.toHaveBeenCalled();
+      expect(mockTransport.deployApp).not.toHaveBeenCalled();
+      expect(mockAudit.record).not.toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'deploy.env.warn' }),
+      );
+      expect(mockC4.beginDispatchStandalone).toHaveBeenCalledTimes(2); // CREATE + CONFIGURE refusé
+      expect(mockC4.settleStandalone).toHaveBeenCalledTimes(1); // SUCCESS de createGitApp seulement
+      expect(mockHosting.releasePreProvider).not.toHaveBeenCalled();
+    });
+
+    it('C2+C4 : refus de beginDispatch SANS arrêt (créateur non résolu) → toujours propagé (502 + FAILED, jamais absorbé)', async () => {
+      enableC2C4();
+      mockPrisma.hostingService.findMany.mockResolvedValue([hostingServiceRow()]);
+      happyProvider();
+      mockC4.beginDispatchStandalone.mockImplementation((params: { nature: string }) =>
+        params.nature === 'CREATE'
+          ? Promise.resolve({ attemptId: 'att-c4-1', targetIntentHash: 'hash-c4-1' })
+          : Promise.reject(
+              new ConflictException(
+                'Créateur non résolu sur cette allocation — dispatch refusé (incertitude conservée).',
+              ),
+            ),
+      );
+      // hasStop reste FALSE : conflit réel, pas un arrêt → échec classique.
+      mockPrisma.deployment.update.mockResolvedValue(deploymentRow({ status: 'FAILED' }));
+
+      const err = await service
+        .create(dto({ clientRequestId: CID, environment: { FOO: 'bar' } }), actor)
+        .then(
+          () => null,
+          (e: unknown) => e,
+        );
+      expect(err).toBeInstanceOf(BadGatewayException);
+      expect((err as Error).message).toContain('Créateur non résolu');
+      expect(mockTransport.setAppEnvironment).not.toHaveBeenCalled();
+      expect(mockTransport.deployApp).not.toHaveBeenCalled();
+      expect(mockAudit.record).toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'deploy.failed' }),
+      );
+      expect(mockPrisma.deployment.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ status: DeploymentStatus.FAILED }),
+        }),
+      );
+      expect(mockHosting.releasePreProvider).not.toHaveBeenCalled();
+    });
+
+    it('C2+C4 : appel échoue APRÈS bascule OFF → incertitude UNKNOWN consignée, AUCUNE transition métier', async () => {
+      enableC2C4();
+      mockPrisma.hostingService.findMany.mockResolvedValue([hostingServiceRow()]);
+      happyProvider();
+      // La garde C4 passe OFF PENDANT l'appel limites, puis l'appel échoue.
+      mockTransport.applyAppLimits.mockImplementation(async () => {
+        delete process.env.HOSTING_C4_ENABLED;
+        throw new Error('panel timeout après bascule OFF');
+      });
+
+      const out = await service.create(dto({ clientRequestId: CID }), actor);
+
+      // Consignation : UNKNOWN durable sur la tentative CONFIGURE (incertitude
+      // conservée), même si la suite est gelée.
+      expect(mockC4.settleStandalone).toHaveBeenCalledTimes(2); // CREATE SUCCESS + CONFIGURE UNKNOWN
+      expect(mockC4.settleStandalone).toHaveBeenCalledWith(
+        expect.objectContaining({ attemptId: 'att-c4-1', outcome: 'UNKNOWN' }),
+      );
+      // AUCUNE transition métier : pas de FAILED, pas d'audit deploy.failed,
+      // pas de poursuite (DNS/run), pas de libération.
+      expect(out.id).toBe('dep1');
+      expect(mockPrisma.deployment.update).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ status: DeploymentStatus.FAILED }),
+        }),
+      );
+      expect(mockAudit.record).not.toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'deploy.failed' }),
+      );
+      expect(mockTransport.deployApp).not.toHaveBeenCalled();
+      expect(mockCloudflare.allocateClientSubdomain).not.toHaveBeenCalled();
+      expect(mockHosting.releasePreProvider).not.toHaveBeenCalled();
+      expect(mockPrisma.deployment.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ detail: expect.stringContaining('figée') }),
+        }),
+      );
+    });
+
+    it('C2+C4 : arrêt pendant la LECTURE listServers → aucune création suivante (0 tentative, 0 appel réseau), gel', async () => {
+      enableC2C4();
+      mockPrisma.hostingService.findMany.mockResolvedValue([hostingServiceRow()]);
+      happyProvider();
+      let armed = false;
+      mockC4.hasStop.mockImplementation(async () => armed);
+      // La lecture réseau pose l'ARRÊT pendant qu'elle s'exécute.
+      mockTransport.listServers.mockImplementation(async () => {
+        armed = true;
+        return [{ uuid: 'srv-panel-1', ip: 'portal.exemple.com' }];
+      });
+
+      const out = await service.create(dto({ clientRequestId: CID }), actor);
+
+      // Barrière READ → CREATE : aucun dispatch CREATE émis, aucune création.
+      expect(mockC4.beginDispatchStandalone).not.toHaveBeenCalled();
+      expect(mockTransport.createGitApp).not.toHaveBeenCalled();
+      expect(mockTransport.deployApp).not.toHaveBeenCalled();
+      expect(mockHosting.markBound).not.toHaveBeenCalled();
+      expect(mockC4.settleStandalone).not.toHaveBeenCalled();
+      expect(mockHosting.releasePreProvider).not.toHaveBeenCalled();
+      // Gel : vue retournée, statut inchangé, aucun deploy.failed.
+      expect(out.id).toBe('dep1');
+      expect(mockPrisma.deployment.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 'dep1' },
+          data: expect.objectContaining({ detail: expect.stringContaining('figée') }),
+        }),
+      );
+      expect(mockAudit.record).not.toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'deploy.failed' }),
+      );
+    });
+
+    it('C2+C4 : échec réseau ambiguë sur op config → settle UNKNOWN durable + HALT, aucun dispatch suivant, aucune libération', async () => {
+      enableC2C4();
+      mockPrisma.hostingService.findMany.mockResolvedValue([hostingServiceRow()]);
+      happyProvider();
+      mockTransport.applyAppLimits.mockRejectedValue(new Error('panel timeout (5xx ambigu)'));
+
+      const err = await service.create(dto({ clientRequestId: CID }), actor).then(
+        () => null,
+        (e: unknown) => e,
+      );
+      expect(err).toBeInstanceOf(BadGatewayException);
+      expect((err as Error).message).toContain('panel timeout');
+
+      // Tentative CONFIGURE consignée UNKNOWN (jamais FAILED_RETRYABLE) :
+      // sans preuve d'échec définitif, l'incertitude est conservée.
+      expect(mockC4.beginDispatchStandalone).toHaveBeenCalledTimes(2); // CREATE + CONFIGURE
+      expect(mockC4.settleStandalone).toHaveBeenCalledTimes(2);
+      expect(mockC4.settleStandalone).toHaveBeenCalledWith(
+        expect.objectContaining({ attemptId: 'att-c4-1', outcome: 'UNKNOWN' }),
+      );
+      expect(mockC4.settleStandalone).not.toHaveBeenCalledWith(
+        expect.objectContaining({ outcome: 'FAILED_RETRYABLE' }),
+      );
+      // HALT : AUCUN dispatch suivant (DNS/run), aucun best-effort silencieux.
+      expect(mockTransport.deployApp).not.toHaveBeenCalled();
+      expect(mockCloudflare.allocateClientSubdomain).not.toHaveBeenCalled();
+      expect(mockAudit.record).not.toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'deploy.limits' }),
+      );
+      expect(mockAudit.record).toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'deploy.failed' }),
+      );
+      // Post-intention : JAMAIS de libération (un retour tardif pourrait
+      // contredire un nettoyage) — le créateur non résolu bloque aussi remove.
+      expect(mockHosting.releasePreProvider).not.toHaveBeenCalled();
+      expect(mockHosting.markBound).toHaveBeenCalledTimes(1); // liaison antérieure à l'échec
+      expect(mockPrisma.deployment.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ status: DeploymentStatus.FAILED }),
+        }),
+      );
+    });
+
+    it('C2+C4 : parcours nominal complet couvert puis suppression nettoyée — preuve unique + quota libéré', async () => {
+      enableC2C4();
+      mockPrisma.hostingService.findMany.mockResolvedValue([hostingServiceRow()]);
+      happyProvider();
+      mockCloudflare.findActiveRootDomain.mockResolvedValue({
+        id: 'dom1',
+        name: 'example.com',
+        zoneId: 'zone1',
+        cnameTarget: null,
+        status: 'ACTIVE',
+      });
+      mockCloudflare.allocateClientSubdomain.mockResolvedValue({
+        subdomain: 'monapp',
+        fqdn: 'monapp.example.com',
+        recordId: 'rec-9',
+        domainId: 'dom1',
+      });
+
+      const out = await service.create(dto({ clientRequestId: CID }), actor);
+
+      expect(out.id).toBe('dep1');
+      // 5 dispatches couverts (app, limites, DNS, domaine app, run), tous SUCCESS.
+      expect(mockC4.beginDispatchStandalone).toHaveBeenCalledTimes(5);
+      expect(mockC4.settleStandalone).toHaveBeenCalledTimes(5);
+      expect(
+        mockC4.settleStandalone.mock.calls.every(
+          (c) => (c[0] as { outcome: string }).outcome === 'SUCCESS',
+        ),
+      ).toBe(true);
+      expect(mockTransport.createGitApp).toHaveBeenCalledTimes(1);
+      expect(mockTransport.setAppDomain).toHaveBeenCalledWith(
+        expect.anything(),
+        'app-1',
+        'monapp.example.com',
+      );
+      expect(mockTransport.deployApp).toHaveBeenCalledTimes(1);
+      expect(mockPrisma.deployment.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ status: DeploymentStatus.DEPLOYING }),
+        }),
+      );
+      expect(mockAudit.record).toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'deploy.create' }),
+      );
+      expect(mockHosting.markBound).toHaveBeenCalledTimes(1);
+
+      // ── Suppression : garde verte (0 créateur non résolu) → preuve unique ──
+      mockPrisma.deployment.findFirst.mockResolvedValue({
+        ...deploymentRow({ status: 'ACTIVE', appName: 'mon-app' }),
+        server: serverRow(),
+        clientSubdomain: {
+          id: 'cs1',
+          subdomain: 'monapp',
+          domainId: 'dom1',
+          fqdn: 'monapp.example.com',
+          recordId: 'rec-9',
+          deploymentId: 'dep1',
+          domain: { id: 'dom1', name: 'example.com', zoneId: 'zone1' },
+        },
+      });
+      mockPrisma.hostingServiceAllocation.findFirst.mockResolvedValue({
+        id: 'alloc1',
+        status: 'BOUND',
+      });
+      mockPrisma.hostingServiceAllocation.findUnique.mockResolvedValue({ status: 'RELEASED' });
+
+      const removed = await service.remove('dep1', actor);
+
+      expect(removed).toEqual({
+        removed: true,
+        appName: 'mon-app',
+        partial: false,
+        freedQuota: true,
+        c4: { release: expect.objectContaining({ status: 'released' }) },
+      });
+      // UNE SEULE preuve de libération ; liaison localisée via l'allocation
+      // (jamais le repli sur tentative) ; le nettoyage local est DÉLÉGUÉ à la
+      // T-release (paramètre cleanup committé dans SA transaction, simulée ici).
+      expect(mockC4r.releaseAfterCleanup).toHaveBeenCalledTimes(1);
+      expect(mockC4r.releaseAfterCleanup).toHaveBeenCalledWith(
+        expect.objectContaining({
+          allocationId: 'alloc1',
+          app: 'deleted',
+          dns: 'deleted',
+          cleanup: expect.objectContaining({
+            deploymentId: 'dep1',
+            removeClientSubdomain: true,
+            actorUserId: 'u1',
+          }),
+        }),
+      );
+      expect(mockPrisma.c4ProviderAttempt.findFirst).not.toHaveBeenCalled();
+      expect(mockAudit.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'deploy.delete',
+          details: expect.objectContaining({ removed: true, partial: false, freedQuota: true }),
+        }),
+      );
+      expect(mockC4.unresolvedCreative).toHaveBeenCalledWith('alloc1');
+    });
+
+    it('C2 ON + C4 OFF : appel direct best-effort, ZÉRO tentative/barrière, contrat historique préservé', async () => {
+      enableC2(); // C4 OFF par défaut
+      mockPrisma.hostingService.findMany.mockResolvedValue([hostingServiceRow()]);
+      happyProvider();
+
+      const out = await service.create(
+        dto({ clientRequestId: CID, environment: { FOO: 'bar' } }),
+        actor,
+      );
+
+      expect(out.id).toBe('dep1');
+      expect(mockC4.beginDispatchStandalone).not.toHaveBeenCalled();
+      expect(mockC4.settleStandalone).not.toHaveBeenCalled();
+      expect(mockC4.hasStop).not.toHaveBeenCalled();
+      expect(mockTransport.setAppEnvironment).toHaveBeenCalledWith(
+        expect.anything(),
+        'app-1',
+        { FOO: 'bar' },
+      );
+      expect(mockTransport.applyAppLimits).toHaveBeenCalledTimes(1);
+      expect(mockTransport.deployApp).toHaveBeenCalledTimes(1);
+      expect(mockHosting.markBound).toHaveBeenCalledTimes(1); // C2 inchangé
+      expect(mockPrisma.deployment.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ status: DeploymentStatus.DEPLOYING }),
+        }),
+      );
+      expect(mockAudit.record).toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'deploy.create' }),
+      );
+    });
+
+    it('C2+C4 : réponse createGitApp OK + arrêt, PUIS échec du persist (TX annulée) → GEL honnête, tentative DISPATCHED, 0 transition', async () => {
+      enableC2C4();
+      mockPrisma.hostingService.findMany.mockResolvedValue([hostingServiceRow()]);
+      happyProvider();
+      const logSpy = jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+      let stopArmed = false;
+      mockC4.hasStop.mockImplementation(async () => stopArmed);
+      mockTransport.createGitApp.mockImplementation(async () => {
+        stopArmed = true; // arrêt posé pendant la réponse provider (réussie)
+        return { uuid: 'app-1' };
+      });
+      // Échec injecté DANS le persist de la settle SUCCESS → rollback conjoint.
+      mockTx.deployment.update.mockRejectedValueOnce(new Error('TX settle annulée (persist)'));
+
+      const out = await service.create(dto({ clientRequestId: CID }), actor);
+
+      // GEL honnête : détail = consignation ANNULÉE (jamais « identifiants
+      // conservés » quand la TX a été annulée).
+      expect(out.id).toBe('dep1');
+      expect(mockPrisma.deployment.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 'dep1' },
+          data: { detail: expect.stringContaining('identifiants NON enregistrés') },
+        }),
+      );
+      // Statut métier inchangé : AUCUNE écriture FAILED, AUCUN deploy.failed.
+      expect(mockPrisma.deployment.update).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ status: DeploymentStatus.FAILED }),
+        }),
+      );
+      expect(mockAudit.record).not.toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'deploy.failed' }),
+      );
+      // Rollback : l'identifiant provider n'est JAMAIS écrit hors TX annulée.
+      expect(mockPrisma.deployment.update).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ coolifyUuid: expect.anything() }),
+        }),
+      );
+      // Aucun appel suivant (aucune liaison, config, domaine ni run).
+      expect(mockHosting.markBound).not.toHaveBeenCalled();
+      expect(mockTransport.setAppEnvironment).not.toHaveBeenCalled();
+      expect(mockTransport.applyAppLimits).not.toHaveBeenCalled();
+      expect(mockTransport.setAppDomain).not.toHaveBeenCalled();
+      expect(mockTransport.deployApp).not.toHaveBeenCalled();
+      expect(mockCloudflare.allocateClientSubdomain).not.toHaveBeenCalled();
+      // Tentative BLOQUANTE conservée : UNE settle (échec), jamais re-settlée
+      // ni effacée (pas de REFUSED).
+      expect(mockC4.settleStandalone).toHaveBeenCalledTimes(1);
+      expect(mockC4.settleStandalone).not.toHaveBeenCalledWith(
+        expect.objectContaining({ outcome: 'REFUSED' }),
+      );
+      // Échec de consignation SIGNALÉ explicitement (log ERROR, après stop).
+      expect(logSpy).toHaveBeenCalledWith(
+        expect.stringContaining('Consignation SUCCESS échouée après stop/OFF (createGitApp)'),
+      );
+      logSpy.mockRestore();
+    });
+
+    it('C2+C4 : réponse DNS OK + arrêt, PUIS échec du persist (TX annulée) → GEL sans transition, CONFIGURE DISPATCHED', async () => {
+      enableC2C4();
+      mockPrisma.hostingService.findMany.mockResolvedValue([hostingServiceRow()]);
+      happyProvider();
+      const logSpy = jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+      mockCloudflare.findActiveRootDomain.mockResolvedValue({
+        id: 'dom1',
+        name: 'example.com',
+        zoneId: 'zone1',
+        cnameTarget: null,
+        status: 'ACTIVE',
+      });
+      let stopArmed = false;
+      mockC4.hasStop.mockImplementation(async () => stopArmed);
+      mockCloudflare.allocateClientSubdomain.mockImplementation(async () => {
+        stopArmed = true; // arrêt posé pendant l'appel DNS (réponse réussie)
+        return {
+          subdomain: 'monapp',
+          fqdn: 'monapp.example.com',
+          recordId: 'rec-9',
+          domainId: 'dom1',
+        };
+      });
+      // Échec injecté DANS le persist (création row ClientSubdomain) → rollback.
+      mockTx.clientSubdomain.create.mockRejectedValueOnce(
+        new Error('TX settle annulée (persist DNS)'),
+      );
+
+      const out = await service.create(dto({ clientRequestId: CID }), actor);
+
+      expect(out.id).toBe('dep1');
+      // Détail honnête : les identifiants DNS reçus ne sont JAMAIS annoncés
+      // persistés quand la TX est annulée.
+      expect(mockPrisma.deployment.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: { detail: expect.stringContaining('identifiants NON enregistrés') },
+        }),
+      );
+      expect(mockPrisma.deployment.update).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ status: DeploymentStatus.FAILED }),
+        }),
+      );
+      expect(mockAudit.record).not.toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'deploy.failed' }),
+      );
+      // Aucun appel suivant (domaine app, run) ni audit dérivé.
+      expect(mockTransport.setAppDomain).not.toHaveBeenCalled();
+      expect(mockTransport.deployApp).not.toHaveBeenCalled();
+      expect(mockAudit.record).not.toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'deploy.domain' }),
+      );
+      expect(mockAudit.record).not.toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'deploy.create' }),
+      );
+      // Identifiants DNS jamais écrits hors TX annulée.
+      expect(mockPrisma.deployment.update).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ fqdn: 'monapp.example.com' }),
+        }),
+      );
+      // 3 settles : CREATE app SUCCESS + limites SUCCESS + allocate_dns
+      // (SUCCESS dont le persist a échoué = tentative laissée DISPATCHED).
+      expect(mockC4.settleStandalone).toHaveBeenCalledTimes(3);
+      expect(mockC4.settleStandalone).not.toHaveBeenCalledWith(
+        expect.objectContaining({ outcome: 'REFUSED' }),
+      );
+      expect(logSpy).toHaveBeenCalledWith(
+        expect.stringContaining('Consignation SUCCESS échouée après stop/OFF (allocate_dns)'),
+      );
+      logSpy.mockRestore();
+    });
+
+    it('C2+C4 module B : réponse createProject OK + arrêt, PUIS échec du persist (divergence TX) → GEL honnête, 0 création suivante', async () => {
+      enableC2C4();
+      mockPrisma.subscription.findFirst.mockResolvedValue(
+        autoTarget({
+          deploymentModule: autoModule({ kind: 'PER_CLIENT_PROJECT', sharedProjectUuid: null }),
+        }),
+      );
+      mockPrisma.hostingService.findMany.mockResolvedValue([hostingServiceRow()]);
+      happyProvider();
+      const logSpy = jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+      mockPrisma.clientProject.findUnique.mockResolvedValue(null);
+      let stopArmed = false;
+      mockC4.hasStop.mockImplementation(async () => stopArmed);
+      mockTransport.createProject.mockImplementation(async () => {
+        stopArmed = true; // arrêt posé pendant la réponse provider (réussie)
+        return { uuid: 'proj-1', name: 'client-u1' };
+      });
+      // Échec injecté DANS le persist : projet concurrent DIVERGENT →
+      // ConflictException réelle du code = rollback CONJOINT de la settle.
+      mockTx.clientProject.findUnique.mockResolvedValue({
+        id: 'cp-x',
+        projectUuid: 'proj-AUTRE',
+        userId: 'u1',
+        serverId: 'srv-coolify',
+      });
+
+      const out = await service.create(dto({ clientRequestId: CID }), actor);
+
+      expect(out.id).toBe('dep1');
+      // GEL honnête : consignation ANNULÉE, aucun identifiant prétendu.
+      expect(mockPrisma.deployment.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: { detail: expect.stringContaining('identifiants NON enregistrés') },
+        }),
+      );
+      expect(mockPrisma.deployment.update).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ status: DeploymentStatus.FAILED }),
+        }),
+      );
+      expect(mockAudit.record).not.toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'deploy.failed' }),
+      );
+      // Rollback : AUCUNE écriture projet/identifiants hors TX annulée.
+      expect(mockTx.clientProject.create).not.toHaveBeenCalled();
+      expect(mockPrisma.clientProject.create).not.toHaveBeenCalled();
+      expect(mockPrisma.deployment.update).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ coolifyProjectUuid: expect.anything() }),
+        }),
+      );
+      // Gel AVANT toute création suivante : 0 tentative app, 0 réseau app.
+      expect(mockC4.beginDispatchStandalone).toHaveBeenCalledTimes(1); // CREATE projet
+      expect(mockTransport.listServers).not.toHaveBeenCalled();
+      expect(mockTransport.createGitApp).not.toHaveBeenCalled();
+      expect(mockHosting.markBound).not.toHaveBeenCalled();
+      expect(mockTransport.deployApp).not.toHaveBeenCalled();
+      // Tentative projet laissée DISPATCHED (bloquante), jamais re-settlée.
+      expect(mockC4.settleStandalone).toHaveBeenCalledTimes(1);
+      expect(mockC4.settleStandalone).not.toHaveBeenCalledWith(
+        expect.objectContaining({ outcome: 'REFUSED' }),
+      );
+      expect(logSpy).toHaveBeenCalledWith(
+        expect.stringContaining('Consignation SUCCESS échouée après stop/OFF (createProject)'),
+      );
+      logSpy.mockRestore();
+    });
+
+    it('C2+C4 : échec persist SANS arrêt/OFF → toujours propagé (502 + FAILED + deploy.failed), tentative DISPATCHED', async () => {
+      enableC2C4();
+      mockPrisma.hostingService.findMany.mockResolvedValue([hostingServiceRow()]);
+      happyProvider();
+      const logSpy = jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+      // hasStop reste FALSE : pas d'arrêt → contrat ON inchangé (HALT).
+      mockTx.deployment.update.mockRejectedValueOnce(new Error('TX settle annulée (persist)'));
+
+      const err = await service.create(dto({ clientRequestId: CID }), actor).then(
+        () => null,
+        (e: unknown) => e,
+      );
+      expect(err).toBeInstanceOf(BadGatewayException);
+      expect((err as Error).message).toContain('TX settle annulée');
+      expect(mockPrisma.deployment.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ status: DeploymentStatus.FAILED }),
+        }),
+      );
+      expect(mockAudit.record).toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'deploy.failed' }),
+      );
+      // Tentative toujours DISPATCHED (bloquante pour le retry 409) : UNE
+      // settle tentée, jamais re-settlée ; pas de gel, pas de log « après stop ».
+      expect(mockC4.settleStandalone).toHaveBeenCalledTimes(1);
+      expect(mockC4.settleStandalone).not.toHaveBeenCalledWith(
+        expect.objectContaining({ outcome: 'REFUSED' }),
+      );
+      expect(mockHosting.markBound).not.toHaveBeenCalled();
+      expect(mockTransport.deployApp).not.toHaveBeenCalled();
+      expect(logSpy).not.toHaveBeenCalled();
+      logSpy.mockRestore();
     });
   });
 });

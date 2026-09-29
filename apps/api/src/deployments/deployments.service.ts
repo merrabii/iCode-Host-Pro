@@ -4,6 +4,7 @@ import {
   ConflictException,
   ForbiddenException,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
 import {
@@ -23,6 +24,7 @@ import {
   ServerPanelProvider,
   Subscription,
   SubscriptionStatus,
+  SubdomainStatus,
 } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuditService } from '../audit/audit.service';
@@ -32,7 +34,7 @@ import { Actor } from '../users/users.service';
 import { isHostingC2Enabled } from '../hosting/c2-flag';
 import { isHostingC4Enabled } from '../hosting/c4-flag';
 import { C4CapabilityService } from '../hosting/c4-capability.service';
-import { C4ProtocolService } from '../hosting/c4-protocol.service';
+import { C4ProtocolService, C4BarrierAbortError } from '../hosting/c4-protocol.service';
 import { C4ReleaseResult, C4ReleaseService } from '../hosting/c4-release.service';
 import { HostingServicesService } from '../hosting/hosting-services.service';
 import { ReservationPayload, normalizeClientRequestId } from '../hosting/hosting-fingerprint';
@@ -103,6 +105,37 @@ type DeploymentWithRefs = Deployment & {
   server?: { id: string; name: string } | null;
 };
 
+// ── 17B.4F-C4 — couverture des dispatches de configuration ──────────────────
+
+/** Opérations provider post-`createGitApp` couvertes par le protocole C4. */
+type C4ConfigOp =
+  | 'set_app_environment'
+  | 'apply_app_limits'
+  | 'allocate_dns'
+  | 'set_app_domain'
+  | 'deploy_app';
+
+/** Issue d'une opération de configuration : consignée (`ok`), échec réseau
+ *  sous OFF uniquement (`neterr` → best-effort historique ; sous ON, l'échec
+ *  réseau lance UNKNOWN durable + throw) ou barrière post-appel (`frozen`). */
+type C4ConfigRun<T> =
+  | { status: 'ok'; result: T }
+  | { status: 'neterr'; error: unknown }
+  /** `settleFailed` : la settle SUCCESS a échoué (TX annulée) → aucun
+   *  identifiant n'est conservé : le gel doit écrire le détail honnête et ne
+   *  JAMAIS renvoyer `result` comme preuve persistée. */
+  | { status: 'frozen'; result?: T; settleFailed?: boolean };
+
+/** Détail de gel — écriture DU SEUL détail : aucun statut métier, aucune
+ *  liaison, aucune activation après un dispatch confirmé puis figé. */
+const C4_FROZEN_DETAIL =
+  'Création confirmée puis figée (barrière de sécurité) — identifiants conservés, aucune opération supplémentaire. Contactez le support.';
+/** Détail de gel suite à un ÉCHEC DE CONSIGNATION (TX de settle SUCCESS
+ *  annulée APRÈS stop/OFF) : détail honnête — les identifiants ne sont JAMAIS
+ *  annoncés conservés quand le rollback a annulé leur écriture. */
+const C4_FROZEN_SETTLE_FAILED_DETAIL =
+  'Création confirmée puis figée (barrière de sécurité) — consignation ANNULÉE (transaction échouée), identifiants NON enregistrés, aucune opération supplémentaire. Contactez le support.';
+
 /** Mapping best-effort du statut brut Coolify vers notre DeploymentStatus.
  *  Exporté pour réutilisation par ProvisioningService (preuve de mise en ligne
  *  avant confirmation d'une commande store). */
@@ -144,6 +177,8 @@ export function mapCoolifyStatus(raw: string): DeploymentStatus | null {
  */
 @Injectable()
 export class DeploymentsService {
+  private readonly log = new Logger(DeploymentsService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly audit: AuditService,
@@ -513,6 +548,26 @@ export class DeploymentsService {
         },
       });
 
+      // Snapshot de garde C4 pris AVANT le premier dispatch couvert ; les
+      // barrières restent VIVES (relues à chaque frontière via `c4Barrier`).
+      const c4Enabled = isHostingC4Enabled();
+      // Captures non-nulles (TS : `row`/`c2` restent unions — un const local
+      // reste réduit dans les callbacks et dans les barrières).
+      const c2Ctx = c2;
+      const dispatchRowId = row.id;
+      const dispatchOrderId = row.orderId ?? null;
+      // Barrière VIVE : arrêt opposable sur le périmètre OU garde passée OFF
+      // entre-temps — testée AVANT et APRÈS chaque dispatch couvert.
+      const c4Barrier = async (): Promise<boolean> =>
+        (await this.c4.hasStop(
+          C4ProtocolService.scopesFor({
+            order: dispatchOrderId,
+            service: c2Ctx!.hostingServiceId,
+            allocation: c2Ctx!.allocationId,
+            deployment: dispatchRowId,
+          }),
+        )) || !isHostingC4Enabled();
+
       // ── C2 : intention provider DURCIE AVANT toute mutation distante ────────
       // (`createProject` du module B inclus — résolu juste après ce marqueur).
       // Elle ne prouve NI un résultat provider NI une reprise distante : juste
@@ -533,35 +588,157 @@ export class DeploymentsService {
           );
         }
         intentPossessed = true;
-        // 1ʳᵉ mutation distante couverte par l'intention : projet provider.
-        const proj = await this.resolveProject(module, server, actor.sub);
+        // 1ʳᵉ mutation distante couverte par l'intention : projet provider —
+        // sous C4, TENTATIVE CREATE durable émise AVANT `createProject`.
+        const proj = await this.resolveProjectForProvision(module, server, actor.sub, {
+          rowId: dispatchRowId,
+          allocationId: c2.allocationId,
+          orderId: row.orderId ?? null,
+          holder: actor.sub,
+          covered: c4Enabled,
+          barrier: c4Barrier,
+        });
         projectUuid = proj.projectUuid;
         clientProjectId = proj.clientProjectId;
-        await this.prisma.deployment.update({
-          where: { id: row.id },
-          data: {
-            coolifyProjectUuid: projectUuid ?? null,
-            clientProjectId: clientProjectId ?? null,
-          },
-        });
+        // Gel post-projet : identifiants DÉJÀ conservés (settle persist) puis
+        // AUCUNE transition — ni liaison, ni activation, aucun appel suivant.
+        if (proj.frozen) return this.freezeProvision(dispatchRowId, { settleFailed: proj.settleFailed });
+        // Identifiant déjà persisté atomiquement dans la settle → non réécrit.
+        if (!proj.persistedInSettle) {
+          await this.prisma.deployment.update({
+            where: { id: row.id },
+            data: {
+              coolifyProjectUuid: projectUuid ?? null,
+              clientProjectId: clientProjectId ?? null,
+            },
+          });
+        }
       }
 
-      const app = await transport.createGitApp(target, {
-        repoUrl,
-        branch,
-        serviceName: appName,
-        buildPack: packed,
-        appName,
-        projectUuid: projectUuid ?? server.coolifyProjectUuid ?? undefined,
-        serverUuid: await this.resolveCoolifyServerUuid(server, transport),
-        // Phase 16 — build file-based (base directory, commandes).
-        publishDirectory: conn.publishDirectory,
-        baseDirectory: conn.baseDirectory,
-        buildCommand: conn.buildCommand,
-        installCommand: conn.installCommand,
-        // Fix 503 — SPA Vite : transmet is_static:true à Coolify.
-        isStatic: conn.isStatic,
-      });
+      // ── READ d'argument AVANT toute tentative : la résolution du
+      //    `serverUuid` (`listServers` si la valeur n'est pas en base) n'est
+      //    PAS une mutation — lecture d'abord, PUIS barrière VIVE, PUIS
+      //    tentative CREATE. Un arrêt/OFF apparu pendant la lecture
+      //    n'autorise AUCUNE création suivante (0 tentative, 0 appel réseau,
+      //    gel sans transition). Aucun catch n'est ajouté ici : le repli
+      //    best-effort historique de la lecture reste strictement en amont et
+      //    ne peut pas contourner cette barrière. ──────────────────────────
+      const argServerUuid = await this.resolveCoolifyServerUuid(server, transport);
+      if (c2Ctx && c4Enabled && (await c4Barrier())) {
+        return this.freezeProvision(dispatchRowId);
+      }
+
+      // ── 17B.4F-C4 (sous ON uniquement) : tentative CREATE durable émise
+      //    DANS sa propre transaction, AVANT le premier dispatch couvert
+      //    (`createGitApp`) : arrêt opposable + créateur non résolu + takeover
+      //    du périmètre committés avant tout réseau — miroir exact du parcours
+      //    C3. Sous OFF : aucune tentative, contrat historique inchangé. ─────
+      let c4Ticket: { attemptId: string; targetIntentHash: string | null } | null = null;
+      if (c2Ctx && c4Enabled) {
+        try {
+          c4Ticket = await this.c4.beginDispatchStandalone({
+            nature: 'CREATE',
+            scope: { type: 'DEPLOYMENT', id: dispatchRowId },
+            allocationId: c2Ctx.allocationId,
+            orderId: row.orderId,
+            holder: actor.sub,
+            targetIntent: {
+              type: 'application',
+              serverId: server.id,
+              appName,
+              repoUrl,
+              branch,
+              buildPack: packed,
+              projectUuid: projectUuid ?? null,
+            },
+          });
+        } catch (err) {
+          // Refus DÛ À UN ARRÊT (barrière relue) → GEL : le catch général ne
+          // transforme JAMAIS un arrêt C4 en transition métier (FAILED). Les
+          // autres refus (créateur non résolu, tentative déjà ouverte) sont
+          // propagés — conflit réel, jamais absorbé.
+          if (await c4Barrier()) return this.freezeProvision(dispatchRowId);
+          throw err;
+        }
+      }
+
+      let app: { uuid: string };
+      try {
+        app = await transport.createGitApp(target, {
+          repoUrl,
+          branch,
+          serviceName: appName,
+          buildPack: packed,
+          appName,
+          projectUuid: projectUuid ?? server.coolifyProjectUuid ?? undefined,
+          serverUuid: argServerUuid,
+          // Phase 16 — build file-based (base directory, commandes).
+          publishDirectory: conn.publishDirectory,
+          baseDirectory: conn.baseDirectory,
+          buildCommand: conn.buildCommand,
+          installCommand: conn.installCommand,
+          // Fix 503 — SPA Vite : transmet is_static:true à Coolify.
+          isStatic: conn.isStatic,
+        });
+      } catch (err) {
+        if (c4Ticket) {
+          // Résultat provider incertain (timeout / 5xx ambigu) ⇒ outcome
+          // UNKNOWN DURABLE : créateur non résolu, aucun rejeu de création,
+          // aucune libération automatique. TX dédiée : la consignation doit
+          // aboutir même si la suite échoue ; si elle échoue elle-même, la
+          // tentative reste DISPATCHED (incertitude conservée, jamais perdue).
+          try {
+            await this.c4.settleStandalone({
+              attemptId: c4Ticket.attemptId,
+              holder: actor.sub,
+              outcome: 'UNKNOWN',
+              targetIntentHash: c4Ticket.targetIntentHash,
+            });
+          } catch {
+            // Rien à faire : DISPATCHED/UNKNOWN restent bloquants par contrat.
+          }
+          // Appel échoué APRÈS une bascule OFF / un arrêt : l'incertitude
+          // vient d'être consignée ci-dessus, AUCUNE transition métier ensuite
+          // (gel — jamais de FAILED dérivé du catch général).
+          if (await c4Barrier()) return this.freezeProvision(dispatchRowId);
+        }
+        throw err;
+      }
+      if (c4Ticket) {
+        // Consignation SUCCÈS + persistance ATOMIQUE de l'identifiant reçu
+        // (même tx que la vérification d'identité) : si la persistance échoue,
+        // rollback conjoint ⇒ aucun identifiant « enregistré » sans preuve.
+        try {
+          await this.c4.settleStandalone({
+            attemptId: c4Ticket.attemptId,
+            holder: actor.sub,
+            outcome: 'SUCCESS',
+            targetIntentHash: c4Ticket.targetIntentHash,
+            returnedIdentifiers: { uuid: app.uuid },
+            persist: async (ptx) => {
+              await ptx.deployment.update({
+                where: { id: dispatchRowId },
+                data: { coolifyUuid: app.uuid },
+              });
+            },
+          });
+        } catch (err) {
+          // Consignation échouée APRÈS stop/OFF → GEL SANS transition métier
+          // (le catch général ne fabrique JAMAIS un FAILED), tentative laissée
+          // DISPATCHED (bloquante), identifiants JAMAIS annoncés (TX annulée
+          // = rollback conjoint), échec de consignation signalé au log. Sans
+          // arrêt/OFF : propagé (contrat ON inchangé).
+          if (await this.absorbSettleFailureAfterStop('createGitApp', err, c4Barrier)) {
+            return this.freezeProvision(dispatchRowId, { settleFailed: true });
+          }
+          throw err;
+        }
+        // ── Barrière post-appel : un ARRÊT posé (ou la garde passée OFF)
+        //    pendant l'appel n'autorise QUE la consignation déjà effectuée :
+        //    identifiants conservés ci-dessus, puis AUCUNE transition métier
+        //    (pas de liaison, pas d'activation, aucun appel réseau). ────────
+        if (await c4Barrier()) return this.freezeProvision(dispatchRowId);
+      }
       if (c2) {
         // ── Liaison allocation → déploiement. L'uuid est une preuve LOCALE de
         // création d'app (JAMAIS une réussite de déploiement : le run n'est même
@@ -574,13 +751,38 @@ export class DeploymentsService {
           proof: { providerProven: Boolean(app.uuid) },
         });
       }
+      // ── 17B.4F-C4 — chaque opération de configuration est UN dispatch
+      //    couvert : tentative CONFIGURE durable + barrière vivante avant
+      //    (gel gracieux, aucun appel) et après (consignation déjà faite,
+      //    puis gel) — voir `dispatchConfig`. Sous ON, un échec réseau met
+      //    UNKNOWN durable + HALT (jamais de poursuite best-effort) ; sous
+      //    OFF (C2 ou C4) : appel direct + catch, AUCUNE tentative. ───────
+      const c4ConfigCovered = Boolean(c2Ctx) && c4Enabled;
+      const cfgCtx = {
+        dispatchRowId,
+        allocationId: c2Ctx?.allocationId ?? null,
+        orderId: row.orderId ?? null,
+        holder: actor.sub,
+      };
       // Phase 16 — variables d'environnement de BUILD (best-effort : un échec
       // est tracé en warn et n'annule jamais le déploiement).
       if (Object.keys(conn.environment).length) {
-        try {
-          await transport.setAppEnvironment(target, app.uuid, conn.environment);
-        } catch (err) {
-          const m = err instanceof Error ? err.message : String(err);
+        const run = await this.dispatchConfig(
+          c4ConfigCovered,
+          'set_app_environment',
+          cfgCtx,
+          {
+            op: 'set_app_environment',
+            appId: app.uuid,
+            keys: Object.keys(conn.environment).sort(),
+          },
+          () => transport.setAppEnvironment(target, app.uuid, conn.environment),
+          { returned: () => ({ ok: true }) },
+          c4Barrier,
+        );
+        if (run.status === 'frozen') return this.freezeProvision(dispatchRowId, { settleFailed: run.settleFailed });
+        if (run.status === 'neterr') {
+          const m = run.error instanceof Error ? run.error.message : String(run.error);
           await this.audit.record({
             actorId: actor.sub,
             actorEmail: actor.email,
@@ -603,8 +805,17 @@ export class DeploymentsService {
         const limits = eff.limits;
         let limitsStatus: LimitsStatus = LimitsStatus.APPLIED;
         let limitsLastError: string | null = null;
-        try {
-          await transport.applyAppLimits(target, app.uuid, limits);
+        const run = await this.dispatchConfig(
+          c4ConfigCovered,
+          'apply_app_limits',
+          cfgCtx,
+          { op: 'apply_app_limits', appId: app.uuid, limits },
+          () => transport.applyAppLimits(target, app.uuid, limits),
+          { returned: () => ({ ok: true }) },
+          c4Barrier,
+        );
+        if (run.status === 'frozen') return this.freezeProvision(dispatchRowId, { settleFailed: run.settleFailed });
+        if (run.status === 'ok') {
           deployDetail = `Déploiement déclenché — limites appliquées (${limits.memory ?? ''} RAM${limits.cpus ? `, ${limits.cpus} CPU` : ''}).`;
           await this.audit.record({
             actorId: actor.sub,
@@ -614,8 +825,8 @@ export class DeploymentsService {
             resourceId: row.id,
             details: { coolifyUuid: app.uuid, ...limits, packName: pack?.name },
           });
-        } catch (err) {
-          const m = err instanceof Error ? err.message : String(err);
+        } else {
+          const m = run.error instanceof Error ? run.error.message : String(run.error);
           limitsStatus = LimitsStatus.FAILED;
           limitsLastError = m;
           deployDetail = `Déploiement déclenché — AVERTISSEMENT : limites non appliquées (${m}).`;
@@ -651,15 +862,67 @@ export class DeploymentsService {
         if (chosen && (await this.allowClientDomain(actor.sub, chosen))) root = chosen;
       }
       if (root) {
-        try {
-          const alloc = await this.cloudflare.allocateClientSubdomain({
-            root,
-            requested: dto.subdomain,
+        const rootDomain = root;
+        const dnsInput = {
+          root: rootDomain,
+          requested: dto.subdomain,
+          seed: appName || 'app',
+          fallbackHost: server.hostname,
+          deploymentId: dispatchRowId,
+        };
+        const run = await this.dispatchConfig(
+          c4ConfigCovered,
+          'allocate_dns',
+          cfgCtx,
+          {
+            op: 'allocate_dns',
+            deploymentId: dispatchRowId,
+            rootId: rootDomain.id,
+            requested: dto.subdomain ?? null,
             seed: appName || 'app',
-            fallbackHost: server.hostname,
-            deploymentId: row.id,
-          });
-          dns = { subdomain: alloc.subdomain, fqdn: alloc.fqdn, domainId: root.id };
+          },
+          () =>
+            // Sous ON : AUCUNE row écrite pendant l'appel — ClientSubdomain
+            // (recordId) est créée DANS la settle, avec les identifiants de
+            // tentative, pour l'atomicité exigée par le contrat C4 ; la
+            // barrière READ→CREATE est DÉLÉGUÉE au helper (arrêt/OFF pendant
+            // la lecture → `C4BarrierAbortError`, aucune création). Sous OFF :
+            // appel EXACTEMENT historique (row écrite par CloudflareService).
+            c4ConfigCovered
+              ? this.cloudflare.allocateClientSubdomain(dnsInput, { deferRow: true, barrier: c4Barrier })
+              : this.cloudflare.allocateClientSubdomain(dnsInput),
+          {
+            // Identifiants reçus : sous-domaine/fqdn/racine + recordId
+            // conservés DANS la settle (même tx que la row ClientSubdomain).
+            returned: (alloc) => ({
+              subdomain: alloc.subdomain,
+              fqdn: alloc.fqdn,
+              domainId: rootDomain.id,
+              ...(alloc.recordId ? { recordId: alloc.recordId } : {}),
+            }),
+            persist: async (ptx, alloc) => {
+              await ptx.clientSubdomain.create({
+                data: {
+                  subdomain: alloc.subdomain,
+                  domainId: rootDomain.id,
+                  fqdn: alloc.fqdn,
+                  recordId: alloc.recordId ?? null,
+                  status: SubdomainStatus.CREATED,
+                  deploymentId: dispatchRowId,
+                },
+              });
+              await ptx.deployment.update({
+                where: { id: dispatchRowId },
+                data: { subdomain: alloc.subdomain, fqdn: alloc.fqdn, domainId: rootDomain.id },
+              });
+            },
+          },
+          c4Barrier,
+        );
+        if (run.status === 'frozen') return this.freezeProvision(dispatchRowId, { settleFailed: run.settleFailed });
+        if (run.status === 'ok') {
+          const alloc = run.result;
+          dns = { subdomain: alloc.subdomain, fqdn: alloc.fqdn, domainId: rootDomain.id };
           deployDetail += ` App : https://${alloc.fqdn}.`;
           await this.audit.record({
             actorId: actor.sub,
@@ -667,10 +930,10 @@ export class DeploymentsService {
             action: 'deploy.domain',
             resourceType: 'deployment',
             resourceId: row.id,
-            details: { coolifyUuid: app.uuid, subdomain: alloc.subdomain, fqdn: alloc.fqdn, root: root.name },
+            details: { coolifyUuid: app.uuid, subdomain: alloc.subdomain, fqdn: alloc.fqdn, root: rootDomain.name },
           });
-        } catch (err) {
-          const m = err instanceof Error ? err.message : String(err);
+        } else {
+          const m = run.error instanceof Error ? run.error.message : String(run.error);
           deployDetail += ` (DNS : ${m})`;
           await this.audit.record({
             actorId: actor.sub,
@@ -678,7 +941,7 @@ export class DeploymentsService {
             action: 'deploy.domain.warn',
             resourceType: 'deployment',
             resourceId: row.id,
-            details: { coolifyUuid: app.uuid, requested: dto.subdomain, root: root.name, message: m },
+            details: { coolifyUuid: app.uuid, requested: dto.subdomain, root: rootDomain.name, message: m },
           });
         }
       }
@@ -687,10 +950,19 @@ export class DeploymentsService {
       // sous-domaine public (CNAME Cloudflare) renvoie 503 « no available server ».
       // Best-effort, comme dans la voie store (provisioning.actionCreateApp).
       if (dns.fqdn) {
-        try {
-          await transport.setAppDomain(target, app.uuid, dns.fqdn);
-        } catch (err) {
-          const m = err instanceof Error ? err.message : String(err);
+        const fqdn = dns.fqdn;
+        const run = await this.dispatchConfig(
+          c4ConfigCovered,
+          'set_app_domain',
+          cfgCtx,
+          { op: 'set_app_domain', appId: app.uuid, fqdn },
+          () => transport.setAppDomain(target, app.uuid, fqdn),
+          { returned: () => ({ ok: true }) },
+          c4Barrier,
+        );
+        if (run.status === 'frozen') return this.freezeProvision(dispatchRowId, { settleFailed: run.settleFailed });
+        if (run.status === 'neterr') {
+          const m = run.error instanceof Error ? run.error.message : String(run.error);
           deployDetail += ` (domaine app : ${m})`;
           await this.audit.record({
             actorId: actor.sub,
@@ -698,11 +970,22 @@ export class DeploymentsService {
             action: 'deploy.domain.app.warn',
             resourceType: 'deployment',
             resourceId: row.id,
-            details: { coolifyUuid: app.uuid, fqdn: dns.fqdn, message: m },
+            details: { coolifyUuid: app.uuid, fqdn, message: m },
           });
         }
       }
-      await transport.deployApp(target, app.uuid);
+      const runDeploy = await this.dispatchConfig(
+        c4ConfigCovered,
+        'deploy_app',
+        cfgCtx,
+        { op: 'deploy_app', appId: app.uuid },
+        () => transport.deployApp(target, app.uuid),
+        { returned: () => ({ ok: true }) },
+        c4Barrier,
+      );
+      if (runDeploy.status === 'frozen') return this.freezeProvision(dispatchRowId, { settleFailed: runDeploy.settleFailed });
+      // Échec réseau du run : l'erreur d'origine remonte (contrat 502 historique).
+      if (runDeploy.status === 'neterr') throw runDeploy.error;
       const updated = await this.prisma.deployment.update({
         where: { id: row.id },
         data: {
@@ -795,6 +1078,195 @@ export class DeploymentsService {
       // provider aveugle. Contrat 502 inchangé pour le parcours historique. ──
       throw new BadGatewayException(`Échec du déploiement : ${message}`);
     }
+  }
+
+  // ── 17B.4F-C4 — dispatches couverts (projet dédié + configuration) ────────
+
+  /** Gel post-dispatch : ÉCRITURE DU SEUL détail (jamais de statut métier,
+   *  ni liaison, ni activation). Sans échec de settle : identifiants déjà
+   *  conservés (détail classique) ; `settleFailed` (TX annulée après stop/OFF)
+   *  : détail honnête — identifiants NON enregistrés, jamais prétendus. */
+  private async freezeProvision(
+    dispatchRowId: string,
+    opts?: { settleFailed?: boolean },
+  ): Promise<DeploymentView> {
+    const kept = await this.prisma.deployment.update({
+      where: { id: dispatchRowId },
+      data: {
+        detail: opts?.settleFailed
+          ? C4_FROZEN_SETTLE_FAILED_DETAIL
+          : C4_FROZEN_DETAIL,
+      },
+      include: { server: { select: { id: true, name: true } } },
+    });
+    return this.toView(kept);
+  }
+
+  /**
+   * Consignation SUCCESS échouée (TX de settle annulée — callback `persist`
+   * rejeté, identifiants DONC NON persistés) : si un arrêt / bascule OFF est
+   * actif à l'instant de la relecture (barrière VIVE), JAMAIS de transition
+   * métier — tentative laissée `DISPATCHED` (bloquante par contrat, jamais
+   * re-settlée), gel appliqué avec détail honnête (`settleFailed`), et l'échec
+   * de consignation est SIGNALÉ EXPLICITEMENT (log ERROR). Retourne `true` =
+   * gel à appliquer ; `false` = sans arrêt/OFF, l'erreur est propagée au catch
+   * général (contrat ON inchangé : FAILED + 502, tentative toujours
+   * DISPATCHED = bloquante).
+   */
+  private async absorbSettleFailureAfterStop(
+    op: string,
+    err: unknown,
+    barrier: () => Promise<boolean>,
+  ): Promise<boolean> {
+    if (!(await barrier())) return false;
+    this.log.error(
+      `[C4] Consignation SUCCESS échouée après stop/OFF (${op}) : transaction ` +
+        `annulée (identifiants NON persistés), tentative laissée DISPATCHED ` +
+        `(bloquante), AUCUNE transition métier. err=${
+          err instanceof Error ? err.message : String(err)
+        }`,
+    );
+    return true;
+  }
+
+  /**
+   * 17B.4F-C4 — opération de configuration post-`createGitApp` (env, limites,
+   * DNS, domaine, run) sous couverture C4 :
+   *  • barrière PRÉ-dispatch (arrêt opposable OU garde OFF relue) → `frozen` :
+   *    AUCUN dispatch réseau, aucun état modifié (gel gracieux) ;
+   *  • refus de `beginDispatch` (course sur arrêt, créateur non résolu,
+   *    tentative déjà ouverte) : si la barrière relue est vraie (arrêt/OFF) →
+   *    `frozen` (GEL — le catch général ne transforme JAMAIS un arrêt C4 en
+   *    transition métier) ; sinon le refus est propagé, JAMAIS absorbé par le
+   *    catch best-effort de l'appelant ;
+   *  • erreur d'appel → settle **UNKNOWN DURABLE** (les transports n'exposent
+   *    AUCUNE preuve d'échec définitif) PUIS : barrière vraie (bascule OFF /
+   *    arrêt pendant l'appel) → `frozen` = incertitude consignée, AUCUNE
+   *    transition métier ; barrière fausse → THROW (HALT : le catch général →
+   *    FAILED + 502, contrat ON sans arrêt). Un échec de la settle laisse
+   *    `DISPATCHED` (même garantie, a fortiori) ;
+   *  • `C4BarrierAbortError` (barrière READ→CREATE au sein du helper) →
+   *    settle `REFUSED` (« aucune ressource créée », terminale sûre) puis
+   *    `frozen` ;
+   *  • succès → settle SUCCESS + `persist` atomique PUIS barrière
+   *    POST-dispatch → `frozen` si un arrêt/OFF est apparu pendant l'appel ;
+   *  • **échec de cette settle SUCCESS** (TX annulée, identifiants NON
+   *    persistés) → barrière relue vraie (arrêt/OFF) → `frozen` +
+   *    `settleFailed` (gel SANS transition métier, tentative laissée
+   *    DISPATCHED = bloquante, aucun `result` prétendu persisté, échec de
+   *    consignation SIGNALÉ au log) ; barrière fausse → THROW (HALT ON).
+   * Sous OFF (C4 ou C2) : appel direct + catch best-effort (`neterr` →
+   * traitement historique), AUCUNE barrière ni tentative — contrat inchangé.
+   */
+  private async dispatchConfig<T>(
+    covered: boolean,
+    op: C4ConfigOp,
+    ctx: {
+      dispatchRowId: string;
+      allocationId: string | null;
+      orderId: string | null;
+      holder: string;
+    },
+    targetIntent: Record<string, unknown>,
+    call: () => Promise<T>,
+    handlers: {
+      returned: (result: T) => Record<string, unknown>;
+      persist?: (ptx: Prisma.TransactionClient, result: T) => Promise<void>;
+    },
+    barrier: () => Promise<boolean>,
+  ): Promise<C4ConfigRun<T>> {
+    if (!covered) {
+      // Contrat historique : appel direct, best-effort, ZÉRO tentative/barrière.
+      try {
+        return { status: 'ok', result: await call() };
+      } catch (error) {
+        return { status: 'neterr', error };
+      }
+    }
+    if (await barrier()) return { status: 'frozen' };
+    let ticket: { attemptId: string; targetIntentHash: string | null };
+    try {
+      ticket = await this.c4.beginDispatchStandalone({
+        nature: 'CONFIGURE',
+        scope: { type: 'DEPLOYMENT', id: ctx.dispatchRowId },
+        allocationId: ctx.allocationId,
+        orderId: ctx.orderId,
+        holder: ctx.holder,
+        targetIntent,
+      });
+    } catch (error) {
+      // Refus DÛ À UN ARRÊT/OFF (barrière relue) → GEL sans transition
+      // métier ; refus sans arrêt (créateur non résolu, tentative ouverte)
+      // → propagé (conflit réel, jamais absorbé).
+      if (await barrier()) return { status: 'frozen' };
+      throw error;
+    }
+    let result!: T;
+    try {
+      result = await call();
+    } catch (error) {
+      if (error instanceof C4BarrierAbortError) {
+        // Barrière READ→CREATE déclenchée dans le helper : la MUTATION n'a
+        // pas eu lieu → consignation REFUSED (terminale sûre, ne bloque pas)
+        // puis GEL — aucune transition métier.
+        try {
+          await this.c4.settleStandalone({
+            attemptId: ticket.attemptId,
+            holder: ctx.holder,
+            outcome: 'REFUSED',
+            targetIntentHash: ticket.targetIntentHash,
+            returnedIdentifiers: { op, reason: 'barrier_during_read' },
+          });
+        } catch {
+          // Rien à faire : DISPATCHED resterait bloquant par contrat.
+        }
+        return { status: 'frozen' };
+      }
+      // Sous ON : erreur d'appel ⇒ outcome UNKNOWN DURABLE (pas de preuve
+      // d'échec définitif), settle tentée même si la suite est gelée —
+      // l'incertitude est TOUJOURS consignée.
+      try {
+        await this.c4.settleStandalone({
+          attemptId: ticket.attemptId,
+          holder: ctx.holder,
+          outcome: 'UNKNOWN',
+          targetIntentHash: ticket.targetIntentHash,
+          returnedIdentifiers: { error: 'provider_error', op },
+        });
+      } catch {
+        // Rien à faire : DISPATCHED/UNKNOWN restent bloquants par contrat.
+      }
+      // Arrêt/OFF apparu pendant l'appel → GEL sans transition métier
+      // (jamais de FAILED dérivé du catch général) ; sinon HALT : THROW
+      // → catch général → FAILED + 502 (contrat ON sans arrêt).
+      if (await barrier()) return { status: 'frozen' };
+      throw error;
+    }
+    try {
+      await this.c4.settleStandalone({
+        attemptId: ticket.attemptId,
+        holder: ctx.holder,
+        outcome: 'SUCCESS',
+        targetIntentHash: ticket.targetIntentHash,
+        returnedIdentifiers: handlers.returned(result),
+        ...(handlers.persist
+          ? { persist: (ptx: Prisma.TransactionClient) => handlers.persist!(ptx, result) }
+          : {}),
+      });
+    } catch (error) {
+      // Consignation SUCCESS échouée (TX annulée, identifiants NON persistés)
+      // : SI arrêt/OFF actif → GEL sans transition métier, tentative laissée
+      // DISPATCHED (bloquante), SANS `result` (aucun identifiant prétendu
+      // persisté), échec de consignation signalé au log. Sans arrêt/OFF :
+      // propagé (HALT ON inchangé : catch général → FAILED, tentative
+      // toujours DISPATCHED).
+      if (await this.absorbSettleFailureAfterStop(op, error, barrier)) {
+        return { status: 'frozen', settleFailed: true };
+      }
+      throw error;
+    }
+    if (await barrier()) return { status: 'frozen', result };
+    return { status: 'ok', result };
   }
 
   // ── 17B.4F-C2 — parcours sous garde ────────────────────────────────────────
@@ -1208,7 +1680,10 @@ export class DeploymentsService {
     id: string,
     actor: Actor,
   ): Promise<{
-    removed: true;
+    /** D9/honnêteté de réponse : VRAI seulement si la row locale a réellement
+     *  disparu à l'issue de cet appel (un nettoyage bloqué ne prétend jamais
+     *  avoir supprimé). */
+    removed: boolean;
     appName: string | null;
     partial: boolean;
     /** D9 : true SEULEMENT si une libération RELEASED a réellement été committée. */
@@ -1236,7 +1711,22 @@ export class DeploymentsService {
           select: { id: true, status: true },
         })
       : null;
-    if (c4Enabled && allocation && (await this.c4.unresolvedCreative(allocation.id)) > 0) {
+    // Repli C2/C3 × C4 : `markBound` ne pose le lien `deploymentId` qu'après
+    // SUCCÈS provider — sur un échec de création (incertitude UNKNOWN), la row
+    // n'est liée à aucune allocation et la garde ci-dessous ne pourrait jamais
+    // se déclencher (suppression abusive + slot fantôme). On retrouve alors
+    // l'allocation par la tentative de dispatch de CETTE row (portée
+    // DEPLOYMENT, déjà indexée), sans toucher au contrat de liaison C1.
+    let guardAllocationId: string | null = allocation?.id ?? null;
+    if (c4Enabled && !guardAllocationId) {
+      const attempt = await this.prisma.c4ProviderAttempt.findFirst({
+        where: { scopeType: 'DEPLOYMENT', scopeId: id, allocationId: { not: null } },
+        orderBy: { dispatchedAt: 'desc' },
+        select: { allocationId: true },
+      });
+      guardAllocationId = attempt?.allocationId ?? null;
+    }
+    if (c4Enabled && guardAllocationId && (await this.c4.unresolvedCreative(guardAllocationId)) > 0) {
       // Règle GO 4 — DELETE interdit tant qu'un créateur non résolu existe.
       throw new ConflictException(
         'Créateur non résolu sur cette allocation — suppression refusée (incertitude conservée).',
@@ -1510,6 +2000,14 @@ export class DeploymentsService {
     }
 
     const releaseBlocked = c4Release?.status === 'blocked';
+    // Contrat de réponse honnête : `removed` reflète la RÉALITÉ locale (une
+    // T-release bloquée/rollbackée n'a rien supprimé — on ne prétend pas le
+    // contraire). Relecture fraîche plutôt qu'un drapeau dérivé.
+    const localGone = !(await this.prisma.deployment.findUnique({
+      where: { id },
+      select: { id: true },
+    }));
+    const partial = dnsFailed || releaseBlocked;
     await this.audit.record({
       actorId: actor.sub,
       actorEmail: actor.email,
@@ -1522,15 +2020,16 @@ export class DeploymentsService {
         hadCoolifyApp: Boolean(row.coolifyUuid),
         hadSubdomain: Boolean(cs),
         dnsOutcome: dnsFailed ? 'failed' : ownsCs ? 'deleted' : 'absent',
-        partial: dnsFailed || releaseBlocked,
+        removed: localGone,
+        partial,
         freedQuota,
         ...(c4Release ? { c4Release } : {}),
       } as unknown as Prisma.InputJsonValue,
     });
     return {
-      removed: true,
+      removed: localGone,
       appName: row.appName,
-      partial: dnsFailed || releaseBlocked,
+      partial,
       freedQuota,
       ...(c4Release ? { c4: { release: c4Release } } : {}),
     };
@@ -1631,6 +2130,179 @@ export class DeploymentsService {
     // Module B — projet Coolify dédié du client, créé à la première app.
     const cp = await this.getOrCreateClientProject(userId, server, module);
     return { projectUuid: cp.projectUuid, clientProjectId: cp.id };
+  }
+
+  /**
+   * 17B.4F-C4 — résolution du projet provider dans le parcours couvert :
+   *  • aucun module / module A / projet client déjà existant → valeur
+   *    retournée SANS réseau ni tentative (réutilisation normale, zéro
+   *    dispatch inutile — la 2ᵉ app du client recrée JAMAIS un projet) ;
+   *  • sous OFF (C4) → `getOrCreateClientProject` historique exact ;
+   *  • sous ON, module B, première app → TENTATIVE CREATE durable émise AVANT
+   *    `createProject` : échec réseau → settle UNKNOWN durable + rethrow (le
+   *    flux s'arrête là : aucun `createGitApp`, aucune libération) ; succès →
+   *    settle SUCCESS avec `persist` ATOMIQUE (row projet + identifiants sur la
+   *    row déploiement DANS LA MÊME tx — rollback conjoint si échec, jamais
+   *    d'identifiant prétendu enregistré sans preuve ; divergence d'uuid →
+   *    Conflict annulant la settle, jamais d'écrasement) PUIS barrière
+   *    post-appel (arrêt/OFF apparu pendant l'appel → `frozen` : identifiants
+   *    conservés, aucune transition). Si la settle SUCCESS elle-même échoue
+   *    (TX annulée) : barrière relue vraie → `frozen` + `settleFailed` (aucun
+   *    identifiant prétendu, tentative DISPATCHED = bloquante, échec de
+   *    consignation SIGNALÉ au log, jamais de transition métier) ; barrière
+   *    fausse → propagé (contrat ON inchangé).
+   * Aucune suppression de projet partagé n'est jamais émise ici.
+   */
+  private async resolveProjectForProvision(
+    module: DeploymentModule | null,
+    server: Server,
+    userId: string,
+    ctx: {
+      rowId: string;
+      allocationId: string;
+      orderId: string | null;
+      holder: string;
+      covered: boolean;
+      barrier: () => Promise<boolean>;
+    },
+  ): Promise<{
+    projectUuid?: string;
+    clientProjectId?: string;
+    persistedInSettle?: boolean;
+    frozen?: boolean;
+    /** Settle SUCCESS annulée (persist rejeté) : identifiants NON persistés —
+     *  le gel doit écrire le détail honnête, jamais « identifiants conservés ». */
+    settleFailed?: boolean;
+  }> {
+    if (!module) {
+      // Aucun module configuré → comportement historique : projet du serveur.
+      return { projectUuid: server.coolifyProjectUuid ?? undefined };
+    }
+    const mod = module;
+    if (mod.kind === DeploymentModuleKind.SHARED_PROJECT) {
+      if (!mod.sharedProjectUuid) {
+        throw new BadRequestException(
+          "Le module partagé n'a pas de projet Coolify configuré (page Packs).",
+        );
+      }
+      return { projectUuid: mod.sharedProjectUuid };
+    }
+    // Module B — UN SEUL projet dédié par (client, serveur) : existant →
+    // réutilisé tel quel, AUCUNE tentative ni appel réseau (dédupe historique).
+    const key = { userId, serverId: server.id };
+    const existing = await this.prisma.clientProject.findUnique({
+      where: { userId_serverId: key },
+    });
+    if (existing) {
+      return { projectUuid: existing.projectUuid, clientProjectId: existing.id };
+    }
+    if (!ctx.covered) {
+      // Garde OFF : chemin historique (création paresseuse + persist dédié).
+      const cp = await this.getOrCreateClientProject(userId, server, mod);
+      return { projectUuid: cp.projectUuid, clientProjectId: cp.id };
+    }
+
+    const name = `${mod.perClientPrefix}-${userId}`;
+    // Cible UNIQUE et correcte du projet : l'UUID du SERVEUR Coolify (jamais
+    // `coolifyProjectUuid`, qui est un projet, pas le serveur) — la MÊME
+    // valeur figée sert la tentative et l'appel provider.
+    const serverUuid = server.coolifyServerUuid ?? '0';
+    // Tentative CREATE durable COMMITTÉE avant le réseau (miroir du parcours C3).
+    let ticket: { attemptId: string; targetIntentHash: string | null };
+    try {
+      ticket = await this.c4.beginDispatchStandalone({
+        nature: 'CREATE',
+        scope: { type: 'DEPLOYMENT', id: ctx.rowId },
+        allocationId: ctx.allocationId,
+        orderId: ctx.orderId,
+        holder: ctx.holder,
+        targetIntent: {
+          type: 'project',
+          serverId: server.id,
+          serverUuid,
+          name,
+        },
+      });
+    } catch (err) {
+      // Refus DÛ À UN ARRÊT/OFF (barrière relue) → GEL : jamais le catch
+      // général ne transforme l'arrêt en transition métier ; sinon propagé.
+      if (await ctx.barrier()) return { frozen: true };
+      throw err;
+    }
+    let created: { uuid: string };
+    try {
+      created = await this.panelFactory.create().createProject(this.buildTarget(server), {
+        name,
+        description: 'Projet Coolify dédié du client (Module B).',
+        serverUuid,
+      });
+    } catch (err) {
+      // Incertitude DURABLE : créateur non résolu, aucun rejeu, aucune libération.
+      try {
+        await this.c4.settleStandalone({
+          attemptId: ticket.attemptId,
+          holder: ctx.holder,
+          outcome: 'UNKNOWN',
+          targetIntentHash: ticket.targetIntentHash,
+        });
+      } catch {
+        // Rien à faire : DISPATCHED/UNKNOWN restent bloquants par contrat.
+      }
+      // Appel échoué APRÈS bascule OFF/arrêt : incertitude consignée ci-
+      // dessus, AUCUNE transition métier (gel) — jamais de FAILED dérivé.
+      if (await ctx.barrier()) return { frozen: true };
+      throw err;
+    }
+    const projectUuid = created.uuid;
+    let persistedId: string | undefined;
+    try {
+      await this.c4.settleStandalone({
+        attemptId: ticket.attemptId,
+        holder: ctx.holder,
+        outcome: 'SUCCESS',
+        targetIntentHash: ticket.targetIntentHash,
+        returnedIdentifiers: { projectUuid },
+        persist: async (ptx) => {
+          const row = await ptx.clientProject.findUnique({ where: { userId_serverId: key } });
+          let clientProjectId: string;
+          if (row) {
+            if (row.projectUuid !== projectUuid) {
+              // Course concurrente divergente : rollback CONJOINT de la settle —
+              // jamais d'écrasement d'un identifiant déjà engagé.
+              throw new ConflictException(
+                'Projet dédié divergent détecté pour ce client/serveur — consignation annulée.',
+              );
+            }
+            clientProjectId = row.id;
+          } else {
+            clientProjectId = (
+              await ptx.clientProject.create({
+                data: { ...key, moduleId: mod.id, name, projectUuid },
+              })
+            ).id;
+          }
+          await ptx.deployment.update({
+            where: { id: ctx.rowId },
+            data: { coolifyProjectUuid: projectUuid, clientProjectId },
+          });
+          persistedId = clientProjectId;
+        },
+      });
+    } catch (err) {
+      // Consignation SUCCESS échouée (TX annulée — divergence concurrente ou
+      // écriture rejetée) : SI arrêt/OFF actif → GEL SANS transition métier,
+      // tentative laissée DISPATCHED (bloquante). Le rollback conjoint annule
+      // TOUTES les écritures de `persist` : retour `frozen` SANS `projectUuid`
+      // ni `clientProjectId` (aucun identifiant prétendu), échec de
+      // consignation signalé au log. Sans arrêt/OFF : propagé (contrat ON
+      // inchangé).
+      if (await this.absorbSettleFailureAfterStop('createProject', err, ctx.barrier)) {
+        return { frozen: true, settleFailed: true };
+      }
+      throw err;
+    }
+    const frozen = await ctx.barrier();
+    return { projectUuid, clientProjectId: persistedId, persistedInSettle: true, frozen };
   }
 
   /**

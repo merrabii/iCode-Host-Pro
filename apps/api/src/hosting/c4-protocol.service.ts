@@ -47,6 +47,22 @@ export interface C4SettleParams {
 /** Natures dont le dispatch est INTERDIT après un arrêt (rule 3). */
 const STOP_BLOCKED_NATURES: readonly C4Nature[] = ['CREATE', 'CONFIGURE'];
 
+/**
+ * 17B.4F-C4 — barrière AU SEIN d'un helper à frontières READ → CREATE/CONFIGURE
+ * (ex. `allocateClientSubdomain` : `findRecordByName` puis `createRecord`) :
+ * la lecture réseau a eu lieu, un arrêt/OFF est apparu entre-temps — le helper
+ * ABANDONNE la mutation et signale « aucune ressource créée » (le caller
+ * consigne `REFUSED`, terminale sûre, puis GEL sans transition métier).
+ * Aucun catch de lecture ne peut contourner ce signal : il est levé AVANT la
+ * création, hors de tout embranchement de lecture.
+ */
+export class C4BarrierAbortError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'C4BarrierAbortError';
+  }
+}
+
 /** Stabilisation JSON (clés triées récursivement) pour un hash déterministe. */
 function stableStringify(value: unknown): string {
   if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';

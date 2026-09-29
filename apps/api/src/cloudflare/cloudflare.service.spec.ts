@@ -2,6 +2,7 @@ import { ConflictException } from '@nestjs/common';
 import { Domain, SubdomainStatus } from '@prisma/client';
 import { CloudflareService } from './cloudflare.service';
 import { CloudflareTransport } from './cloudflare.transport';
+import { C4BarrierAbortError } from '../hosting/c4-protocol.service';
 
 // Phase 3 — unit du service Cloudflare : le jeton n'est JAMAIS renvoyé
 // (vue hasApiToken), il est chiffré à l'écriture, la racine est ≤ 1, et
@@ -163,6 +164,72 @@ describe('CloudflareService', () => {
           data: expect.objectContaining({ status: SubdomainStatus.CREATED, recordId: 'rec-42', deploymentId: 'dep1' }),
         }),
       );
+    });
+
+    // 17B.4F-C4 — mode différé : la row ClientSubdomain (recordId) est créée
+    // par le caller DANS LA MÊME tx que sa consignation de tentative.
+    it('deferRow (C4) : AUCUNE row écrite ici — recordId/domainId renvoyés pour la settle', async () => {
+      mockTransport.findRecordByName.mockResolvedValue(null);
+      mockPrisma.clientSubdomain.findFirst.mockResolvedValue(null);
+      mockTransport.createRecord.mockResolvedValue('rec-77');
+
+      const out = await service.allocateClientSubdomain(baseInput, { deferRow: true });
+
+      expect(out).toEqual({
+        subdomain: 'monapp',
+        fqdn: 'monapp.arumdigital.com',
+        recordId: 'rec-77',
+        domainId: 'dom1',
+      });
+      expect(mockPrisma.clientSubdomain.create).not.toHaveBeenCalled(); // écriture DÉFÉRÉE
+      expect(mockTransport.createRecord).toHaveBeenCalledTimes(1); // réseau réel effectué
+    });
+
+    it('deferRow (C4) : échec réseau → aucune row ERROR (la trace d’incertitude est la tentative UNKNOWN)', async () => {
+      mockTransport.findRecordByName.mockResolvedValue(null);
+      mockPrisma.clientSubdomain.findFirst.mockResolvedValue(null);
+      mockTransport.createRecord.mockRejectedValue(new Error('Cloudflare API : timeout'));
+
+      await expect(
+        service.allocateClientSubdomain(baseInput, { deferRow: true }),
+      ).rejects.toThrow(/timeout/);
+      expect(mockPrisma.clientSubdomain.create).not.toHaveBeenCalled();
+    });
+
+    // 17B.4F-C4 — barrière READ → CREATE au sein du helper : l'arrêt/OFF
+    // apparu pendant la lecture (findRecordByName) annule la mutation.
+    it('barrière : arrêt pendant la lecture DNS → AUCUNE création suivante (C4BarrierAbortError)', async () => {
+      mockPrisma.clientSubdomain.findFirst.mockResolvedValue(null);
+      let armed = false;
+      mockTransport.findRecordByName.mockImplementation(async () => {
+        armed = true; // l'arrêt apparaît PENDANT la lecture (READ)
+        return null;
+      });
+
+      await expect(
+        service.allocateClientSubdomain(baseInput, {
+          deferRow: true,
+          barrier: async () => armed,
+        }),
+      ).rejects.toBeInstanceOf(C4BarrierAbortError);
+
+      // Aucune mutation : ni record Cloudflare, ni row locale (même deferRow).
+      expect(mockTransport.createRecord).not.toHaveBeenCalled();
+      expect(mockPrisma.clientSubdomain.create).not.toHaveBeenCalled();
+    });
+
+    it('barrière : lecture verte (aucun arrêt) → création normale avec recordId', async () => {
+      mockTransport.findRecordByName.mockResolvedValue(null);
+      mockPrisma.clientSubdomain.findFirst.mockResolvedValue(null);
+      mockTransport.createRecord.mockResolvedValue('rec-1');
+
+      const out = await service.allocateClientSubdomain(baseInput, {
+        deferRow: true,
+        barrier: async () => false,
+      });
+
+      expect(out.recordId).toBe('rec-1');
+      expect(mockTransport.createRecord).toHaveBeenCalledTimes(1);
     });
 
     it('auto-slug re-tries with a suffix when the base name is taken (no explicit request)', async () => {

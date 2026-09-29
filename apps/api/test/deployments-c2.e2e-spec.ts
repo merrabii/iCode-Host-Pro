@@ -687,6 +687,61 @@ describe('Deployments 17B.4F-C2 — garde HOSTING_C2_ENABLED (e2e)', () => {
       expect(fakeCreateGitApp.mock.calls.length).toBe(gitBefore);
     });
 
+    it('C2+C4 : échec provider → row NON liée + tentative scope DEPLOYMENT, DELETE → 409 (repli garde), aucune libération', async () => {
+      // Interleave C2×C4 : sous C4 ON, la tentative CREATE durable existe mais
+      // `markBound` (succès) n'a jamais lié la row — la garde « créateur non
+      // résolu » doit se retrouver via la tentative de portée DEPLOYMENT.
+      const ORIGINAL_C4_ENV = process.env.HOSTING_C4_ENABLED;
+      process.env.HOSTING_C4_ENABLED = 'true';
+      try {
+        fakeCreateGitApp.mockRejectedValueOnce(new Error('panel timeout c2c4'));
+        const cidT = newClientRequestId();
+        const allocBefore = await consuming(mainSvc);
+        const gitBefore = fakeCreateGitApp.mock.calls.length;
+
+        const res = await post(token[mainEmail], {
+          repoFullName: 'owner/demo',
+          clientRequestId: cidT,
+          hostingServiceId: mainSvc,
+        });
+        expect(res.status).toBe(502);
+        expect(fakeCreateGitApp.mock.calls.length).toBe(gitBefore + 1); // UN appel, aucun rejeu
+
+        const failed = await prisma.deployment.findFirst({
+          where: { user: { email: mainEmail }, status: 'FAILED' },
+          orderBy: { createdAt: 'desc' },
+        });
+        expect(failed).toBeTruthy();
+        const alloc = await prisma.hostingServiceAllocation.findFirst({
+          where: { idempotencyKey: { contains: cidT } },
+        });
+        expect(alloc).toBeTruthy();
+        expect(alloc!.deploymentId).toBeNull(); // markBound jamais tourné
+        expect(alloc!.providerIntentAt).not.toBeNull();
+        expect(await consuming(mainSvc)).toBe(allocBefore + 1); // incertain = consommé
+
+        const att = await prisma.c4ProviderAttempt.findFirst({
+          where: { scopeType: 'DEPLOYMENT', scopeId: failed!.id },
+        });
+        expect(att).toBeTruthy();
+        expect(att!.allocationId).toBe(alloc!.id); // prémisse du repli de remove()
+
+        const del = await request(app.getHttpServer())
+          .delete(`/${GlobalPrefix}/client/deployments/${failed!.id}`)
+          .set('Authorization', `Bearer ${token[mainEmail]}`);
+        expect(del.status).toBe(409);
+        expect(String(del.body.message)).toContain('Créateur non résolu');
+        // État adressable conservé : aucune écriture locale, aucune libération.
+        expect(await prisma.deployment.findUnique({ where: { id: failed!.id } })).toBeTruthy();
+        expect(await consuming(mainSvc)).toBe(allocBefore + 1);
+        expect(await prisma.c4ReleaseEvidence.count({ where: { allocationId: alloc!.id } })).toBe(0);
+        expect(fakeCreateGitApp.mock.calls.length).toBe(gitBefore + 1);
+      } finally {
+        if (ORIGINAL_C4_ENV === undefined) delete process.env.HOSTING_C4_ENABLED;
+        else process.env.HOSTING_C4_ENABLED = ORIGINAL_C4_ENV;
+      }
+    });
+
     it('B0 plein (5/5) : rejeu d’une opération existante renvoyée, NOUVEAU clientRequestId → 403 sans slot consommé', async () => {
       // Remplissage du quota pack (maxApps=5) pour quotaEmail — tout en C2.
       const firstCid = newClientRequestId();

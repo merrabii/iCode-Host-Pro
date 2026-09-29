@@ -10,6 +10,7 @@ import { Domain, DomainStatus, Prisma, SubdomainStatus } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuditService } from '../audit/audit.service';
 import { CryptoService, MailCryptoError } from '../crypto/crypto.service';
+import { C4BarrierAbortError } from '../hosting/c4-protocol.service';
 import {
   CfDnsRecord,
   CfZone,
@@ -59,6 +60,12 @@ export interface AvailabilityView {
 export interface AllocatedSubdomain {
   subdomain: string;
   fqdn: string;
+  /** Uniquement en mode différé (couverture C4) : preuve provider renvoyée au
+   *  caller pour être persistée ATOMIQUEMENT avec la consignation de la
+   *  tentative — la row ClientSubdomain est alors créée DANS la même tx que le
+   *  settle, jamais dans une écriture séparée préalable. */
+  recordId?: string;
+  domainId?: string;
 }
 
 const DEFAULT_SETTINGS_VIEW: Omit<CloudflareSettingsView, 'id' | 'createdAt' | 'updatedAt'> = {
@@ -432,14 +439,27 @@ export class CloudflareService {
    *   domaine, audit warn côté déploiement) ;
    * - auto (slug du nom de service) & pris → réessai avec suffixe court.
    */
-  async allocateClientSubdomain(input: {
-    root: Domain;
-    requested?: string;
-    seed: string;
-    fallbackHost: string;
-    /** FK → Deployment.id ; null côté store (pas de Deployment rows). */
-    deploymentId?: string;
-  }): Promise<AllocatedSubdomain> {
+  async allocateClientSubdomain(
+    input: {
+      root: Domain;
+      requested?: string;
+      seed: string;
+      fallbackHost: string;
+      /** FK → Deployment.id ; null côté store (pas de Deployment rows). */
+      deploymentId?: string;
+    },
+    options?: {
+      /** Mode différé (C4) : AUCUNE écriture ClientSubdomain ici — le recordId
+       *  est renvoyé pour être persisté par le caller dans LA MÊME tx que la
+       *  consignation de sa tentative (atomicité exigée par le protocole). */
+      deferRow?: boolean;
+      /** Barrière vivante (C4) : re-vérifiée APRÈS les lectures (READ) et
+       *  AVANT `createRecord` (CREATE) — un arrêt/OFF apparu pendant la
+       *  lecture annule la mutation (lévée `C4BarrierAbortError`, aucune
+       *  ressource créée, aucun contournement possible par un catch). */
+      barrier?: () => Promise<boolean>;
+    },
+  ): Promise<AllocatedSubdomain> {
     const { root } = input;
     const t = await this.target();
     const transport = this.cfFactory.create();
@@ -458,7 +478,22 @@ export class CloudflareService {
       const existing = await transport.findRecordByName(t, root.zoneId, fqdn);
       const takenLocally = !!((await this.prisma.clientSubdomain.findFirst({ where: { fqdn } })));
       if (!existing && !takenLocally) {
-        return this.createSubdomainRecord({ t, transport, root, subdomain, fqdn, content, deploymentId: input.deploymentId });
+        // Barrière READ → CREATE : lectures terminées, AVANT toute mutation.
+        if (options?.barrier && (await options.barrier())) {
+          throw new C4BarrierAbortError(
+            `Arrêt/garde C4 pendant la lecture DNS (${fqdn}) — création du record annulée.`,
+          );
+        }
+        return this.createSubdomainRecord({
+          t,
+          transport,
+          root,
+          subdomain,
+          fqdn,
+          content,
+          deploymentId: input.deploymentId,
+          deferRow: options?.deferRow,
+        });
       }
       if (requestedExplicit) {
         throw new BadRequestException(`Sous-domaine déjà pris : ${fqdn}`);
@@ -467,7 +502,10 @@ export class CloudflareService {
     throw new BadRequestException(`Impossible de trouver un sous-domaine libre sous ${root.name}.`);
   }
 
-  /** Crée le CNAME (proxied, ttl auto) puis la row ClientSubdomain. `deploymentId` nullable côté store. */
+  /** Crée le CNAME (proxied, ttl auto) puis la row ClientSubdomain. `deploymentId` nullable côté store.
+   *  `deferRow` (C4) : renvoie recordId/domainId SANS écrire la row — le caller la crée
+   *  dans LA MÊME transaction que sa consignation de tentative ; l'échec réseau ne laisse
+   *  alors aucune row locale (la trace d'incertitude est C4ProviderAttempt UNKNOWN). */
   private async createSubdomainRecord(args: {
     t: CloudflareTarget;
     transport: CloudflareTransport;
@@ -476,6 +514,7 @@ export class CloudflareService {
     fqdn: string;
     content: string;
     deploymentId?: string;
+    deferRow?: boolean;
   }): Promise<AllocatedSubdomain> {
     const { t, transport, root, subdomain, fqdn, content } = args;
     let recordId: string | null = null;
@@ -488,6 +527,7 @@ export class CloudflareService {
         ttl: 1,
       });
     } catch (err) {
+      if (args.deferRow) throw err; // trace = tentative C4 (UNKNOWN), aucune row locale
       await this.prisma.clientSubdomain.create({
         data: {
           subdomain,
@@ -498,6 +538,9 @@ export class CloudflareService {
         },
       });
       throw err;
+    }
+    if (args.deferRow) {
+      return { subdomain, fqdn, recordId: recordId ?? undefined, domainId: root.id };
     }
     await this.prisma.clientSubdomain.create({
       data: {
