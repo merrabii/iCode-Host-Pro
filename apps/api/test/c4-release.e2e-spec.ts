@@ -532,6 +532,14 @@ describe('17B.4F-C4 — tentatives/libération/finalize (e2e base isolée c4test
     const cs = await prisma.clientSubdomain.findFirst({ where: { deploymentId: dep.id } });
     expect(cs?.recordId).toBe('fake-rec-1');
     expect(order.domainValue).toBe(cs?.fqdn);
+
+    // 17B.4F-C4 (Point 3) — la settle D'ALLOC DNS porte les identifiants
+    // COMPLETS (subdomain/fqdn/recordId) : la row ClientSubdomain est créée
+    // DANS CETTE settle (persist conjoint), jamais à côté.
+    const dnsIds = (configure[0].returnedIdentifiers ?? {}) as Record<string, unknown>;
+    expect(dnsIds.subdomain).toBe(cs?.subdomain);
+    expect(dnsIds.fqdn).toBe(cs?.fqdn);
+    expect(dnsIds.recordId).toBe('fake-rec-1');
   });
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -1050,6 +1058,94 @@ describe('17B.4F-C4 — tentatives/libération/finalize (e2e base isolée c4test
         (await prisma.hostingService.findUniqueOrThrow({ where: { orderId } })).status,
       ).not.toBe(HostingServiceStatus.PROVISIONING); // jamais le miroir figé
     });
+
+    it('garde TX ① arrêt : stop ORDER posé → finalize 409 « Arrêt demandé », zéro preuve/audit, statuts inchangés', async () => {
+      const orderId = await seedBoundNotActivated('fin6');
+      const alloc6 = await allocOf(orderId);
+      allocIds.push(alloc6!.id);
+      await c4.requestStop({ scope: { type: 'ORDER', id: orderId }, reason: 'e2e finalize stop' });
+
+      // Le probe réseau passe (garde posée DANS la TX finale, pas avant).
+      const probeBefore = fakeDeploymentStatus.mock.calls.length;
+      fakeDeploymentStatus.mockResolvedValueOnce({ rawStatus: 'finished' });
+      const res = await postFinalize(orderId, 'finalize malgre arret');
+      expect(res.status).toBe(409);
+      expect(res.body.message).toContain('Arrêt demandé');
+      expect(fakeDeploymentStatus.mock.calls.length).toBe(probeBefore + 1); // probe unique consommé
+
+      expect(await prisma.c4ReadinessProof.findUnique({ where: { orderId } })).toBeNull();
+      expect(
+        await prisma.auditLog.count({
+          where: { action: 'provision.finalize.c4', resourceId: orderId },
+        }),
+      ).toBe(0);
+      expect((await prisma.order.findUniqueOrThrow({ where: { id: orderId } })).status).toBe(
+        OrderStatus.PROVISIONING,
+      );
+      expect(
+        (await prisma.hostingService.findUniqueOrThrow({ where: { orderId } })).status,
+      ).toBe(HostingServiceStatus.PROVISIONING);
+      expect(
+        (await prisma.deployment.findUniqueOrThrow({ where: { orderId } })).status,
+      ).toBe(DeploymentStatus.DEPLOYING);
+    });
+
+    it('garde TX ② tentative ouverte : créative DISPATCHED → 409 « non résolue », 0 preuve ; consignée → 201 ACTIVE + preuve', async () => {
+      const orderId = await seedBoundNotActivated('fin7');
+      const alloc7 = await allocOf(orderId);
+      allocIds.push(alloc7!.id);
+      const dep7 = await prisma.deployment.findUniqueOrThrow({ where: { orderId } });
+
+      // Crash simulé : tentative créative committée mais jamais consignée.
+      const open = await prisma.c4ProviderAttempt.create({
+        data: {
+          nature: 'CONFIGURE',
+          phase: 'DISPATCHED',
+          scopeType: 'DEPLOYMENT',
+          scopeId: dep7.id,
+          allocationId: alloc7!.id,
+          orderId,
+          holder: 'e2e-unresolved',
+        },
+      });
+
+      fakeDeploymentStatus.mockResolvedValueOnce({ rawStatus: 'finished' });
+      const refused = await postFinalize(orderId, 'finalize tentative ouverte');
+      expect(refused.status).toBe(409);
+      expect(refused.body.message).toContain('Tentative provider non résolue');
+      expect(await prisma.c4ReadinessProof.findUnique({ where: { orderId } })).toBeNull();
+      expect(
+        await prisma.auditLog.count({
+          where: { action: 'provision.finalize.c4', resourceId: orderId },
+        }),
+      ).toBe(0);
+      expect((await prisma.order.findUniqueOrThrow({ where: { id: orderId } })).status).toBe(
+        OrderStatus.PROVISIONING,
+      );
+
+      // Consignation de la tentative (outcome terminal) → la garde ne voit
+      // plus de créateur non résolu → finalisation possible.
+      await prisma.c4ProviderAttempt.update({
+        where: { id: open.id },
+        data: { phase: 'RETURNED', outcome: 'REFUSED', returnedAt: new Date() },
+      });
+      fakeDeploymentStatus.mockResolvedValueOnce({ rawStatus: 'finished' });
+      const ok = await postFinalize(orderId, 'finalize apres resolution tentative');
+      expect(ok.status).toBe(201);
+      expect(ok.body).toMatchObject({ orderId, status: 'ACTIVE', replay: false });
+      expect((await prisma.order.findUniqueOrThrow({ where: { id: orderId } })).status).toBe(
+        OrderStatus.ACTIVE,
+      );
+      expect(await prisma.c4ReadinessProof.findUnique({ where: { orderId } })).toBeTruthy();
+      expect(
+        await prisma.auditLog.count({
+          where: { action: 'provision.finalize.c4', resourceId: orderId },
+        }),
+      ).toBe(1);
+      expect(
+        (await prisma.hostingService.findUniqueOrThrow({ where: { orderId } })).status,
+      ).toBe(HostingServiceStatus.ACTIVE);
+    });
   });
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -1119,9 +1215,17 @@ describe('17B.4F-C4 — tentatives/libération/finalize (e2e base isolée c4test
 
       // Zéro tentative C4 sous OFF (parcours C3 legacy : cycle ACTIF intact).
       expect(await attemptsOf(orderId)).toHaveLength(0);
-      expect((await prisma.order.findUniqueOrThrow({ where: { id: orderId } })).status).toBe(
-        OrderStatus.ACTIVE,
-      );
+      const orderOff = await prisma.order.findUniqueOrThrow({ where: { id: orderId } });
+      expect(orderOff.status).toBe(OrderStatus.ACTIVE);
+
+      // Contrat OFF historique (Point 3 — régression) : row ClientSubdomain
+      // ÉCRITE PAR LE HELPER (aucune settle n'existe sous OFF) + fqdn livré.
+      const depOff = await prisma.deployment.findUniqueOrThrow({ where: { orderId } });
+      const csOff = await prisma.clientSubdomain.findFirst({
+        where: { deploymentId: depOff.id },
+      });
+      expect(csOff?.recordId).toBe('fake-rec-1');
+      expect(csOff?.fqdn).toBe(orderOff.domainValue);
 
       // Les marqueurs POSÉS sous ON ne sont JAMAIS effacés par le flag.
       const t3Stop = await prisma.c4StopRequest.findFirst({
@@ -1352,6 +1456,113 @@ describe('17B.4F-C4 — tentatives/libération/finalize (e2e base isolée c4test
       appIdentifier: dep.coolifyUuid,
       dnsIdentifier: cs!.fqdn,
     });
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // 11B — DNS du parcours store sous C4 ON (Point 3) : barrière READ→CREATE
+  //       + rollback TX réel du persist (contrat C4 pointé côté client store)
+  // ═══════════════════════════════════════════════════════════════════════
+  it('DNS store (ON) : arrêt pendant la lecture → C4BarrierAbortError, tentative REFUSED, AUCUNE row/record, AUCUNE transition, step FAILED', async () => {
+    const orderId = await seedOrder('dnsbar');
+    const readsBefore = fakeCfTransport.findRecordByName.mock.calls.length;
+    const createsBefore = fakeCfTransport.createRecord.mock.calls.length;
+
+    // La LECTURE DNS pose l'ARRÊT : la barrière vivante doit annuler la
+    // création AVANT toute mutation (createRecord JAMAIS appelé).
+    fakeCfTransport.findRecordByName.mockImplementationOnce(async () => {
+      await c4.requestStop({ scope: { type: 'ORDER', id: orderId }, reason: 'e2e dns barrier' });
+      return null;
+    });
+    await runProvision(orderId);
+
+    expect(fakeCfTransport.findRecordByName.mock.calls.length).toBe(readsBefore + 1);
+    expect(fakeCfTransport.createRecord.mock.calls.length).toBe(createsBefore); // ZÉRO mutation
+
+    // Tentative CONFIGURE (dns) consignée REFUSED (terminale sûre, ne bloque
+    // pas) — CREATE antérieure intacte.
+    const attempts = await attemptsOf(orderId);
+    expect(attempts).toHaveLength(2); // CREATE SUCCESS + CONFIGURE REFUSED
+    const dns = attempts.find((a) => a.nature === 'CONFIGURE');
+    expect(dns).toBeTruthy();
+    expect(dns!.phase).toBe('RETURNED');
+    expect(dns!.outcome).toBe('REFUSED');
+    expect(
+      (dns!.returnedIdentifiers as { reason?: string } | null)?.reason,
+    ).toBe('barrier_during_read');
+    expect(attempts.find((a) => a.nature === 'CREATE')?.outcome).toBe('SUCCESS');
+
+    // AUCUNE écriture DNS locale (aucune row, aucun fqdn livré)…
+    const depBar = await prisma.deployment.findUniqueOrThrow({ where: { orderId } });
+    expect(await prisma.clientSubdomain.count({ where: { deploymentId: depBar.id } })).toBe(0);
+    const orderBar = await prisma.order.findUniqueOrThrow({ where: { id: orderId } });
+    expect(orderBar.domainValue).toBeNull();
+    // …et AUCUNE transition métier : step FAILED (bookkeeping) puis cycle
+    // GELÉ par l'arrêt (contrat C4 : aucun flip dérivé d'une fermeture).
+    expect(orderBar.status).toBe(OrderStatus.PROVISIONING);
+    expect(
+      (await prisma.hostingService.findUniqueOrThrow({ where: { orderId } })).status,
+    ).toBe(HostingServiceStatus.PROVISIONING);
+    const depBarAfter = await prisma.deployment.findUniqueOrThrow({ where: { orderId } });
+    expect(depBarAfter.coolifyUuid).toBeTruthy(); // uuid CREATE consigné AVANT le DNS
+    expect(depBarAfter.status).toBe(DeploymentStatus.DEPLOYING);
+    const allocBar = await allocOf(orderId);
+    allocIds.push(allocBar!.id);
+    expect(allocBar?.status).toBe(HostingServiceAllocationStatus.RESERVED); // TX-E gelée
+    expect(
+      await prisma.provisioningLog.count({ where: { orderId, status: 'FAILED' } }),
+    ).toBe(1);
+  });
+
+  it('DNS store (ON) : conflit fqdn RÉEL pendant la settle → rollback TX conjoint (tentative DISPATCHED, aucune row partielle), step FAILED, HALT ON', async () => {
+    const orderId = await seedOrder('dnsrace');
+    // Sous-domaine déterministe pour connaître le fqdn visé par l'allocation.
+    await prisma.order.update({
+      where: { id: orderId },
+      data: { requestedSubdomain: 'racedns' },
+    });
+    const dom = await prisma.domain.findUniqueOrThrow({ where: { id: domainId } });
+    const targetFqdn = `racedns.${dom.name}`;
+
+    // Concurrence RÉELLE : un writer externe commit la row `fqdn` PENDANT
+    // l'appel réseau (createRecord) → le persist de la settle subit un VRAI
+    // P2002 (unicité PostgreSQL) → rollback TX conjoint vérifié en base.
+    fakeCfTransport.createRecord.mockImplementationOnce(async () => {
+      await prisma.clientSubdomain.create({
+        data: { subdomain: 'racedns', domainId, fqdn: targetFqdn, status: 'CREATED' },
+      });
+      return 'fake-rec-race';
+    });
+    await runProvision(orderId);
+
+    // Rollback réel : tentative LAISSÉE DISPATCHED (update RETURNED +
+    // création row annulés ensemble), incertitude conservée.
+    const attempts = await attemptsOf(orderId);
+    const dns = attempts.find((a) => a.nature === 'CONFIGURE');
+    expect(dns).toBeTruthy();
+    expect(dns!.phase).toBe('DISPATCHED');
+    expect(dns!.outcome).toBeNull();
+    expect(dns!.returnedIdentifiers).toBeNull();
+
+    // AUCUNE écriture PARTIELLE de notre allocation : une SEULE row (celle du
+    // concurrent, jamais liée à ce déploiement, aucun recordId), zéro doublon.
+    const rows = await prisma.clientSubdomain.findMany({ where: { fqdn: targetFqdn } });
+    expect(rows).toHaveLength(1);
+    expect(rows[0].deploymentId).toBeNull();
+    expect(rows[0].recordId).toBeNull(); // notre row (recordId 'fake-rec-race') n'a JAMAIS été créée
+
+    // HALT ON sans arrêt : step FAILED, AUCUNE transition, fqdn jamais livré.
+    const orderRace = await prisma.order.findUniqueOrThrow({ where: { id: orderId } });
+    expect(orderRace.status).toBe(OrderStatus.PROVISIONING);
+    expect(orderRace.domainValue).toBeNull();
+    expect(
+      await prisma.provisioningLog.count({ where: { orderId, status: 'FAILED' } }),
+    ).toBe(1);
+    // La consignation CREATE antérieure (TX dédiée) reste intacte.
+    const depRace = await prisma.deployment.findUniqueOrThrow({ where: { orderId } });
+    expect(depRace.coolifyUuid).toBeTruthy();
+    const allocRace = await allocOf(orderId);
+    allocIds.push(allocRace!.id);
+    expect(allocRace?.status).toBe(HostingServiceAllocationStatus.BOUND); // TX-E déjà tournée
   });
 
   // ═══════════════════════════════════════════════════════════════════════

@@ -15,6 +15,7 @@ import {
   Prisma,
   ProvisioningStepStatus,
   ProvisionAction,
+  SubdomainStatus,
 } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuditService } from '../audit/audit.service';
@@ -36,7 +37,7 @@ import { isHostingC3Enabled } from '../hosting/c3-flag';
 import { isHostingC4Enabled } from '../hosting/c4-flag';
 import { C3CapabilityService } from '../hosting/c3-capability.service';
 import { C4CapabilityService } from '../hosting/c4-capability.service';
-import { C4ProtocolService } from '../hosting/c4-protocol.service';
+import { C4ProtocolService, C4BarrierAbortError } from '../hosting/c4-protocol.service';
 import { HostingServicesService } from '../hosting/hosting-services.service';
 import { ReservationPayload, storeIdempotencyKey } from '../hosting/hosting-fingerprint';
 import { isAbsentExternalError } from './order-cancel.service';
@@ -2275,6 +2276,23 @@ export class ProvisioningService {
     if (ctx.fqdn) return { fqdn: ctx.fqdn, message: `Sous-domaine déjà alloué : https://${ctx.fqdn}` };
 
     // ── 17B.4F-C4 : émission/consignation de la tentative CONFIGURE (DNS) ───
+    const c4Covered = !!(ctx.c4 && ctx.guard);
+    /**
+     * Barrière vivante (miroir exact du parcours C2) : un ARRÊT posé (ou la
+     * garde passée OFF) pendant les lectures DNS annule la mutation — aucune
+     * création Cloudflare/row locale ne peut contourner un arrêt.
+     */
+    const c4Barrier = async (): Promise<boolean> => {
+      if (!c4Covered) return false;
+      if (!isHostingC4Enabled()) return true;
+      return this.c4.hasStop(
+        C4ProtocolService.scopesFor({
+          order: ctx.order.id,
+          service: ctx.c4!.serviceId,
+          allocation: ctx.c4!.allocationId,
+        }),
+      );
+    };
     const c4Emit = async (
       intent: Record<string, unknown>,
     ): Promise<{ attemptId: string; targetIntentHash: string | null } | null> => {
@@ -2292,8 +2310,9 @@ export class ProvisioningService {
     };
     const c4Settle = async (
       ticket: { attemptId: string; targetIntentHash: string | null } | null,
-      outcome: 'SUCCESS' | 'UNKNOWN',
+      outcome: 'SUCCESS' | 'REFUSED' | 'UNKNOWN',
       identifiers: Record<string, unknown>,
+      persist?: (ptx: Prisma.TransactionClient) => Promise<void>,
     ): Promise<void> => {
       if (!ticket || !ctx.c4) return;
       // TX dédiée hors garde Order : la consignation (vérité reçue du réseau,
@@ -2304,21 +2323,43 @@ export class ProvisioningService {
         outcome,
         targetIntentHash: ticket.targetIntentHash,
         returnedIdentifiers: identifiers,
+        ...(persist ? { persist } : {}),
       });
     };
     const allocWithC4 = async (
       intent: Record<string, unknown>,
-      fn: () => Promise<{ subdomain: string; fqdn: string }>,
+      fn: () => Promise<{ subdomain: string; fqdn: string; recordId?: string }>,
+      persist?: (
+        ptx: Prisma.TransactionClient,
+        result: { subdomain: string; fqdn: string; recordId?: string },
+      ) => Promise<void>,
     ): Promise<{ subdomain: string; fqdn: string }> => {
       const ticket = await c4Emit(intent);
-      let result: { subdomain: string; fqdn: string };
+      let result: { subdomain: string; fqdn: string; recordId?: string };
       try {
         result = await fn();
       } catch (err) {
+        if (err instanceof C4BarrierAbortError) {
+          // Barrière READ→CREATE déclenchée dans le helper : AUCUNE mutation
+          // n'a eu lieu → consignation REFUSED (terminale sûre, ne bloque pas)
+          // puis propagation — le step est marqué FAILED (bookkeeping) puis la
+          // boucle GÈLE sous arrêt : JAMAIS de transition métier.
+          await c4Settle(ticket, 'REFUSED', { reason: 'barrier_during_read' });
+          throw err;
+        }
         await c4Settle(ticket, 'UNKNOWN', {});
         throw err;
       }
-      await c4Settle(ticket, 'SUCCESS', { fqdn: result.fqdn });
+      await c4Settle(
+        ticket,
+        'SUCCESS',
+        {
+          subdomain: result.subdomain,
+          fqdn: result.fqdn,
+          ...(result.recordId ? { recordId: result.recordId } : {}),
+        },
+        persist ? (ptx) => persist(ptx, result) : undefined,
+      );
       return result;
     };
 
@@ -2368,6 +2409,35 @@ export class ProvisioningService {
         })
       : null;
     let alloc: { subdomain: string; fqdn: string };
+    // ── 17B.4F-C4 (sous ON uniquement) : AUCUNE row écrite pendant l'appel —
+    //    ClientSubdomain (recordId) est créée DANS la settle, avec les
+    //    identifiants de tentative (atomicité exigée par le contrat C4) ; la
+    //    barrière READ→CREATE est DÉLÉGUÉE au helper (arrêt/OFF pendant la
+    //    lecture → `C4BarrierAbortError`, aucune création). Sous OFF : appel
+    //    EXACTEMENT historique (row écrite par CloudflareService).
+    const callAlloc = (
+      input: Parameters<CloudflareService['allocateClientSubdomain']>[0],
+    ): ReturnType<CloudflareService['allocateClientSubdomain']> =>
+      c4Covered
+        ? this.cloudflare.allocateClientSubdomain(input, { deferRow: true, barrier: c4Barrier })
+        : this.cloudflare.allocateClientSubdomain(input);
+    const persistRow = c4Covered
+      ? async (
+          ptx: Prisma.TransactionClient,
+          r: { subdomain: string; fqdn: string; recordId?: string },
+        ) => {
+          await ptx.clientSubdomain.create({
+            data: {
+              subdomain: r.subdomain,
+              domainId: root.id,
+              fqdn: r.fqdn,
+              recordId: r.recordId ?? null,
+              status: SubdomainStatus.CREATED,
+              ...(existingDeployment ? { deploymentId: existingDeployment.id } : {}),
+            },
+          });
+        }
+      : undefined;
     if (fullOrder?.requestedSubdomain) {
       const fqdn = `${fullOrder.requestedSubdomain.trim().toLowerCase()}.${root.name}`;
       const existing = await this.prisma.clientSubdomain.findFirst({ where: { fqdn } });
@@ -2393,25 +2463,27 @@ export class ProvisioningService {
         alloc = await allocWithC4(
           { rootId: root.id, requested: fullOrder.requestedSubdomain, fallbackHost, seed },
           () =>
-            this.cloudflare.allocateClientSubdomain({
+            callAlloc({
               root,
               seed,
               fallbackHost,
               requested: fullOrder.requestedSubdomain ?? undefined,
               ...(existingDeployment ? { deploymentId: existingDeployment.id } : {}),
             }),
+          persistRow,
         );
       }
     } else {
       alloc = await allocWithC4(
         { rootId: root.id, fallbackHost, seed },
         () =>
-          this.cloudflare.allocateClientSubdomain({
+          callAlloc({
             root,
             seed,
             fallbackHost,
             ...(existingDeployment ? { deploymentId: existingDeployment.id } : {}),
           }),
+        persistRow,
       );
     }
     // Si la row n'existait pas au moment de l'alloc (CREATE_APP après DNS),
