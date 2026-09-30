@@ -625,11 +625,16 @@ select:disabled {
   backdrop-filter: blur(2px);
   display: none;
   opacity: 0;
-  transition: opacity .25s ease;
+  visibility: hidden;
+  pointer-events: none;
+  transition: opacity .25s ease, visibility 0s linear .25s;
 }
 
 .mobile-nav-overlay.open {
   opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+  transition: opacity .25s ease, visibility 0s;
 }
 
 .mobile-nav {
@@ -648,11 +653,14 @@ select:disabled {
   gap: 10px;
   overflow-y: auto;
   transform: translateX(-105%);
-  transition: transform .28s var(--ease-spring);
+  visibility: hidden;
+  transition: transform .28s var(--ease-spring), visibility 0s linear .28s;
 }
 
 .mobile-nav.open {
   transform: translateX(0);
+  visibility: visible;
+  transition: transform .28s var(--ease-spring), visibility 0s;
 }
 
 .mobile-nav .mobile-nav-head {

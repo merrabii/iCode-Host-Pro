@@ -3,15 +3,19 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
 import { AppShell } from '@/components/app-shell';
+import { spaceNavFor } from '@/config/nav';
 import { PageLoading } from '@/components/ui';
 import { useToast } from '@/components/toast';
 import {
+  fetchMe,
   getClientKnowledge,
+  getSessionToken,
   listClientKnowledge,
   listClientKnowledgeCategories,
   type KnowledgeArticle,
   type KnowledgeArticleSummary,
   type KnowledgeType,
+  type Me,
 } from '@/lib/api';
 import { IconBook, IconChevronRight, IconLifeBuoy, IconSearch } from '@/components/icons';
 import { useBrand } from '@/components/brand-provider';
@@ -49,6 +53,21 @@ export default function AidePage() {
 
   const [open, setOpen] = useState<KnowledgeArticle | null>(null);
   const [reading, setReading] = useState(false);
+
+  // Session optionnelle (sans redirection) : navigation cohérente au rôle + pied de page exact.
+  const [shellMe, setShellMe] = useState<Me | null>(null);
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      const t = await getSessionToken();
+      if (!t) return;
+      const m = await fetchMe(t);
+      if (alive && m) setShellMe(m);
+    })();
+    return () => {
+      alive = false;
+    };
+  }, []);
 
   const load = useCallback(async (category: string, query: string) => {
     const [r, c] = await Promise.all([
@@ -92,7 +111,7 @@ export default function AidePage() {
   if (loading) return <PageLoading label="Chargement du centre d’aide…" />;
 
   return (
-    <AppShell me={null} nav={[]} footStatus={`${articles.length} articles`}>
+    <AppShell me={shellMe} nav={spaceNavFor(shellMe?.role)} footStatus={`${articles.length} articles`}>
       <div className="wrap-lg">
         {/* ── Héro ──────────────────────────────────────────────────────── */}
         <div className="aide-hero">

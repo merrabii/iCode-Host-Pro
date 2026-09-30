@@ -226,12 +226,21 @@ export function inviteLink(token: string, email: string): string {
 // ── Phase 5 (ADR-021) — client workspace (Subscription) ────────────────────
 // Bloc 4 : la table Service a été supprimée — tout abonnement/service passe par
 // POST /store/checkout (order-driven). Aucune création manuelle.
+export interface SubscriptionPackRef {
+  id: string;
+  name: string;
+  ramMb: number;
+  cpuCores: number;
+  storageLimit: number | null;
+  maxApps?: number | null;
+  deploymentModule?: { id: string; code: string; name: string } | null;
+}
 export interface ProductRef {
   id: string;
   name: string;
   kind?: string;
   status?: string;
-  pack?: PackMin | null;
+  pack?: SubscriptionPackRef | null;
 }
 export interface SubscriptionOrderRef {
   id: string;

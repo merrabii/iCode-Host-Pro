@@ -18,6 +18,7 @@ import {
   IconShield,
   IconUsers,
 } from '@/components/icons';
+import { isAdminRole, isSupportRole } from '@/lib/session';
 
 /** Navigation de la console d'administration (Phase 10 : + Sécurité + Support). */
 export const ADMIN_NAV: NavSection[] = [
@@ -82,8 +83,11 @@ export const CLIENT_NAV: NavSection[] = [
       { label: 'Centre d’aide', href: '/aide', icon: IconLifeBuoy },
     ],
   },
-  {
-    section: 'Administration',
-    items: [{ label: 'Console admin', href: '/manager', icon: IconGrid }],
-  },
 ];
+
+/** Navigation de l'espace courant selon le rôle (pages partagées : /profil, /aide). */
+export function spaceNavFor(role?: string | null): NavSection[] {
+  if (role && isAdminRole(role)) return ADMIN_NAV;
+  if (role && isSupportRole(role)) return SUPPORT_NAV;
+  return CLIENT_NAV;
+}

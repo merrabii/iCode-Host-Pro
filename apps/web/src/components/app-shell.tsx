@@ -2,7 +2,7 @@
 
 import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
-import { useEffect, useState, type ComponentType, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type ComponentType, type ReactNode } from 'react';
 import { useBrand } from './brand-provider';
 import { BrandLogo } from './brand-logo';
 import { roleLabel } from '@/lib/session';
@@ -80,6 +80,8 @@ export function AppShell({
 
   // Tiroir de navigation mobile (repliée < 900px).
   const [navOpen, setNavOpen] = useState(false);
+  const hamburgerRef = useRef<HTMLButtonElement>(null);
+  const drawerRef = useRef<HTMLElement>(null);
 
   // Verrouille le défilement de la page quand le tiroir est ouvert.
   useEffect(() => {
@@ -91,6 +93,48 @@ export function AppShell({
   useEffect(() => {
     setNavOpen(false);
   }, [pathname]);
+
+  const drawerWasOpen = useRef(false);
+  useEffect(() => {
+    if (!navOpen) {
+      if (drawerWasOpen.current) {
+        drawerWasOpen.current = false;
+        const el = document.activeElement;
+        const inDrawer = !!el && !!drawerRef.current && drawerRef.current.contains(el);
+        if (!el || el === document.body || el === document.documentElement || inDrawer) {
+          hamburgerRef.current?.focus();
+        }
+      }
+      return;
+    }
+    drawerWasOpen.current = true;
+    drawerRef.current?.querySelector<HTMLElement>('[data-nav-close]')?.focus();
+
+    function onKeyDown(e: KeyboardEvent) {
+      if (e.key === 'Escape') {
+        setNavOpen(false);
+        return;
+      }
+      if (e.key !== 'Tab' || !drawerRef.current) return;
+      const focusables = Array.from(
+        drawerRef.current.querySelectorAll<HTMLElement>('a[href], button:not([disabled])'),
+      );
+      if (focusables.length === 0) return;
+      const first = focusables[0]!;
+      const last = focusables[focusables.length - 1]!;
+      const active = document.activeElement as HTMLElement | null;
+      const inside = !!active && drawerRef.current.contains(active);
+      if (e.shiftKey && (active === first || !inside)) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && (active === last || !inside)) {
+        e.preventDefault();
+        first.focus();
+      }
+    }
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, [navOpen]);
 
   function isActive(href: string): boolean {
     if (href === '/') return pathname === '/';
@@ -134,6 +178,7 @@ export function AppShell({
           {!bare && (
             <button
               type="button"
+              ref={hamburgerRef}
               className={`hamburger${navOpen ? ' open' : ''}`}
               onClick={() => setNavOpen((o) => !o)}
               aria-label={navOpen ? 'Fermer la navigation' : 'Ouvrir la navigation'}
@@ -252,7 +297,12 @@ export function AppShell({
             onClick={() => setNavOpen(false)}
             aria-hidden
           />
-          <aside className={`mobile-nav${navOpen ? ' open' : ''}`} aria-label="Navigation mobile">
+          <aside
+            ref={drawerRef}
+            className={`mobile-nav${navOpen ? ' open' : ''}`}
+            aria-label="Navigation mobile"
+            inert={!navOpen}
+          >
             <div className="mobile-nav-head">
               {brand.logoType === 'DEFAULT' ? (
                 <span className="logo-badge" aria-hidden>
@@ -265,6 +315,15 @@ export function AppShell({
                 <span className="brand-title">{brand.name}</span>
                 <span className="brand-sub">{brand.sub}</span>
               </div>
+              <button
+                type="button"
+                className="icon-btn"
+                data-nav-close
+                onClick={() => setNavOpen(false)}
+                aria-label="Fermer la navigation"
+              >
+                ✕
+              </button>
             </div>
             {navTree}
             <button type="button" className="refresh-btn" onClick={() => window.location.reload()}>

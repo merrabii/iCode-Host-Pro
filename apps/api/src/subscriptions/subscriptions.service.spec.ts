@@ -264,11 +264,34 @@ describe('SubscriptionsService', () => {
   });
 
   describe('ownership guards', () => {
-    it('listMySubscriptions scopes to the actor', async () => {
+    it('listMySubscriptions scopes to the actor and exposes the public pack view', async () => {
       mockPrisma.subscription.findMany.mockResolvedValue([]);
       await service.listMySubscriptions(user);
       expect(mockPrisma.subscription.findMany).toHaveBeenCalledWith(
-        expect.objectContaining({ where: { userId: 'u1' } }),
+        expect.objectContaining({
+          where: { userId: 'u1' },
+          include: {
+            product: {
+              select: {
+                id: true,
+                name: true,
+                kind: true,
+                status: true,
+                pack: {
+                  select: {
+                    id: true,
+                    name: true,
+                    ramMb: true,
+                    cpuCores: true,
+                    storageLimit: true,
+                    maxApps: true,
+                    deploymentModule: { select: { id: true, code: true, name: true } },
+                  },
+                },
+              },
+            },
+          },
+        }),
       );
     });
   });

@@ -570,6 +570,7 @@ export default function ClientPage() {
 
   const activeSub = subs.find((s) => s.status === 'ACTIVE') ?? null;
   const currentPack = activeSub?.product?.pack ?? null;
+  const pendingCount = subs.filter((s) => s.status === 'PENDING').length;
   const availablePlans = products.filter((p) => p.status === 'ACTIVE' && p.pack);
   const banner = isImp ? (
     <ImpersonationBanner targetEmail={me?.email ?? ''} kind={impKind} onReturn={onReturn} />
@@ -938,8 +939,14 @@ export default function ClientPage() {
             title={activeSub ? 'Souscription active' : 'Aucune souscription active'}
             sub={
               activeSub
-                ? `${activeSub.product?.name ?? activeSub.productId} · souscrite le ${new Date(activeSub.createdAt).toLocaleDateString()}`
-                : 'Souscrivez à une offre ci-dessous pour déployer vos applications.'
+                ? `${activeSub.product?.name ?? activeSub.productId} · souscrite le ${new Date(activeSub.createdAt).toLocaleDateString()}${
+                    pendingCount > 0
+                      ? ` · ${pendingCount} souscription${pendingCount > 1 ? 's' : ''} en attente`
+                      : ''
+                  }`
+                : pendingCount > 0
+                  ? 'Une souscription est en attente de confirmation de paiement.'
+                  : 'Souscrivez à une offre ci-dessous pour déployer vos applications.'
             }
           >
             {activeSub && currentPack ? (
@@ -969,11 +976,18 @@ export default function ClientPage() {
                   )}
                 </div>
               </div>
+            ) : activeSub ? (
+              <EmptyState>
+                Souscription active sans pack d’hébergement rattaché : les limites du plan ne sont pas lisibles ici —
+                contactez le support.
+              </EmptyState>
             ) : (
               <EmptyState>
                 {subs.length === 0
                   ? 'Commander une offre ci-dessous : une souscription active (payée) débloque le déploiement.'
-                  : 'Votre souscription n’est pas active — passez une commande pour débloquer le déploiement.'}
+                  : pendingCount > 0
+                    ? 'Une souscription est en attente de confirmation — elle s’active après validation du paiement.'
+                    : 'Votre souscription n’est pas active — passez une commande pour débloquer le déploiement.'}
               </EmptyState>
             )}
 

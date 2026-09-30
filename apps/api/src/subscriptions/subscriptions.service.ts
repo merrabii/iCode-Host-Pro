@@ -106,7 +106,25 @@ export class SubscriptionsService {
     return this.prisma.subscription.findMany({
       where: { userId: actor.sub },
       include: {
-        product: { select: { id: true, name: true, kind: true, status: true } },
+        product: {
+          select: {
+            id: true,
+            name: true,
+            kind: true,
+            status: true,
+            pack: {
+              select: {
+                id: true,
+                name: true,
+                ramMb: true,
+                cpuCores: true,
+                storageLimit: true,
+                maxApps: true,
+                deploymentModule: { select: { id: true, code: true, name: true } },
+              },
+            },
+          },
+        },
       },
       orderBy: { createdAt: 'desc' },
     });

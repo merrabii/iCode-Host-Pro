@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import { AppShell } from '@/components/app-shell';
+import { spaceNavFor } from '@/config/nav';
 import { Alert, Badge, Button, Field, Input, PageIntro, PageLoading } from '@/components/ui';
 import { useToast } from '@/components/toast';
 import { useAnySession } from '@/lib/session';
@@ -162,7 +163,7 @@ export default function ProfilPage() {
   ];
 
   return (
-    <AppShell me={me} nav={[]} bare={false}>
+    <AppShell me={me} nav={spaceNavFor(me.role)} bare={false}>
       <div className="wrap-md">
         <PageIntro
           eyebrow="Mon profil"
