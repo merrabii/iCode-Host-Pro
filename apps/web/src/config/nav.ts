@@ -73,14 +73,17 @@ export const SUPPORT_NAV: NavSection[] = [
   },
 ];
 
-/** Navigation de l'espace client. */
+/** Navigation de l'espace client — rubriques directes (liens vers /client?rub=…)
+ *  + pages : fonctionnent depuis /client, /profil et /aide. */
 export const CLIENT_NAV: NavSection[] = [
   {
     section: 'Espace client',
     items: [
-      { label: 'Mes services', href: '/client', icon: IconServer },
+      { label: 'Mes applications', href: '/client?rub=apps', icon: IconServer },
+      { label: 'Hébergement', href: '/client?rub=host', icon: IconBoxes },
+      { label: 'Assistance', href: '/client?rub=help', icon: IconLifeBuoy },
       { label: 'Mon profil', href: '/profil', icon: IconKey },
-      { label: 'Centre d’aide', href: '/aide', icon: IconLifeBuoy },
+      { label: 'Centre d’aide', href: '/aide', icon: IconBook },
     ],
   },
 ];

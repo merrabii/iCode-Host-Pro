@@ -6,7 +6,7 @@ import { useEffect, useRef, useState, type ComponentType, type ReactNode } from 
 import { useBrand } from './brand-provider';
 import { BrandLogo } from './brand-logo';
 import { roleLabel } from '@/lib/session';
-import { IconChevronDown, IconLogOut, IconRefresh, IconUser } from './icons';
+import { IconLogOut, IconRefresh, IconUser } from './icons';
 import { ThemeToggle } from './theme-toggle';
 
 export type NavBadge = { text: string; tone?: 'ok' | 'info' | 'violet' | 'warn' };
@@ -61,6 +61,7 @@ export function AppShell({
   info = [],
   banner = null,
   bare = false,
+  activeHref = null,
   children,
 }: {
   me: ShellUser;
@@ -72,6 +73,9 @@ export function AppShell({
   banner?: ReactNode;
   /** Mode « bare » : topbar seule, sans sidebar — pour les écrans centrés (auth, …). */
   bare?: boolean;
+  /** Contexte actif pour les entrées à query (ex. `/client?rub=host`) : ces
+   *  entrées ne portent pas de path propre, la page passée en page courante. */
+  activeHref?: string | null;
   children: ReactNode;
 }) {
   const pathname = usePathname();
@@ -82,6 +86,25 @@ export function AppShell({
   const [navOpen, setNavOpen] = useState(false);
   const hamburgerRef = useRef<HTMLButtonElement>(null);
   const drawerRef = useRef<HTMLElement>(null);
+
+  // Popover du pied de sidebar (profil / déconnexion) — proposition C.
+  const [footOpen, setFootOpen] = useState(false);
+  useEffect(() => {
+    if (!footOpen) return;
+    const onDown = (e: MouseEvent) => {
+      const t = e.target as Element | null;
+      if (!t || !t.closest?.('.foot-user')) setFootOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setFootOpen(false);
+    };
+    document.addEventListener('mousedown', onDown);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onDown);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [footOpen]);
 
   // Verrouille le défilement de la page quand le tiroir est ouvert.
   useEffect(() => {
@@ -137,6 +160,9 @@ export function AppShell({
   }, [navOpen]);
 
   function isActive(href: string): boolean {
+    // Entrée à query (rubriques `/client?rub=…`) : pathname seul ne suffit pas,
+    // comparée au contexte actif fourni par la page courante.
+    if (href.includes('?')) return activeHref ? href === activeHref : false;
     if (href === '/') return pathname === '/';
     return pathname === href || pathname.startsWith(href + '/');
   }
@@ -156,7 +182,12 @@ export function AppShell({
         <nav key={s.section ?? i} className="nav" aria-label={s.section ?? 'Navigation'}>
           {s.section && <div className="nav-section-label">{s.section}</div>}
           {s.items.map((item) => (
-            <Link key={item.href} href={item.href} className={`nav-item${isActive(item.href) ? ' active' : ''}`}>
+            <Link
+              key={item.href}
+              href={item.href}
+              className={`nav-item${isActive(item.href) ? ' active' : ''}`}
+              onClick={() => setNavOpen(false)}
+            >
               <span className="nav-item-left">
                 <item.icon />
                 <span className="nav-item-label">{item.label}</span>
@@ -169,6 +200,71 @@ export function AppShell({
         </nav>
       ))}
     </>
+  );
+
+  const sideFoot = (
+    <div className="sidebar-foot">
+      <div className="foot-status">
+        <span className="dot" />
+        {footStatus}
+      </div>
+      <div className="foot-user">
+        {me ? (
+          <>
+            <button
+              type="button"
+              className="foot-user-btn"
+              aria-haspopup="menu"
+              aria-expanded={footOpen}
+              onClick={() => setFootOpen((o) => !o)}
+            >
+              <IconUser />
+              <span className="flex-1">
+                <div className="foot-user-name">{me.name || me.email}</div>
+                <div className="foot-user-mail">
+                  {roleLabel(me.role)} — {me.email}
+                </div>
+              </span>
+            </button>
+            {footOpen && (
+              <div className="foot-user-popover" role="menu">
+                <button
+                  type="button"
+                  role="menuitem"
+                  className="foot-popover-item"
+                  onClick={() => {
+                    setFootOpen(false);
+                    router.replace('/profil');
+                  }}
+                >
+                  <IconUser />
+                  Mon profil
+                </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  className="foot-popover-item danger"
+                  onClick={() => {
+                    setFootOpen(false);
+                    void logout();
+                  }}
+                >
+                  <IconLogOut />
+                  Déconnexion
+                </button>
+              </div>
+            )}
+          </>
+        ) : (
+          <div className="foot-user-btn">
+            <IconUser />
+            <span className="flex-1">
+              <div className="foot-user-name">Non connecté</div>
+            </span>
+          </div>
+        )}
+      </div>
+    </div>
   );
 
   return (
@@ -224,7 +320,13 @@ export function AppShell({
         <div className="topbar-right">
           <ThemeToggle />
           {me && (
-            <button type="button" className="user-chip" onClick={() => router.replace('/profil')}>
+            <button
+              type="button"
+              className="user-chip"
+              onClick={() => router.replace('/profil')}
+              aria-label={`Ouvrir le profil de ${me.name || me.email}`}
+              title="Mon profil"
+            >
               <span className="avatar">{userInitials(me)}</span>
               <span>
                 <div className="user-name">{me.name || me.email}</div>
@@ -261,7 +363,6 @@ export function AppShell({
                 <span className="brand-sub">{brand.sub}</span>
               </div>
             )}
-            <IconChevronDown className="chevron" />
           </div>
 
           {navTree}
@@ -271,19 +372,7 @@ export function AppShell({
             Actualiser
           </button>
 
-          <div className="sidebar-foot">
-            <div className="foot-status">
-              <span className="dot" />
-              {footStatus}
-            </div>
-            <div className="foot-user">
-              <IconUser />
-              <div className="flex-1">
-                <div className="foot-user-name">{me ? me.name || me.email : 'Non connecté'}</div>
-                {me && <div className="foot-user-mail">{roleLabel(me.role)} — {me.email}</div>}
-              </div>
-            </div>
-          </div>
+          {sideFoot}
         </aside>
 
         <main className="main">{children}</main>
@@ -330,19 +419,7 @@ export function AppShell({
               <IconRefresh />
               Actualiser
             </button>
-            <div className="sidebar-foot">
-              <div className="foot-status">
-                <span className="dot" />
-                {footStatus}
-              </div>
-              <div className="foot-user">
-                <IconUser />
-                <div className="flex-1">
-                  <div className="foot-user-name">{me ? me.name || me.email : 'Non connecté'}</div>
-                  {me && <div className="foot-user-mail">{roleLabel(me.role)} — {me.email}</div>}
-                </div>
-              </div>
-            </div>
+            {sideFoot}
           </aside>
         </>
       )}

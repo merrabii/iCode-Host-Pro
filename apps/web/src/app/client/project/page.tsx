@@ -314,7 +314,7 @@ export default function ClientProjectPage() {
 
   if (phase === 'loading') {
     return (
-      <AppShell me={null} nav={CLIENT_NAV}>
+      <AppShell me={null} nav={CLIENT_NAV} activeHref="/client?rub=apps">
         <PageLoading />
       </AppShell>
     );
@@ -322,7 +322,7 @@ export default function ClientProjectPage() {
 
   if (phase === 'denied') {
     return (
-      <AppShell me={null} nav={CLIENT_NAV} tenant={{ label: 'Espace client' }}>
+      <AppShell me={null} nav={CLIENT_NAV} tenant={{ label: 'Espace client' }} activeHref="/client?rub=apps">
         <div className="auth-wrap">
           <div className="auth-card">
             <h2>Connexion requise</h2>
@@ -350,7 +350,7 @@ export default function ClientProjectPage() {
         : null;
 
   return (
-    <AppShell me={me} nav={CLIENT_NAV} tenant={{ label: 'Espace client' }}>
+    <AppShell me={me} nav={CLIENT_NAV} tenant={{ label: 'Espace client' }} activeHref="/client?rub=apps">
       <div className="wrap-lg">
         <a className="store-back" href="/client">
           <IconChevronLeft size={15} /> Retour à l’espace client
