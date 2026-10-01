@@ -2336,6 +2336,65 @@ select:disabled {
   gap: 8px;
 }
 
+/* Action secondaire en style lien (hiérarchie : 1 bouton + liens discrets) */
+.auth-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  padding: 7px 10px;
+  border: none;
+  background: none;
+  border-radius: 9px;
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  text-decoration: none;
+  text-align: center;
+  cursor: pointer;
+  transition: var(--transition);
+}
+
+.auth-link:hover {
+  color: var(--brand-accent);
+  background: color-mix(in srgb, var(--brand-primary) 8%, transparent);
+}
+
+.auth-link:focus-visible {
+  outline: 2px solid var(--active-text);
+  outline-offset: 2px;
+}
+
+/* Erreur de saisie associée au champ (aria-describedby) */
+.field-error {
+  display: block;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--tint-red-fg);
+}
+
+/* QR TOTP local : attente de la génération */
+.qr-pending {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px dashed var(--border-soft);
+  border-radius: 10px;
+  background: var(--card-bg-2);
+}
+
+/* QR TOTP local : échec de génération (message accessible, remplace le spinner) */
+.qr-error {
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--tint-red-fg) 45%, transparent);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--tint-red-fg) 8%, transparent);
+  color: var(--tint-red-fg);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
 /* mise en page d'authentification : valeur de marque à gauche, carte à droite */
 .auth-split {
   width: 100%;

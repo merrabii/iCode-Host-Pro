@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { AppShell } from '@/components/app-shell';
 import { spaceNavFor } from '@/config/nav';
 import { Alert, Badge, Button, Field, Input, PageIntro, PageLoading } from '@/components/ui';
+import { TotpQr } from '@/components/totp-qr';
 import { useToast } from '@/components/toast';
 import { useAnySession } from '@/lib/session';
 import {
@@ -227,15 +228,7 @@ export default function ProfilPage() {
                   </>
                 ) : (
                   <>
-                    {mfaUri && (
-                      <img
-                        src={`https://api.qrserver.com/v1/create-qr-code/?size=170x170&data=${encodeURIComponent(mfaUri)}`}
-                        alt="QR code TOTP"
-                        width={170}
-                        height={170}
-                        style={{ borderRadius: 10, border: '1px solid var(--border-soft)' }}
-                      />
-                    )}
+                    {mfaUri && <TotpQr uri={mfaUri} size={170} />}
                     <details>
                       <summary className="muted" style={{ fontSize: 13 }}>Clé secrète (saisie manuelle)</summary>
                       <code className="input-mono mt-sm" style={{ display: 'block', padding: 8 }}>{mfaSecret}</code>

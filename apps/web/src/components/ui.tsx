@@ -176,10 +176,10 @@ export function StatCard({
 }
 
 /* ---- Formulaires ------------------------------------------------------ */
-export function Field({ label, required, hint, className, children }: { label: ReactNode; required?: boolean; hint?: ReactNode; className?: string; children: ReactNode }) {
+export function Field({ label, htmlFor, required, hint, className, children }: { label: ReactNode; htmlFor?: string; required?: boolean; hint?: ReactNode; className?: string; children: ReactNode }) {
   return (
     <div className={`field${className ? ` ${className}` : ''}`}>
-      <label>
+      <label htmlFor={htmlFor}>
         {label}
         {required && <span className="req"> *</span>}
       </label>

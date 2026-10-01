@@ -6,6 +6,7 @@ import { AppShell } from '@/components/app-shell';
 import { useToast } from '@/components/toast';
 import { Button, Field, Input } from '@/components/ui';
 import { Turnstile } from '@/components/turnstile';
+import { TotpQr } from '@/components/totp-qr';
 import { useBrand } from '@/components/brand-provider';
 import { IconCheck, IconServer, IconShield, IconUsers } from '@/components/icons';
 import { roleRank, ROLE_RANK } from '@/lib/session';
@@ -25,6 +26,11 @@ import {
 } from '@/lib/api';
 
 type Mode = 'login' | 'invite' | 'register' | 'free';
+
+/** Validation d'email (mêmes règles que le champ natif type=email). */
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+/** Longueur minimale de mot de passe (identique à l'attribut minLength). */
+const PASSWORD_MIN = 8;
 
 export default function AuthPage() {
   const router = useRouter();
@@ -55,6 +61,8 @@ export default function AuthPage() {
   const [busy, setBusy] = useState(false);
   const [turnstileToken, setTurnstileToken] = useState('');
   const [error, setError] = useState<string | null>(null);
+  // Erreurs de saisie associées aux champs (aria-describedby / aria-invalid).
+  const [fieldErrors, setFieldErrors] = useState<{ email?: string; password?: string; token?: string }>({});
   // Setup TOTP lors d'un enroll forcé (politique admin).
   const [totpSecret, setTotpSecret] = useState<string | null>(null);
   const [totpUri, setTotpUri] = useState<string | null>(null);
@@ -103,7 +111,9 @@ export default function AuthPage() {
         account_disabled: 'Ce compte est désactivé.',
       };
       const msg = map[err] ?? (params.get('detail') ? `Erreur : ${params.get('detail')}` : 'Échec de l’authentification.');
-      toast.error(msg);
+      // Affiché inline dans la carte (role=alert) — même pattern que les
+      // erreurs de soumission, pour rester visible et accessible.
+      setError(msg);
     }
 
     getPublicAuthConfig().then((c) => setConfig(c));
@@ -130,11 +140,25 @@ export default function AuthPage() {
     setTotpSecret(null);
     setTotpUri(null);
     setError(null);
+    setFieldErrors({});
   }
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
     setError(null);
+
+    // Validation de saisie (identique aux attributs natifs) → erreurs
+    // associées au champ, sans appel réseau si invalide.
+    const fe: { email?: string; password?: string; token?: string } = {};
+    if (!EMAIL_RE.test(email.trim())) fe.email = 'Saisissez une adresse email valide.';
+    if (password.length < PASSWORD_MIN) fe.password = `Mot de passe : ${PASSWORD_MIN} caractères minimum.`;
+    if (mode === 'invite' && !token.trim()) fe.token = 'Collez le jeton d’invitation reçu.';
+    if (fe.email || fe.password || fe.token) {
+      setFieldErrors(fe);
+      return;
+    }
+    setFieldErrors({});
+
     setBusy(true);
     try {
       if (mode === 'invite') {
@@ -312,8 +336,9 @@ export default function AuthPage() {
               submitMfa();
             }}
           >
-            <Field label="Code" required>
+            <Field label="Code" htmlFor="auth-mfa" required>
               <Input
+                id="auth-mfa"
                 inputMode="numeric"
                 maxLength={6}
                 value={mfaCode}
@@ -323,7 +348,7 @@ export default function AuthPage() {
               />
             </Field>
             {error && <ErrorMsg>{error}</ErrorMsg>}
-            <Button type="submit" disabled={busy || !mfaCode.trim()}>
+            <Button type="submit" busy={busy} disabled={busy || !mfaCode.trim()}>
               Vérifier
             </Button>
           </form>
@@ -348,38 +373,32 @@ export default function AuthPage() {
             avant de se connecter. Utilisez une application comme Google Authenticator, Authy ou
             1Password.
           </p>
-          {!totpSecret ? (
-            <>
-              {error && <ErrorMsg>{error}</ErrorMsg>}
-              <div className="mt">
-                <Button onClick={startEnroll} disabled={busy}>
-                  Préparer mon code QR
-                </Button>
-              </div>
-            </>
-          ) : (
-            <>
-              <div className="mt">
-                {totpUri && (
-                  <>
-                    <img
-                      src={`https://api.qrserver.com/v1/create-qr-code/?size=180x180&data=${encodeURIComponent(totpUri)}`}
-                      alt="QR code d’enrôlement TOTP"
-                      width={180}
-                      height={180}
-                      style={{ borderRadius: 10, border: '1px solid var(--border-soft)' }}
-                    />
-                    <details className="mt-sm" open={false}>
-                      <summary className="muted" style={{ fontSize: 13 }}>
-                        Clé secrète (saisie manuelle)
-                      </summary>
-                      <code className="input-mono mt-sm" style={{ display: 'block', padding: 8 }}>
-                        {totpSecret}
-                      </code>
-                    </details>
-                  </>
-                )}
-              </div>
+      {!totpSecret ? (
+        <>
+          {error && <ErrorMsg>{error}</ErrorMsg>}
+          <div className="mt">
+            <Button onClick={startEnroll} busy={busy} disabled={busy}>
+              Préparer mon code QR
+            </Button>
+          </div>
+        </>
+      ) : (
+        <>
+          <div className="mt">
+            {totpUri && (
+              <>
+                <TotpQr uri={totpUri} />
+                <details className="mt-sm" open={false}>
+                  <summary className="muted" style={{ fontSize: 13 }}>
+                    Clé secrète (saisie manuelle)
+                  </summary>
+                  <code className="input-mono mt-sm" style={{ display: 'block', padding: 8 }}>
+                    {totpSecret}
+                  </code>
+                </details>
+              </>
+            )}
+          </div>
               <form
                 className="auth-form mt"
                 onSubmit={(e) => {
@@ -387,8 +406,9 @@ export default function AuthPage() {
                   confirmEnroll();
                 }}
               >
-                <Field label="Premier code (6 chiffres)" required>
+                <Field label="Premier code (6 chiffres)" htmlFor="auth-enroll-code" required>
                   <Input
+                    id="auth-enroll-code"
                     inputMode="numeric"
                     maxLength={6}
                     value={mfaCode}
@@ -397,7 +417,7 @@ export default function AuthPage() {
                   />
                 </Field>
                 {error && <ErrorMsg>{error}</ErrorMsg>}
-                <Button type="submit" disabled={busy || !mfaCode.trim()}>
+                <Button type="submit" busy={busy} disabled={busy || !mfaCode.trim()}>
                   Activer
                 </Button>
               </form>
@@ -462,32 +482,80 @@ export default function AuthPage() {
           </div>
         )}
 
-        <form className="auth-form" onSubmit={submit}>
+        {/* noValidate : validation gérée ci-dessous → erreurs inline accessibles
+            (role=alert, aria-invalid) au lieu des infobulles natives non
+            présentes dans le DOM. Les attributs required/minLength restent en
+            place pour la sémantique. */}
+        <form className="auth-form" onSubmit={submit} noValidate>
           {mode === 'invite' && (
-            <Field label="Jeton d’invitation (rempli depuis le lien reçu)" required>
-              <Input value={token} onChange={(e) => setToken(e.target.value)} className="input-mono" />
+            <Field label="Jeton d’invitation (rempli depuis le lien reçu)" htmlFor="auth-token" required>
+              <>
+                <Input
+                  id="auth-token"
+                  value={token}
+                  aria-invalid={fieldErrors.token ? true : undefined}
+                  aria-describedby={fieldErrors.token ? 'auth-token-err' : undefined}
+                  onChange={(e) => {
+                    setToken(e.target.value);
+                    if (fieldErrors.token) setFieldErrors((f) => ({ ...f, token: undefined }));
+                  }}
+                  className="input-mono"
+                />
+                {fieldErrors.token && (
+                  <span className="field-error" id="auth-token-err" role="alert">{fieldErrors.token}</span>
+                )}
+              </>
             </Field>
           )}
-          <Field label="Email" required>
-            <Input type="email" required value={email} onChange={(e) => setEmail(e.target.value)} />
+          <Field label="Email" htmlFor="auth-email" required>
+            <>
+              <Input
+                id="auth-email"
+                type="email"
+                required
+                autoComplete="email"
+                value={email}
+                aria-invalid={fieldErrors.email ? true : undefined}
+                aria-describedby={fieldErrors.email ? 'auth-email-err' : undefined}
+                onChange={(e) => {
+                  setEmail(e.target.value);
+                  if (fieldErrors.email) setFieldErrors((f) => ({ ...f, email: undefined }));
+                }}
+              />
+              {fieldErrors.email && (
+                <span className="field-error" id="auth-email-err" role="alert">{fieldErrors.email}</span>
+              )}
+            </>
           </Field>
           {mode !== 'login' && (
-            <Field label="Nom (optionnel)">
-              <Input value={name} onChange={(e) => setName(e.target.value)} />
+            <Field label="Nom (optionnel)" htmlFor="auth-name">
+              <Input id="auth-name" autoComplete="name" value={name} onChange={(e) => setName(e.target.value)} />
             </Field>
           )}
-          <Field label="Mot de passe" required>
-            <Input
-              type="password"
-              required
-              minLength={8}
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-            />
+          <Field label="Mot de passe" htmlFor="auth-password" required>
+            <>
+              <Input
+                id="auth-password"
+                type="password"
+                required
+                minLength={PASSWORD_MIN}
+                autoComplete={mode === 'login' ? 'current-password' : 'new-password'}
+                value={password}
+                aria-invalid={fieldErrors.password ? true : undefined}
+                aria-describedby={fieldErrors.password ? 'auth-password-err' : undefined}
+                onChange={(e) => {
+                  setPassword(e.target.value);
+                  if (fieldErrors.password) setFieldErrors((f) => ({ ...f, password: undefined }));
+                }}
+              />
+              {fieldErrors.password && (
+                <span className="field-error" id="auth-password-err" role="alert">{fieldErrors.password}</span>
+              )}
+            </>
           </Field>
           {config?.turnstileSiteKey && <Turnstile siteKey={config.turnstileSiteKey} onChange={setTurnstileToken} />}
           {error && <ErrorMsg>{error}</ErrorMsg>}
-          <Button type="submit" disabled={busy}>
+          <Button type="submit" busy={busy} disabled={busy}>
             {mode === 'login'
               ? 'Connexion'
               : mode === 'register'
@@ -498,34 +566,25 @@ export default function AuthPage() {
           </Button>
         </form>
 
+        {/* Hiérarchie : une action secondaire principale + liens discrets. */}
         <div className="auth-meta">
           {mode === 'login' && (
-            <Button variant="secondary" onClick={() => { setMode('invite'); resetFlow(); }}>
-              J’ai une invitation — accepter un jeton
-            </Button>
-          )}
-          {mode === 'invite' && (
-            <Button variant="secondary" onClick={() => { setMode('login'); resetFlow(); }}>
-              J’ai déjà un compte — se connecter
-            </Button>
-          )}
-          {(mode === 'login' || mode === 'invite') && (
             <Button variant="secondary" onClick={() => { setMode('register'); resetFlow(); }}>
-              Je viens d’une commande & je n’ai pas de compte
+              Créer un compte
             </Button>
           )}
-          {mode === 'register' && (
+          {(mode === 'register' || mode === 'invite' || mode === 'free') && (
             <Button variant="secondary" onClick={() => { setMode('login'); resetFlow(); }}>
-              J’ai déjà un compte — se connecter
+              Se connecter
             </Button>
           )}
-          {mode === 'free' && (
-            <Button variant="secondary" onClick={() => { setMode('login'); resetFlow(); }}>
-              J’ai déjà un compte — me connecter
-            </Button>
+          {mode === 'login' && (
+            <button type="button" className="auth-link" onClick={() => { setMode('invite'); resetFlow(); }}>
+              J’ai une invitation — accepter un jeton
+            </button>
           )}
-          <a className="btn-secondary btn-oauth" href="/offres" style={{ justifyContent: 'center' }}>
-            Consulter le catalogue & commander
+          <a className="auth-link" href="/offres">
+            Consulter le catalogue &amp; commander
           </a>
         </div>
       </div>
@@ -571,14 +630,12 @@ function Shell({ children }: { children: React.ReactNode }) {
             </span>
           </div>
         </aside>
-        <div className="auth-stage">
-          <div className="auth-card">{children}</div>
-        </div>
+        <div className="auth-stage">{children}</div>
       </div>
     </AppShell>
   );
 }
 
 function ErrorMsg({ children }: { children: React.ReactNode }) {
-  return <div className="alert error" style={{ fontSize: 13.5 }}>{children}</div>;
+  return <div className="alert error" role="alert" style={{ fontSize: 13.5, marginBottom: 0 }}>{children}</div>;
 }
