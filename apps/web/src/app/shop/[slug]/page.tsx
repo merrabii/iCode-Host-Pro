@@ -204,11 +204,20 @@ export default function ShopProductPage() {
                 className="store-detail-banner store-detail-banner-pro"
                 style={{ background: `linear-gradient(135deg, ${product.color ?? 'var(--brand-primary)'}, color-mix(in srgb, ${product.color ?? 'var(--brand-primary)'} 40%, #000))` }}
               >
+                <span className="store-detail-banner-mono" aria-hidden>
+                  {product.name.trim().slice(0, 2).toUpperCase()}
+                </span>
                 {product.category?.name && <span className="store-detail-chip">{product.category.name}</span>}
               </div>
 
               <h1 className="store-detail-title">{product.name}</h1>
               {product.slogan && <p className="store-detail-slogan">{product.slogan}</p>}
+
+              {product.status !== 'ACTIVE' && (
+                <div className="alert warn" role="status">
+                  Cette offre n&apos;est pas disponible actuellement (état : {product.status}).
+                </div>
+              )}
 
               {/* ── Sous-domaine au choix (Plan Gratuit…) — juste après le
                   titre/slogan, PAS dans la colonne prix. */}
@@ -235,7 +244,9 @@ export default function ShopProductPage() {
                     {product.pack.bandwidth ? <Feature icon={IconGlobe} label="Bande passante" value={product.pack.bandwidth} /> : null}
                   </>
                 )}
-                <Feature icon={IconGlobe} label="Sous-domaine" value="gratuit inclus" />
+                {/* B5 : le sous-domaine gratuit n'existe que pour les produits
+                    porteurs d'une FreeSubdomainRule (plus d'affichage codé en dur). */}
+                {needsSubdomain && <Feature icon={IconGlobe} label="Sous-domaine" value="gratuit inclus" />}
                 <Feature icon={IconShield} label="SSL" value="automatique" />
                 <Feature icon={IconMail} label="Support" value="par email" />
               </section>

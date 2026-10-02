@@ -123,6 +123,7 @@ export async function apiJson(
 
 /** Best-effort error message from an ApiResult, falling back to a default. */
 export function apiError(res: ApiResult, fallback: string): string {
+  if (res.status === 0) return fallback; // échec réseau (fetch a jeté) : message lisible, pas de TypeError
   const d = res.data as { message?: string } | null;
   if (d?.message) return String(d.message);
   return fallback;
@@ -323,6 +324,45 @@ export const storeCheckout = async (payload: {
   try { data = await res.json(); } catch { /* non-JSON */ }
   return { ok: res.ok, status: res.status, data };
 };
+
+/** Moyen de paiement PUBLIC du tunnel (GET /store/payment-methods) — vue
+ *  serveur : id, name, type, config non-secrète uniquement (§7). */
+export interface PublicPaymentMethod {
+  id: string;
+  name: string;
+  type: string;
+  config?: unknown;
+}
+
+export async function listPaymentMethods(): Promise<ApiResult> {
+  try {
+    const res = await fetch('/api/store/payment-methods', {
+      headers: { 'Content-Type': 'application/json' },
+    });
+    let data: unknown = null;
+    try { data = await res.json(); } catch { /* non-JSON */ }
+    return { ok: res.ok, status: res.status, data };
+  } catch {
+    return { ok: false, status: 0, data: null };
+  }
+}
+
+/** Statut PUBLIC d'une commande (GET /store/orders/:id/status) : `{ found,
+ *  status }`, dépourvu de PII (jamais email, facture ni dates). C'est LA
+ *  source d'état réel pour la page de confirmation : aucune affirmation
+ *  d'activation sans ce retour serveur. */
+export async function getOrderStatus(
+  orderId: string,
+): Promise<{ found: boolean; status?: string } | null> {
+  try {
+    const res = await fetch(`/api/store/orders/${encodeURIComponent(orderId)}/status`);
+    if (!res.ok) return null;
+    const data = (await res.json()) as { found?: boolean; status?: string };
+    return { found: !!data.found, status: data.status };
+  } catch {
+    return null;
+  }
+}
 
 /** Vérif PUBLIC de disponibilité d'un sous-domaine au checkout (POST /store/subdomain/check).
  *  Contraintes (longueur/allowedChars/rejectPattern) + dispo réelle Cloudflare. */

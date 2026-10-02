@@ -3978,6 +3978,9 @@ select:disabled {
 .store-total span { font-size: 14px; font-weight: 700; }
 .store-total strong { font-size: 26px; font-weight: 900; letter-spacing: -.02em; color: var(--active-text); }
 .store-cta { width: 100%; justify-content: center; }
+/* Taille tactile : CTA principaux du tunnel (Continuer / Commander /
+   Confirmer) ≥ 44 px sur desktop comme sur mobile. */
+.store-cta { min-height: 46px; }
 .store-secure-note { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; margin-top: 2px; }
 .success-text { color: var(--tint-green-fg, #16a34a); font-weight: 700; }
 b.success-text, .success-text b { font-weight: 850; }
@@ -4067,7 +4070,9 @@ b.success-text, .success-text b { font-weight: 850; }
   .store-brand-tag { display: none; }
   .store-footer { flex-direction: column; text-align: center; }
 }/* --- /cart : coordination (récap + coordonnées) ---------------- */
-.store-cart { display: grid; grid-template-columns: minmax(0, 400px) 1fr; gap: 28px; align-items: start; margin-top: 8px; }
+/* Desktop : formulaire/actions à GAUCHE (1fr), récap produit/prix/TVA/total
+   à DROITE (400px max) — DOM aligné sur l'ordre visuel (clavier = visuel). */
+.store-cart { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 400px); gap: 28px; align-items: start; margin-top: 8px; }
 .store-recap-label {
   font-size: 11.5px; font-weight: 800; text-transform: uppercase; letter-spacing: .06em;
   color: var(--text-muted); margin-top: 4px;
@@ -4093,6 +4098,86 @@ b.success-text, .success-text b { font-weight: 850; }
 
 @media (max-width: 860px) {
   .store-cart { grid-template-columns: 1fr; }
+  /* B2 — sur mobile l'action principale (formulaire) passe AVANT le récap
+     (l'ordre DOM seul repoussait le formulaire sous un long récap). */
+  .store-cart-form { order: 1; }
+  .store-cart-recap { order: 2; }
+}
+
+/* ============================================================
+   Lot B — boutique & parcours de commande (B1–B6)
+   ============================================================ */
+
+/* B1 — menu de repli mobile (accessible au clavier) */
+.store-menu-btn {
+  display: none;
+  align-items: center; justify-content: center;
+  width: 38px; height: 38px; border-radius: 10px;
+  border: 1px solid var(--border); background: var(--card-bg-2);
+  color: var(--text-primary); cursor: pointer; transition: all .15s ease;
+}
+.store-menu-btn:hover { border-color: var(--active-text); color: var(--active-text); }
+
+/* Accessibilité clavier — cible visible sur les éléments de navigation boutique */
+.store-card:focus-visible,
+.store-filter:focus-visible,
+.store-nav a:focus-visible,
+.store-menu-btn:focus-visible,
+.store-cart-btn:focus-visible,
+.alert-retry:focus-visible {
+  outline: 2px solid var(--active-text);
+  outline-offset: 2px;
+}
+
+/* « Réessayer » dans une alerte (états d'erreur /shop et /checkout) */
+.alert-retry {
+  background: none; border: 0; padding: 0; margin-left: 4px;
+  color: inherit; font: inherit; font-weight: 700;
+  text-decoration: underline; text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+/* État de chargement : spinner + label alignés (shop, cart, payment, success) */
+.store-loading {
+  display: flex; align-items: center; justify-content: center; gap: 9px;
+  min-height: 120px;
+}
+.store-loading .spinner { width: 17px; height: 17px; }
+
+/* B5 — monogramme sur la bannière produit (banner moins « vide ») */
+.store-detail-banner { position: relative; overflow: hidden; }
+.store-detail-banner-mono {
+  position: absolute; inset: 0;
+  display: grid; place-items: center;
+  font-size: 58px; font-weight: 900; letter-spacing: -.05em;
+  color: rgba(255, 255, 255, .2);
+  user-select: none; pointer-events: none;
+}
+
+/* B4 — variantes du badge de confirmation selon l'état réel de la commande */
+.store-success-badge.wait {
+  background: color-mix(in srgb, var(--tint-amber-fg, #d97706) 15%, var(--card-bg));
+  color: var(--tint-amber-fg, #d97706);
+}
+.store-success-badge.bad {
+  background: color-mix(in srgb, var(--tint-red-fg, #dc2626) 13%, var(--card-bg));
+  color: var(--tint-red-fg, #dc2626);
+}
+
+@media (max-width: 960px) {
+  .store-menu-btn { display: inline-flex; margin-left: auto; }
+  .store-topbar-right { margin-left: 0; }
+  .store-nav {
+    display: none;
+    position: absolute; top: 100%; left: 0; right: 0;
+    flex-direction: column; align-items: stretch; gap: 2px;
+    margin-left: 0; padding: 8px 16px 12px;
+    background: var(--bg); border-bottom: 1px solid var(--border-soft);
+    box-shadow: 0 16px 34px color-mix(in srgb, #000 22%, transparent);
+    z-index: 60;
+  }
+  .store-nav.open { display: flex; }
+  .store-nav a { padding: 11px 12px; font-size: 14.5px; border-radius: 9px; }
 }
 
 /* ---- Pilote /client — Classique émeraude (périmètre : page /client) ---- */
@@ -4156,7 +4241,7 @@ b.success-text, .success-text b { font-weight: 850; }
   .client-page .panel { padding: 14px; }
 }
 
-/* ---- Rubriques A — en-tête, onglets, liste d'apps, menu ⋯, FAB ---- */
+/* ---- Rubriques A — en-tête, onglets, liste d'apps, menu ⋯ ---- */
 .client-page .client-head {
   display: flex;
   align-items: flex-end;
@@ -4481,8 +4566,6 @@ b.success-text, .success-text b { font-weight: 850; }
 }
 .client-page .client-confirm-act { display: flex; gap: 8px; flex-wrap: wrap; }
 
-.client-page .client-fab { display: none; }
-
 @media (max-width: 1024px) {
   .client-page .client-list { grid-template-columns: minmax(0, 1fr); }
 }
@@ -4494,21 +4577,17 @@ b.success-text, .success-text b { font-weight: 850; }
 }
 
 @media (max-width: 768px) {
-  .client-page { padding-bottom: 96px; }
   .client-page .client-head { flex-direction: column; align-items: flex-start; gap: 10px; }
-  .client-page .client-head-act { display: none; }
-  .client-page .client-fab {
-    display: inline-flex;
-    position: fixed;
-    right: 16px;
-    bottom: calc(16px + env(safe-area-inset-bottom, 0px));
-    z-index: 50;
-    box-shadow: 0 12px 30px rgba(0, 0, 0, 0.3);
+  /* CTA unique « Nouvelle application » : ligne dédiée pleine largeur en tête
+     de rubrique (avant le quota et la liste) — plus de FAB flottant en bas. */
+  .client-page .client-head-act { display: flex; width: 100%; }
+  .client-page .client-head-act > .btn-primary {
+    flex: 1 1 auto;
+    width: 100%;
+    min-height: 46px;
+    justify-content: center;
+    white-space: nowrap;
   }
-}
-
-@media (max-width: 480px) {
-  .client-page .btn.client-fab { width: auto; min-height: 46px; }
 }
 
 /* ── Modale « Nouvelle application » (correction complémentaire) ───────── */

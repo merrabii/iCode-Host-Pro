@@ -214,7 +214,7 @@ function ClientSpace() {
   // défaut). États du formulaire (saisies, source, depIntent) vivent dans ce
   // composant parent → brouillon conservé à la fermeture/réouverture.
   const [formOpen, setFormOpen] = useState(false);
-  /** Élément déclencheur (CTA en-tête ou FAB) : focus rendu à la fermeture. */
+  /** Élément déclencheur (CTA permanent d'en-tête) : focus rendu à la fermeture. */
   const formOpener = useRef<HTMLElement | null>(null);
   // Rubriques : source de vérité = l'URL `?rub=` (liens sidebar directs,
   // fonctionnent depuis /profil et /aide ; pas de remount → données et
@@ -367,8 +367,9 @@ function ClientSpace() {
     };
   }, [menuFor]);
 
-  // CTA unique « Nouvelle application » (en-tête + FAB mobile) :
-  // ouvre la MODALE dans la rubrique Applications (et la referme si déjà ouverte).
+  // CTA unique « Nouvelle application » (permanent, en tête de rubrique sur
+  // TOUS les formats — plus de FAB mobile) : ouvre la MODALE dans la rubrique
+  // Applications (et la referme si déjà ouverte).
   function openForm() {
     formOpener.current =
       document.activeElement instanceof HTMLElement ? document.activeElement : null;
@@ -376,8 +377,8 @@ function ClientSpace() {
   }
   function closeForm() {
     // Le focus est rendu au déclencheur par le cleanup de l'effet
-    // d'ouverture (après retrait de inert — le FAB mobile étant remonté au
-    // moment de la fermeture, c'est le CTA visible courant qui est visé).
+    // d'ouverture (après retrait de inert) : le CTA d'en-tête étant
+    // permanent (jamais démonté), le focus lui revient en haut de page.
     setFormOpen(false);
   }
   function onNewAppClick() {
@@ -473,13 +474,19 @@ function ClientSpace() {
         else el.setAttribute('aria-hidden', ariaHidden);
       }
       const opener = formOpener.current;
-      // Noeud d'origine encore monté (CTA d'en-tête) → focus dessus ; sinon
-      // (FAB mobile démonté pendant l'ouverture puis remonté) → CTA visible.
-      let target: HTMLElement | null = opener && opener.isConnected ? opener : null;
+      // CTA « Nouvelle application » permanent en tête de rubrique (plus de
+      // FAB) : le focus lui revient en haut, que l'ouverture ait été déclenchée
+      // au clavier (opener = CTA) ou avec un clic qui n'a pas capturé le focus
+      // (opener hors-CTA → premier CTA visible = ce même bouton unique).
+      const isToggle = (el: Element | null | undefined): el is HTMLElement =>
+        el instanceof HTMLElement &&
+        el.matches('[data-client-form-toggle]') &&
+        el.getClientRects().length > 0;
+      let target: HTMLElement | null = isToggle(opener) ? opener : null;
       if (!target) {
         target =
           Array.from(document.querySelectorAll<HTMLElement>('[data-client-form-toggle]')).find(
-            (el) => el.getBoundingClientRect().width > 0,
+            isToggle,
           ) ?? null;
       }
       target?.focus();
@@ -710,19 +717,6 @@ function ClientSpace() {
       );
     }
     void loadDeployments(token);
-  }
-
-  /**
-   * Mise à niveau du plan (Phase 13 → Bloc 1/4) : bascule la MÊME souscription
-   * ACTIVE vers un produit/pack supérieur via la procédure de commande store
-   * (POST /store/checkout repointe l'abonnement existant) — applications et
-   * données préservées, seules les limites/quota changent (resynchronisés).
-   */
-  async function upgradeTo(subId: string, productId: string) {
-    const product = products.find((p) => p.id === productId);
-    const slug = product?.slug;
-    if (!slug) return toast.error('Offre indisponible à la commande.');
-    router.push(`/shop/${slug}`);
   }
 
   async function onReturn() {
@@ -1315,20 +1309,6 @@ function ClientSpace() {
               })}
             </ul>
           )}
-
-            {deployEnabled && !formOpen && (
-              <button
-                type="button"
-                className="btn-primary client-fab"
-                data-client-form-toggle
-                aria-expanded={formOpen}
-                aria-controls="client-form-zone"
-                disabled={isImp}
-                onClick={onNewAppClick}
-              >
-                <IconPlus /> Nouvelle application
-              </button>
-            )}
         </div>
 
         {/* ═══ RUBRIQUE 2 — HÉBERGEMENT & ABONNEMENTS ═══ */}
@@ -1445,7 +1425,20 @@ function ClientSpace() {
               Souscrivez ou changez de pack — vos applications et vos données sont conservées.
             </span>
           </div>
-          <Panel title="Offres" sub="Chaque commande crée ou améliore votre souscription.">
+          <Panel title="Offres" sub="Consultez les offres disponibles.">
+            {/* Offre d'upgrade : l'indisponibilité du changement de pack est
+                présentée ICI, avant tout engagement dans un paiement (le refus
+                serveur surviendrait seulement à la confirmation de commande).
+                Action = assistance existante ; aucun jargon technique. */}
+            {activeSub && (
+              <div className="alert warn" role="alert" style={{ marginBottom: 12 }}>
+                <b>Le changement d&apos;offre n&apos;est pas encore disponible en ligne.</b>{' '}
+                Contactez l&apos;assistance pour connaître les possibilités.{' '}
+                <button type="button" className="alert-retry" onClick={() => goRub('help')}>
+                  Contacter l&apos;assistance
+                </button>
+              </div>
+            )}
             {availablePlans.length === 0 ? (
               <EmptyState>Aucune offre disponible pour l&apos;instant.</EmptyState>
             ) : (
@@ -1464,13 +1457,16 @@ function ClientSpace() {
                       </div>
                       {isCurrent ? (
                         <Badge tone="ok">Votre offre</Badge>
+                      ) : activeSub ? (
+                        /* Compte déjà abonné : aucune commande d'upgrade ne peut
+                           aboutir (refus serveur au paiement) → on n'engage pas
+                           le tunnel, on oriente vers l'assistance. */
+                        <Button size="sm" variant="secondary" disabled={isImp} onClick={() => goRub('help')}>
+                          Contacter l&apos;assistance
+                        </Button>
                       ) : (
-                        <Button
-                          size="sm"
-                          disabled={isImp}
-                          onClick={() => (activeSub ? upgradeTo(activeSub.id, p.id) : subscribe(p.id))}
-                        >
-                          {activeSub ? 'Commander' : 'Souscrire'}
+                        <Button size="sm" disabled={isImp} onClick={() => subscribe(p.id)}>
+                          Souscrire
                         </Button>
                       )}
                     </div>

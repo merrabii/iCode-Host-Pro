@@ -13,6 +13,10 @@ import { cartStorage, cartHtCents, type CartItem } from '@/lib/cart';
 
 interface CartCtx {
   item: CartItem | null;
+  /** Hydratation localStorage terminée — distingue « panier vide » de « pas
+   *  encore lu ». Les pages /cart et /checkout n'affichent l'état vide
+   *  qu'après `ready === true` (fini le flash « panier vide » au montage). */
+  ready: boolean;
   count: number; // nbr d'éléments configurés (options + add-ons) — le badge du panier
   htCents: number;
   setItem: (item: CartItem) => void;
@@ -25,9 +29,11 @@ const Ctx = createContext<CartCtx | null>(null);
  *  StoreShell — pages /shop et /checkout lisent `useCart()`. */
 export function CartProvider({ children }: { children: ReactNode }) {
   const [item, setItemState] = useState<CartItem | null>(null);
+  const [ready, setReady] = useState(false);
 
   useEffect(() => {
     setItemState(cartStorage.read());
+    setReady(true);
   }, []);
 
   const setItem = useCallback((next: CartItem) => {
@@ -46,12 +52,13 @@ export function CartProvider({ children }: { children: ReactNode }) {
       : 0;
     return {
       item,
+      ready,
       count,
       htCents: cartHtCents(item),
       setItem,
       clear,
     };
-  }, [item, setItem, clear]);
+  }, [item, ready, setItem, clear]);
 
   // Le contenu est rendu immédiatement (SSR) ; le panier s'hydrate après la
   // lecture du localStorage — pas de flash de page ni de "panier vide" bloquant.

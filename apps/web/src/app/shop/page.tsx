@@ -35,19 +35,24 @@ export default function ShopPage() {
   const { brand } = useBrand();
   const [products, setProducts] = useState<PublicProduct[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [attempt, setAttempt] = useState(0);
   const [q, setQ] = useState('');
   const [filter, setFilter] = useState<string>('all');
 
   useEffect(() => {
+    let alive = true;
     (async () => {
+      setError(null);
       const res = await listPublicProducts();
+      if (!alive) return;
       if (!res.ok) {
         setError(apiError(res, 'Impossible de charger la boutique.'));
         return;
       }
       setProducts((res.data as PublicProduct[]) ?? []);
     })();
-  }, []);
+    return () => { alive = false; };
+  }, [attempt]);
 
   const categories = useMemo(() => {
     const set = new Set<string>();
@@ -115,14 +120,28 @@ export default function ShopPage() {
         </div>
       </div>
 
+      {/* États : chargement (role=status) / erreur (role=alert + réessayer) / vide */}
       {!products && !error && (
-        <div className="store-loading">Chargement de la boutique…</div>
+        <div className="store-loading" role="status">
+          <span className="spinner" aria-hidden /> Chargement de la boutique…
+        </div>
       )}
-      {error && <div className="alert error">{error}</div>}
-      {products && products.length === 0 && (
+      {error && (
+        <div className="alert error" role="alert">
+          {error}{' '}
+          <button
+            type="button"
+            className="alert-retry"
+            onClick={() => { setProducts(null); setAttempt((a) => a + 1); }}
+          >
+            Réessayer
+          </button>
+        </div>
+      )}
+      {products && products.length === 0 && !error && (
         <p className="store-empty">Aucune offre disponible pour le moment.</p>
       )}
-      {products && visible.length === 0 && (
+      {products && visible.length === 0 && products.length > 0 && (
         <p className="store-empty">Aucun résultat pour cette recherche.</p>
       )}
 

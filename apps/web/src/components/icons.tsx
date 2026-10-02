@@ -166,6 +166,13 @@ export const IconX = ({ size = 16, className }: IconProps) => (
     <path d="m6 6 12 12" />
   </svg>
 );
+export const IconMenu = ({ size = 16, className }: IconProps) => (
+  <svg {...base(size)} className={className} data-icon="menu">
+    <path d="M4 6h16" />
+    <path d="M4 12h16" />
+    <path d="M4 18h16" />
+  </svg>
+);
 
 export const IconAlert = ({ size = 16, className }: IconProps) => (
   <svg {...base(size)} className={className} data-icon="alert">

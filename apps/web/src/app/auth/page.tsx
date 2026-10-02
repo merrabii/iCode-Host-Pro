@@ -583,7 +583,7 @@ export default function AuthPage() {
               J’ai une invitation — accepter un jeton
             </button>
           )}
-          <a className="auth-link" href="/offres">
+          <a className="auth-link" href="/shop">
             Consulter le catalogue &amp; commander
           </a>
         </div>

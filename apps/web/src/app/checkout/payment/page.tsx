@@ -5,18 +5,15 @@ import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { StoreShell } from '@/components/store-shell';
 import { useCart } from '@/components/cart-provider';
-import { useToast } from '@/components/toast';
 import { IconChevronLeft, IconMail, IconShield } from '@/components/icons';
-import { billingCycleLabel, formatCents, storeCheckout } from '@/lib/api';
+import {
+  billingCycleLabel,
+  formatCents,
+  listPaymentMethods,
+  storeCheckout,
+  type PublicPaymentMethod,
+} from '@/lib/api';
 import { buyerStorage } from '@/lib/cart';
-
-/** Vue publique d'un moyen de paiement actif (id, name, type, config non secrète). */
-interface PaymentMethodView {
-  id: string;
-  name: string;
-  type: string;
-  config?: unknown;
-}
 
 /** Résultat de POST /store/checkout conservé pour la page de succès. */
 interface CheckoutResult {
@@ -38,33 +35,45 @@ export default function CheckoutPaymentPage() {
 
 function CheckoutPaymentView() {
   const router = useRouter();
-  const toast = useToast();
-  const { item } = useCart();
+  const { item, ready } = useCart();
 
-  const [methods, setMethods] = useState<PaymentMethodView[] | null>(null);
+  const [methods, setMethods] = useState<PublicPaymentMethod[] | null>(null);
+  const [methodsError, setMethodsError] = useState(false);
   const [methodId, setMethodId] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const contact = useMemo(() => buyerStorage.read(), []);
 
-  // Chargement des moyens de paiement actifs (publics, sans secrets).
-  useEffect(() => {
-    (async () => {
-      try {
-        const res = await fetch('/api/store/payment-methods');
-        if (!res.ok) { setMethods([]); return; }
-        const data = (await res.json()) as PaymentMethodView[];
-        setMethods(data);
-        if (data.length) setMethodId((id) => id || data[0].id);
-      } catch { setMethods([]); }
-    })();
+  // Chargement des moyens de paiement ACTIFS (publics, sans secrets) — via le
+  // helper API (plus de fetch en dur) + état d'erreur distingué de la liste vide.
+  const loadMethods = useMemo(() => {
+    let seq = 0;
+    return async () => {
+      const my = ++seq;
+      setMethodsError(false);
+      const res = await listPaymentMethods();
+      if (my !== seq) return; // réponse périmée (double appel)
+      if (!res.ok) {
+        setMethods(null);
+        setMethodsError(true);
+        return;
+      }
+      const data = (Array.isArray(res.data) ? res.data : []) as PublicPaymentMethod[];
+      setMethods(data);
+      if (data.length) setMethodId((id) => id || data[0].id);
+    };
   }, []);
 
-  // Sans produit dans le panier → retour boutique.
   useEffect(() => {
-    if (item === null) return; // le panier s'hydrate après le montage (localStorage)
-  }, [item]);
+    loadMethods();
+  }, [loadMethods]);
+
+  // Hydratation du panier confirmée ET aucun produit → retour boutique promis
+  // (avant : effet vide qui ne redirigeait jamais).
+  useEffect(() => {
+    if (ready && !item) router.replace('/shop');
+  }, [ready, item, router]);
 
   const subdomain = item?.subdomain;
   const requestedDomainId = item?.requestedDomainId;
@@ -72,12 +81,12 @@ function CheckoutPaymentView() {
 
   async function confirmer(e: FormEvent) {
     e.preventDefault();
-    if (!item || !productSlug) { toast.error('Panier incomplet — repassez par la boutique.'); return; }
-    if (!contact) { toast.error('Coordonnées manquantes — revenez à l’étape précédente.'); return; }
-    if (!methodId) { toast.error('Choisissez un moyen de paiement.'); return; }
+    setError(null);
+    if (!item || !productSlug) { setError('Panier incomplet — repassez par la boutique.'); return; }
+    if (!contact) { setError('Coordonnées manquantes — revenez à l’étape précédente.'); return; }
+    if (!methodId) { setError('Choisissez un moyen de paiement.'); return; }
 
     setLoading(true);
-    setError(null);
     try {
       const res = await storeCheckout({
         productSlug,
@@ -98,11 +107,16 @@ function CheckoutPaymentView() {
       const r = data as CheckoutResult;
       if (!r.subdomain && subdomain) r.subdomain = subdomain; // retour API sans sous-domaine ? on garde le choix
       // Persister l'ordre pour la page de succès (id + numéro de facture).
+      // La page de succès re-vérifiera l'état réel côté serveur.
       try { sessionStorage.setItem(ORDER_KEY, JSON.stringify(r)); } catch { /* noop */ }
       router.replace(`/checkout/success?orderId=${encodeURIComponent(r.orderId)}`);
     } finally {
       setLoading(false);
     }
+  }
+
+  if (!ready) {
+    return <div className="store-loading" role="status">Chargement du panier…</div>;
   }
 
   if (item === null) {
@@ -131,55 +145,50 @@ function CheckoutPaymentView() {
       <Link href="/cart" className="store-back"><IconChevronLeft size={15} /> Retour au récapitulatif</Link>
       <header>
         <h1 className="store-detail-title">Paiement</h1>
-        <p className="muted">Confirmez le moyen de paiement — la commande est validée immédiatement et votre abonnement devient actif.</p>
+        <p className="muted">Vérifiez le récapitulatif, puis confirmez votre commande.</p>
       </header>
 
-      {error && <div className="alert error">{error}</div>}
+      {error && (
+        <div className="alert error" role="alert">
+          {isUpgradeRefusal(error) ? (
+            <>
+              <b>Le changement d&apos;offre n&apos;est pas encore disponible en ligne.</b>{' '}
+              Contactez l&apos;assistance pour connaître les possibilités.{' '}
+              <Link className="alert-retry" href="/client?rub=help">
+                Contacter l&apos;assistance
+              </Link>
+            </>
+          ) : (
+            error
+          )}
+        </div>
+      )}
 
       <div className="store-cart">
-        {/* Colonne récap */}
-        <section className="store-cart-recap">
-          <div className="store-summary-box">
-            <h3>{item.product.name}</h3>
-            <p className="muted" style={{ fontSize: 12.5 }}>{billingCycleLabel(item.product.billingCycle)}</p>
-
-            {subdomain && (
-              <div className="store-cart-subdomain">
-                <span className="store-recap-label">Adresse de votre application</span>
-                <span className="store-cart-subdomain-val">https://{subdomain}.…</span>
-              </div>
-            )}
-
-            <ul className="store-totals">
-              <li><span>Souscription</span><span>{formatCents(subtotal)}</span></li>
-              {optionsHt !== 0 && <li><span>Options</span><span>+{formatCents(optionsHt)}</span></li>}
-              {addonsHt !== 0 && <li><span>Suppléments</span><span>+{formatCents(addonsHt)}</span></li>}
-              <li><span>Installation</span><span>{formatCents(installation)}</span></li>
-              {tax !== 0 && <li><span>Taxe ({taxRate} %)</span><span>{formatCents(tax)}</span></li>}
-            </ul>
-            <div className="store-total">
-              <span>Total</span>
-              <strong>{formatCents(total)}</strong>
-            </div>
-
-            <div className="store-contact-note">
-              <IconMail size={16} />
-              <div>
-                <b>Détails de compte à {contact?.email ?? '…'}</b>
-                <span>Votre compte client, vos identifiants et l'accès à votre application vous seront envoyés à cette adresse.</span>
-              </div>
-            </div>
-          </div>
-        </section>
-
-        {/* Colonne moyen de paiement */}
+        {/* Colonne moyens de paiement (gauche) — en premier dans le DOM :
+            ordre clavier = ordre visuel (actions → récap). */}
         <form className="store-cart-form" onSubmit={confirmer} noValidate>
           <div className="store-config">
             <h2>Moyen de paiement</h2>
 
-            {methods === null && <p className="muted">Chargement des moyens de paiement…</p>}
-            {methods !== null && methods.length === 0 && (
-              <div className="alert error">Aucun moyen de paiement n'est actif pour le moment.</div>
+            {/* États : chargement / erreur réseau / aucun moyen actif (blocage
+                expliqué) / liste réelle des moyens actifs renvoyés par l'API. */}
+            {methods === null && !methodsError && (
+              <p className="muted" role="status">Chargement des moyens de paiement…</p>
+            )}
+            {methodsError && (
+              <div className="alert error" role="alert">
+                Impossible de charger les moyens de paiement.{' '}
+                <button type="button" className="alert-retry" onClick={() => loadMethods()}>
+                  Réessayer
+                </button>
+              </div>
+            )}
+            {methods !== null && methods.length === 0 && !methodsError && (
+              <div className="alert error" role="alert">
+                <b>Paiement indisponible :</b> aucun moyen de paiement n&apos;est actuellement actif.
+                La confirmation de commande est donc bloquée — réessayez plus tard.
+              </div>
             )}
 
             {methods !== null && methods.length > 0 && (
@@ -206,8 +215,8 @@ function CheckoutPaymentView() {
             <div className="store-contact-note">
               <IconShield size={16} />
               <div>
-                <b>Paiement simulé</b>
-                <span>À cette étape de validation, la commande est enregistrée et votre abonnement activé immédiatement. Aucune carte n'est débitée.</span>
+                <b>Aucune saisie de carte</b>
+                <span>Ce tunnel n&apos;exige aucune carte bancaire : le paiement est géré par le moyen de paiement ci-dessus. L&apos;état de votre commande s&apos;affiche ensuite sur la page de confirmation.</span>
               </div>
             </div>
           </div>
@@ -216,9 +225,54 @@ function CheckoutPaymentView() {
             {loading ? 'Commande en cours…' : 'Confirmer la commande'}
           </button>
         </form>
+
+        {/* Colonne récap (droite) — après le formulaire dans le DOM et à
+            droite sur desktop (montants et règles de calcul inchangés). */}
+        <section className="store-cart-recap">
+          <div className="store-summary-box">
+            <h3>{item.product.name}</h3>
+            <p className="muted" style={{ fontSize: 12.5 }}>{billingCycleLabel(item.product.billingCycle)}</p>
+
+            {subdomain && (
+              <div className="store-cart-subdomain">
+                <span className="store-recap-label">Sous-domaine choisi</span>
+                <span className="store-cart-subdomain-val">{subdomain}</span>
+              </div>
+            )}
+
+            <ul className="store-totals">
+              <li><span>Souscription</span><span>{formatCents(subtotal)}</span></li>
+              {optionsHt !== 0 && <li><span>Options</span><span>+{formatCents(optionsHt)}</span></li>}
+              {addonsHt !== 0 && <li><span>Suppléments</span><span>+{formatCents(addonsHt)}</span></li>}
+              <li><span>Installation</span><span>{formatCents(installation)}</span></li>
+              {tax !== 0 && <li><span>Taxe ({taxRate} %)</span><span>{formatCents(tax)}</span></li>}
+            </ul>
+            <div className="store-total">
+              <span>Total</span>
+              <strong>{formatCents(total)}</strong>
+            </div>
+
+            <div className="store-contact-note">
+              <IconMail size={16} />
+              <div>
+                <b>Détails de compte à {contact?.email ?? '…'}</b>
+                <span>Votre compte client, vos identifiants et l'accès à votre application vous seront envoyés à cette adresse.</span>
+              </div>
+            </div>
+          </div>
+        </section>
       </div>
     </div>
   );
+}
+
+/**
+ * Refus backend d'une commande « changement de pack » pour un compte déjà
+ * abonné (limite serveur, message brut technique) → reformulé côté client en
+ * langage clair + action assistance (aucun jargon interne affiché).
+ */
+function isUpgradeRefusal(msg: string): boolean {
+  return /upgrade non pris en charge|abonnement actif existant/i.test(msg);
 }
 
 /** Extrait un court texte d'instruction d'un `config` (objet Json non secret). */

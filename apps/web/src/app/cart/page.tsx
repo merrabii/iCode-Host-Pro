@@ -6,6 +6,7 @@ import { useRouter } from 'next/navigation';
 import { StoreShell } from '@/components/store-shell';
 import { useCart } from '@/components/cart-provider';
 import { useToast } from '@/components/toast';
+import { Field, Input } from '@/components/ui';
 import { IconChevronLeft, IconChevronRight, IconMail, IconShield } from '@/components/icons';
 import { billingCycleLabel, fetchMe, formatCents, getSessionToken, type Me } from '@/lib/api';
 import { buyerStorage } from '@/lib/cart';
@@ -34,7 +35,7 @@ export default function CartPage() {
 function CartView() {
   const router = useRouter();
   const toast = useToast();
-  const { item, clear } = useCart();
+  const { item, clear, ready } = useCart();
 
   const [values, setValues] = useState<Record<string, string>>({});
   const [errors, setErrors] = useState<Record<string, string>>({});
@@ -44,7 +45,6 @@ function CartView() {
   //   'custom'           = autres coordonnées (société / autre personne).
   const [me, setMe] = useState<Me | null>(null);
   const [billingMode, setBillingMode] = useState<'account' | 'custom'>('account');
-  const [sessionChecked, setSessionChecked] = useState(false);
 
   // Détecte la session : si connecté, on propose le choix ; sinon on reste sur
   // la saisie libre (le serveur ignorera `useAccountDetails` pour un invité).
@@ -56,7 +56,6 @@ function CartView() {
         const m = await fetchMe(token);
         if (m) { setMe(m); setBillingMode('account'); }
       } catch { /* non connecté */ }
-      finally { setSessionChecked(true); }
     })();
   }, []);
 
@@ -143,7 +142,13 @@ function CartView() {
     router.push('/checkout/payment');
   }
 
-  // ── Panier vide ────────────────────────────────────────────────
+  // ── États de panier ───────────────────────────────────────────
+  // `ready` = lecture localStorage terminée : on ne montre « panier vide »
+  // qu'après hydratation (plus de flash au montage).
+  if (!ready) {
+    return <div className="store-loading" role="status">Chargement du panier…</div>;
+  }
+
   if (!item) {
     return (
       <div className="store-single">
@@ -169,7 +174,115 @@ function CartView() {
       </header>
 
       <div className="store-cart">
-        {/* Colonne récap (à droite) */}
+        {/* Colonne coordonnées (gauche) — en premier dans le DOM : ordre
+            clavier = ordre visuel (formulaire → actions → récap). */}
+        <form className="store-cart-form" onSubmit={commander} noValidate>
+          <div className="store-config">
+            <h2>Vos coordonnées</h2>
+
+            {/* Point 6 — membre connecté : coordonnées du compte OU autres
+                coordonnées de facturation (société / autre personne). */}
+            {me && (
+              <div className="store-billing-toggle">
+                <div className="store-billing-toggle-label">Coordonnées de facturation</div>
+                <div className="store-billing-toggle-grid">
+                  <label className={`store-billing-opt${billingMode === 'account' ? ' active' : ''}`}>
+                    <input
+                      type="radio"
+                      name="billingMode"
+                      checked={billingMode === 'account'}
+                      onChange={() => setBillingMode('account')}
+                    />
+                    <span>
+                      <b>Utiliser les coordonnées de mon compte</b>
+                      <span className="muted">{me.name || ''} · {me.email}</span>
+                    </span>
+                  </label>
+                  <label className={`store-billing-opt${billingMode === 'custom' ? ' active' : ''}`}>
+                    <input
+                      type="radio"
+                      name="billingMode"
+                      checked={billingMode === 'custom'}
+                      onChange={() => setBillingMode('custom')}
+                    />
+                    <span>
+                      <b>Autres coordonnées de facturation</b>
+                      <span className="muted">Entreprise ou autre personne (nom, email, téléphone).</span>
+                    </span>
+                  </label>
+                </div>
+                {billingMode === 'account' && (
+                  <p className="muted store-billing-note" style={{ fontSize: 12 }}>
+                    La commande et la facture porteront les coordonnées de votre compte. L'accès à votre
+                    espace reste attaché à votre connexion <strong className="store-contact-email">{me.email}</strong>.
+                  </p>
+                )}
+                {/* Profil sans nom : le nom (requis) est verrouillé en mode
+                    « coordonnées du compte » → expliquer le blocage et offrir
+                    l'action vers « Autres coordonnées » (pas de modification
+                    du profil depuis la boutique). */}
+                {billingMode === 'account' && !me.name && (
+                  <div className="alert warn" role="alert">
+                    <b>Nom manquant sur votre compte :</b> la commande exige un nom, mais votre profil
+                    n'en contient pas. Choisissez « Autres coordonnées de facturation » pour le saisir
+                    ici, ou complétez votre nom depuis votre espace client.{' '}
+                    <button type="button" className="alert-retry" onClick={() => setBillingMode('custom')}>
+                      Utiliser d'autres coordonnées
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {fields.map((f) => (
+              <Field
+                key={f.id}
+                htmlFor={`cf-${f.id}`}
+                label={f.label}
+                required={f.required}
+              >
+                <Input
+                  id={`cf-${f.id}`}
+                  type={f.type === 'EMAIL' ? 'email' : f.type === 'TEL' ? 'tel' : 'text'}
+                  value={values[f.key] ?? ''}
+                  onChange={(e) => setValues((s) => ({ ...s, [f.key]: e.target.value }))}
+                  placeholder={f.placeholder ?? undefined}
+                  autoComplete={f.type === 'EMAIL' ? 'email' : f.type === 'TEL' ? 'tel' : 'name'}
+                  disabled={!!me && billingMode === 'account' && (f.type === 'EMAIL' || f.key === 'name')}
+                  aria-invalid={errors[f.key] ? true : undefined}
+                  aria-describedby={errors[f.key] ? `cf-${f.id}-err` : undefined}
+                />
+                {errors[f.key] && (
+                  <span id={`cf-${f.id}-err`} className="field-error" role="alert">{errors[f.key]}</span>
+                )}
+              </Field>
+            ))}
+
+            {/* Encart DesignSystem : détails de compte sur cet email */}
+            <div className="store-contact-note">
+              <IconMail size={16} />
+              <div>
+                <b>Vos détails de compte vous seront envoyés à cette adresse.</b>
+                {email && !errors.email ? (
+                  <span>Après paiement validé, votre compte client et vos identifiants seront livrés à <strong className="store-contact-email">{email}</strong>.</span>
+                ) : (
+                  <span>Renseignez votre email ci-dessus : c'est là que vous recevrez vos détails de compte et votre sous-domaine gratuit.</span>
+                )}
+              </div>
+            </div>
+          </div>
+
+          <button type="submit" className="btn-primary store-cta">
+            Commander <IconChevronRight size={15} />
+          </button>
+
+          <span className="muted store-secure-note" style={{ justifyContent: 'center' }}>
+            <IconShield size={13} /> Aucun compte n'est créé tant que le paiement n'est pas validé.
+          </span>
+        </form>
+
+        {/* Colonne récap (droite) — après le formulaire dans le DOM et à
+            droite sur desktop (montants et règles de calcul inchangés). */}
         <section className="store-cart-recap">
           <div className="store-summary-box">
             <h3>{item.product.name}</h3>
@@ -177,8 +290,8 @@ function CartView() {
 
             {item.subdomain && (
               <div className="store-cart-subdomain">
-                <span className="store-recap-label">Adresse de votre application</span>
-                <span className="store-cart-subdomain-val">https://{item.subdomain}.…</span>
+                <span className="store-recap-label">Sous-domaine choisi</span>
+                <span className="store-cart-subdomain-val">{item.subdomain}</span>
               </div>
             )}
 
@@ -240,93 +353,6 @@ function CartView() {
             )}
           </div>
         </section>
-
-        {/* Colonne coordonnées */}
-        <form className="store-cart-form" onSubmit={commander} noValidate>
-          <div className="store-config">
-            <h2>Vos coordonnées</h2>
-
-            {/* Point 6 — membre connecté : coordonnées du compte OU autres
-                coordonnées de facturation (société / autre personne). */}
-            {me && (
-              <div className="store-billing-toggle">
-                <div className="store-billing-toggle-label">Coordonnées de facturation</div>
-                <div className="store-billing-toggle-grid">
-                  <label className={`store-billing-opt${billingMode === 'account' ? ' active' : ''}`}>
-                    <input
-                      type="radio"
-                      name="billingMode"
-                      checked={billingMode === 'account'}
-                      onChange={() => setBillingMode('account')}
-                    />
-                    <span>
-                      <b>Utiliser les coordonnées de mon compte</b>
-                      <span className="muted">{me.name || ''} · {me.email}</span>
-                    </span>
-                  </label>
-                  <label className={`store-billing-opt${billingMode === 'custom' ? ' active' : ''}`}>
-                    <input
-                      type="radio"
-                      name="billingMode"
-                      checked={billingMode === 'custom'}
-                      onChange={() => setBillingMode('custom')}
-                    />
-                    <span>
-                      <b>Autres coordonnées de facturation</b>
-                      <span className="muted">Entreprise ou autre personne (nom, email, téléphone).</span>
-                    </span>
-                  </label>
-                </div>
-                {billingMode === 'account' && (
-                  <p className="muted store-billing-note" style={{ fontSize: 12 }}>
-                    La commande et la facture porteront les coordonnées de votre compte. L'accès à votre
-                    espace reste attaché à votre connexion <strong className="store-contact-email">{me.email}</strong>.
-                  </p>
-                )}
-              </div>
-            )}
-
-            {fields.map((f) => (
-              <div className="field" key={f.id}>
-                <label htmlFor={`cf-${f.id}`}>
-                  {f.label} {f.required && <span className="req">*</span>}
-                </label>
-                <input
-                  id={`cf-${f.id}`}
-                  className="input"
-                  type={f.type === 'EMAIL' ? 'email' : f.type === 'TEL' ? 'tel' : 'text'}
-                  value={values[f.key] ?? ''}
-                  onChange={(e) => setValues((s) => ({ ...s, [f.key]: e.target.value }))}
-                  placeholder={f.placeholder ?? undefined}
-                  autoComplete={f.type === 'EMAIL' ? 'email' : f.type === 'TEL' ? 'tel' : 'name'}
-                  disabled={!!me && billingMode === 'account' && (f.type === 'EMAIL' || f.key === 'name')}
-                />
-                {errors[f.key] && <span className="store-field-error">{errors[f.key]}</span>}
-              </div>
-            ))}
-
-            {/* Encart DesignSystem : détails de compte sur cet email */}
-            <div className="store-contact-note">
-              <IconMail size={16} />
-              <div>
-                <b>Vos détails de compte vous seront envoyés à cette adresse.</b>
-                {email && !errors.email ? (
-                  <span>Après paiement validé, votre compte client et vos identifiants seront livrés à <strong className="store-contact-email">{email}</strong>.</span>
-                ) : (
-                  <span>Renseignez votre email ci-dessus : c'est là que vous recevrez vos détails de compte et votre sous-domaine gratuit.</span>
-                )}
-              </div>
-            </div>
-          </div>
-
-          <button type="submit" className="btn-primary store-cta">
-            Commander <IconChevronRight size={15} />
-          </button>
-
-          <span className="muted store-secure-note" style={{ justifyContent: 'center' }}>
-            <IconShield size={13} /> Aucun compte n'est créé tant que le paiement n'est pas validé.
-          </span>
-        </form>
       </div>
     </div>
   );
