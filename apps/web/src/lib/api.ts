@@ -389,6 +389,261 @@ export async function checkStoreSubdomain(
   }
 }
 
+// ── GO P4 (lot B1) — visibilité : mes commandes / mes factures (client + admin)
+/** Query string commune aux listes paginées (page 1-based, perPage borné). */
+function listQs(query: {
+  page?: number;
+  perPage?: number;
+  status?: string;
+  q?: string;
+}): string {
+  const q = new URLSearchParams();
+  if (query.page) q.set('page', String(query.page));
+  if (query.perPage) q.set('perPage', String(query.perPage));
+  if (query.status) q.set('status', query.status);
+  if (query.q) q.set('q', query.q);
+  const s = q.toString();
+  return s ? `?${s}` : '';
+}
+
+export type OrderStatusName =
+  | 'PENDING_PAYMENT'
+  | 'PAID'
+  | 'PROVISIONING'
+  | 'ACTIVE'
+  | 'SUSPENDED'
+  | 'CANCELLED'
+  | 'REFUNDED';
+export type InvoiceStatusName =
+  | 'UNPAID'
+  | 'PAID'
+  | 'CANCELLED'
+  | 'REFUNDED'
+  | 'CREDITED';
+
+export interface OrderListItem {
+  id: string;
+  status: OrderStatusName | string;
+  productName: string;
+  billingCycle: string;
+  currency: string;
+  amountHtCents: number;
+  taxAmountCents: number;
+  amountTtcCents: number;
+  createdAt: string;
+  paidAt?: string | null;
+  nextBillingDate?: string | null;
+  autoRenew?: boolean;
+  customerName?: string;
+  customerEmail?: string;
+  paymentMethodName?: string | null;
+  product?: { slug: string | null } | null;
+  invoice?: { id: string; number: string; status: string } | null;
+}
+export interface AdminOrderListItem extends OrderListItem {
+  idempotencyKey?: string | null;
+  customer?: {
+    id: string;
+    email: string;
+    name: string;
+    userId?: string | null;
+  } | null;
+}
+export interface OrderStatusEvent {
+  id: string;
+  status: string;
+  note?: string | null;
+  actorEmail?: string | null;
+  createdAt: string;
+}
+export interface OrderSummary {
+  totalTtcCents: number;
+  statuses: { status: string; count: number; amountTtcCents: number }[];
+}
+export interface OrderDetail extends AdminOrderListItem {
+  statusHistory?: OrderStatusEvent[];
+  optionsSnapshot?: unknown;
+  addonsSnapshot?: unknown;
+  domainType?: string;
+  domainValue?: string | null;
+  requestedSubdomain?: string | null;
+  paymentMethod?: { id: string; name: string; type: string } | null;
+  subscription?: {
+    id: string;
+    status: string;
+    product?: { slug: string | null } | null;
+  } | null;
+}
+export interface OrderListPage<T = OrderListItem> {
+  items: T[];
+  total: number;
+  page: number;
+  perPage: number;
+  summary?: OrderSummary;
+}
+
+export interface InvoiceListItem {
+  id: string;
+  number: string;
+  status: InvoiceStatusName | string;
+  currency: string;
+  amountHtCents: number;
+  taxAmountCents: number;
+  amountTtcCents: number;
+  issuedAt: string;
+  dueDate?: string | null;
+  paidAt?: string | null;
+  orderId?: string | null;
+  hasPdf?: boolean;
+  order?: { id: string; productName: string; status: string } | null;
+}
+export interface AdminInvoiceListItem extends InvoiceListItem {
+  customer?: {
+    id: string;
+    email: string;
+    name: string;
+    userId?: string | null;
+  } | null;
+}
+export interface InvoiceLine {
+  id: string;
+  kind: string;
+  label: string;
+  qty: number;
+  unitPriceHtCents: number;
+  taxRatePercent?: string | number;
+  taxAmountCents: number;
+  totalTtcCents: number;
+}
+export interface InvoiceDetail extends AdminInvoiceListItem {
+  taxRatePercent?: string | number;
+  billingAddress?: unknown;
+  lines?: InvoiceLine[];
+}
+export interface InvoiceListPage<T = InvoiceListItem> {
+  items: T[];
+  total: number;
+  page: number;
+  perPage: number;
+}
+
+export interface AdminCustomerItem {
+  id: string;
+  email: string;
+  name: string;
+  phone?: string | null;
+  accountType?: string;
+  userId?: string | null;
+  walletBalanceCents?: number;
+  createdAt: string;
+  _count?: { orders: number; invoices: number };
+}
+export interface CustomerListPage {
+  items: AdminCustomerItem[];
+  total: number;
+  page: number;
+  perPage: number;
+}
+
+export type ListQuery = {
+  page?: number;
+  perPage?: number;
+  status?: string;
+  q?: string;
+};
+
+/** Libellés FR des statuts de commande (vues client + admin). */
+export const ORDER_STATUS_LABEL: Record<string, string> = {
+  PENDING_PAYMENT: 'En attente de paiement',
+  PAID: 'Payée',
+  PROVISIONING: 'Provisionnement',
+  ACTIVE: 'Active',
+  SUSPENDED: 'Suspendue',
+  CANCELLED: 'Annulée',
+  REFUNDED: 'Remboursée',
+};
+/** Tonalité badge par statut de commande. */
+export const ORDER_STATUS_TONE: Record<
+  string,
+  'green' | 'blue' | 'amber' | 'red' | 'neutral'
+> = {
+  PENDING_PAYMENT: 'amber',
+  PAID: 'blue',
+  PROVISIONING: 'blue',
+  ACTIVE: 'green',
+  SUSPENDED: 'amber',
+  CANCELLED: 'red',
+  REFUNDED: 'red',
+};
+/** Libellés FR des statuts de facture. */
+export const INVOICE_STATUS_LABEL: Record<string, string> = {
+  UNPAID: 'Impayée',
+  PAID: 'Payée',
+  CANCELLED: 'Annulée',
+  REFUNDED: 'Remboursée',
+  CREDITED: 'Avoir',
+};
+/** Tonalité badge par statut de facture. */
+export const INVOICE_STATUS_TONE: Record<
+  string,
+  'green' | 'blue' | 'amber' | 'red' | 'neutral'
+> = {
+  UNPAID: 'amber',
+  PAID: 'green',
+  CANCELLED: 'red',
+  REFUNDED: 'red',
+  CREDITED: 'blue',
+};
+
+// Client — isolation portée par l'API (filtre propriétaire + 404 au détail).
+export const listMyOrders = (t: string, query: ListQuery = {}) =>
+  apiJson(`/api/client/orders${listQs(query)}`, t) as Promise<
+    ApiResult<OrderListPage>
+  >;
+export const getMyOrder = (t: string, id: string) =>
+  apiJson(`/api/client/orders/${encodeURIComponent(id)}`, t) as Promise<
+    ApiResult<OrderDetail>
+  >;
+export const listMyInvoices = (t: string, query: ListQuery = {}) =>
+  apiJson(`/api/client/invoices${listQs(query)}`, t) as Promise<
+    ApiResult<InvoiceListPage>
+  >;
+export const getMyInvoice = (t: string, id: string) =>
+  apiJson(`/api/client/invoices/${encodeURIComponent(id)}`, t) as Promise<
+    ApiResult<InvoiceDetail>
+  >;
+
+// Admin — listes globales paginées + agrégats KPI (commandes).
+export const listAdminOrders = (t: string, query: ListQuery = {}) =>
+  apiJson(`/api/store/admin/orders${listQs(query)}`, t) as Promise<
+    ApiResult<OrderListPage<AdminOrderListItem>>
+  >;
+export const getAdminOrder = (t: string, id: string) =>
+  apiJson(`/api/store/admin/orders/${encodeURIComponent(id)}`, t) as Promise<
+    ApiResult<OrderDetail>
+  >;
+export const confirmAdminOrderPayment = (
+  t: string,
+  id: string,
+  body: { reference?: string; note?: string },
+) =>
+  apiJson(`/api/store/admin/orders/${encodeURIComponent(id)}/confirm-payment`, t, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+export const listAdminInvoices = (t: string, query: ListQuery = {}) =>
+  apiJson(`/api/store/admin/invoices${listQs(query)}`, t) as Promise<
+    ApiResult<InvoiceListPage<AdminInvoiceListItem>>
+  >;
+export const getAdminInvoice = (t: string, id: string) =>
+  apiJson(`/api/store/admin/invoices/${encodeURIComponent(id)}`, t) as Promise<
+    ApiResult<InvoiceDetail>
+  >;
+export const listAdminCustomers = (t: string, query: ListQuery = {}) =>
+  apiJson(`/api/store/admin/customers${listQs(query)}`, t) as Promise<
+    ApiResult<CustomerListPage>
+  >;
+
 // ── Phase 6 (ADR-022) — mail settings + invitation emails ────────────────────
 /** Masked view of the SMTP settings — the stored password is NEVER exposed. */
 export interface MailSettings {

@@ -31,6 +31,8 @@ export const ADMIN_NAV: NavSection[] = [
       { label: 'Catégories', href: '/manager/categories', icon: IconDatabase },
       { label: 'Packs', href: '/manager/packs', icon: IconLayers },
       { label: 'Utilisateurs', href: '/manager/utilisateurs', icon: IconUsers },
+      { label: 'Commandes', href: '/manager/commandes', icon: IconBox },
+      { label: 'Factures', href: '/manager/factures', icon: IconFileText },
       { label: 'Souscriptions & services', href: '/manager/subscriptions', icon: IconBoxes },
       { label: 'Invitations', href: '/manager/invitations', icon: IconMail },
       { label: 'Configuration mail', href: '/manager/mail', icon: IconMail },
@@ -80,6 +82,8 @@ export const CLIENT_NAV: NavSection[] = [
     section: 'Espace client',
     items: [
       { label: 'Mes applications', href: '/client?rub=apps', icon: IconServer },
+      { label: 'Mes commandes', href: '/client/commandes', icon: IconBox },
+      { label: 'Mes factures', href: '/client/factures', icon: IconFileText },
       { label: 'Hébergement', href: '/client?rub=host', icon: IconBoxes },
       { label: 'Assistance', href: '/client?rub=help', icon: IconLifeBuoy },
       { label: 'Mon profil', href: '/profil', icon: IconKey },

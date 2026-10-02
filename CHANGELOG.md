@@ -1,5 +1,20 @@
 # CHANGELOG
 
+## 2026-10-02 — **GO socle commercial — P4 (visibilité : mes commandes / mes factures + listes admin, audit B1)** (branche `feat/socle-commercial`, checkpoints locaux, aucun push)
+### Lot B1 — vues client + listes d'exploitation (audit §1.1, §5, E-03/E-07)
+- **Aucune migration** : lot 100 % code (lectures + UI), base `icode_host_pro_socle` inchangée (49e migration P3).
+- **Vues client** `GET /client/orders`, `GET /client/orders/:id`, `GET /client/invoices`, `GET /client/invoices/:id` (JwtAuthGuard, `ClientStoreController`) : **isolation par propriétaire servie côté API** — `customer.userId = sub` avec repli `customer.email = JWT email` pour les dossiers invités ; détail non appartenant au compte = **404** (jamais 403 : aucune révélation d'existence) ; pagination stricte (page 1-based, perPage ≤ 200, `page=0` → 400, statut invalide → 400) ; select explicite **sans secret interne** (aucune clé d'idempotence/tête, `hasPdf` au lieu du chemin PDF disque).
+- **Listes admin** : `GET /store/admin/orders` avec **`summary` KPI agrégé** (effectifs + CA TTC par statut via `groupBy`, summary qui suit les filtres = KPI de la vue courante) + `GET /store/admin/orders/:id` (détail : client, historique, abonnement, méthode) sur `AdminOrdersController` ; **nouveau** `AdminBillingController` : `GET /store/admin/invoices` (+ `/:id` avec lignes), `GET /store/admin/customers` (+ compteurs `_count`) — tous `JwtAuthGuard + RolesGuard + @Roles(ADMIN)`.
+- **Web client** : pages `/client/commandes` (liste paginée + filtre statut + détail `?id=` avec timeline de statut et facture liée consultable inline) et `/client/factures` (liste + détail avec lignes) ; entrées « Mes commandes » / « Mes factures » dans `CLIENT_NAV`.
+- **Web admin** : pages `/manager/commandes` (StatCards KPI, filtre statut, recherche email/nom/produit, pagination, détail + **bouton « Confirmer le règlement »** qui rend enfin l'`POST …/confirm-payment` atteignable depuis l'UI — il n'avait aucune page) et `/manager/factures` (recherche numéro/email, détail lignes) ; entrées « Commandes » / « Factures » dans `ADMIN_NAV`.
+- **Promesses de `/checkout/success` tenues** : liens « Voir mes commandes » ajoutés sur les 3 états (référence manquante, commande introuvable, commande trouvée) — « retrouvez l'état de votre commande dans votre espace client » devient cliquable.
+
+### Tests P4
+- **Nouveau** `test/visibility-lists.e2e-spec.ts` : **15/15 PASS** — A isolation client (liste filtrée par propriétaire, 404 croisé, factures isolées, zéro secret en liste, 401 anonyme) ; B repli email du dossier invité (`userId` nul) ; C pagination (pages disjoints, total stable) + validation (400 page/statut) + filtre statut proprio ; D RBAC admin (401 anonyme / 403 USER ×3) + KPI summary (CA 10000, comptes 1/1/2) + recherche/filtre/pagination + détails (200/404) + clients globaux (3 dossiers, invité visible tel quel).
+- **Smoke de non-régression** : `store-payment-confirmation` (25) + `account-recovery` (16) + `rbac-deployment-modules` (7) = **48/48 PASS** (controller admin-orders modifié).
+- **Unit API complet : 1015/1015 PASS (56 suites)** ; `tsc --noEmit` API **et** Web PASS.
+- **Lint** : `eslint` toujours absent du workspace (préexistant, non bloquant).
+
 ## 2026-10-02 — **GO socle commercial — P3 (compte client : reset mdp + édition profil, audit A1)** (branche `feat/socle-commercial`, checkpoints locaux, aucun push)
 ### Lot A1 — clients et accès (audit socle §1.1)
 - **Migration additive** `20261002100000_add_password_reset` : table `PasswordResetToken` (`tokenHash` sha256 @unique, `expiresAt`, `usedAt`, FK `User` CASCADE) — 1 table neuve, aucune ALTER existante, anciennes migrations intactes. Types Prisma régénérés.

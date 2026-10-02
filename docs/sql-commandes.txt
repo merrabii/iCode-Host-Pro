@@ -1111,3 +1111,11 @@ npx prisma migrate deploy          -- base icode_host_pro_socle (49e migration :
 -- Recette e2e/unit sur cette MÊME base dédiée (aucune écriture live).
 -- Nouveaux tests : npx jest --config ./test/jest-e2e.json account-recovery --runInBand (16/16).
 -- Env : PASSWORD_RESET_EXPIRES_IN_MINUTES (défaut 30, borné 5..1440 dans le service).
+
+--
+-- Lot P4 (GO socle, audit B1 — visibilité) : AUCUNE migration.
+--   100 % code : vues client "mes commandes / mes factures" (isolation par
+--   propriétaire) + listes admin paginées (orders/invoices/customers + KPI).
+--   Base inchangée (49e migration P3).
+-- Recette e2e sur base icode_host_pro_socle :
+--   npx jest --config ./test/jest-e2e.json visibility-lists --runInBand  (15/15)

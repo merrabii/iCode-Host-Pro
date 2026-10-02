@@ -115,7 +115,8 @@ function SuccessInner() {
               retrouvez votre commande dans votre espace client.
             </p>
             <div className="store-success-actions">
-              <Link href="/shop" className="btn-primary">Retour à la boutique</Link>
+              <Link href="/client/commandes" className="btn-primary">Voir mes commandes</Link>
+              <Link href="/shop" className="btn-secondary">Retour à la boutique</Link>
             </div>
           </div>
         </div>
@@ -172,7 +173,8 @@ function SuccessInner() {
               </div>
             </div>
             <div className="store-success-actions">
-              <Link href="/shop" className="btn-primary">Retour à la boutique</Link>
+              <Link href="/client/commandes" className="btn-primary">Voir mes commandes</Link>
+              <Link href="/shop" className="btn-secondary">Retour à la boutique</Link>
               <Link href="/auth" className="btn-secondary">Se connecter</Link>
             </div>
           </div>
@@ -250,6 +252,7 @@ function SuccessInner() {
 
           <div className="store-success-actions">
             <Link href="/client" className="btn-primary">Accéder à mon espace <IconChevronRight size={15} /></Link>
+            <Link href="/client/commandes" className="btn-secondary">Voir mes commandes</Link>
             <Link href="/shop" className="btn-secondary">Retour à la boutique</Link>
           </div>
         </div>

@@ -9,9 +9,11 @@ import { MailModule } from '../mail/mail.module';
 import { ProductsModule } from '../products/products.module';
 import { PanelTransportFactory } from '../servers/panel-transport.factory';
 import { BillingPaymentAdminController } from './billing-payment.admin.controller';
+import { AdminBillingController } from './admin-billing.controller';
 import { AdminOrdersController } from './admin-orders.controller';
 import { CheckoutController } from './checkout.controller';
 import { CheckoutService } from './checkout.service';
+import { ClientStoreController } from './client-store.controller';
 import { DEPLOYMENT_EVIDENCE_CONNECTORS } from './deployment-evidence';
 import { DeploymentEvidenceService } from './deployment-evidence.service';
 import { OrderCancelService } from './order-cancel.service';
@@ -42,6 +44,8 @@ import { StoreSubdomainController } from './store-subdomain.controller';
     PaymentMethodsController,
     BillingPaymentAdminController,
     AdminOrdersController,
+    AdminBillingController,
+    ClientStoreController,
     CheckoutController,
     StoreProvisioningAdminController,
     StoreSubdomainController,
