@@ -1446,6 +1446,112 @@ select:disabled {
   }
 }
 
+/* étapes de démarrage (accueil) */
+.landing-step-num {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 9px;
+  background: var(--active-bg);
+  color: var(--active-text);
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.landing-step-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 2px;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--brand-primary);
+}
+
+.landing-step-link:hover {
+  text-decoration: underline;
+}
+
+/* vitrine du héro : liste de libellés (aucun chiffre) */
+.landing-win-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.landing-win-item {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 11px 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: 12px;
+  background: var(--card-bg-2);
+}
+
+.landing-win-item b {
+  font-size: 13px;
+  letter-spacing: -.01em;
+}
+
+.landing-win-item span {
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+
+/* questions fréquentes (accueil) */
+.landing-faq {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: 100%;
+  max-width: 760px;
+  margin: 0 auto;
+}
+
+.landing-faq details {
+  padding: 0 18px;
+  border: 1px solid var(--border-soft);
+  border-radius: 14px;
+  background: var(--card-bg);
+}
+
+.landing-faq summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 15px 0;
+  cursor: pointer;
+  list-style: none;
+  font-size: 14.5px;
+  font-weight: 650;
+}
+
+.landing-faq summary::-webkit-details-marker {
+  display: none;
+}
+
+.landing-faq summary::after {
+  content: "+";
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--brand-primary);
+}
+
+.landing-faq details[open] summary::after {
+  content: "\2013";
+}
+
+.landing-faq p {
+  margin: 0 0 16px;
+  color: var(--text-secondary);
+  font-size: 13.5px;
+  line-height: 1.6;
+}
+
 /* ---- 10ter. Offres (catalogue public, conversion) -------------- */
 .offres {
   max-width: 1080px;
