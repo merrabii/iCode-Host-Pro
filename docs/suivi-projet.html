@@ -1,0 +1,570 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>iCode Host Pro — Suivi global du projet</title>
+<style>
+*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:#f3f6f6;color:#172c2b;font:16px/1.65 system-ui,sans-serif}
+a{color:#087755}header{background:#093f37;color:white;padding:52px max(24px,calc((100vw - 1150px)/2))}header p{max-width:850px;color:#d2e9e3}
+h1{font-size:clamp(30px,5vw,50px);line-height:1.12;margin:12px 0}h2{font-size:27px;line-height:1.25}h3{font-size:18px;margin:0 0 8px}
+nav{background:white;padding:18px;display:flex;gap:8px;flex-wrap:wrap;border-bottom:1px solid #d3e0db}nav a{padding:7px 12px;background:#edf5f0;border-radius:8px;text-decoration:none;font-size:14px}
+main{max-width:1200px;margin:auto;padding:24px}section{margin:0 0 30px;background:white;border:1px solid #dce5e2;padding:28px;border-radius:18px;scroll-margin-top:20px}
+.cards{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}article{border:1px solid #dce6e1;padding:20px;border-radius:12px;background:#f7faf8}article p{margin:0}
+.notice{background:#fff5df;border-left:4px solid #bd8a22;padding:18px;margin-bottom:20px}
+.table{overflow:auto}table{width:100%;border-collapse:collapse;font-size:14px}th{text-align:left;background:#e9f3ee}td,th{padding:13px;vertical-align:top;border-bottom:1px solid #dce5e2;min-width:150px}td:first-child{font-weight:650}
+figure{margin:24px 0;padding:22px;background:#edf6f2;border-radius:14px}figcaption{font-weight:750;margin-bottom:18px}
+.flow{counter-reset:step;list-style:none;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin:0;padding:0}
+.flow li{counter-increment:step;background:white;border:1px solid #b8d4c8;padding:18px;border-radius:10px}
+.flow li:before{content:counter(step);display:inline-grid;place-items:center;background:#087755;color:white;border-radius:50%;width:26px;height:26px;margin-right:10px}
+.flow b{font-size:16px}.flow span{display:block;margin-top:9px;font-size:14px}
+button{padding:10px 16px;border:1px solid #b7d5c9;background:white;color:#164d40;border-radius:8px;font-weight:700;cursor:pointer}
+input{padding:12px;border:1px solid #a9c0b7;border-radius:8px;min-width:260px;font:inherit}
+.tools{display:flex;gap:10px;flex-wrap:wrap;margin:20px 0}.tag{font-size:12px;text-transform:uppercase;letter-spacing:2px;color:#b7e9d4}
+code{overflow-wrap:anywhere;background:#eaf1ed;padding:2px 5px}footer{text-align:center;padding:30px;color:#4c665b}
+.small{font-size:13.5px;color:#4c665b;margin-top:10px}
+.s-ok{color:#087755;font-weight:750}.s-part{color:#9a6b0f;font-weight:750}.s-no{color:#9c3131;font-weight:750}.s-unk{color:#5d6f6a;font-weight:750}
+.matrix td{min-width:104px}.matrix td:first-child{min-width:250px}.matrix th{min-width:104px}
+.diagram{display:block;width:100%;min-width:760px;height:auto;color:inherit}
+body.dark{background:#101b1a;color:#e0ede8}
+.dark section,.dark nav,.dark .flow li{background:#192b27}
+.dark article,.dark figure,.dark th,.dark nav a,.dark code{background:#243b34}
+.dark a{color:#7ee0b6}.dark .notice{background:#403723}
+.dark td,.dark th,.dark section,.dark article,.dark .flow li{border-color:#40574f}
+.dark .small{color:#9fb3ac}.dark .s-ok{color:#7ee0b6}.dark .s-part{color:#f0c674}.dark .s-no{color:#ff9d9d}.dark .s-unk{color:#9fb3ac}
+@media(max-width:650px){main{padding:12px}section{padding:18px}.cards,.flow{grid-template-columns:1fr}header{padding:30px 20px}h2{font-size:23px}input{min-width:0;width:100%}}
+@media print{nav,.tools{display:none}body,body.dark{background:white;color:black}section{break-inside:auto;border:0}h2,h3{break-after:avoid}header{background:white;color:black;padding:10px}header p{color:black}.cards{display:block}article{margin-bottom:10px}.table{overflow:visible}.dark .s-ok,.dark .s-part,.dark .s-no,.dark .s-unk{color:black}}
+</style>
+</head>
+<body>
+<header>
+<div class="tag">Document de pilotage · version 3 · 02/10/2026</div>
+<h1>iCode Host Pro<br>Comprendre le projet, du début à la suite</h1>
+<p>Vue d’ensemble des décisions, des parcours, du protocole C1–C4, des états d’avancement (prévu → production), des évolutions visuelles, des incidents et du chemin restant. Fichier autonome : aucune ressource réseau.</p>
+<div class="tools">
+<button id="theme">Clair / sombre</button>
+<button onclick="window.print()">Imprimer / PDF</button>
+<input id="search" aria-label="Rechercher une section" placeholder="Filtrer : quota, prix, commit, promo…">
+<button id="reset">Tout afficher</button>
+</div>
+</header>
+<nav aria-label="Sommaire">
+<a href="#etat">01 · Où en sommes-nous ?</a>
+<a href="#vision">02 · Objectif et architecture</a>
+<a href="#historique">03 · Chronologie technique et livraisons</a>
+<a href="#etats">04 · États d’avancement (prévu → production)</a>
+<a href="#parcours">05 · Parcours utilisateur</a>
+<a href="#protocole">06 · C1–C4 : pourquoi ces protections ?</a>
+<a href="#environnements">07 · Recette et environnement habituel</a>
+<a href="#preuves">08 · Validations : ce qu’elles prouvent</a>
+<a href="#decisions">09 · Décisions (registre ADR)</a>
+<a href="#incidents">10 · Incidents résolus et points résiduels</a>
+<a href="#ui">11 · Interface et choix validés</a>
+<a href="#reste">12 · Travaux restants et décisions</a>
+<a href="#livraison">13 · Comment un lot passe de l’idée à la livraison</a>
+<a href="#documents">14 · Documents, maintenance et continuité</a>
+<a href="#lancement">15 · Objectif de lancement (décision)</a>
+</nav>
+<main>
+
+<section id="etat">
+<h2>01 · Où en sommes-nous ?</h2>
+<div class="notice">État documentaire arrêté au <b>2 octobre 2026</b>, après l’intégration et la poussée de l’accueil public sous <code>54331f0</code> sur <code>main</code>. Ce document synthétise les rapports de recette, l’historique git et les fichiers de continuité du dépôt ; ce n’est pas un audit en direct des serveurs. Aucun pourcentage global arbitraire.</div>
+<div class="cards">
+<article>
+<h3>Dernière base poussée</h3>
+<p><code>54331f081b1fb2fcda9ff26202eee854769c16d6</code> — accueil public. Parent <code>ad60fb226e879accba6413caa772bc920e0bd583</code> (lot B). Local et distant identiques (<code>origin/main…HEAD = 0 0</code>) selon le rapport post-push du 02/10/2026.</p>
+</article>
+<article>
+<h3>Accueil / — committé, intégré, poussé</h3>
+<p>Visuel validé par Mourad, puis tarifs simplifiés (prix de base seul, zéro affiché, tarif absent explicite, libellé « Sécurité du compte »). Commit local unique <b>54331f0</b> — 2 fichiers, 382 insertions / 88 suppressions —, intégré en fast-forward sur <code>main</code> puis poussé sans force. L’état « commit attendu » de la version&nbsp;1 est <b>clos</b>.</p>
+</article>
+<article>
+<h3>Production réelle</h3>
+<p>Aucune activation C1–C4 ni mise en production de la plateforme dans cette séquence. Le dépôt est en développement local : un push est un checkpoint, pas un déploiement.</p>
+</article>
+<article>
+<h3>Objectif de lancement (décision du propriétaire)</h3>
+<p>Plateforme commerciale utilisable de bout en bout : gestion des clients, des commandes, des factures, des abonnements, d’un portefeuille sécurisé, du paiement par solde et des recharges par virement ou carte via un prestataire à sélectionner. Plan en 5 étapes et matrice PASS / ÉCHEC / BLOQUÉ / NON TESTÉ : <a href="#lancement">section 15</a>.</p>
+</article>
+<article>
+<h3>Prochaine transition</h3>
+<p>Clôturer ce lot documentaire (revue puis commit/push sous GO dédié), puis enchaîner sur l’étape 1 du plan de lancement : <b>audit du socle commercial existant avant tout nouveau développement</b>, sans présumer ces fonctions absentes ni opérationnelles (<a href="#lancement">section 15</a>).</p>
+</article>
+</div>
+</section>
+
+<section id="vision">
+<h2>02 · Objectif et architecture</h2>
+<p>iCode Host Pro est un plan de contrôle d’hébergement : il gère les comptes, offres, commandes, quotas et intentions de déploiement, puis orchestre des services externes. Il ne remplace pas le moteur de build du panel d’hébergement.</p>
+<div class="notice">Règle d’architecture durable : la plateforme reste agnostique du panel. Tout passage au panel se fait par l’abstraction <code>PanelTransport</code> / <code>PanelTransportFactory</code> ; aucun identifiant, nom d’app ou hostname du panel n’est exposé au client (ni dans l’UI, ni dans les emails).</div>
+<figure>
+<figcaption>Schéma hors ligne — du navigateur aux systèmes externes (aucune ressource distante)</figcaption>
+<div class="table">
+<svg class="diagram" viewBox="0 0 900 340" role="img" aria-label="Navigateur, application web Next.js, API NestJS, PostgreSQL et adaptateurs externes : panel d’hébergement, DNS, SMTP" xmlns="http://www.w3.org/2000/svg">
+<g fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round">
+<rect x="12" y="110" width="160" height="76" rx="10"></rect>
+<rect x="212" y="110" width="170" height="76" rx="10"></rect>
+<rect x="422" y="110" width="170" height="76" rx="10"></rect>
+<rect x="640" y="14" width="250" height="56" rx="10"></rect>
+<rect x="640" y="96" width="250" height="56" rx="10"></rect>
+<rect x="640" y="178" width="250" height="56" rx="10"></rect>
+<rect x="640" y="260" width="250" height="56" rx="10"></rect>
+</g>
+<g fill="currentColor" font-family="system-ui,sans-serif" font-size="12.5">
+<text x="92" y="134" text-anchor="middle" font-weight="700" font-size="13.5">Navigateur</text>
+<text x="92" y="154" text-anchor="middle" font-size="11.5">public + espace client</text>
+<text x="92" y="172" text-anchor="middle" font-size="11.5">aucun secret côté client</text>
+<text x="297" y="134" text-anchor="middle" font-weight="700" font-size="13.5">apps/web — Next.js</text>
+<text x="297" y="154" text-anchor="middle" font-size="11.5">accueil, boutique, auth</text>
+<text x="297" y="172" text-anchor="middle" font-size="11.5">/client, /manager</text>
+<text x="507" y="134" text-anchor="middle" font-weight="700" font-size="13.5">apps/api — NestJS</text>
+<text x="507" y="154" text-anchor="middle" font-size="11.5">identité, catalogue</text>
+<text x="507" y="172" text-anchor="middle" font-size="11.5">checkout, quotas</text>
+<text x="765" y="36" text-anchor="middle" font-weight="700" font-size="13.5">PostgreSQL</text>
+<text x="765" y="56" text-anchor="middle" font-size="11.5">commandes, tentatives, preuves</text>
+<text x="765" y="118" text-anchor="middle" font-weight="700" font-size="13.5">PanelTransport (hébergement)</text>
+<text x="765" y="138" text-anchor="middle" font-size="11.5">déploiements — simulé en recette</text>
+<text x="765" y="200" text-anchor="middle" font-weight="700" font-size="13.5">DNS externe</text>
+<text x="765" y="220" text-anchor="middle" font-size="11.5">sous-domaines — simulé en recette</text>
+<text x="765" y="282" text-anchor="middle" font-weight="700" font-size="13.5">SMTP (mail)</text>
+<text x="765" y="302" text-anchor="middle" font-size="11.5">notifications — simulé en recette</text>
+</g>
+<g stroke="currentColor" stroke-width="1.5" fill="none">
+<path d="M172 148 H200"></path>
+<path d="M382 148 H410"></path>
+<path d="M592 148 H605 V42 H632"></path>
+<path d="M592 148 H615 V124 H632"></path>
+<path d="M592 148 H622 V206 H632"></path>
+<path d="M592 148 H632 V288"></path>
+</g>
+<g fill="currentColor">
+<polygon points="200,143 210,148 200,153"></polygon>
+<polygon points="410,143 420,148 410,153"></polygon>
+<polygon points="632,37 642,42 632,47"></polygon>
+<polygon points="632,119 642,124 632,129"></polygon>
+<polygon points="632,201 642,206 632,211"></polygon>
+<polygon points="632,283 642,288 632,293"></polygon>
+</g>
+</svg>
+</div>
+<p class="small">En recette, les trois adaptateurs externes pointent vers des simulateurs locaux : seule la base PostgreSQL et les services applicatifs sont réels.</p>
+</figure>
+<div class="cards">
+<article>
+<h3>Métier et transport</h3>
+<p>La décision de consommer un slot appartient au moteur métier. Un retour réseau incertain n’est pas une preuve d’absence de ressource.</p>
+</article>
+<article>
+<h3>Deux voies d’installation</h3>
+<p>Une interface web d’installation (host / user / password PostgreSQL) et une installation sur serveur vierge en une commande. Le bootstrap de la plateforme ne doit dépendre ni du réseau, ni du panel des apps clients.</p>
+</article>
+<article>
+<h3>Périmètre commercial</h3>
+<p>WordPress/Hestia et d’autres produits ont été évoqués ; leur disponibilité complète ne peut pas être déduite des lots C1–C4 ni du styling. Le portefeuille, le paiement par solde et les recharges virement/carte font partie de l’objectif de lancement — prestataire à sélectionner (<a href="#lancement">§15</a>).</p>
+</article>
+<article>
+<h3>Personnalisation</h3>
+<p>Un seul système : BrandConfig, <code>/api/brand</code>, variables <code>--brand-*</code> et préférence clair/sombre. Le vert classique reste le thème de référence ; le rebrand est différé à la fin du projet.</p>
+</article>
+</div>
+</section>
+
+<section id="historique">
+<h2>03 · Chronologie technique et livraisons</h2>
+<div class="notice">
+<b>Convention de lecture</b> — <b class="s-ok">Vérifié</b> : hash présent dans l’historique git de ce dépôt (local identique à <code>origin/main</code> au 02/10/2026) ou preuve produite dans la séquence en cours.<br>
+<b class="s-part">Ancien constat</b> : affirmation extraite de <code>PROJECT_STATUS.md</code>, <code>CHANGELOG.md</code> ou d’un rapport, <b>non relancée</b> dans la séquence en cours.<br>
+<b class="s-unk">Non vérifiable</b> : information absente ou contradictoire dans ce checkout — signalée comme telle.
+</div>
+<h3>Ère 1 — Fondations documentées (Phase 0 → Phase 17, 2026-08-30 → 2026-09-19)</h3>
+<p class="small">Les chiffres de tests de cette ère sont des <b class="s-part">anciens constats</b> ; les hashes sont <b class="s-ok">vérifiables</b> dans l’historique git.</p>
+<div class="table">
+<table>
+<thead><tr><th>Étape</th><th>But et résultat rapporté</th><th>Référence / statut</th></tr></thead>
+<tbody>
+<tr><td>Phase 0 — socle</td><td>Monorepo pnpm + Turborepo, API health, diagnostic Next, Prisma/Postgres, règles de gouvernance.</td><td><code>262655d</code> · <b class="s-ok">poussé</b> · tests : ancien constat</td></tr>
+<tr><td>Phases 1–5 — identité et console</td><td>JWT + refresh httpOnly, modèle cœur Product/Server, console <code>/manager</code>, journal d’audit, espace client, inscription fermée par invitations.</td><td><code>fd06d43</code>, <code>e81d300</code>, <code>9da3b26</code>, <code>c2f9c35</code>, <code>6f80115</code> · <b class="s-ok">poussés</b></td></tr>
+<tr><td>Phase 6 — mail</td><td>Configuration SMTP admin, mots de passe chiffrés au repos, emails d’invitation en best-effort.</td><td><code>47838c1</code> · <b class="s-ok">poussé</b> · <b class="s-part">validé en live par le propriétaire (2026-08-31)</b></td></tr>
+<tr><td>Phases 7 à 9 — design, serveurs, connectivité</td><td>Design system et tokens, pages serveurs/produits larges, sonde de connectivité réelle, adaptateurs de panneau (Hestia/Coolify), auto-détection IP/port.</td><td><code>31af3e2</code>, <code>1d7131e</code>, <code>7786f46</code>, <code>ea456b2</code> · <b class="s-ok">poussés</b></td></tr>
+<tr><td>Phases 10–11 — sécurité, support, connaissance</td><td>Settings de sécurité (Turnstile, OAuth, MFA, inscription), impersonation, code de support, clés Turnstile admin, base de connaissance et <code>/aide</code>.</td><td><code>30a4b33</code>, <code>c315369</code> · <b class="s-ok">poussés</b></td></tr>
+<tr><td>Phase 3 Cloudflare — DNS</td><td>Zones et enregistrements live, sous-domaine client alloué au déploiement, clé API chiffrée jamais renvoyée.</td><td><code>5395840</code> · <b class="s-ok">poussé</b> · <b class="s-part">vérifié en live avec clé réelle</b></td></tr>
+<tr><td>Phases 12–13 — catalogue et modules</td><td>Produit → Catégorie + Pack avec limites réellement appliquées au panel, modules de déploiement A/B, quota d’apps, dashboard client moderne.</td><td><code>1d2527d</code>, <code>0bfd856</code> → <code>52cae27</code> · <b class="s-ok">poussés</b> · <b class="s-part">limites vérifiées live</b></td></tr>
+<tr><td>Phase 14 — branding</td><td>Multi-brand / white-label configurable, logo fichier réel, image seule ou image + texte.</td><td><code>2cf7b1d</code>, <code>8e5abcf</code> · <b class="s-ok">poussés</b> · <b class="s-part">validé 2 fois par le propriétaire</b></td></tr>
+<tr><td>Phases 16–17 — store et packs</td><td>Tunnel boutique complet, abonnements par commande (suppression du Service), build config fichier, limites RAM/CPU par pack, quota par pack.</td><td><code>9a7968c</code>, <code>4705366</code>, <code>539cacd</code>, <code>0cd96a4</code> · <b class="s-ok">poussés</b></td></tr>
+<tr><td>Réconciliation et rollback</td><td>Moteur de réconciliation agnostique de provider, activation atomique après preuve, rollback de provisioning idempotent, édition admin de la réconciliation.</td><td><code>19171a7</code> → <code>9034f43</code>, <code>722ca39</code>, <code>f366932</code> · <b class="s-ok">poussés</b></td></tr>
+<tr><td>Déploiements et sécurité d’exploitation</td><td>Fondations d’hébergement sécurisé, garde de déploiement active par défaut, statut « exited » jamais actif, endpoint public de statut protégé.</td><td><code>a96684f</code>, <code>eb1197e</code>, <code>9b07645</code>, <code>e851d50</code> · <b class="s-ok">poussés</b></td></tr>
+<tr><td>Tests et durcissements</td><td>Couverture E2E du checkout multi-domaines (21 tests), rate-limit du statut public de commande + TRUST_PROXY, alignement des index avec la migration existante.</td><td><code>f07148f</code>, <code>6550a46</code>, <code>cb6ff28</code>, <code>20c82f1</code> · <b class="s-ok">poussés</b></td></tr>
+</tbody>
+</table>
+</div>
+<h3>Ère 2 — Cycle récent (protocole C1–C4, lots UI/UX, accueil)</h3>
+<div class="table">
+<table>
+<thead><tr><th>Étape</th><th>But et résultat rapporté</th><th>Référence / statut</th></tr></thead>
+<tbody>
+<tr><td>C1 — moteur transactionnel</td><td>Réservation idempotente, quota, empreinte HMAC, ownership, ordre de verrous service → allocation → déploiement. Concurrence A/B et courses testées.</td><td><code>4a54fcd</code> · <b class="s-ok">poussé</b> · <b class="s-part">858 tests unit (ancien constat)</b></td></tr>
+<tr><td>C2 — déploiements directs</td><td>Garde OFF par défaut, réserve puis lie le déploiement, intent stable côté web, choix du service compatible.</td><td><code>957df90</code> · <b class="s-ok">poussé</b></td></tr>
+<tr><td>C3 — commandes boutique</td><td>Tracking durable, token/lease, intention avant réseau, absence de takeover après intention, cache négatif revérifié en base sous OFF.</td><td><code>1fe8241</code> · <b class="s-ok">poussé</b></td></tr>
+<tr><td>C4 — nettoyage et récupération</td><td>Cinq tables de protocole ; tentatives, stops, takeover et preuves ; suppression/libération conditionnées ; finalize fondé sur preuve exacte.</td><td><code>189a8ab</code> · <b class="s-ok">poussé</b></td></tr>
+<tr><td>Corrections C2/C4 en recette</td><td>Couverture create/config/project, retour suppression honnête, refus de nettoyage si création non résolue, gel après stop, échec de consignation.</td><td><code>bdc332e</code> · <b class="s-ok">poussé</b></td></tr>
+<tr><td>Clôture technique C1–C4</td><td>Rollback PostgreSQL réel, finalisation et gardes, DNS C3 consigné atomiquement sous C4, purge de tests bornée aux fixtures.</td><td><code>e0444dc</code> · <b class="s-ok">poussé</b> · <b class="s-part">rollback 8/8 (ancien constat)</b></td></tr>
+<tr><td>P1–P4 UI</td><td>Lien admin retiré du client, navigation profil/aide, overlay mobile corrigé, pack public exposé sans serveur.</td><td><code>af96213</code> · <b class="s-ok">poussé</b></td></tr>
+<tr><td>Dashboard client + modale</td><td>Sidebar, cartes, quota, modale de création GitHub/URL, conservation du brouillon, clé d’intention, garde double-clic.</td><td><code>5281c9d</code> · <b class="s-ok">poussé</b></td></tr>
+<tr><td>Lot A — authentification</td><td>Carte unique, erreurs inline, QR TOTP généré localement, gestion des erreurs et résultats périmés.</td><td><code>398bd33</code> · <b class="s-ok">poussé</b> · <b class="s-part">26/26 + QR 12/12 (ancien constat)</b></td></tr>
+<tr><td>Lot B — boutique et checkout</td><td>Navigation mobile, panier, suivi honnête de commande, récapitulatif à droite, upgrade indisponible expliqué, CTA client en haut mobile.</td><td><code>ad60fb2</code> · <b class="s-ok">poussé</b></td></tr>
+<tr><td>Accueil public</td><td>Maquettes A/B, choix « B + densité d’A », intégration (StoreShell, étapes, fonctionnalités, catalogue réel, FAQ), suppression des faux chiffres, tarifs simplifiés.</td><td><code>54331f0</code> · <b class="s-ok">committé, intégré en fast-forward, poussé (02/10/2026)</b> — 2 fichiers, 382+/88−</td></tr>
+<tr><td>Lot documentaire (ce fichier)</td><td>Suivi global en HTML dans <code>docs/</code> : historique, états, décisions, incidents, maintenance.</td><td><b class="s-part">branche <code>docs/suivi-projet</code>, non committé à cet arrêt</b></td></tr>
+</tbody>
+</table>
+</div>
+<div class="notice"><b>Informations non vérifiables dans ce checkout</b> : <code>memory/architecture.md</code> référencé par <code>CLAUDE.md</code> — le dossier <code>memory/</code> est <b>absent</b> de ce dépôt ; les numéros de phases initialement évoqués (« 20 phases ») ne constituent pas une liste exhaustive ; les compteurs de migrations (45 ou 48) et de routes viennent des rapports et n’ont pas été relancés ; le statut ADR-040 « LOCALLY » provient du registre de décisions, sans revérification indépendante.</div>
+</section>
+
+<section id="etats">
+<h2>04 · États d’avancement (prévu → production)</h2>
+<div class="notice"><b>Sept états distincts, jamais confondus.</b> <b>Prévu</b> = décidé/documenté (ADR, plan). <b>Développé</b> = code présent dans le dépôt. <b>Testé en simulation</b> = exercé avec transports externes simulés, mocks ou base isolée. <b>Testé réellement</b> = exercé contre un système réel (mail, DNS, panel, dépôt public, navigateur sur service réel). <b>Committé</b> = au moins un commit local. <b>Poussé</b> = présent sur <code>origin/main</code>. <b>Activé en production</b> = mis en service sur l’environnement de production de la plateforme.</div>
+<div class="table">
+<table class="matrix">
+<thead><tr><th>Composant / lot</th><th>Prévu</th><th>Développé</th><th>Testé (simulation)</th><th>Testé (réel)</th><th>Committé</th><th>Poussé</th><th>Activé en production</th></tr></thead>
+<tbody>
+<tr><td>Socle, auth, console admin, audit (phases 0–5)</td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-ok">✓ <span class="small">anciens constats</span></td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-no">✗</td></tr>
+<tr><td>Mail et invitations (phase 6)</td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-ok">✓ <span class="small">live propriétaire 2026-08-31</span></td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-no">✗</td></tr>
+<tr><td>Design system, serveurs, connectivité (7–9)</td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-part">~ <span class="small">sonde serveurs réelle (ancien constat)</span></td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-no">✗</td></tr>
+<tr><td>Sécurité, support, Turnstile, connaissance (10–11)</td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-part">~ <span class="small">siteKey vide / OAuth désactivé en recette</span></td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-no">✗</td></tr>
+<tr><td>Déploiement GitHub → panel (10bis)</td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-ok">✓ <span class="small">dépôt public → HTTP 200 (ancien constat)</span></td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-no">✗</td></tr>
+<tr><td>DNS externe + sous-domaines client</td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-ok">✓ <span class="small">clé réelle : zones/CNAME vérifiés</span></td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-no">✗</td></tr>
+<tr><td>Catalogue, packs, modules A/B (12–13)</td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-ok">✓ <span class="small">limites RAM/CPU appliquées live</span></td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-no">✗</td></tr>
+<tr><td>Branding / white-label (14)</td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-ok">✓ <span class="small">validé 2× par le propriétaire</span></td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-no">✗</td></tr>
+<tr><td>Store order-driven + build config (16)</td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-ok">✓ <span class="small">app SPA live → HTTP 200</span></td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-no">✗</td></tr>
+<tr><td>Provisioning à preuve réelle + port Node (17)</td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-ok">✓ <span class="small">produit réel ACTIVE, HTTPS 200 (ancien constat)</span></td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-no">✗</td></tr>
+<tr><td>Réconciliation + rollback idempotent</td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-part">~ <span class="small">exercé sur base isolée</span></td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-no">✗</td></tr>
+<tr><td>C1 — moteur transactionnel</td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-part">~ <span class="small">base isolée, transports simulés</span></td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-no">✗</td></tr>
+<tr><td>C2 — déploiements directs</td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-no">✗ <span class="small">aucun déploiement réel sous C2</span></td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-no">✗</td></tr>
+<tr><td>C3 — commandes boutique</td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-no">✗ <span class="small">DNS simulé</span></td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-no">✗</td></tr>
+<tr><td>C4 — nettoyage et récupération</td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-part">~ <span class="small">rollback PostgreSQL réel, base isolée</span></td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-no">✗</td></tr>
+<tr><td>Navigation P1–P4 + modale de création</td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-part">~ <span class="small">navigateur réel sur recette, adaptateurs simulés</span></td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-no">✗</td></tr>
+<tr><td>Lot A — authentification</td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-part">~ <span class="small">QR/TOTP réels, OAuth désactivé</span></td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-no">✗</td></tr>
+<tr><td>Lot B — boutique et checkout</td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-part">~ <span class="small">parcours nominal simulé + rejeux</span></td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-no">✗</td></tr>
+<tr><td>Accueil public (<code>54331f0</code>)</td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-part">~ <span class="small">recette locale : API + catalogue réel de la base recette</span></td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-no">✗</td></tr>
+<tr><td>Ce document (<code>docs/suivi-projet.html</code>)</td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-part">~ <span class="small">ouverture locale + navigation vérifiées</span></td><td class="s-no">✗</td><td class="s-no">✗</td><td class="s-no">✗</td></tr>
+<tr><td>Activation plateforme en production</td><td class="s-ok">✓ <span class="small">prévu en fin de projet</span></td><td class="s-no">✗</td><td class="s-unk">?</td><td class="s-unk">?</td><td class="s-no">✗</td><td class="s-no">✗</td><td class="s-no">✗</td></tr>
+</tbody>
+</table>
+</div>
+<p class="small">Légende : <b class="s-ok">✓</b> confirmé par une preuve citée · <b class="s-part">~</b> partiellement ou sous conditions précisées · <b class="s-no">✗</b> non fait · <b class="s-unk">?</b> non vérifiable dans cette séquence. <b>Aucune ligne n’est « activée en production »</b> : la plateforme reste en développement local, un push n’est qu’un checkpoint.</p>
+</section>
+
+<section id="parcours">
+<h2>05 · Parcours utilisateur</h2>
+<figure>
+<figcaption>Commande d’une offre — lecture fonctionnelle</figcaption>
+<ol class="flow">
+<li><b>Choix</b><span>Catalogue et fiche produit : capacités et prix issus des données.</span></li>
+<li><b>Configuration et identité</b><span>Domaine/sous-domaine, panier, compte et coordonnées selon le parcours existant.</span></li>
+<li><b>Commande et paiement</b><span>Moyen disponible, validation serveur et clé d’idempotence ; pas de nouvel ordre sur simple rejeu.</span></li>
+<li><b>Provisioning</b><span>Suivi de la commande et déploiement ; ACTIVE seulement si l’état autoritaire le confirme.</span></li>
+</ol>
+</figure>
+<p><strong>Affichage :</strong> formulaire à gauche et récapitulatif prix/TVA/total à droite sur ordinateur. Sur mobile, champs puis récapitulatif. Une commande annulée doit rester affichée CANCELLED : sa présence ne prouve pas un achat réussi.</p>
+<figure>
+<figcaption>Nouvelle application depuis /client</figcaption>
+<ol class="flow">
+<li><b>Ouvrir</b><span>CTA permanent en haut, également sur mobile ; plus de bouton flottant en bas.</span></li>
+<li><b>Choisir la source</b><span>Modale : compte GitHub ou URL de dépôt pris en charge.</span></li>
+<li><b>Configurer</b><span>Détection, branche, sous-domaine et service compatible ; brouillon conservé.</span></li>
+<li><b>Soumettre</b><span>Garde double-clic, intention stable et réservation sous quota ; suivre le résultat réel.</span></li>
+</ol>
+</figure>
+<p>Un compte GitHub non lié doit proposer sa connexion. La recette a couvert ce cas ; la liaison réelle et certains parcours OAuth restent à éprouver avec leur configuration réelle.</p>
+<figure>
+<figcaption>Parcours public après l’accueil</figcaption>
+<ol class="flow">
+<li><b>Accueil <code>/</code></b><span>Hero, étapes, capacités réelles, offres du catalogue, FAQ — sans chiffres inventés.</span></li>
+<li><b>Boutique <code>/shop</code></b><span>Cartes produits, prix facturé, cycle de facturation ; fiche produit <code>/shop/&lt;slug&gt;</code>.</span></li>
+<li><b>Aide <code>/aide</code> et Connexion <code>/auth</code></b><span>Navigation publique commune (StoreShell), panier <code>/cart</code> si sélection.</span></li>
+</ol>
+</figure>
+</section>
+
+<section id="protocole">
+<h2>06 · C1–C4 : pourquoi ces protections ?</h2>
+<div class="table">
+<table>
+<thead><tr><th>Mécanisme</th><th>Règle</th><th>Conséquence</th></tr></thead>
+<tbody>
+<tr><td>Réservation</td><td>Une intention identique rejouée récupère la même allocation avant le contrôle de nouveau quota.</td><td>Un timeout ne doit pas produire une seconde consommation.</td></tr>
+<tr><td>Empreinte</td><td>Business et environnement participent à une empreinte HMAC versionnée.</td><td>Une clé réutilisée avec un autre payload est refusée.</td></tr>
+<tr><td>Ownership</td><td>Contrôle sous verrou ; erreurs sans divulgation d’un objet tiers.</td><td>L’utilisateur ne peut pas réserver ou lier les ressources d’un autre.</td></tr>
+<tr><td>Token + lease</td><td>Reclaim possible avant intention avec lease expiré ; jamais après intention.</td><td>Un ancien appel réseau ne doit pas être doublé par un nouveau worker.</td></tr>
+<tr><td>Tentative durable</td><td>Dispatch enregistré avant réseau ; résultat et identifiants consignés ensemble.</td><td>Le protocole sait distinguer une absence prouvée d’une incertitude.</td></tr>
+<tr><td>ON → OFF / stop</td><td>Nouveaux dispatchs et transitions bloqués ; retour d’un appel déjà émis peut être consigné avec identité vérifiée.</td><td>Conserver les identifiants sans bind, activation ou libération implicite.</td></tr>
+<tr><td>Échec du settle</td><td>Après stop : gel, tentative DISPATCHED bloquante, erreur journalisée ; aucun identifiant présenté comme persisté.</td><td>L’incertitude reste visible et consomme le slot.</td></tr>
+<tr><td>Pré-protocole</td><td>Intention ancienne sans couverture de tentative/takeover : pre_protocol_uncertain.</td><td>Aucun force/override ; support requis, slot conservé.</td></tr>
+<tr><td>Finalisation</td><td>Preuve ACTIVE issue de l’état autoritaire du panel pour provider/serveur/UUID exacts ; états revérifiés sous verrou.</td><td>Une réponse HTTP du FQDN ne suffit pas à prouver l’identité.</td></tr>
+<tr><td>Idempotence finalize</td><td>Si déjà ACTIVE et cohérent : retour sans transport ni nouvel audit de transition.</td><td>Une répétition n’ajoute pas de nouvel effet.</td></tr>
+<tr><td>Suppression</td><td>Cleanup local, preuve et RELEASED dans une même transaction ; DNS non concluant bloque.</td><td>Éviter les slots libérés avec des ressources encore non maîtrisées.</td></tr>
+</tbody>
+</table>
+</div>
+<figure>
+<figcaption>Décision de récupération simplifiée — pas un remplacement du code</figcaption>
+<ol class="flow">
+<li><b>Pré-intention</b><span>Aucun appel possible prouvé : libération pré-provider selon contrat C1.</span></li>
+<li><b>Après intention couverte</b><span>Examiner tentatives, stop, identité et preuves ; création jamais rejouée aveuglément.</span></li>
+<li><b>Résultat incertain</b><span>Timeout / UNKNOWN / tentative ouverte : bloquer la libération et conserver les preuves.</span></li>
+<li><b>Preuve concluante</b><span>Nettoyage ou finalisation uniquement via les portes autorisées et transactions prévues.</span></li>
+</ol>
+</figure>
+</section>
+
+<section id="environnements">
+<h2>07 · Recette et environnement habituel</h2>
+<div class="table">
+<table>
+<thead><tr><th>Élément</th><th>Recette isolée</th><th>Habituel / live local</th></tr></thead>
+<tbody>
+<tr><td>Répertoire</td><td>Documents/iCode-Host-Recette</td><td>Documents/Projet iCode Host</td></tr>
+<tr><td>Web / API</td><td>3002 / 3011</td><td>3000 / 3001</td></tr>
+<tr><td>Base</td><td>icode_host_pro_recette</td><td>icode_host_pro</td></tr>
+<tr><td>Migrations rapportées</td><td>48/48 au lancement de la recette</td><td>45 ; C1/C3/C4 en attente au dernier contrôle fourni</td></tr>
+<tr><td>Transports</td><td>Simulateurs panel3021, DNS3022, GitHub3023, SMTP3025</td><td>Aucun appel réel autorisé dans les lots récents</td></tr>
+<tr><td>Navigateur</td><td>Profil dédié et proxy3999 ; pas de confusion de cookies par port</td><td>Ne pas utiliser pour les scénarios recette</td></tr>
+<tr><td>Garde</td><td>Refus des sorties réelles et des ports habituels</td><td>Aucune écriture métier ou activation dans cette séquence</td></tr>
+<tr><td>Build web</td><td><code>API_UPSTREAM=http://localhost:3011</code> ; vérifier le manifeste de rewrite</td><td>Ne pas recopier la configuration de recette en production</td></tr>
+</tbody>
+</table>
+</div>
+<div class="notice">Ces ports et chiffres sont des configurations/constats rapportés, pas des sondes actuelles. Un port ouvert aujourd’hui ne garantit pas que le build exécuté corresponde au dernier commit.</div>
+<p>Constat : le port 5432 était bloqué (<code>bind</code> refusé, WSAEACCES) en présence d’une exclusion de port 5403–5502. La plage TCP a été remise à 49152/16384 sous GO ; après redémarrage, 5432 était publié par Docker et PostgreSQL healthy. Aucune suppression de volume/base n’a été nécessaire (voir §10).</p>
+<p><strong>Pourquoi aucun build réel lors d’un test sur 3002 ?</strong> La recette envoie vers le simulateur. Le diagnostic de la tentative manuelle précise du propriétaire reste non corrélé avec certitude ; les essais anciens d’applications de démonstration ont été reliés au mode deploySlow et ne doivent pas être confondus avec cette tentative.</p>
+</section>
+
+<section id="preuves">
+<h2>08 · Validations : ce qu’elles prouvent</h2>
+<div class="table">
+<table>
+<thead><tr><th>Lot / preuve rapportée</th><th>Résultat</th><th>Portée et limite</th></tr></thead>
+<tbody>
+<tr><td>C1</td><td>858 unit ; B1 23 ; C1 24 ; A/B deux passages</td><td>Tests sur versions désignées dans les rapports ; pas une exécution récente globale.</td></tr>
+<tr><td>C4 initial corrigé</td><td>969 unit ; 173 e2e / 12 suites</td><td>Base isolée, transports simulés.</td></tr>
+<tr><td>Clôture C1–C4</td><td>Rollback PG 8/8 ; release 25/25 ; unit provisioning 92/92</td><td>Conflits et rollback réels sur base isolée ; bascule OFF pendant lecture non entièrement pilotée.</td></tr>
+<tr><td>Navigation P1–P4</td><td>29/29 navigateur ; subscriptions 16/16 ; builds/typechecks</td><td>Clics CDP en viewport mobile, pas un appareil tactile réel.</td></tr>
+<tr><td>Client modale</td><td>66/66 puis corrections ciblées 14/14</td><td>Idempotence/timeouts simulés ; fixtures historiques conservées.</td></tr>
+<tr><td>Auth</td><td>26/26 ; TotpQr 12/12 ; typecheck/build</td><td>Turnstile siteKey vide, OAuth désactivé, invitation sans jeton : non éprouvés intégralement.</td></tr>
+<tr><td>Lot B</td><td>50/0/7 INFO, puis 25/0/3, 20/0/2 et CTA 10/0/1</td><td>Le premier nominal revendiqué était un rejeu CANCELLED ; rapport rectifié puis compte dédié nominal simulé.</td></tr>
+<tr><td>Accueil</td><td>31/31 intégration ; tarif 7/7 couvrant 12 cas ; typecheck 0</td><td>Build/navigateur initiaux avant les dernières corrections tarifaires ; aucun rebuild ultérieur (non demandé).</td></tr>
+<tr><td>Accueil — git</td><td>Commit <code>54331f0</code> (2 fichiers, 382+/88−) ; intégration fast-forward ; push sans force ; <code>origin/main…HEAD = 0 0</code></td><td>Préconditions revérifiées à chaque étape (HEAD, parent, fichiers, stats, distant au parent attendu).</td></tr>
+</tbody>
+</table>
+</div>
+<p class="small">Aucune batterie générale de tests n’a été relancée à l’occasion des GO accueil : seuls des contrôles ciblés (DOM, tarifs, typecheck) ont été exécutés, conformément aux consignes de non-régression ciblée.</p>
+</section>
+
+<section id="decisions">
+<h2>09 · Décisions (registre ADR)</h2>
+<div class="notice"><b>Règle de gouvernance :</b> <code>DECISIONS.md</code> fait foi. Un statut <b>PROPOSED</b> n’est pas une approbation ; l’approbation est toujours explicite du propriétaire. Aucun statut n’est jamais inféré.</div>
+<div class="table">
+<table>
+<thead><tr><th>Statut au registre</th><th>ADR concernés</th><th>Portée</th></tr></thead>
+<tbody>
+<tr><td>APPROVED (propriétaire)</td><td>ADR-001 à 005, 010 à 025, 027</td><td>Monorepo, Next.js, NestJS, base, API, adaptateurs de panel, socle de configuration, Docker de dev, conventions, auth, modèle de données, console <code>/manager</code>, audit, invitations, espace client, mail, design system, serveurs, connectivité, sécurité/support.</td></tr>
+<tr><td>IMPLEMENTED (relevé au registre)</td><td>ADR-026, 028, 030 à 039, 041</td><td>Auto-détection IP/port, clés Turnstile + base de connaissance, déploiement GitHub → panel, catalogue/packs, modules A/B, DNS externe, white-label, abonnements par commande, build config fichier, provisioning à preuve, port Node, Turnstile partagé, rate-limit du statut public.</td></tr>
+<tr><td>PROPOSED (à ne pas traiter comme livrés)</td><td>ADR-006, 007, 008, 009, 029</td><td>Docker de dev, jobs asynchrones/Redis, gestion complète des secrets et de la configuration persistée, cycle d’installation, enforcement des quotas/suspension automatique.</td></tr>
+<tr><td>Statut à confirmer</td><td>ADR-040 « LOCALLY »</td><td>Choix du domaine racine et gel d’<code>effectiveDomainId</code> — statut relevé dans le registre, <b class="s-unk">non revérifié</b> dans cette séquence.</td></tr>
+</tbody>
+</table>
+</div>
+<h3>Décisions prises dans la séquence récente (accueil)</h3>
+<div class="cards">
+<article><h3>Visuel</h3><p>Structure B + densité d’A validée par le propriétaire après comparaison de deux maquettes (44 contrôles, captures desktop/mobile clair+sombre).</p></article>
+<article><h3>Tarifs de l’accueil</h3><p>Prix affiché = <code>priceHtCents</code> seul + cycle ; zéro affiché comme zéro ; prix absent → « Tarif à consulter » avec accès à la fiche ; <b>jamais</b> de prix barré sur cette page.</p></article>
+<article><h3>Promotion</h3><p>Aucune correction des parcours boutique/admin/facturation : l’écart entre champ promo, prix barré et montant facturé est documenté comme <b>sujet distinct</b> (§10 et §12).</p></article>
+<article><h3>Traitements git</h3><p>Commit local unique → intégration fast-forward → push sans force, chacun sous GO dédié. Aucun amend, aucun second commit, aucune action de production.</p></article>
+<article><h3>Objectif de lancement (nouveau cap)</h3><p>Plateforme commerciale de bout en bout (clients, commandes, factures, abonnements, portefeuille sécurisé, paiement par solde, recharges virement/carte via prestataire à sélectionner) — plan en 5 étapes, audit d’abord, essais réels contrôlés (prestataires réels, ressources dédiées) sous GO dédié, distincts de l’activation commerciale en production. Détail : <a href="#lancement">section 15</a>.</p></article>
+</div>
+</section>
+
+<section id="incidents">
+<h2>10 · Incidents résolus et points résiduels</h2>
+<div class="table">
+<table>
+<thead><tr><th>Incident</th><th>Symptôme constaté</th><th>Résolution</th><th>État / preuve</th></tr></thead>
+<tbody>
+<tr><td>Port 5432 bloqué sous Windows</td><td><code>bind</code> refusé (WSAEACCES), API recette sans base ; exclusion de port 5403–5502.</td><td>Remise de la plage dynamique TCP à 49152/16384 (<code>netsh</code>) sous GO, puis redémarrage du poste.</td><td class="s-ok">Résolu — plage TCP restaurée à 49152/16384 et accès PostgreSQL rétabli après redémarrage (Docker publie 5432, PostgreSQL healthy). Aucune cause ni persistance non démontrée n’est affirmée.</td></tr>
+<tr><td>Déploiement DEPLOYING vs commande ACTIVE</td><td>Statuts divergents entre la ligne de déploiement et la commande.</td><td><code>reconcileDeploymentActive(orderId)</code> borné à DEPLOYING, idempotent, jamais FAILED → ACTIVE.</td><td class="s-ok">Résolu — commit <code>fdce1a0</code>.</td></tr>
+<tr><td>Refus 403 à la création d’une app</td><td>IP sortante dynamique non autorisée côté panel.</td><td>IP ré-autorisée ; la commande est restée PROVISIONING sans être forcée.</td><td class="s-ok">Résolu — gotcha consigné dans la documentation.</td></tr>
+<tr><td>Port des backends Node arbitraire</td><td>Apps Node publiées sur un port erroné.</td><td>Résolution hiérarchique du port (contrat de build → défaut → état) — ADR-038.</td><td class="s-ok">Résolu — commits <code>7490de1</code>, <code>528d1b9</code>.</td></tr>
+<tr><td>Application SPA statique → 503</td><td>Build config absent pour les projets Vite.</td><td>Fichier de configuration de build + détection SPA statique — ADR-036.</td><td class="s-ok">Résolu — commit <code>539cacd</code>.</td></tr>
+<tr><td>Statut « exited » interprété comme actif</td><td>Faux positif d’activité.</td><td>Le statut « exited » n’est plus mappé vers actif.</td><td class="s-ok">Résolu — commit <code>9b07645</code>.</td></tr>
+<tr><td>Turnstile : runtime ≠ paramétrage</td><td>Activation incohérente entre réglage admin et exécution.</td><td>Alignement du runtime sur le paramètre admin, puis activation partagée (<code>enabled && configured</code>).</td><td class="s-ok">Résolu — commits <code>27439b9</code>, ADR-039.</td></tr>
+<tr><td>Settling DNS non atomique (C3)</td><td>Enregistrement DNS non consigné dans la même transaction.</td><td>Settling atomique + vérification de récupération C4.</td><td class="s-ok">Résolu — commit <code>e0444dc</code>.</td></tr>
+<tr><td>Overlay mobile et bouton flottant</td><td>Clics interceptés, FAB persistant hors rubrique.</td><td>Overlay non interceptant et tiroir accessible — P1–P4 (<code>af96213</code>) ; déplacement du CTA « Nouvelle application » en haut — Lot B (<code>ad60fb2</code>).</td><td class="s-ok">Résolu — <code>af96213</code> (overlay) puis <code>ad60fb2</code> (CTA en haut).</td></tr>
+<tr><td>« Nominal » du lot B erroné</td><td>Un rejeu CANCELLED avait été présenté comme un parcours nominal réussi.</td><td>Rapport rectifié, puis compte dédié et scénario nominal simulés.</td><td class="s-ok">Résolu — consigné dans le rapport lot B.</td></tr>
+<tr><td>Secret TOTP visible dans une capture</td><td>QR contenant un secret, capturé tel quel.</td><td>Capture du QR masquée avant partage.</td><td class="s-ok">Résolu — preuve de masquage en recette.</td></tr>
+<tr><td>Slots orphelins en recette</td><td>Artefacts de recette résiduels.</td><td>Script de nettoyage en recette (<code>cleanup-ghost-slots.mjs</code>).</td><td class="s-unk">? Non revérifié dans cette séquence.</td></tr>
+</tbody>
+</table>
+</div>
+<h3>Points résiduels — non corrigés, à suivre</h3>
+<div class="table">
+<table>
+<thead><tr><th>Point résiduel</th><th>Constat</th><th>Statut</th></tr></thead>
+<tbody>
+<tr><td>Flakiness du test « loopback »</td><td>Première passe complète 492/495 puis 495/495, fichier non modifié.</td><td class="s-no">Non corrigé — à stabiliser (ancien constat).</td></tr>
+<tr><td>Lint absent du checkout</td><td>Script <code>lint</code> présent mais ESLint et sa configuration absents ; aucune dépendance installée.</td><td class="s-no">Non corrigé — suivi séparé recommandé.</td></tr>
+<tr><td>Incohérence promotionnelle</td><td>Champ « prix promo » en admin, prix barré en boutique, montant facturé toujours sans promo (fiche, panier, checkout).</td><td class="s-no">Non corrigée — documentée ici, sujet distinct (§09, §12).</td></tr>
+<tr><td><code>memory/architecture.md</code></td><td>Référencé par <code>CLAUDE.md</code>, dossier <code>memory/</code> absent de ce checkout.</td><td class="s-unk">Non vérifiable — à rétablir ou à désigner autrement.</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section id="ui">
+<h2>11 · Interface et choix validés</h2>
+<div class="cards">
+<article><h3>Client</h3><p>Proposition C adaptée : sidebar, quota détaillé et cartes. Création en une modale GitHub/URL, sans détour vers un formulaire dans la page.</p></article>
+<article><h3>Mobile</h3><p>Overlay fermé non interceptant et tiroir accessible (<code>af96213</code>) ; header réorganisé ; boutons essentiels sans troncature ; « Nouvelle application » déplacé en haut (<code>ad60fb2</code>).</p></article>
+<article><h3>Auth</h3><p>Expérience allégée et QR généré localement. Un QR TOTP encode un secret : captures à masquer avant partage.</p></article>
+<article><h3>Commerce</h3><p><code>/offres</code> redirige vers <code>/shop</code>. Menu public mobile, panier et checkout clarifiés. Statuts reflétés honnêtement, y compris refus ou annulation.</p></article>
+<article><h3>Accueil</h3><p>Hybride B + densité A validé visuellement : hero court, étapes, capacités, offres réelles, FAQ et CTA. Deux fichiers modifiés (<code>page.tsx</code>, <code>globals.css</code>).</p></article>
+<article><h3>Couleurs</h3><p>Vert par défaut, clair/sombre et recoloration BrandConfig conservés. Les visuels proposés par un outil externe restent soumis à intégration et tests en recette.</p></article>
+</div>
+</section>
+
+<section id="reste">
+<h2>12 · Travaux restants et décisions</h2>
+<div class="table">
+<table>
+<thead><tr><th>Priorité / statut</th><th>Travail</th><th>Critère de sortie</th></tr></thead>
+<tbody>
+<tr><td>Immédiat</td><td>Clore le lot documentaire : revue de <code>docs/suivi-projet.html</code>, puis commit/push sous GO dédié (non faits à cet arrêt).</td><td>Fichier versionné, chemin absolu communiqué, arbre propre, aucun autre fichier touché.</td></tr>
+<tr><td>Immédiat — clos</td><td>Accueil public : commit local, intégration main, push.</td><td class="s-ok">Faits : <code>54331f0</code>, fast-forward, push sans force, <code>origin/main…HEAD = 0 0</code>.</td></tr>
+<tr><td>Immédiat — nouveau cap, étape 1</td><td>Audit du socle commercial existant (clients, commandes, factures, abonnements, portefeuille sécurisé, paiement par solde, recharges virement/carte) <b>avant tout nouveau développement</b>, <b>sans présumer ces fonctions absentes ni opérationnelles</b>.</td><td>Inventaire constaté fonction par fonction, preuve à l’appui ; puis écarts et lots (étapes 2 à 5 du <a href="#lancement">plan</a>).</td></tr>
+<tr><td>Cadre de réalisation</td><td>Implémentation par lots avec tests isolés, puis intégrations en environnement de test, puis essais réels contrôlés avec <b>prestataires réels sur ressources dédiées, sous GO dédié avant lancement</b> — distincts de l’activation commerciale en production.</td><td>Matrice PASS / ÉCHEC / BLOQUÉ / NON TESTÉ renseignée pour chaque parcours (environnement, preuve, résultat, limites).</td></tr>
+<tr><td>Docker / extensions</td><td>Prise en charge des Dockerfiles clients <b>à auditer</b> (parcours UI, API et provider) ; Docker Compose et les autres extensions <b>ne doivent pas retarder implicitement</b> le socle commercial.</td><td>Audit de la prise en charge (UI/API/provider) ; aucun report automatique de l’objectif de lancement.</td></tr>
+<tr><td>À planifier avant utilisation commerciale des promos</td><td>Résoudre la sémantique de promo : champ admin, prix barré boutique et prix effectivement facturé divergent.</td><td>Une seule règle validée, affichages et calcul serveur cohérents ; zéro correctement distingué de l’absence.</td></tr>
+<tr><td>Fonctionnel restant</td><td>Upgrade automatique de l’offre/quota. Actuellement refus explicite et assistance.</td><td>Spécification du changement, tarification/prorata éventuel, capacités et transitions, puis tests.</td></tr>
+<tr><td>Préparation aux essais réels</td><td>Définir cible isolée réelle, domaine de test, credentials, ressources autorisées et stratégie de récupération.</td><td>Plan concret approuvé avant tout appel panel/DNS réel.</td></tr>
+<tr><td>Activation / production</td><td>Évaluer migrations, sauvegarde/restauration, déploiement, flags, runner et supervision.</td><td>Procédure revue et GO dédié, distinct des essais réels contrôlés ; aucun basculement implicite après push.</td></tr>
+<tr><td>Parcours réels à couvrir</td><td>GitHub lié, OAuth/Turnstile/MFA selon politique, email et moyen de paiement retenu, déploiement et suppression réels.</td><td>Preuves corrélées à un compte/une commande/un UUID dédiés ; aucun effet sur clients réels.</td></tr>
+<tr><td>Séparé</td><td>Mot de passe oublié : fonctionnalité backend complète, pas un simple lien UI.</td><td>Parcours sécurisé spécifié et validé.</td></tr>
+<tr><td>Progressif</td><td>Pages restantes <code>/manager</code>, profil, aide, autres vues : inventaire actualisé avant extension du styling.</td><td>Périmètre déterminé sans prétendre toutes les pages modernisées.</td></tr>
+<tr><td>Hors périmètre de lancement — à arbitrer</td><td>WordPress managé et autres produits. Le portefeuille, le paiement par solde et les recharges virement/carte font partie de l’objectif de lancement (<a href="#lancement">§15</a>), prestataire à sélectionner.</td><td>Décision explicite et état réel établi ; ne pas les annoncer comme livrés.</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section id="livraison">
+<h2>13 · Comment un lot passe de l’idée à la livraison</h2>
+<figure>
+<figcaption>Cycle de livraison utilisé dans la conversation</figcaption>
+<ol class="flow">
+<li><b>Cadrage</b><span>Périmètre, état de départ, contraintes et résultat attendu.</span></li>
+<li><b>Réalisation recette</b><span>Code ou maquettes ; preuves et essais limités aux parcours touchés.</span></li>
+<li><b>Revue</b><span>Patch lisible + rapport honnête + validation visuelle propriétaire.</span></li>
+<li><b>Git puis exploitation</b><span>Commit local unique → intégration fast-forward → push sous GO ; mise en production séparée.</span></li>
+</ol>
+</figure>
+<p>Ne pas relancer une batterie générale uniquement parce qu’un rapport est demandé. Relancer ce qui est affecté par un changement concret ou nécessaire à un risque restant. Conserver les erreurs initiales et leur explication au lieu de remplacer l’historique par un unique chiffre vert.</p>
+</section>
+
+<section id="documents">
+<h2>14 · Documents, maintenance et continuité</h2>
+<div class="table">
+<table>
+<thead><tr><th>Document</th><th>Rôle</th></tr></thead>
+<tbody>
+<tr><td><code>docs/suivi-projet.html</code> (ce fichier)</td><td>Suivi global versionné — chemin absolu communiqué à chaque mise à jour.</td></tr>
+<tr><td>RAPPORT-CORRECTIONS.md</td><td>Corrections C2/C4, limites et preuves avant/après.</td></tr>
+<tr><td>RAPPORT-CLOTURE-TECHNIQUE.md</td><td>Rollback PostgreSQL, finalisation et DNS C3 atomique.</td></tr>
+<tr><td>RAPPORT-CORRECTIONS-P1P4.md</td><td>Navigation, mobile et contrat pack public.</td></tr>
+<tr><td>RAPPORT-MODALE-CREATION.md / RAPPORT-GO.md</td><td>Modalité de création et scénarios recette.</td></tr>
+<tr><td>RAPPORT-LOT-A-AUTH.md</td><td>Auth, QR local et limites des tests.</td></tr>
+<tr><td>RAPPORT-LOT-B.md</td><td>Commerce, corrections, vrais/rejoués nominaux et limites.</td></tr>
+<tr><td>RAPPORT-MAQUETTES-ACCUEIL.md</td><td>Choix visuel, intégration, corrections tarifaires, commit et push (§11).</td></tr>
+<tr><td>ETAT-REPRISE.md</td><td>Reprise après incident ; vérifier sa fraîcheur avant utilisation.</td></tr>
+<tr><td>PROJECT_STATUS.md, DECISIONS.md, TASKS.md, CHANGELOG.md, HANDOVER.md</td><td>Fichiers de continuité du dépôt ; <code>DECISIONS.md</code> fait foi pour les statuts de décision.</td></tr>
+</tbody>
+</table>
+</div>
+<div class="notice">
+<b>Consigne de maintenance.</b> Mettre à jour <code>docs/suivi-projet.html</code> <b>à la clôture de chaque lot</b> : état (§01), chronologie (§03), matrice des états (§04), validations (§08), incidents (§10), travaux restants (§12), plan de lancement et matrices PASS/ÉCHEC (§15) — avec la date, la base, le commit, les preuves, les limites et la prochaine action — puis <b>communiquer son chemin absolu</b>. La même consigne est reprise dans <code>PROJECT_STATUS.md</code>.
+</div>
+<p><strong>Emplacement :</strong> <code>docs/suivi-projet.html</code>, à la racine du dépôt — hors <code>recette/</code> (exclu de git), hors <code>apps/</code> : il n’est <strong>servi par aucune route de l’application</strong>. Versionné sous la branche dédiée <code>docs/suivi-projet</code>.</p>
+<p><strong>Contenus exclus :</strong> scripts de recette, secrets et identifiants, captures sensibles, données personnelles de fixtures, URL d’infrastructure externe. Les rapports sources locaux ne sont pas incorporés intégralement : cette page en fournit une synthèse organisée.</p>
+<p>Ce fichier est autonome : <strong>aucun CDN, police distante, analytique, secret ni appel réseau</strong>. Les schémas sont des listes visuelles structurées et un schéma SVG inline, lisibles hors ligne. La recherche, le sommaire, le thème clair/sombre et l’impression restent disponibles sans dépendance externe.</p>
+</section>
+
+<section id="lancement">
+<h2>15 · Objectif de lancement (décision du propriétaire)</h2>
+<div class="notice"><b>Décision du propriétaire — consignée le 02/10/2026.</b> L’objectif de lancement est une <b>plateforme commerciale utilisable de bout en bout</b> : gestion des clients, des commandes, des factures, des abonnements, d’un portefeuille sécurisé, du paiement par solde et des recharges par virement ou carte via <b>un prestataire à sélectionner</b>. Cette décision <b>n’emporte aucune affirmation sur l’état actuel</b> de ces fonctions : rien n’est présumé absent, rien n’est présumé opérationnel avant l’étape 1.</div>
+
+<h3>Plan en 5 étapes</h3>
+<ol class="flow">
+<li><b>1. Audit de l’existant</b><span>Inventaire des fonctions commerciales réellement présentes, <b>avant tout nouveau développement</b>, sans présumer qu’elles sont absentes ou opérationnelles. État constaté fonction par fonction, preuve à l’appui.</span></li>
+<li><b>2. Écarts et lots</b><span>Identification des écarts entre l’état constaté et l’objectif, puis conception des lots manquants.</span></li>
+<li><b>3. Implémentation et tests isolés</b><span>Développement par lot, tests isolés du lot avant toute intégration.</span></li>
+<li><b>4. Tests d’intégration</b><span>Tests des intégrations en environnement de test, parcours de bout en bout.</span></li>
+<li><b>5. Essais réels contrôlés</b><span>Avec <b>prestataires réels sur ressources dédiées</b>, sous <b>GO dédié</b>, avec preuves corrélées, <b>avant tout lancement</b> — distincts de l’<b>activation commerciale en production</b> (GO séparé).</span></li>
+</ol>
+
+<h3>Matrice de recette — 4 statuts et 4 environnements</h3>
+<div class="table">
+<table>
+<thead><tr><th>Statut</th><th>Signification</th><th>Preuve attendue pour toute ligne</th></tr></thead>
+<tbody>
+<tr><td class="s-ok">PASS</td><td>Parcours exécuté et conforme.</td><td rowspan="2">Pour chaque ligne : <b>environnement</b>, <b>preuve</b>, <b>résultat observé</b>, <b>limites</b>.</td></tr>
+<tr><td class="s-no">ÉCHEC</td><td>Parcours exécuté, résultat non conforme (écart à corriger).</td></tr>
+<tr><td class="s-part">BLOQUÉ</td><td>Exécution empêchée (prérequis, accès, dépendance, prestataire indisponible).</td><td>Cause et condition de déblocage à préciser.</td></tr>
+<tr><td class="s-unk">NON TESTÉ</td><td>Pas exécuté — <b>statut par défaut</b> tant que l’audit n’a pas été mené.</td><td>Aucune preuve : ne jamais le convertir en PASS par déduction.</td></tr>
+</tbody>
+</table>
+</div>
+<p class="small"><b>Toujours préciser l’environnement :</b> <b class="s-part">simulation</b> (transports/mocks en recette) · <b class="s-part">prestataire en mode test</b> (sandbox du futur prestataire de recharge) · <b class="s-ok">essai réel contrôlé</b> (prestataires réels, ressources dédiées, sous GO dédié) · <b class="s-no">activation commerciale en production</b> (basculement commercial, GO distinct — jamais déduit d’un essai). Un PASS en simulation ne vaut jamais PASS réel ; un essai réel contrôlé ne vaut pas activation.</p>
+
+<h3>Parcours commerciaux — état initial (aucun audit réalisé)</h3>
+<div class="table">
+<table class="matrix">
+<thead><tr><th>Parcours</th><th>Statut</th><th>Environnement</th><th>Preuve</th><th>Résultat observé</th><th>Limites</th></tr></thead>
+<tbody>
+<tr><td>Gestion des clients</td><td class="s-unk">NON TESTÉ</td><td>à définir</td><td>—</td><td>—</td><td>État inconnu : audit étape 1</td></tr>
+<tr><td>Commandes</td><td class="s-unk">NON TESTÉ</td><td>à définir</td><td>—</td><td>—</td><td>État inconnu : audit étape 1</td></tr>
+<tr><td>Factures</td><td class="s-unk">NON TESTÉ</td><td>à définir</td><td>—</td><td>—</td><td>État inconnu : audit étape 1</td></tr>
+<tr><td>Abonnements</td><td class="s-unk">NON TESTÉ</td><td>à définir</td><td>—</td><td>—</td><td>État inconnu : audit étape 1</td></tr>
+<tr><td>Portefeuille sécurisé</td><td class="s-unk">NON TESTÉ</td><td>à définir</td><td>—</td><td>—</td><td>État inconnu : audit étape 1</td></tr>
+<tr><td>Paiement par solde</td><td class="s-unk">NON TESTÉ</td><td>à définir</td><td>—</td><td>—</td><td>État inconnu : audit étape 1</td></tr>
+<tr><td>Recharge par virement</td><td class="s-unk">NON TESTÉ</td><td>à définir</td><td>—</td><td>—</td><td>État inconnu : audit étape 1</td></tr>
+<tr><td>Recharge par carte (prestataire à sélectionner)</td><td class="s-unk">NON TESTÉ</td><td>à définir</td><td>—</td><td>—</td><td>Prestataire non choisi ; état inconnu</td></tr>
+</tbody>
+</table>
+</div>
+<p class="small"><b>Indices de code vérifiés (git grep sur les fichiers trackés) — à qualifier, pas à conclure :</b> le dépôt contient <code>BillingSetting</code>, des champs <code>wallet</code>/<code>invoice</code> (migration <code>init_billing_store</code>) et des libellés « facture » côté checkout. Cela ne prouve ni l’absence ni l’opérationnalité de la fonction : c’est précisément ce que l’audit de l’étape 1 devra établir.</p>
+
+<h3>Docker et extensions — cadre explicite</h3>
+<div class="cards">
+<article><h3>Dockerfile</h3><p>La <b>prise en charge des Dockerfiles clients reste à auditer</b> dans les parcours UI, API et provider (détection, choix du build pack, déploiement). Décision ouverte ; <b>aucune conclusion n’est tirée de l’absence de Dockerfile dans ce dépôt</b>.</p></article>
+<article><h3>Compose et autres extensions</h3><p>Docker Compose, et les autres extensions du socle, <b>ne doivent pas retarder implicitement</b> l’objectif commercial : aucun report automatique. Chaque sujet non bloquant est arbitré séparément, sans glisser la date de lancement.</p></article>
+</div>
+
+<h3>Inconnues conservées (ne pas liquider par la documentation)</h3>
+<div class="table">
+<table>
+<thead><tr><th>Inconnue</th><th>Consigne</th></tr></thead>
+<tbody>
+<tr><td><code>memory/architecture.md</code></td><td><b>Ne pas le recréer sans vérifier sa source</b> (dossier absent de ce checkout) — rester signalé comme non vérifiable.</td></tr>
+<tr><td><code>cleanup-ghost-slots.mjs</code></td><td><b>Ne pas l’exécuter</b> — hors périmètre de ce lot.</td></tr>
+<tr><td>Flakiness « loopback », lint absent, incohérence promotionnelle</td><td>Rester documentés comme points résiduels (§10) tant qu’ils ne sont pas traités.</td></tr>
+<tr><td>Chiffres anciens (migrations 45/48, compteurs de tests, routes)</td><td>Rester qualifiés « ancien constat » (§03) — non relancés.</td></tr>
+</tbody>
+</table>
+</div>
+<div class="notice">Ce lot est <b>documentaire</b> : il consigne la décision, le plan et les matrices à renseigner. <b>Aucun audit, aucun test métier, aucun contrôle live exécuté</b> pour l’instant.</div>
+</section>
+
+</main>
+<footer>État fondé sur les rapports communiqués et l’historique git du dépôt · aucun secret ni donnée personnelle · aucun accès direct au poste requis pour lire ce fichier</footer>
+<script>document.getElementById("theme").onclick=()=>document.body.classList.toggle("dark");const s=document.getElementById("search");s.oninput=()=>document.querySelectorAll("main section").forEach(x=>x.hidden=!x.textContent.toLowerCase().includes(s.value.toLowerCase()));document.getElementById("reset").onclick=()=>{s.value="";s.oninput()};document.querySelectorAll("nav a").forEach(a=>a.onclick=()=>{s.value="";s.oninput()});</script>
+</body>
+</html>

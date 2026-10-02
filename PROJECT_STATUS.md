@@ -1,5 +1,14 @@
 # PROJECT_STATUS — Code Diali
 
+## Suivi global documentaire — `docs/suivi-projet.html`
+**Consigne de maintenance :** mettre à jour `docs/suivi-projet.html` **à la clôture de chaque lot** — état courant, chronologie, matrice des états (prévu / développé / testé en simulation / testé réellement / committé / poussé / activé en production), validations, incidents et travaux restants, avec **date, base, commit, preuves, limites et prochaine action** — puis **communiquer son chemin absolu** dans le rapport de clôture du lot.
+- Chemin absolu courant : `C:\Users\mourad.errabii\Documents\iCode-Host-Recette\docs\suivi-projet.html` (worktree de recette ; chemin équivalent dans le dépôt principal après intégration : `C:\Users\mourad.errabii\Documents\Projet iCode Host\docs\suivi-projet.html`).
+- Fichier autonome (aucun CDN, aucune ressource réseau, aucun secret ni donnée personnelle), versionné sous la branche `docs/suivi-projet`, hors `recette/` (exclu de git) et **hors routes de l'application**.
+- Version courante : **v4 du 02/10/2026** (rectifications documentaires ciblées), base **`54331f0`** (accueil public committé, intégré en fast-forward puis poussé). §15 = objectif de lancement (plateforme commerciale de bout en bout, portefeuille / paiement par solde / recharges virement-carte inclus, prestataire à sélectionner), plan en 5 étapes et matrices PASS / ÉCHEC / BLOQUÉ / NON TESTÉ — décision propriétaire consignée dans le HTML.
+- **Prochaine étape :** audit du socle commercial existant **avant tout nouveau développement** (étape 1 du plan de lancement, §15 du HTML).
+
+**Délimitation — sections historiques :** les sections **« Overall status »**, **« Current phase »** et **« State »** (y compris les déclinaisons « State - Phase … ») qui suivent sont **historiques** : leur contenu est conservé tel quel et n’est plus mis à jour. La **synthèse actuelle fait foi dans `docs/suivi-projet.html`** (chemin absolu ci-dessus).
+
 ## Overall status
 **Couverture E2E Phase 4 (checkout Store multi-domaines, plateforme white-label Code Diali) : implémentation terminée et validée** — `apps/api/test/store-checkout-domains.e2e-spec.ts` (**21 nouveaux tests**) inclus dans le changement `test(store): add multi-domain checkout e2e coverage` ; validations API/Web réussies (voir Dernière validation complète). Les phases 1–17 + Phase 3 Turnstile + Phase 4 Multi-domaines store + Phase 17 ADR-038 + **ADR-041 (Rate-limit statut public de commande + TRUST_PROXY)** sont **validées, commitées et poussées**. Test `invitations.service.spec` déjà déterministe (fake timers Jest, `expiresAt` 1 jour futur, horloge contrôlée).
 
