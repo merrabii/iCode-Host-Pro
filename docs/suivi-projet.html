@@ -69,11 +69,11 @@ body.dark{background:#101b1a;color:#e0ede8}
 
 <section id="etat">
 <h2>01 · Où en sommes-nous ?</h2>
-<div class="notice">État documentaire arrêté au <b>2 octobre 2026</b>, après l’intégration et la poussée de l’accueil public sous <code>54331f0</code> sur <code>main</code>. Ce document synthétise les rapports de recette, l’historique git et les fichiers de continuité du dépôt ; ce n’est pas un audit en direct des serveurs. Aucun pourcentage global arbitraire.</div>
+<div class="notice">État documentaire arrêté au <b>2 octobre 2026</b>, après l’intégration et la poussée du suivi global sous <code>2174eb6</code> sur <code>main</code>, puis réalisation de <b>l’étape 1 — audit du socle commercial</b> (<code>docs/audit-socle-commercial.md</code>, branche <code>audit/socle-commercial</code>, non committée). Ce document synthétise les rapports de recette, l’historique git et les fichiers de continuité du dépôt ; ce n’est pas un audit en direct des serveurs. Aucun pourcentage global arbitraire.</div>
 <div class="cards">
 <article>
 <h3>Dernière base poussée</h3>
-<p><code>54331f081b1fb2fcda9ff26202eee854769c16d6</code> — accueil public. Parent <code>ad60fb226e879accba6413caa772bc920e0bd583</code> (lot B). Local et distant identiques (<code>origin/main…HEAD = 0 0</code>) selon le rapport post-push du 02/10/2026.</p>
+<p><code>2174eb6f2125fb52729685bbf65fbc36dc958f29</code> — suivi global documentaire. Parent <code>54331f081b1fb2fcda9ff26202eee854769c16d6</code> (accueil public). Local et distant identiques (<code>origin/main…HEAD = 0 0</code>) selon le rapport post-push du 02/10/2026.</p>
 </article>
 <article>
 <h3>Accueil / — committé, intégré, poussé</h3>
@@ -89,7 +89,7 @@ body.dark{background:#101b1a;color:#e0ede8}
 </article>
 <article>
 <h3>Prochaine transition</h3>
-<p>Clôturer ce lot documentaire (revue puis commit/push sous GO dédié), puis enchaîner sur l’étape 1 du plan de lancement : <b>audit du socle commercial existant avant tout nouveau développement</b>, sans présumer ces fonctions absentes ni opérationnelles (<a href="#lancement">section 15</a>).</p>
+<p>Étape 1 <b class="s-ok">réalisée</b> (audit du socle commercial, 02/10/2026 — <code>docs/audit-socle-commercial.md</code>). Ensuite : <b>votre arbitrage des 8 décisions du rapport (§6), puis ouverture des lots A0→E1 sous GO dédié</b> — ne pas commencer leur implémentation avant décision (<a href="#lancement">section 15</a>).</p>
 </article>
 </div>
 </section>
@@ -214,7 +214,8 @@ body.dark{background:#101b1a;color:#e0ede8}
 <tr><td>Lot A — authentification</td><td>Carte unique, erreurs inline, QR TOTP généré localement, gestion des erreurs et résultats périmés.</td><td><code>398bd33</code> · <b class="s-ok">poussé</b> · <b class="s-part">26/26 + QR 12/12 (ancien constat)</b></td></tr>
 <tr><td>Lot B — boutique et checkout</td><td>Navigation mobile, panier, suivi honnête de commande, récapitulatif à droite, upgrade indisponible expliqué, CTA client en haut mobile.</td><td><code>ad60fb2</code> · <b class="s-ok">poussé</b></td></tr>
 <tr><td>Accueil public</td><td>Maquettes A/B, choix « B + densité d’A », intégration (StoreShell, étapes, fonctionnalités, catalogue réel, FAQ), suppression des faux chiffres, tarifs simplifiés.</td><td><code>54331f0</code> · <b class="s-ok">committé, intégré en fast-forward, poussé (02/10/2026)</b> — 2 fichiers, 382+/88−</td></tr>
-<tr><td>Lot documentaire (ce fichier)</td><td>Suivi global en HTML dans <code>docs/</code> : historique, états, décisions, incidents, maintenance.</td><td><b class="s-part">branche <code>docs/suivi-projet</code>, non committé à cet arrêt</b></td></tr>
+<tr><td>Lot documentaire (ce fichier)</td><td>Suivi global en HTML dans <code>docs/</code> : historique, états, décisions, incidents, maintenance.</td><td><code>2174eb6</code> · <b class="s-ok">committé, intégré en fast-forward, poussé (02/10/2026)</b> — 2 fichiers, 579 insertions</td></tr>
+<tr><td>Étape 1 — audit du socle commercial</td><td>Matrice capacités/validations (8 familles), schéma commande→facture→provisioning, anomalies par gravité, 10 blocages, lots A0→E1, 8 décisions à arbitrer.</td><td><code>docs/audit-socle-commercial.md</code> · <b class="s-part">branche <code>audit/socle-commercial</code>, non committé à cet arrêt</b> · 137/137 unit + reproduction HTTP isolée 7/7 (02/10, consolidé)</td></tr>
 </tbody>
 </table>
 </div>
@@ -381,7 +382,7 @@ body.dark{background:#101b1a;color:#e0ede8}
 <article><h3>Tarifs de l’accueil</h3><p>Prix affiché = <code>priceHtCents</code> seul + cycle ; zéro affiché comme zéro ; prix absent → « Tarif à consulter » avec accès à la fiche ; <b>jamais</b> de prix barré sur cette page.</p></article>
 <article><h3>Promotion</h3><p>Aucune correction des parcours boutique/admin/facturation : l’écart entre champ promo, prix barré et montant facturé est documenté comme <b>sujet distinct</b> (§10 et §12).</p></article>
 <article><h3>Traitements git</h3><p>Commit local unique → intégration fast-forward → push sans force, chacun sous GO dédié. Aucun amend, aucun second commit, aucune action de production.</p></article>
-<article><h3>Objectif de lancement (nouveau cap)</h3><p>Plateforme commerciale de bout en bout (clients, commandes, factures, abonnements, portefeuille sécurisé, paiement par solde, recharges virement/carte via prestataire à sélectionner) — plan en 5 étapes, audit d’abord, essais réels contrôlés (prestataires réels, ressources dédiées) sous GO dédié, distincts de l’activation commerciale en production. Détail : <a href="#lancement">section 15</a>.</p></article>
+<article><h3>Objectif de lancement (nouveau cap)</h3><p>Plateforme commerciale de bout en bout (clients, commandes, factures, abonnements, portefeuille sécurisé, paiement par solde, recharges virement/carte via prestataire à sélectionner) — plan en 5 étapes, <b>audit d’étape 1 réalisé le 02/10/2026</b>, essais réels contrôlés (prestataires réels, ressources dédiées) sous GO dédié, distincts de l’activation commerciale en production. Détail : <a href="#lancement">section 15</a>.</p></article>
 </div>
 </section>
 
@@ -438,9 +439,10 @@ body.dark{background:#101b1a;color:#e0ede8}
 <table>
 <thead><tr><th>Priorité / statut</th><th>Travail</th><th>Critère de sortie</th></tr></thead>
 <tbody>
-<tr><td>Immédiat</td><td>Clore le lot documentaire : revue de <code>docs/suivi-projet.html</code>, puis commit/push sous GO dédié (non faits à cet arrêt).</td><td>Fichier versionné, chemin absolu communiqué, arbre propre, aucun autre fichier touché.</td></tr>
+<tr><td>Immédiat — clos</td><td>Lot documentaire : revue de <code>docs/suivi-projet.html</code>, commit, intégration, push.</td><td class="s-ok">Faits : <code>2174eb6</code> (2 fichiers, 579 insertions), fast-forward sur <code>main</code>, push sans force — <code>origin/main…HEAD = 0 0</code>.</td></tr>
 <tr><td>Immédiat — clos</td><td>Accueil public : commit local, intégration main, push.</td><td class="s-ok">Faits : <code>54331f0</code>, fast-forward, push sans force, <code>origin/main…HEAD = 0 0</code>.</td></tr>
-<tr><td>Immédiat — nouveau cap, étape 1</td><td>Audit du socle commercial existant (clients, commandes, factures, abonnements, portefeuille sécurisé, paiement par solde, recharges virement/carte) <b>avant tout nouveau développement</b>, <b>sans présumer ces fonctions absentes ni opérationnelles</b>.</td><td>Inventaire constaté fonction par fonction, preuve à l’appui ; puis écarts et lots (étapes 2 à 5 du <a href="#lancement">plan</a>).</td></tr>
+<tr><td>Immédiat — clos</td><td>Étape 1 : audit du socle commercial existant <b>avant tout nouveau développement</b> — capacité par capacité, preuves fichier:ligne, tests ciblés (clients, commandes, factures, abonnements, portefeuille, solde, recharges, administration).</td><td class="s-ok">Fait le 02/10/2026 : <code>docs/audit-socle-commercial.md</code> (implémentation/validation séparées, anomalies classées, 137/137 unit + reproduction HTTP isolée 7/7, e2e antérieures réutilisées, aucun commit).</td></tr>
+<tr><td>À arbitrer (propriétaire)</td><td>8 décisions du rapport §6 (prestataire de paiement, règle promo, ordre des lots, effet de la suspension, politique virement, devise/taxes, conformité compte, CI) puis validation des lots A0→E1.</td><td>Décisions consignées ; GO dédié avant toute implémentation.</td></tr>
 <tr><td>Cadre de réalisation</td><td>Implémentation par lots avec tests isolés, puis intégrations en environnement de test, puis essais réels contrôlés avec <b>prestataires réels sur ressources dédiées, sous GO dédié avant lancement</b> — distincts de l’activation commerciale en production.</td><td>Matrice PASS / ÉCHEC / BLOQUÉ / NON TESTÉ renseignée pour chaque parcours (environnement, preuve, résultat, limites).</td></tr>
 <tr><td>Docker / extensions</td><td>Prise en charge des Dockerfiles clients <b>à auditer</b> (parcours UI, API et provider) ; Docker Compose et les autres extensions <b>ne doivent pas retarder implicitement</b> le socle commercial.</td><td>Audit de la prise en charge (UI/API/provider) ; aucun report automatique de l’objectif de lancement.</td></tr>
 <tr><td>À planifier avant utilisation commerciale des promos</td><td>Résoudre la sémantique de promo : champ admin, prix barré boutique et prix effectivement facturé divergent.</td><td>Une seule règle validée, affichages et calcul serveur cohérents ; zéro correctement distingué de l’absence.</td></tr>
@@ -476,6 +478,7 @@ body.dark{background:#101b1a;color:#e0ede8}
 <table>
 <thead><tr><th>Document</th><th>Rôle</th></tr></thead>
 <tbody>
+<tr><td><code>docs/audit-socle-commercial.md</code></td><td>Étape 1 — matrice des capacités/validations, schéma commande→facture→provisioning, anomalies, blocages, lots proposés, décisions à arbitrer (02/10/2026).</td></tr>
 <tr><td><code>docs/suivi-projet.html</code> (ce fichier)</td><td>Suivi global versionné — chemin absolu communiqué à chaque mise à jour.</td></tr>
 <tr><td>RAPPORT-CORRECTIONS.md</td><td>Corrections C2/C4, limites et preuves avant/après.</td></tr>
 <tr><td>RAPPORT-CLOTURE-TECHNIQUE.md</td><td>Rollback PostgreSQL, finalisation et DNS C3 atomique.</td></tr>
@@ -500,10 +503,11 @@ body.dark{background:#101b1a;color:#e0ede8}
 <section id="lancement">
 <h2>15 · Objectif de lancement (décision du propriétaire)</h2>
 <div class="notice"><b>Décision du propriétaire — consignée le 02/10/2026.</b> L’objectif de lancement est une <b>plateforme commerciale utilisable de bout en bout</b> : gestion des clients, des commandes, des factures, des abonnements, d’un portefeuille sécurisé, du paiement par solde et des recharges par virement ou carte via <b>un prestataire à sélectionner</b>. Cette décision <b>n’emporte aucune affirmation sur l’état actuel</b> de ces fonctions : rien n’est présumé absent, rien n’est présumé opérationnel avant l’étape 1.</div>
+<div class="notice"><b>Étape 1 — audit réalisé et consolidé le 02/10/2026</b> (base <code>2174eb6</code>, branche <code>audit/socle-commercial</code>, sans commit). Rapport : <code>docs/audit-socle-commercial.md</code>. Résultat <b>recalculé depuis les 52 lignes de matrice</b> (statut principal) : capacités <b>présentes 19 · partielles 11 · absentes 21 · à vérifier 1</b> ; validations <b>PASS 19 · ÉCHEC 4 · BLOQUÉ 1 · NON TESTÉ 28</b> — dont 4 lignes à statut mixte (API/UI, émission/sérialisation) détaillées au rapport. Preuves : <b>7 suites / 137 tests unitaires (137/137)</b> + <b>reproduction HTTP isolée RBAC 7/7</b> (base isolée <code>icode_host_pro_c4test</code>, panneau factice local — 401 sans jeton = 0 appel panneau, USER = 200 + appel observé, mutation = 403). <b>10 blocages de lancement</b> identifiés (paiement simulé, portefeuille et recharges absents, factures non consultables, promo affichée non facturée, renouvellements/remboursements/reset mdp absents, faille RBAC admin, listings absents) — <b>lots A0→E1 proposés (C0/C2/C3a sans prestataire), en attente de votre arbitrage (§6)</b> ; aucune implémentation commencée.</div>
 
 <h3>Plan en 5 étapes</h3>
 <ol class="flow">
-<li><b>1. Audit de l’existant</b><span>Inventaire des fonctions commerciales réellement présentes, <b>avant tout nouveau développement</b>, sans présumer qu’elles sont absentes ou opérationnelles. État constaté fonction par fonction, preuve à l’appui.</span></li>
+<li><b>1. Audit de l’existant</b><span>Inventaire des fonctions commerciales réellement présentes, <b>avant tout nouveau développement</b>, sans présumer qu’elles sont absentes ou opérationnelles. <b class="s-ok">Fait le 02/10/2026</b> — <code>docs/audit-socle-commercial.md</code>.</span></li>
 <li><b>2. Écarts et lots</b><span>Identification des écarts entre l’état constaté et l’objectif, puis conception des lots manquants.</span></li>
 <li><b>3. Implémentation et tests isolés</b><span>Développement par lot, tests isolés du lot avant toute intégration.</span></li>
 <li><b>4. Tests d’intégration</b><span>Tests des intégrations en environnement de test, parcours de bout en bout.</span></li>
@@ -518,25 +522,25 @@ body.dark{background:#101b1a;color:#e0ede8}
 <tr><td class="s-ok">PASS</td><td>Parcours exécuté et conforme.</td><td rowspan="2">Pour chaque ligne : <b>environnement</b>, <b>preuve</b>, <b>résultat observé</b>, <b>limites</b>.</td></tr>
 <tr><td class="s-no">ÉCHEC</td><td>Parcours exécuté, résultat non conforme (écart à corriger).</td></tr>
 <tr><td class="s-part">BLOQUÉ</td><td>Exécution empêchée (prérequis, accès, dépendance, prestataire indisponible).</td><td>Cause et condition de déblocage à préciser.</td></tr>
-<tr><td class="s-unk">NON TESTÉ</td><td>Pas exécuté — <b>statut par défaut</b> tant que l’audit n’a pas été mené.</td><td>Aucune preuve : ne jamais le convertir en PASS par déduction.</td></tr>
+<tr><td class="s-unk">NON TESTÉ</td><td>Pas exécuté — <b>statut par défaut</b> tant que le parcours n’a pas été exécuté (un audit par lecture n’est pas une exécution).</td><td>Aucune preuve : ne jamais le convertir en PASS par déduction.</td></tr>
 </tbody>
 </table>
 </div>
 <p class="small"><b>Toujours préciser l’environnement :</b> <b class="s-part">simulation</b> (transports/mocks en recette) · <b class="s-part">prestataire en mode test</b> (sandbox du futur prestataire de recharge) · <b class="s-ok">essai réel contrôlé</b> (prestataires réels, ressources dédiées, sous GO dédié) · <b class="s-no">activation commerciale en production</b> (basculement commercial, GO distinct — jamais déduit d’un essai). Un PASS en simulation ne vaut jamais PASS réel ; un essai réel contrôlé ne vaut pas activation.</p>
 
-<h3>Parcours commerciaux — état initial (aucun audit réalisé)</h3>
+<h3>Parcours commerciaux — résultat de l’audit (étape 1, 02/10/2026)</h3>
 <div class="table">
 <table class="matrix">
 <thead><tr><th>Parcours</th><th>Statut</th><th>Environnement</th><th>Preuve</th><th>Résultat observé</th><th>Limites</th></tr></thead>
 <tbody>
-<tr><td>Gestion des clients</td><td class="s-unk">NON TESTÉ</td><td>à définir</td><td>—</td><td>—</td><td>État inconnu : audit étape 1</td></tr>
-<tr><td>Commandes</td><td class="s-unk">NON TESTÉ</td><td>à définir</td><td>—</td><td>—</td><td>État inconnu : audit étape 1</td></tr>
-<tr><td>Factures</td><td class="s-unk">NON TESTÉ</td><td>à définir</td><td>—</td><td>—</td><td>État inconnu : audit étape 1</td></tr>
-<tr><td>Abonnements</td><td class="s-unk">NON TESTÉ</td><td>à définir</td><td>—</td><td>—</td><td>État inconnu : audit étape 1</td></tr>
-<tr><td>Portefeuille sécurisé</td><td class="s-unk">NON TESTÉ</td><td>à définir</td><td>—</td><td>—</td><td>État inconnu : audit étape 1</td></tr>
-<tr><td>Paiement par solde</td><td class="s-unk">NON TESTÉ</td><td>à définir</td><td>—</td><td>—</td><td>État inconnu : audit étape 1</td></tr>
-<tr><td>Recharge par virement</td><td class="s-unk">NON TESTÉ</td><td>à définir</td><td>—</td><td>—</td><td>État inconnu : audit étape 1</td></tr>
-<tr><td>Recharge par carte (prestataire à sélectionner)</td><td class="s-unk">NON TESTÉ</td><td>à définir</td><td>—</td><td>—</td><td>Prestataire non choisi ; état inconnu</td></tr>
+<tr><td>Gestion des clients</td><td class="s-ok">PASS</td><td>e2e recette 2026-09-25 · unit 02/10</td><td><code>client.e2e-spec</code> isolation ; <code>audit-socle-commercial.md</code> §1.1</td><td>Inscription, connexion, isolation des données opérationnelles</td><td>Reset mdp, édition profil, suppression de compte <b>absents</b></td></tr>
+<tr><td>Commandes</td><td class="s-ok">PASS <span class="small">(simulation)</span></td><td>unit 02/10 (137/137) · e2e 2026-09-20/27</td><td><code>checkout-c3.spec</code>, <code>c3-provisioning</code></td><td>Création, idempotence, provisioning à preuve opérationnels</td><td>Paiement <b>simulé</b> (PAID immédiat) ; après annulation, le rejeu renvoie la commande <code>CANCELLED</code> avec « provisioning-pending » (réponse trompeuse) — <b>règle de nouvel achat à spécifier (E-08, lot C0)</b></td></tr>
+<tr><td>Factures</td><td class="s-ok">PASS <span class="small">(émission)</span></td><td>unit 02/10 · e2e 2026-09-20</td><td><code>checkout.service.ts:417-448</code>, rapport §1.4</td><td>Émission atomique, montants figés, numérotation transactionnelle</td><td>Consultation, PDF, avoirs <b>absents</b> ; séquence non par exercice</td></tr>
+<tr><td>Abonnements</td><td class="s-ok">PASS <span class="small">(cycle manuel)</span></td><td>unit 02/10 · e2e 2026-09-25</td><td><code>subscriptions.service.spec</code>, rapport §1.5</td><td>Activation à la commande, suspension/résiliation manuelles verrouillées</td><td>Échéances, renouvellement, suspension auto <b>absents</b> ; effet infra suspension à vérifier</td></tr>
+<tr><td>Portefeuille sécurisé</td><td class="s-unk">NON TESTÉ</td><td>—</td><td>Rapport §1.6 (C-03)</td><td><b>Absent</b> : 0 code (modèle Prisma orphelin)</td><td>Rien à tester — à construire (lot C2)</td></tr>
+<tr><td>Paiement par solde</td><td class="s-unk">NON TESTÉ</td><td>—</td><td>Rapport §1.6 (C-03)</td><td><b>Absent</b> : aucun débit/consommation du solde</td><td>Dépend du portefeuille (C2) puis de l’encaissement (C1)</td></tr>
+<tr><td>Recharge par virement</td><td class="s-unk">NON TESTÉ</td><td>—</td><td>Rapport §1.7 (C-04)</td><td><b>Absente</b> : aujourd’hui la commande est « payée » à l’instant, sans validation</td><td>Fondation <b>C3a (validation admin manuelle) sans prestataire</b> ; décision politique virement = §6-5</td></tr>
+<tr><td>Recharge par carte (prestataire à sélectionner)</td><td class="s-part">BLOQUÉ <span class="small">(carte)</span></td><td>—</td><td>Rapport §1.7, §7.3</td><td><b>Absente</b> : aucun prestataire, webhook/`rawBody` absents aujourd’hui (option de bootstrap NestJS à activer)</td><td>Seul l’<b>adaptateur carte</b> (C1/C3b) dépend du choix prestataire — machine à états C0, portefeuille C2 et virement C3a <b>avancent sans lui</b></td></tr>
 </tbody>
 </table>
 </div>
@@ -560,7 +564,7 @@ body.dark{background:#101b1a;color:#e0ede8}
 </tbody>
 </table>
 </div>
-<div class="notice">Ce lot est <b>documentaire</b> : il consigne la décision, le plan et les matrices à renseigner. <b>Aucun audit, aucun test métier, aucun contrôle live exécuté</b> pour l’instant.</div>
+<div class="notice">Étape 1 <b>clôturée le 02/10/2026 puis consolidée</b> (GO rectifications : chaîne d’autorisation vérifiée gardes globaux → contrôleur → service, E-08 reformulé rejeu/nouvel achat, blocages de tests réqualifiés selon les ressources réelles, lots séparés fondations/adaptateur carte, totaux recalculés) : audit dans <code>docs/audit-socle-commercial.md</code>, <b>7 suites / 137 tests unitaires (137 PASS, mocks)</b> + <b>reproduction HTTP isolée 7/7</b> (base test identifiée, panneau factice local), preuves e2e antérieures réutilisées avec dates et limites. <b>Aucune correction applicative, aucune implémentation de lot, aucune dépendance installée, aucun appel externe, aucune migration, aucun commit</b> — les lots attendent votre arbitrage (§6 du rapport).</div>
 </section>
 
 </main>
