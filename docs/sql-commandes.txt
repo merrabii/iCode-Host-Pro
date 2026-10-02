@@ -1091,3 +1091,23 @@ npx prisma migrate deploy          -- base icode_host_pro_socle (48 anciennes + 
 -- Vérifs : colonnes Order présentes ; types Prisma régénérés (paidAt/clientKeyHash).
 -- Recette e2e/unit sur cette MÊME base dédiée (aucune écriture live).
 -- Env chantier : apps/api/.env du worktree (DATABASE_URL=icode_host_pro_socle, gitignored).
+
+--
+-- Migration P3 (additive, écrite main, JAMAIS modify les anciennes) :
+--   table PasswordResetToken (tokenHash sha256 @unique, expiresAt, usedAt,
+--   FK User ON DELETE CASCADE). 1 table neuve, aucune ALTER existante.
+--   Lot A1 du GO socle : jetons de réinitialisation de mot de passe.
+cd apps/api
+npx prisma generate                -- types Prisma (PasswordResetToken) ; EPERM possible sur
+                                   -- query_engine.dll si un process le retient : les fichiers
+                                   -- .d.ts sont néanmoins écrits (vérif: 577 occ. PasswordResetToken)
+npx prisma migrate deploy          -- base icode_host_pro_socle (49e migration : P3)
+-- Fichier SQL : prisma/migrations/20261002100000_add_password_reset/migration.sql
+-- Vérifs :
+--   SELECT to_regclass('"PasswordResetToken"');         -> passwordresettokentoken (non nul)
+--   SELECT indexname FROM pg_indexes WHERE tablename='PasswordResetToken';
+--     -> PasswordResetToken_pkey, _tokenHash_key, _userId_idx
+--   \d "PasswordResetToken" : FK userId -> "User"(id) ON DELETE CASCADE.
+-- Recette e2e/unit sur cette MÊME base dédiée (aucune écriture live).
+-- Nouveaux tests : npx jest --config ./test/jest-e2e.json account-recovery --runInBand (16/16).
+-- Env : PASSWORD_RESET_EXPIRES_IN_MINUTES (défaut 30, borné 5..1440 dans le service).

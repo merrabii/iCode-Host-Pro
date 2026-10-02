@@ -99,6 +99,10 @@ export interface AppConfig {
   /** Phase 5 (ADR-020): invite TTL in days. Optional (default 7), so the JWT
    *  fail-early set above is untouched. */
   inviteExpiresInDays: number;
+  /** GO socle (lot A1): password-reset link TTL in minutes. Optional (default
+   *  30), clamped 5..1440 in the service — same optional pattern as
+   *  inviteExpiresInDays. */
+  passwordResetExpiresInMinutes: number;
   /** Phase 6 (ADR-022): master key for app-level encryption (AES-256-GCM) of
    *  the SMTP password. Optional — only required when an admin SAVES a mail
    *  password (fail-early set untouched, same pattern as inviteExpiresInDays). */
@@ -158,6 +162,7 @@ export function loadAppConfig(
     refreshExpiresInDays: Number(process.env.REFRESH_EXPIRES_IN_DAYS ?? 30),
     cookieName: process.env.COOKIE_NAME ?? 'ihp_refresh',
     inviteExpiresInDays: Number(process.env.INVITE_EXPIRES_IN_DAYS ?? 7),
+    passwordResetExpiresInMinutes: Number(process.env.PASSWORD_RESET_EXPIRES_IN_MINUTES ?? 30),
     encryptionKey: process.env.ENCRYPTION_KEY ?? '',
     publicBaseUrl: process.env.PUBLIC_BASE_URL ?? 'http://localhost:3000',
     turnstileSecretKey: process.env.TURNSTILE_SECRET_KEY ?? '',

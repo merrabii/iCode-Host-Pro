@@ -18,6 +18,8 @@ import { LoginDto } from './dto/login.dto';
 import { FreeSignupDto } from './dto/free-signup.dto';
 import { AcceptInviteDto } from './dto/accept-invite.dto';
 import { ChangePasswordDto } from './dto/change-password.dto';
+import { ForgotPasswordDto } from './dto/forgot-password.dto';
+import { ResetPasswordDto } from './dto/reset-password.dto';
 import { CurrentUser } from './decorators/current-user.decorator';
 import { AllowImpersonationMutation } from './decorators/allow-impersonation.decorator';
 import { JwtAuthGuard } from './guards/jwt-auth.guard';
@@ -130,6 +132,39 @@ export class AuthController {
       throw new UnauthorizedException('Changement de mot de passe impossible en session d’impersonation.');
     }
     return this.auth.changePassword(user.sub, dto.currentPassword, dto.newPassword);
+  }
+
+  // ── GO socle (lot A1): password recovery ────────────────────────────────────
+  @Post('forgot-password')
+  @ApiOperation({ summary: 'Request a one-time reset link (identical answer either way, no enumeration)' })
+  async forgotPassword(@Body() dto: ForgotPasswordDto, @Req() req: CookieRequest) {
+    const rl = this.limiter.consume(
+      rateKey(req.ip, 'forgot-password'),
+      RATE.passwordReset.limit,
+      RATE.passwordReset.windowMs,
+    );
+    if (!rl.allowed) {
+      throw new UnauthorizedException(
+        `Trop de tentatives. Réessayez dans ${Math.ceil(rl.retryAfterMs / 1000)} s.`,
+      );
+    }
+    return this.auth.requestPasswordReset(dto.email, req.ip);
+  }
+
+  @Post('reset-password')
+  @ApiOperation({ summary: 'Consume a one-time reset token and set the new password' })
+  async resetPassword(@Body() dto: ResetPasswordDto, @Req() req: CookieRequest) {
+    const rl = this.limiter.consume(
+      rateKey(req.ip, 'reset-password'),
+      RATE.passwordResetConfirm.limit,
+      RATE.passwordResetConfirm.windowMs,
+    );
+    if (!rl.allowed) {
+      throw new UnauthorizedException(
+        `Trop de tentatives. Réessayez dans ${Math.ceil(rl.retryAfterMs / 1000)} s.`,
+      );
+    }
+    return this.auth.resetPassword(dto.token, dto.password, req.ip);
   }
 
   @Post('refresh')

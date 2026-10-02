@@ -51,6 +51,9 @@ export const RATE = {
   supportRedeem: { limit: 10, windowMs: 60_000 },
   register: { limit: 5, windowMs: 60_000 },
   checkoutIntent: { limit: 20, windowMs: 60_000 },
+  // GO socle (lot A1): reset password — the confirm bucket caps token guessing.
+  passwordReset: { limit: 5, windowMs: 60_000 },
+  passwordResetConfirm: { limit: 10, windowMs: 60_000 },
 } as const;
 
 /** Build a stable bucket key from a client IP + a logical route name. */

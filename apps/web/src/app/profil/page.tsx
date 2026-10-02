@@ -16,6 +16,7 @@ import {
   mfaDisable,
   mfaSetup,
   oauthUnlink,
+  updateProfile,
   type PublicAuthConfig,
 } from '@/lib/api';
 
@@ -37,6 +38,9 @@ export default function ProfilPage() {
   // Password change
   const [curPw, setCurPw] = useState('');
   const [newPw, setNewPw] = useState('');
+  // GO socle (A1) — édition des coordonnées du compte (nom / email)
+  const [editName, setEditName] = useState('');
+  const [editEmail, setEditEmail] = useState('');
   // Support code status
   const [hasCode, setHasCode] = useState(false);
 
@@ -61,7 +65,11 @@ export default function ProfilPage() {
   }, [token]);
 
   useEffect(() => {
-    if (me) setMfaEnabled(!!me.mfaEnabled);
+    if (me) {
+      setMfaEnabled(!!me.mfaEnabled);
+      setEditName(me.name ?? '');
+      setEditEmail(me.email);
+    }
   }, [me]);
 
   useEffect(() => {
@@ -147,6 +155,26 @@ export default function ProfilPage() {
     toast.ok('Mot de passe modifié.');
   }
 
+  // GO socle (A1) — édition de MES coordonnées : PATCH strictement limité au
+  // compte du jeton côté serveur (aucun id dans la requête).
+  async function saveProfile() {
+    if (!editEmail.trim()) {
+      toast.error('L’email est requis.');
+      return;
+    }
+    const res = await updateProfile(token, {
+      name: editName,
+      email: editEmail.trim(),
+    });
+    if (!res.ok) {
+      toast.error((res.data as { message?: string })?.message ?? 'Profil non modifié.');
+      return;
+    }
+    toast.ok('Profil mis à jour.');
+    // Recharge pour resynchroniser l'en-tête d'identité + la session.
+    window.location.reload();
+  }
+
   async function unlink(provider: 'google' | 'github') {
     const res = await oauthUnlink(token, provider);
     if (!res.ok) {
@@ -169,7 +197,7 @@ export default function ProfilPage() {
         <PageIntro
           eyebrow="Mon profil"
           title="Compte & sécurité"
-          sub="Gérez votre double authentification, vos comptes liés (Google / GitHub) et votre mot de passe."
+          sub="Gérez vos coordonnées, votre double authentification, vos comptes liés (Google / GitHub) et votre mot de passe."
         />
 
         {!canEdit && (
@@ -206,6 +234,43 @@ export default function ProfilPage() {
                   ))}
                 </div>
               </div>
+            </div>
+          </div>
+
+          {/* Coordonnées (GO socle A1) — nom / email du compte */}
+          <div className="panel">
+            <div className="panel-head">
+              <div className="flex-1">
+                <div className="panel-title">Coordonnées</div>
+                <div className="panel-sub">Nom et email portés par vos commandes et factures.</div>
+              </div>
+            </div>
+            <div className="panel-body stack">
+              <Field label="Nom">
+                <Input
+                  value={editName}
+                  maxLength={120}
+                  autoComplete="name"
+                  placeholder="Votre nom"
+                  onChange={(e) => setEditName(e.target.value)}
+                  disabled={!canEdit}
+                />
+              </Field>
+              <Field label="Email" required>
+                <Input
+                  type="email"
+                  value={editEmail}
+                  autoComplete="email"
+                  onChange={(e) => setEditEmail(e.target.value)}
+                  disabled={!canEdit}
+                />
+              </Field>
+              <div className="muted" style={{ fontSize: 12.5 }}>
+                L’email sert aussi de login : un email déjà pris par un autre compte est refusé.
+              </div>
+              <Button onClick={saveProfile} disabled={!canEdit || !editEmail.trim()}>
+                Enregistrer les coordonnées
+              </Button>
             </div>
           </div>
 

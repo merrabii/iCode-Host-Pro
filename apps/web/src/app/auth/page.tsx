@@ -14,6 +14,7 @@ import {
   acceptInvite,
   apiError,
   fetchMe,
+  forgotPassword,
   freeSignup,
   getPublicAuthConfig,
   login,
@@ -25,7 +26,7 @@ import {
   type PublicAuthConfig,
 } from '@/lib/api';
 
-type Mode = 'login' | 'invite' | 'register' | 'free';
+type Mode = 'login' | 'invite' | 'register' | 'free' | 'forgot';
 
 /** Validation d'email (mêmes règles que le champ natif type=email). */
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -97,9 +98,13 @@ export default function AuthPage() {
       setError('La politique MFA impose aux administrateurs d’activer la double authentification. Reconnectez-vous pour l’activer.');
     }
 
+    // GO socle (A1) : retour de la page /auth/reset → confirmation en toast.
+    if (params.get('reset') === 'done') {
+      toast.ok('Mot de passe modifié — connectez-vous avec votre nouveau mot de passe.');
+    }
+
     const err = params.get('error');
-    if (err) {
-      const map: Record<string, string> = {
+    if (err) {      const map: Record<string, string> = {
         oauth_missing_params: 'Réponse du fournisseur incomplète.',
         oauth_no_state: 'Jeton de sécurité OAuth absent. Réessayez.',
         oauth_bad_state: 'Jeton de sécurité OAuth invalide.',
@@ -151,7 +156,9 @@ export default function AuthPage() {
     // associées au champ, sans appel réseau si invalide.
     const fe: { email?: string; password?: string; token?: string } = {};
     if (!EMAIL_RE.test(email.trim())) fe.email = 'Saisissez une adresse email valide.';
-    if (password.length < PASSWORD_MIN) fe.password = `Mot de passe : ${PASSWORD_MIN} caractères minimum.`;
+    if (mode !== 'forgot' && password.length < PASSWORD_MIN) {
+      fe.password = `Mot de passe : ${PASSWORD_MIN} caractères minimum.`;
+    }
     if (mode === 'invite' && !token.trim()) fe.token = 'Collez le jeton d’invitation reçu.';
     if (fe.email || fe.password || fe.token) {
       setFieldErrors(fe);
@@ -161,6 +168,17 @@ export default function AuthPage() {
 
     setBusy(true);
     try {
+      // GO socle (A1) : demande de lien de réinitialisation — réponse serveur
+      // identique que le compte existe ou non (aucune fuite par l'UI).
+      if (mode === 'forgot') {
+        const res = await forgotPassword(email.trim());
+        if (!res.ok) throw new Error(apiError(res, 'Demande impossible.'));
+        toast.ok('Si un compte existe pour cet email, un lien de réinitialisation vous a été envoyé.');
+        setMode('login');
+        resetFlow();
+        return;
+      }
+
       if (mode === 'invite') {
         const res = await acceptInvite({ token, email, password, name: name || undefined });
         if (!res.ok) throw new Error(apiError(res, 'Jeton d’invitation invalide.'));
@@ -439,7 +457,9 @@ export default function AuthPage() {
               ? 'Créer un compte pour commander'
               : mode === 'free'
                 ? 'Commencez gratuitement'
-                : 'Accepter l’invitation'}
+                : mode === 'forgot'
+                  ? 'Mot de passe oublié'
+                  : 'Accepter l’invitation'}
         </h2>
         <p>
           {mode === 'login' && 'Accédez à votre espace client et à la console de gestion.'}
@@ -450,10 +470,12 @@ export default function AuthPage() {
           {mode === 'free' &&
             'Créez votre compte gratuitement — aucune carte requise. Vous pourrez déployer votre premier projet immédiatement.'}
           {mode === 'invite' && 'Un compte se crée uniquement par invitation (ADR-020).'}
+          {mode === 'forgot' &&
+            'Entrez votre email : nous vous enverrons un lien à usage unique pour choisir un nouveau mot de passe.'}
         </p>
 
         {/* Boutons OAuth — visibles seulement si le fournisseur est activé. */}
-        {mode !== 'invite' && (config?.oauthGoogleEnabled || config?.oauthGithubEnabled) && (
+        {mode !== 'invite' && mode !== 'forgot' && (config?.oauthGoogleEnabled || config?.oauthGithubEnabled) && (
           <div className="auth-oauth">
             {config.oauthGoogleEnabled && (
               <a
@@ -476,7 +498,7 @@ export default function AuthPage() {
           </div>
         )}
 
-        {mode !== 'invite' && (config?.oauthGoogleEnabled || config?.oauthGithubEnabled) && (
+        {mode !== 'invite' && mode !== 'forgot' && (config?.oauthGoogleEnabled || config?.oauthGithubEnabled) && (
           <div className="auth-divider">
             <span>ou</span>
           </div>
@@ -527,33 +549,37 @@ export default function AuthPage() {
               )}
             </>
           </Field>
-          {mode !== 'login' && (
+          {mode !== 'login' && mode !== 'forgot' && (
             <Field label="Nom (optionnel)" htmlFor="auth-name">
               <Input id="auth-name" autoComplete="name" value={name} onChange={(e) => setName(e.target.value)} />
             </Field>
           )}
-          <Field label="Mot de passe" htmlFor="auth-password" required>
-            <>
-              <Input
-                id="auth-password"
-                type="password"
-                required
-                minLength={PASSWORD_MIN}
-                autoComplete={mode === 'login' ? 'current-password' : 'new-password'}
-                value={password}
-                aria-invalid={fieldErrors.password ? true : undefined}
-                aria-describedby={fieldErrors.password ? 'auth-password-err' : undefined}
-                onChange={(e) => {
-                  setPassword(e.target.value);
-                  if (fieldErrors.password) setFieldErrors((f) => ({ ...f, password: undefined }));
-                }}
-              />
-              {fieldErrors.password && (
-                <span className="field-error" id="auth-password-err" role="alert">{fieldErrors.password}</span>
-              )}
-            </>
-          </Field>
-          {config?.turnstileSiteKey && <Turnstile siteKey={config.turnstileSiteKey} onChange={setTurnstileToken} />}
+          {mode !== 'forgot' && (
+            <Field label="Mot de passe" htmlFor="auth-password" required>
+              <>
+                <Input
+                  id="auth-password"
+                  type="password"
+                  required
+                  minLength={PASSWORD_MIN}
+                  autoComplete={mode === 'login' ? 'current-password' : 'new-password'}
+                  value={password}
+                  aria-invalid={fieldErrors.password ? true : undefined}
+                  aria-describedby={fieldErrors.password ? 'auth-password-err' : undefined}
+                  onChange={(e) => {
+                    setPassword(e.target.value);
+                    if (fieldErrors.password) setFieldErrors((f) => ({ ...f, password: undefined }));
+                  }}
+                />
+                {fieldErrors.password && (
+                  <span className="field-error" id="auth-password-err" role="alert">{fieldErrors.password}</span>
+                )}
+              </>
+            </Field>
+          )}
+          {mode !== 'forgot' && config?.turnstileSiteKey && (
+            <Turnstile siteKey={config.turnstileSiteKey} onChange={setTurnstileToken} />
+          )}
           {error && <ErrorMsg>{error}</ErrorMsg>}
           <Button type="submit" busy={busy} disabled={busy}>
             {mode === 'login'
@@ -562,7 +588,9 @@ export default function AuthPage() {
                 ? 'Créer mon compte & passer la commande'
                 : mode === 'free'
                   ? 'Commencez gratuitement — créer mon compte'
-                  : 'Créer mon compte'}
+                  : mode === 'forgot'
+                    ? 'Envoyer le lien de réinitialisation'
+                    : 'Créer mon compte'}
           </Button>
         </form>
 
@@ -573,7 +601,7 @@ export default function AuthPage() {
               Créer un compte
             </Button>
           )}
-          {(mode === 'register' || mode === 'invite' || mode === 'free') && (
+          {(mode === 'register' || mode === 'invite' || mode === 'free' || mode === 'forgot') && (
             <Button variant="secondary" onClick={() => { setMode('login'); resetFlow(); }}>
               Se connecter
             </Button>
@@ -581,6 +609,11 @@ export default function AuthPage() {
           {mode === 'login' && (
             <button type="button" className="auth-link" onClick={() => { setMode('invite'); resetFlow(); }}>
               J’ai une invitation — accepter un jeton
+            </button>
+          )}
+          {mode === 'login' && (
+            <button type="button" className="auth-link" onClick={() => { setMode('forgot'); resetFlow(); }}>
+              Mot de passe oublié ?
             </button>
           )}
           <a className="auth-link" href="/shop">

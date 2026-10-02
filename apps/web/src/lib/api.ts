@@ -1169,6 +1169,50 @@ export async function login(input: {
     return { ok: false, status: 0, data: { message: String(e) } };
   }
 }
+/** GO socle (lot A1): demande de lien de réinitialisation — la réponse est
+ *  identique que le compte existe ou non (anti-énumération côté serveur). */
+export async function forgotPassword(email: string): Promise<ApiResult> {
+  try {
+    const res = await fetch('/api/auth/forgot-password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ email }),
+    });
+    let data: unknown = null;
+    try {
+      data = await res.json();
+    } catch {
+      /* non-JSON body */
+    }
+    return { ok: res.ok, status: res.status, data };
+  } catch (e) {
+    return { ok: false, status: 0, data: { message: String(e) } };
+  }
+}
+
+/** GO socle (lot A1): consomme le jeton à usage unique reçu par email et
+ *  enregistre le nouveau mot de passe. */
+export async function resetPassword(token: string, password: string): Promise<ApiResult> {
+  try {
+    const res = await fetch('/api/auth/reset-password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ token, password }),
+    });
+    let data: unknown = null;
+    try {
+      data = await res.json();
+    } catch {
+      /* non-JSON body */
+    }
+    return { ok: res.ok, status: res.status, data };
+  } catch (e) {
+    return { ok: false, status: 0, data: { message: String(e) } };
+  }
+}
+
 export async function register(input: {
   email: string;
   password: string;
@@ -1587,6 +1631,10 @@ export const changePassword = (t: string, currentPassword: string, newPassword: 
     method: 'POST',
     body: JSON.stringify({ currentPassword, newPassword }),
   });
+/** GO socle (lot A1): édition de MES coordonnées (nom / email) — PATCH
+ *  /users/me, strictement limité au compte du jeton côté serveur. */
+export const updateProfile = (t: string, patch: { name?: string; email?: string }) =>
+  apiJson('/api/users/me', t, { method: 'PATCH', body: JSON.stringify(patch) });
 export const oauthUnlink = (t: string, provider: 'google' | 'github') =>
   apiJson('/api/auth/oauth/unlink', t, { method: 'POST', body: JSON.stringify({ provider }) });
 

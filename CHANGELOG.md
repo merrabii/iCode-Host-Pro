@@ -1,5 +1,21 @@
 # CHANGELOG
 
+## 2026-10-02 — **GO socle commercial — P3 (compte client : reset mdp + édition profil, audit A1)** (branche `feat/socle-commercial`, checkpoints locaux, aucun push)
+### Lot A1 — clients et accès (audit socle §1.1)
+- **Migration additive** `20261002100000_add_password_reset` : table `PasswordResetToken` (`tokenHash` sha256 @unique, `expiresAt`, `usedAt`, FK `User` CASCADE) — 1 table neuve, aucune ALTER existante, anciennes migrations intactes. Types Prisma régénérés.
+- **`POST /auth/forgot-password`** : réponse **toujours identique** `{ok:true}` (statut/corps identiques compte connu ou non → pas d'énumération), rate-limit 5/min/IP, jeton brut (`randomBytes(32)` base64url) présent **uniquement** dans le lien email, sha256 au repos (convention RefreshToken/Invitation), liens inactifs antérieurs supprimés (un seul actif), email best-effort façon invitations (échec SMTP → seulement `emailSent:false` en audit, la réponse ne change jamais), TTL `PASSWORD_RESET_EXPIRES_IN_MINUTES` (défaut 30, borné 5..1440).
+- **`POST /auth/reset-password`** : message **400 générique unique** pour inconnu / déjà utilisé / expiré (aucun oracle), longueur du mdp vérifiée **avant** de brûler le lien, transaction = mise à jour mdp + `usedAt` + **destruction** des refresh tokens actifs (`deleteMany`, pas `revokedAt` : la fenêtre de réemploi 10 s de `refresh()` doit pouvoir ressusciter une rotation concurrente, jamais une session tuée par un reset), audit `auth.password.reset` sans aucun secret, rate-limit 10/min/IP.
+- **`PATCH /users/me`** (déclaré **avant** `PATCH :id`) : nom/email strictement propres au compte du JWT (aucun id en entrée), trim, nom vide → clearance (`null`), **409** si email pris par un autre compte, **400** corps vide, no-op silencieux si identique, audit `auth.profile.update` (noms de champs seulement) ; lecture seule en session d'impersonation (403 via `JwtAuthGuard` existant).
+- **Web** : helpers `forgotPassword` / `resetPassword` / `updateProfile` (`api.ts`), mode « Mot de passe oublié ? » sur `/auth` (champ email seul, toast de non-divulgation), page `/auth/reset?token=…` (mdp + confirmation, retour `/auth?reset=done` avec toast), panneau « Coordonnées » (nom/email) sur `/profil` désactivé en consultation support.
+- `.env.example` + `configuration.ts` : `PASSWORD_RESET_EXPIRES_IN_MINUTES` (optionnel, même pattern `inviteExpiresInDays`).
+
+### Tests P3
+- **Nouveau** `test/account-recovery.e2e-spec.ts` : **16/16 PASS** — A anti-énumération (réponses identiques, 0 mail/0 jeton sur compte inconnu, audit `found:false`, supersede + sha256-only, rate-limit 5→401) ; B parcours complet (mail→lien→reset, 400 générique ×3, mdp court avant brûlage, sessions **détruites** = cookie refresh 401 immédiat, ancien mdp 401 / nouveau 201, audit sans secrets) ; C profil (trim, 409, 401 anonyme, 400 vide, isolation Bob, login au nouveau email) ; D impersonation = lecture seule (lecture 200 / écriture 403).
+- **Smoke de non-régression** : `store-payment-confirmation` (25) + `rbac-deployment-modules` (7) = **32/32 PASS** après le changement de DI `AuthService` (MailSettingsService).
+- **Unit API complet : 1015/1015 PASS (56 suites)** (`auth.service.spec` + `users.service.spec` étendus, +14 tests) ; `tsc --noEmit` API **et** Web PASS.
+- **Leçon e2e** : `MailSettingsService.isEnabled()` lit le flag `enabled` de la row mail — la fixture doit forcer `enabled:true` (snapshot/restore), sinon aucun email n'est envoyé (le flux échoue alors silencieusement, l'anti-énumération interdisant tout signal).
+- **Lint** : `eslint` toujours absent du workspace (préexistant, non bloquant — aucun ajout de dépendance).
+
 ## 2026-10-02 — **GO socle commercial — P1 (RBAC admin) + P2 (confirmation de paiement)** (branche `feat/socle-commercial`, checkpoints locaux, aucun push)
 ### Contexte
 Chantier global d'autonomie (GO du propriétaire) : réaliser le socle commercial complet en un flux jusqu'à livraison pour revue. Ce checkpoint couvre les lots P1 et P2 ; base dédiée `icode_host_pro_socle` (docker `icode-postgres`, 48 migrations + migration P2), aucune écriture live, aucun push.

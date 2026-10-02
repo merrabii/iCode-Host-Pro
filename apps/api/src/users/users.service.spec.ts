@@ -1,4 +1,4 @@
-import { ForbiddenException, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, ForbiddenException, NotFoundException } from '@nestjs/common';
 import { Role } from '@prisma/client';
 import { UpdateUserDto } from './dto/update-user.dto';
 import { UsersService } from './users.service';
@@ -263,6 +263,78 @@ describe('UsersService', () => {
           resourceId: 'cp-new',
         }),
       );
+    });
+  });
+
+  // ── GO socle (lot A1): self-service profile edit (PATCH /users/me) ─────────
+  describe('updateProfile (own account only)', () => {
+    it('refuses an empty body before touching the database', async () => {
+      await expect(service.updateProfile('u1', {})).rejects.toBeInstanceOf(BadRequestException);
+      expect(mockPrisma.user.findUnique).not.toHaveBeenCalled();
+    });
+
+    it('unknown account → NotFoundException', async () => {
+      mockPrisma.user.findUnique.mockResolvedValue(null);
+      await expect(service.updateProfile('ghost', { name: 'X' })).rejects.toBeInstanceOf(
+        NotFoundException,
+      );
+    });
+
+    it('updates name + email, strips secrets, audits the changed field names', async () => {
+      mockPrisma.user.findUnique
+        .mockResolvedValueOnce(user) // load own account
+        .mockResolvedValueOnce(null); // email conflict check: free
+      mockPrisma.user.update.mockResolvedValue({
+        ...user,
+        name: 'Ada L.',
+        email: 'ada@example.com',
+      });
+
+      const res = await service.updateProfile('u1', { name: '  Ada L.  ', email: 'ada@example.com' });
+
+      expect(mockPrisma.user.update).toHaveBeenCalledWith({
+        where: { id: 'u1' },
+        data: { name: 'Ada L.', email: 'ada@example.com' },
+      });
+      expect(res).not.toHaveProperty('passwordHash');
+      expect(res).not.toHaveProperty('mfaSecretEnc');
+      expect(res).not.toHaveProperty('githubTokenEnc');
+      expect(mockAudit.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'auth.profile.update',
+          actorId: 'u1',
+          details: { fields: ['name', 'email'] },
+        }),
+      );
+    });
+
+    it('email already used by ANOTHER account → ConflictException', async () => {
+      mockPrisma.user.findUnique
+        .mockResolvedValueOnce(user)
+        .mockResolvedValueOnce({ id: 'other', email: 'taken@example.com' });
+      await expect(
+        service.updateProfile('u1', { email: 'taken@example.com' }),
+      ).rejects.toBeInstanceOf(ConflictException);
+      expect(mockPrisma.user.update).not.toHaveBeenCalled();
+    });
+
+    it('blank name clears it (null)', async () => {
+      mockPrisma.user.findUnique.mockResolvedValueOnce(user);
+      mockPrisma.user.update.mockResolvedValue({ ...user, name: null });
+      const res = await service.updateProfile('u1', { name: '   ' });
+      expect(mockPrisma.user.update).toHaveBeenCalledWith({
+        where: { id: 'u1' },
+        data: { name: null, email: 'user@example.com' },
+      });
+      expect(res).not.toHaveProperty('passwordHash');
+    });
+
+    it('no-op when values are already identical (no write, no audit)', async () => {
+      mockPrisma.user.findUnique.mockResolvedValueOnce(user);
+      const res = await service.updateProfile('u1', { email: 'user@example.com', name: 'User' });
+      expect(mockPrisma.user.update).not.toHaveBeenCalled();
+      expect(mockAudit.record).not.toHaveBeenCalled();
+      expect(res).toEqual(expect.objectContaining({ id: 'u1' }));
     });
   });
 });

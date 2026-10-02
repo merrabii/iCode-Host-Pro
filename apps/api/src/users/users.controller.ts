@@ -9,6 +9,7 @@ import { RolesGuard } from '../auth/guards/roles.guard';
 import { MfaService } from '../auth/mfa/mfa.service';
 import { JwtPayload } from '../auth/types';
 import { UpdateUserDto } from './dto/update-user.dto';
+import { UpdateProfileDto } from './dto/update-profile.dto';
 import { UsersService } from './users.service';
 
 @ApiTags('users')
@@ -26,6 +27,14 @@ export class UsersController {
   @ApiOperation({ summary: 'Current user profile' })
   getMe(@CurrentUser() user: JwtPayload) {
     return this.users.getProfile(user.sub);
+  }
+
+  // GO socle (lot A1): self-service profile edit. Declared BEFORE @Patch(':id')
+  // so "me" never matches the id route; userId comes from the JWT only.
+  @Patch('me')
+  @ApiOperation({ summary: 'Update my own profile (name / email)' })
+  updateMe(@Body() dto: UpdateProfileDto, @CurrentUser() user: JwtPayload) {
+    return this.users.updateProfile(user.sub, dto);
   }
 
   // Phase 3 (admin management): listing users and mutating role/active state are

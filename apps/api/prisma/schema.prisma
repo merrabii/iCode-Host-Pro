@@ -33,8 +33,9 @@ model User {
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
-  refreshTokens RefreshToken[]
-  auditLogs     AuditLog[] // audit entries this user performed (Phase 4)
+  refreshTokens       RefreshToken[]
+  passwordResetTokens PasswordResetToken[] // one-time reset links (GO socle, lot A1)
+  auditLogs           AuditLog[] // audit entries this user performed (Phase 4)
   subscriptions Subscription[] // client-owned subscriptions (Phase 5)
   issuedInvites Invitation[] // invitations this admin issued (Phase 5)
 
@@ -184,6 +185,22 @@ model RefreshToken {
   user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
   expiresAt DateTime
   revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+}
+
+// ── GO socle (lot A1): one-time "forgot password" tokens ──────────────────────
+// tokenHash stores sha256(raw) exactly like refresh tokens/invitations: the raw
+// one-time link value exists ONLY in the email, never at rest. Single-use
+// (usedAt) + short TTL. Superseded rows are deleted when a new link is issued.
+model PasswordResetToken {
+  id        String    @id @default(cuid())
+  tokenHash String    @unique // sha256 of the raw reset token
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  usedAt    DateTime?
   createdAt DateTime  @default(now())
 
   @@index([userId])

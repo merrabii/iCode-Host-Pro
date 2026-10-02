@@ -23,6 +23,7 @@ import { SaRateLimiter, RATE, rateKey } from './rate-limiter';
 import { TurnstileService } from './turnstile.service';
 import { MfaService } from './mfa/mfa.service';
 import { SecuritySettingsService } from './security/security-settings.service';
+import { MailSettingsService } from '../mail/mail-settings.service';
 
 @Injectable()
 export class AuthService {
@@ -37,6 +38,7 @@ export class AuthService {
     private readonly turnstile: TurnstileService,
     private readonly mfa: MfaService,
     private readonly settings: SecuritySettingsService,
+    private readonly mailSettings: MailSettingsService,
   ) {}
 
   // ───────────────────────── Order-time registration ─────────────────────────
@@ -466,6 +468,137 @@ export class AuthService {
       action: 'auth.password.change',
       resourceType: 'user',
       resourceId: user.id,
+    });
+    return { ok: true };
+  }
+
+  // ─────────────── Password recovery (GO socle, lot A1) ──────────────────────
+
+  /** Reset-link TTL in minutes: default 30, clamped 5..1440. */
+  private passwordResetTtlMinutes(): number {
+    const raw = this.config.get<number>('passwordResetExpiresInMinutes') ?? 30;
+    return Math.min(Math.max(raw, 5), 1440);
+  }
+
+  /**
+   * Public "forgot password". ALWAYS answers { ok: true } — identical response
+   * whether or not the account exists (no enumeration), never leaks via mail
+   * failure either. When the account exists: one-time token (raw value only in
+   * the email link, sha256 at rest like refresh tokens / invitations), previous
+   * unused links superseded, best-effort email exactly like invitations
+   * (ADR-022: a send failure only flips the audit detail). Nothing secret
+   * (raw token, password) is ever journaled.
+   */
+  async requestPasswordReset(email: string, ip?: string): Promise<{ ok: true }> {
+    const user = await this.prisma.user.findUnique({ where: { email } });
+    if (!user) {
+      await this.audit.record({
+        actorId: null,
+        actorEmail: null,
+        action: 'auth.password.reset_requested',
+        resourceType: 'user',
+        details: { email, found: false, ip: ip ?? null },
+      });
+      return { ok: true };
+    }
+
+    const ttlMinutes = this.passwordResetTtlMinutes();
+    const token = randomBytes(32).toString('base64url');
+    // Supersede every still-unused link of this account (single active link).
+    await this.prisma.passwordResetToken.deleteMany({
+      where: { userId: user.id, usedAt: null },
+    });
+    await this.prisma.passwordResetToken.create({
+      data: {
+        tokenHash: this.hashToken(token),
+        userId: user.id,
+        expiresAt: new Date(Date.now() + ttlMinutes * 60_000),
+      },
+    });
+
+    let emailSent = false;
+    try {
+      if (await this.mailSettings.isEnabled()) {
+        const base = (
+          this.config.get<string>('publicBaseUrl') ?? 'http://localhost:3000'
+        ).replace(/\/+$/, '');
+        const link = `${base}/auth/reset?token=${encodeURIComponent(token)}`;
+        await this.mailSettings.sendPlain({
+          to: user.email,
+          subject: 'Réinitialisation de votre mot de passe - Code Diali',
+          text: [
+            'Bonjour,',
+            '',
+            'Une réinitialisation de mot de passe a été demandée pour votre compte Code Diali.',
+            '',
+            'Pour choisir un nouveau mot de passe, ouvrez ce lien :',
+            link,
+            '',
+            `Ce lien est utilisable une seule fois et expire dans ${ttlMinutes} minutes.`,
+            "Si vous n'êtes pas à l'origine de cette demande, ignorez cet email : votre mot de passe reste inchangé.",
+          ].join('\n'),
+        });
+        emailSent = true;
+      }
+    } catch {
+      emailSent = false; // best-effort: the response never changes (anti-enum)
+    }
+
+    await this.audit.record({
+      actorId: user.id,
+      actorEmail: user.email,
+      action: 'auth.password.reset_requested',
+      resourceType: 'user',
+      resourceId: user.id,
+      details: { emailSent, ttlMinutes, ip: ip ?? null },
+    });
+    return { ok: true };
+  }
+
+  /**
+   * Consume the one-time reset token. Unknown / already-used / expired all
+   * yield the SAME generic 400 (no oracle for token guessing). The password
+   * length is checked BEFORE burning the token, then password update + token
+   * consumption + DESTRUCTION of every active refresh token happen in one
+   * transaction: all sessions die immediately. Deletion, not revocation —
+   * refresh() re-issues a token revoked <10 s ago (rotation race window), which
+   * must NOT resurrect a session killed by a password reset. Journals
+   * auth.password.reset — never the raw token nor the password.
+   */
+  async resetPassword(token: string, newPassword: string, ip?: string): Promise<{ ok: true }> {
+    if (newPassword.length < 8) {
+      throw new BadRequestException('Le nouveau mot de passe doit faire au moins 8 caractères.');
+    }
+    const invalid = 'Lien de réinitialisation invalide ou expiré.';
+    const record = await this.prisma.passwordResetToken.findUnique({
+      where: { tokenHash: this.hashToken(token) },
+    });
+    if (!record || record.usedAt !== null || record.expiresAt < new Date()) {
+      throw new BadRequestException(invalid);
+    }
+    const user = await this.prisma.user.findUnique({ where: { id: record.userId } });
+    if (!user) {
+      throw new BadRequestException(invalid);
+    }
+
+    const passwordHash = await bcrypt.hash(newPassword, 10);
+    await this.prisma.$transaction([
+      this.prisma.passwordResetToken.update({
+        where: { id: record.id },
+        data: { usedAt: new Date() },
+      }),
+      this.prisma.user.update({ where: { id: user.id }, data: { passwordHash } }),
+      this.prisma.refreshToken.deleteMany({
+        where: { userId: user.id, revokedAt: null },
+      }),
+    ]);
+    await this.audit.record({
+      actorId: user.id,
+      actorEmail: user.email,
+      action: 'auth.password.reset',
+      resourceType: 'user',
+      resourceId: user.id,
+      details: { ip: ip ?? null },
     });
     return { ok: true };
   }

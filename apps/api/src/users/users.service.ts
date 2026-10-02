@@ -1,8 +1,9 @@
-import { ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { Role, User } from '@prisma/client';
 import { AuditService } from '../audit/audit.service';
 import { UpdateUserDto } from './dto/update-user.dto';
+import { UpdateProfileDto } from './dto/update-profile.dto';
 import { DeploymentsService } from '../deployments/deployments.service';
 
 // Public shape NEVER carries passwordHash nor the at-rest secrets (MFA TOTP
@@ -32,6 +33,54 @@ export class UsersService {
       throw new NotFoundException('User not found');
     }
     return this.toPublic(user);
+  }
+
+  /**
+   * GO socle (lot A1): self-service edit of the caller's OWN profile
+   * (PATCH /users/me — the userId comes from the JWT, never from the body, so
+   * one account can only ever touch itself). Name: blank clears it. Email:
+   * exact-match uniqueness like register/invitation (409 on another account).
+   * Journals auth.profile.update with the changed field names only.
+   */
+  async updateProfile(userId: string, dto: UpdateProfileDto): Promise<PublicUser> {
+    if (dto.name === undefined && dto.email === undefined) {
+      throw new BadRequestException('Aucun champ à mettre à jour.');
+    }
+    const user = await this.prisma.user.findUnique({ where: { id: userId } });
+    if (!user) {
+      throw new NotFoundException('User not found');
+    }
+
+    const nextName =
+      dto.name === undefined ? user.name : dto.name.trim() === '' ? null : dto.name.trim();
+    const nextEmail = dto.email === undefined ? user.email : dto.email.trim();
+
+    const changed: string[] = [];
+    if (nextName !== user.name) changed.push('name');
+    if (nextEmail !== user.email) {
+      const taken = await this.prisma.user.findUnique({ where: { email: nextEmail } });
+      if (taken && taken.id !== userId) {
+        throw new ConflictException('Un compte existe déjà avec cet email.');
+      }
+      changed.push('email');
+    }
+    if (changed.length === 0) {
+      return this.toPublic(user); // nothing to write (idempotent no-op)
+    }
+
+    const updated = await this.prisma.user.update({
+      where: { id: userId },
+      data: { name: nextName, email: nextEmail },
+    });
+    await this.audit.record({
+      actorId: user.id,
+      actorEmail: user.email,
+      action: 'auth.profile.update',
+      resourceType: 'user',
+      resourceId: user.id,
+      details: { fields: changed },
+    });
+    return this.toPublic(updated);
   }
 
   /** Admin: list every account (public shape, no passwordHash). */
