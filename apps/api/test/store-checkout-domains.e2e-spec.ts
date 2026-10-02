@@ -24,6 +24,10 @@ import {
 import { MailTransportFactory } from './../src/mail/mail-transport.factory';
 import { PanelTransport, PanelTransportFactory } from './../src/servers/panel-transport.factory';
 
+// Sweep de reprise (P2) : désactivé ici pour ne jamais relancer un provisioning
+// derrière le dos des baselines de compteurs provider (voir store-payment-confirmation).
+process.env.ORDER_SWEEP_ENABLED = 'false';
+
 /**
  * Phase 4 — Checkout store multi-domaines (e2e). Couvre les trois groupes :
  *   A. POST /api/store/subdomain/check — vérification publique du sous-domaine
@@ -174,6 +178,7 @@ describe('Store checkout multi-domaines (e2e, Phase 4)', () => {
 
   /** Stalle tous les provisioning fire-and-forget lancés par les checkouts du groupe B. */
   async function settleCheckoutOrders(ids: string[]): Promise<void> {
+    for (const id of ids) await confirmOrder(id);
     for (const id of ids) await waitOrderActive(id);
   }
 
@@ -225,6 +230,15 @@ describe('Store checkout multi-domaines (e2e, Phase 4)', () => {
     const req = request(app.getHttpServer()).post(`/${GlobalPrefix}/store/checkout`).send(body);
     if (token) req.set('Authorization', `Bearer ${token}`);
     return req;
+  }
+
+  /** Confirmation ADMIN du règlement : SEUL déclencheur des droits (P2). */
+  async function confirmOrder(orderId: string): Promise<void> {
+    await request(app.getHttpServer())
+      .post(`/${GlobalPrefix}/store/admin/orders/${orderId}/confirm-payment`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ reference: 'RECETTE' })
+      .expect(201);
   }
 
   // ── Boot ──────────────────────────────────────────────────────────────────
@@ -287,7 +301,9 @@ describe('Store checkout multi-domaines (e2e, Phase 4)', () => {
     });
     provId = prov.id;
     const pm = await prisma.paymentMethod.create({
-      data: { name: `CB-${stamp}`, type: PaymentMethodType.CARD, isActive: true },
+      // BANK_TRANSFER : la méthode CARTe est refusée au checkout sans simulateur
+      // de paiement activé (règle P2) — voir store-payment-confirmation e2e.
+      data: { name: `VIR-${stamp}`, type: PaymentMethodType.BANK_TRANSFER, isActive: true },
     });
     pmId = pm.id;
 
@@ -461,15 +477,14 @@ describe('Store checkout multi-domaines (e2e, Phase 4)', () => {
         }),
       ).expect(201);
       expect(res.body.orderId).toBeTruthy();
-      expect(res.body.nextStep).toBe('provisioning-pending');
+      expect(res.body.nextStep).toBe('payment-pending');
       const order = await prisma.order.findUnique({ where: { id: res.body.orderId } });
       expect(order).toBeTruthy();
       expect(order!.requestedSubdomain).toBe(`sub-b1-${stamp}`);
       expect(order!.requestedDomainId).toBe(domA.id);
-      // La commande est créée PAID, mais le provisioning fire-and-forget peut déjà
-      // l'avoir fait évoluer (PROVISIONING/ACTIVE) — la persistance de la racine
-      // demandée et le gel sont attestés de façon déterministe en groupe C.
-      expect([OrderStatus.PAID, OrderStatus.PROVISIONING, OrderStatus.ACTIVE]).toContain(order!.status);
+      // P2 : checkout payant = PENDING_PAYMENT, AUCUN droit, aucun provisioning
+      // tant que le règlement n'est pas confirmé (confirmé en B-context).
+      expect(order!.status).toBe(OrderStatus.PENDING_PAYMENT);
       bCheckoutOrderIds.push(res.body.orderId as string);
       allOrderIds.push(res.body.orderId as string);
     });
@@ -602,6 +617,7 @@ describe('Store checkout multi-domaines (e2e, Phase 4)', () => {
       c1OrderId = res.body.orderId as string;
       allOrderIds.push(c1OrderId);
 
+      await confirmOrder(c1OrderId);
       await waitOrderActive(c1OrderId);
 
       const order = await prisma.order.findUnique({ where: { id: c1OrderId } });

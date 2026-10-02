@@ -1,5 +1,28 @@
 # CHANGELOG
 
+## 2026-10-02 — **GO socle commercial — P1 (RBAC admin) + P2 (confirmation de paiement)** (branche `feat/socle-commercial`, checkpoints locaux, aucun push)
+### Contexte
+Chantier global d'autonomie (GO du propriétaire) : réaliser le socle commercial complet en un flux jusqu'à livraison pour revue. Ce checkpoint couvre les lots P1 et P2 ; base dédiée `icode_host_pro_socle` (docker `icode-postgres`, 48 migrations + migration P2), aucune écriture live, aucun push.
+
+### P1 — RBAC des lectures admin de modules de déploiement (audit C-02) — commit `86c9f61`
+- `deployment-modules.controller.ts` : `JwtAuthGuard + RolesGuard + @Roles(ADMIN)` sur `GET /`, `GET /:id`, `GET /:id/projects` (les 3 lectures exposaient la config interne des modules à tout USER ; consommateurs = uniquement l'UI admin).
+- **E2E permanent** `test/rbac-deployment-modules.e2e-spec.ts` : **7/7 PASS** (anonyme 401×3, USER 403×3, SUPPORT_L1 403, ADMIN 200, mutation USER 403, compteur panneau 0 sur refus / 1 sur ADMIN, zéro donnée sensible dans les refus).
+- Scan global des contrôleurs : tous les routes `admin/*` restantes sont déjà protégées classe entière (`@UseGuards(JwtAuthGuard, RolesGuard)` + `@Roles(ADMIN)`).
+
+### P2 — Aucun droit avant confirmation de paiement (checkout `PENDING_PAYMENT`)
+- **Migration additive** `20261002000000_add_payment_confirmation` : `Order.paidAt`, `Order.idempotencyBase` (+index), `Order.clientKey` (@unique), `Order.clientKeyHash`. Anciennes migrations intactes.
+- **`checkout.service.ts`** : commande payante créée `PENDING_PAYMENT` + facture `UNPAID` **sans aucun droit** (abonnement/tracking/service/provisioning sortis de la transaction checkout) ; `confirmOrderPaid` = SEUL point d'ouverture (CAS `PENDING→PAID`, idempotent, conflit métier → rollback complet tracé `payment.confirm_failed`, lancement provisioning après commit + audit `provision.launch_failed` si échec) ; commande gratuite (total 0) → confirmation immédiate par règle explicite **+ email d'accès envoyé** (correction : l'email invité n'était jamais envoyé), **0 mouvement de portefeuille** ; idempotence enrichie (clé cliente `Idempotency-Key` : replay / conflit 409 contenu différent ; sans clé : replay si vivante, `chainFrom` si CANCELLED/REFUNDED → nouvelle clé chaînée sans supprimer les anciennes) ; email post-checkout en 2 phases (`pending` sans promesse d'activation / `confirmed`).
+- **`admin-orders.controller.ts` (nouveau)** : `POST store/admin/orders/:id/confirm-payment` (ADMIN, `{reference?, note?}`, audit `payment.admin_confirm`) — seul déclencheur virement en recette.
+- **Simulateur de paiement** (`config/payment-simulator.ts`) : activation stricte `PAYMENT_SIMULATOR_ENABLED=true` + **refus total si `NODE_ENV=production`** ; endpoint `POST store/orders/:id/simulate-payment` (`success/decline/timeout`, CAS sous touch, historique+audit) réservé aux commandes CARTe ; `GET store/payment-methods` masque la CARTe tant que personne ne peut la traiter ; checkout CARTe sans simulateur → 400 honnête.
+- **`order-lifecycle.service.ts` (nouveau)** : sweep de reprise (timer `setInterval` sans dépendance, `ORDER_SWEEP_MS` def 60 s, `ORDER_SWEEP_ENABLED=false` pour tests, anti-chevauchement, `sweep()` public) → expiration `PENDING_PAYMENT` > `PENDING_PAYMENT_TTL_HOURS` (def 48 h) → `CANCELLED` + facture + historique + audit `order.expired` ; relance `provisionOrder` des PAID figées > 2 min (idempotent) + audit `order.relaunch_provisioning`.
+- `.env.example` : `PAYMENT_SIMULATOR_ENABLED`, `PENDING_PAYMENT_TTL_HOURS`, `ORDER_SWEEP_MS`, `ORDER_SWEEP_ENABLED`.
+
+### Tests P2
+- **Nouveau** `test/store-payment-confirmation.e2e-spec.ts` : **25/25 PASS** (matrice A–G : masquage CARTe + refus checkout sans simulateur ; PENDING sans droits + RBAC confirm 401/403/201 + idempotence + audit ; abonnement créé/upgradé UNIQUEMENT à la confirmation ; commande gratuite = accès envoyés + 0 wallet ; simulateur decline/timeout/success + refus production ; idempotence clés cliente ; sweep expiration+chaînage et relance PAID).
+- **Adaptés** (les checkout payants sont désormais `PENDING_PAYMENT`) : `store-checkout-domains.e2e-spec.ts` **21/21 PASS** (fixture CARTe→VIREMENT, helper confirm admin, assertion B1 `payment-pending`, confirm avant provisioning B/C), `c3-provisioning.e2e-spec.ts` **8/8 PASS** (admin ajouté, asserts « 0 droit avant confirmation » sur S0/double-clic, confirm admin, fixture CARTe→VIREMENT, sweep désactivé pour préserver les baselines provider).
+- **Unit API complet : 1001/1001 PASS (56 suites)** dont `checkout-c3.spec` réécrit **17/17** (nouvelles sémantiques + gate simulateur y compris production) ; `tsc --noEmit` PASS.
+- **Lint** : `eslint` toujours absent du workspace (préexistant, non bloquant — aucun ajout de dépendance).
+
 ## 2026-09-19 — **Couverture E2E Phase 4 — checkout Store multi-domaines** (test uniquement, aucune modification de code métier)
 ### Contexte
 Le moteur Phase 4 (ADR-040 : choix de la racine + gel `effectiveDomainId` avant DNS, plateforme white-label Code Diali) reposait sur des tests unitaires. Cette tâche ajoute une couverture E2E de bout en bout du checkout store multi-domaines.

@@ -13,6 +13,7 @@ import {
   InvoiceLineKind,
   InvoiceStatus,
   OrderStatus,
+  PaymentMethodType,
   Prisma,
   ProvisionAction,
   SubscriptionStatus,
@@ -24,6 +25,7 @@ import { RATE, rateKey, SaRateLimiter } from '../auth/rate-limiter';
 import { MailSettingsService } from '../mail/mail-settings.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { CloudflareService } from '../cloudflare/cloudflare.service';
+import { isPaymentSimulatorEnabled } from '../config/payment-simulator';
 import { regexFromRejectPattern } from './subdomain.util';
 import { clientAreaUrl, loginUrl } from './web-links';
 import { ProductsService, PublicProduct } from '../products/products.service';
@@ -71,7 +73,29 @@ export interface CheckoutResult {
   orderId: string;
   invoiceNumber: string;
   email: string;
-  nextStep: 'provisioning-pending';
+  /** `payment-pending` = règlement à confirmer (aucun droit ouvert) ;
+   *  `provisioning-pending` = règlement CONFIRMÉ, exécution lancée. */
+  nextStep: 'payment-pending' | 'provisioning-pending';
+}
+
+/** Source d'une confirmation de règlement (traçabilité, audit). */
+export type ConfirmSource = 'free' | 'admin-transfer' | 'card-simulator';
+
+/** Contexte de confirmation serveur d'une commande. */
+export interface ConfirmPaidContext {
+  source: ConfirmSource;
+  actorEmail?: string | null;
+  reference?: string | null;
+  /** Payload email complet (invité) — uniquement pour la source `free`. */
+  email?: { to: string; name: string; tempPassword: string | null };
+}
+
+/** Résultat d'une confirmation (idempotence : la 2e appelée ne réécrit rien). */
+export interface ConfirmPaidResult {
+  orderId: string;
+  status: OrderStatus;
+  alreadyConfirmed: boolean;
+  subscriptionAction?: 'created' | 'upgraded' | null;
 }
 
 /** Ligne de facture construite côté serveur (d'où dérivent les totaux). */
@@ -87,14 +111,20 @@ interface InvoiceLineInput {
 /**
  * Bloc C — tunnel d'achat sans compte (§10 GATE C).
  *
- * Règles métier (prompt WHMCS + décisions owner) :
+ * Règles métier (prompt WHMCS + décisions owner + GO socle commercial) :
  * - Montants JAMAIS reçus du client : tout est recalculé serveur.
- * - Paiement SIMULÉ instantané : aucune étape PENDING_PAYMENT, la commande est
- *   créée PAID à la soumission (démo — la validation réelle arrive au Bloc D/E).
- * - Compte créé APRÈS paiement, atomiquement : User (mot de passe temporaire
- *   bcrypt, envoyé par email) + Customer FULL lié.
- * - Idempotence (§7) : `idempotencyKey` hash déterministe sur l'Order ; un
- *   double-clic / retry identique renvoie la commande existante (P2002).
+ * - AUCUN paiement simulé implicite : une commande payante est créée
+ *   `PENDING_PAYMENT` et n'ouvre AUCUN droit (abonnement, service, app) avant
+ *   une CONFIRMATION serveur valide (commande gratuite explicite, règlement
+ *   virement validé par l'admin, simulateur de recette explicitement activé).
+ * - Une méthode CARD/BANK_TRANSFER active n'est JAMAIS une preuve de paiement.
+ * - Compte créé APRÈS soumission, atomiquement : User (mot de passe temporaire
+ *   bcrypt, envoyé par email) + Customer FULL lié — le compte ne vaut pas
+ *   confirmation de règlement.
+ * - Idempotence (§7) : hash déterministe d'intention (`idempotencyBase`) ;
+ *   replay tant que la commande est vivante ; un rachat APRÈS annulation crée
+ *   une NOUVELLE clé sans jamais supprimer les anciennes ; la clé client
+ *   (header `Idempotency-Key`) liée à un contenu différent = conflit 409.
  * - Email best-effort : si l'envoi échoue, la commande reste valide et l'échec
  *   est tracé en audit (l'admin peut récupérer le mot de passe).
  */
@@ -114,17 +144,24 @@ export class CheckoutService {
 
   /**
    * POST /store/checkout — tunnel de commande UNIQUE pour l'espace client et le
-   * visiteur invité (Bloc 2). Valide la configuration, recale les montants, crée
-   * User + Customer + Order(PAID) + Invoice(PAID) atomiquement (invité) ou
-   * réutilise le compte + abonnement existants (membre connecté → upgrade order
-   * -driven), envoie l'email. Après paiement : upgrade → `syncAppLimits` sur les
-   * apps déjà déployées ; création → provisioning réel (Bloc D).
+   * visiteur invité (Bloc 2). Valide la configuration, recale les montants,
+   * crée User + Customer + Order(PENDING_PAYMENT) + Invoice(UNPAID)
+   * atomiquement (invité) ou réutilise le compte existant (membre connecté →
+   * upgrade order-driven). Les DROITS (abonnement, tracking C3, service) et le
+   * provisioning ne partent qu'après confirmation serveur (`confirmOrderPaid`).
+   * Commande GRATUITE (total 0) : confirmation immédiate via la règle explicite
+   * — aucun encaissement n'est fabriqué (aucun mouvement de portefeuille).
    */
   async checkoutGuest(
     dto: CheckoutDto,
     ip?: string,
     user?: JwtPayload | null,
+    opts?: { idempotencyKey?: string | null },
   ): Promise<CheckoutResult> {
+    const clientKey = opts?.idempotencyKey?.trim() || null;
+    if (clientKey && clientKey.length > 200) {
+      throw new BadRequestException('Idempotency-Key invalide (200 caractères max).');
+    }
     const rl = this.limiter.consume(
       rateKey(ip, 'store-checkout'),
       RATE.checkoutIntent.limit,
@@ -152,6 +189,14 @@ export class CheckoutService {
     });
     if (!method) {
       throw new BadRequestException('Ce moyen de paiement n’est pas disponible.');
+    }
+    // 2b. Carte : refus HONNÊTE tant qu'aucun adaptateur réel n'est configuré
+    //     (aucun prestataire choisi). Le simulateur (recette/tests) doit être
+    //     explicitement activé — jamais en production (payment-simulator.ts).
+    if (method.type === PaymentMethodType.CARD && !isPaymentSimulatorEnabled()) {
+      throw new BadRequestException(
+        'Le paiement par carte n’est pas encore disponible : aucun prestataire configuré. Choisissez un autre moyen de paiement.',
+      );
     }
 
     // 3. Montants recalculés serveur (produit + options + addons + installation).
@@ -212,25 +257,33 @@ export class CheckoutService {
       ? member!.phone ?? null
       : (dto.phone ?? null);
 
-    // 5. Clé d'idempotence : hash déterministe de la configuration + montant.
-    //    Basée sur les coordonnées de FACTURATION (billingEmail) : un changement
-    //    de mode (compte/autres coordonnées) produit bien une commande distincte.
-    const key = this.idempotencyKey(dto, method.id, amountTtcCents, billingEmail, requestedSubdomain, requestedDomainId);
+    // 5. Hash d'INTENTION : configuration + montant + coordonnées de
+    //    facturation. Base de l'idempotence (§7) et du chaînage des rachats.
+    const baseKey = this.idempotencyKey(
+      dto,
+      method.id,
+      amountTtcCents,
+      billingEmail,
+      requestedSubdomain,
+      requestedDomainId,
+    );
 
-    // 6. Replay (double-clic / retry identique) : on renvoie la commande déjà
-    //    créée, SANS recréer de compte ni de commande (§7 idempotence).
-    const replay = await this.prisma.order.findUnique({ where: { idempotencyKey: key } });
+    // 6. Idempotence — résolution PRÉ-TX :
+    //    (a) clé client (`Idempotency-Key`) : même clé ⇒ contenu identique
+    //        obligatoire (sinon conflit 409), le résultat renvoyé est celui de
+    //        la commande existante quel que soit son état ;
+    //    (b) sans clé client : dernière commande de MÊME intention ; si elle est
+    //        CANCELLED/REFUNDED → NOUVEL achat (nouvelle clé chaînée, anciennes
+    //        clés conservées). Une commande vivante (PENDING_PAYMENT…ACTIVE) →
+    //        replay honnête.
+    const { replay, chainFrom } = await this.resolveIntention(baseKey, clientKey);
     if (replay) {
-      const invoice = await this.prisma.invoice.findUnique({
-        where: { orderId: replay.id },
-      });
-      return {
-        orderId: replay.id,
-        invoiceNumber: invoice?.number ?? '',
-        email: receiptEmail,
-        nextStep: 'provisioning-pending',
-      };
+      return this.replayResult(replay, receiptEmail);
     }
+    // Clé du NOUVEAU départ : base, ou chaînée à la commande annulée/remboursée.
+    const key = chainFrom
+      ? createHash('sha256').update(`${baseKey}|${chainFrom.id}`).digest('hex')
+      : baseKey;
 
     // 7. Invité uniquement : pas de doublon de compte. Un membre déjà connecté ne
     //    déclenche jamais ce contrôle (c'est son propre compte). Le mot de passe
@@ -241,7 +294,6 @@ export class CheckoutService {
     // commande existante AVANT tout refus (« rejeu avant refus »). OFF : ce bloc
     // n'exécute AUCUN appel (zéro différence de comportement legacy).
     let c3On = false;
-    let c3Product: C3CatalogProduct | null = null;
     if (isHostingC3Enabled()) {
       if (!(await this.c3.operational())) {
         throw new ServiceUnavailableException(
@@ -272,7 +324,6 @@ export class CheckoutService {
             );
           }
         }
-        c3Product = catalog;
       }
       c3On = true;
     }
@@ -351,6 +402,9 @@ export class CheckoutService {
           });
         }
         const billing = await this.claimInvoiceSequence(tx);
+        // Commande payante créée EN ATTENTE de règlement : aucun droit ouvert
+        // ici (aucune souscription, aucun tracking C3, aucun service). Les
+        // droits partent de `confirmOrderPaid` (confirmation serveur valide).
         const order = await tx.order.create({
           data: {
             customerId: customer.id,
@@ -360,7 +414,7 @@ export class CheckoutService {
             productId: product.id,
             productName: product.name,
             packId: product.packId ?? null,
-            status: OrderStatus.PAID,
+            status: OrderStatus.PENDING_PAYMENT,
             billingCycle: product.billingCycle,
             currency: billing.currency,
             taxRatePercent: new Prisma.Decimal(taxRatePercent),
@@ -376,56 +430,25 @@ export class CheckoutService {
               ? this.addonsSnapshot(dto, product)
               : Prisma.JsonNull,
             idempotencyKey: key,
+            idempotencyBase: baseKey,
+            clientKey,
+            clientKeyHash: clientKey ? baseKey : null,
             requestedSubdomain,
             requestedDomainId,
           },
         });
-
-        // 17B.4F-C3 (ON) — intention figée + service acheté : écrits DANS LA MÊME
-        // transaction que la commande (un échec ici annule tout : jamais d'Order
-        // sans tracking quand le C3 gérera la commande, jamais de service sans
-        // commande). N'ont lieu que pour un NOUVEAU achat pack (l'upgrade est
-        // refusé plus haut sous C3) : aucun autre ordre ne peut coexister avec
-        // cette écriture.
-        if (c3On && product.packId && c3Product?.pack) {
-          const intent = this.buildC3Intent(product, order, c3Product);
-          await tx.orderProvisioningTracking.create({
-            data: {
-              orderId: order.id,
-              intent: intent as unknown as Prisma.InputJsonValue,
-            },
-          });
-          const snapshots = snapshotsFromPack(c3Product.pack, { name: product.name });
-          await tx.hostingService.create({
-            data: {
-              userId: user.id,
-              orderId: order.id,
-              productId: product.id,
-              packId: product.packId,
-              deploymentModuleId: c3Product.pack.deploymentModuleId ?? null,
-              status: HostingServiceStatus.PROVISIONING,
-              maxAppsSnapshot: snapshots.maxAppsSnapshot,
-              ramMbSnapshot: snapshots.ramMbSnapshot,
-              cpuCoresSnapshot: snapshots.cpuCoresSnapshot,
-              storageLimitGbSnapshot: snapshots.storageLimitGbSnapshot,
-              packNameSnapshot: snapshots.packNameSnapshot,
-              productNameSnapshot: snapshots.productNameSnapshot,
-            },
-          });
-        }
 
         const invoice = await tx.invoice.create({
           data: {
             number: billing.invoiceNumber,
             orderId: order.id,
             customerId: customer.id,
-            status: InvoiceStatus.PAID,
+            status: InvoiceStatus.UNPAID,
             currency: billing.currency,
             taxRatePercent: new Prisma.Decimal(taxRatePercent),
             amountHtCents,
             taxAmountCents,
             amountTtcCents,
-            paidAt: new Date(),
             billingAddress: {
               name: billingName,
               email: billingEmail,
@@ -449,84 +472,83 @@ export class CheckoutService {
         await tx.orderStatusHistory.create({
           data: {
             orderId: order.id,
-            status: OrderStatus.PAID,
-            note: 'Paiement validé (simulation instantanée).',
+            status: OrderStatus.PENDING_PAYMENT,
+            note: 'Commande créée — règlement en attente de confirmation.',
             actorEmail: billingEmail,
           },
         });
 
-        // Bloc 1 — modèle d'abonnement order-driven. Tout produit à pack crée ou
-        // UPGRADE l'abonnement du client dès le paiement (le paiement vaut
-        // approbation ; l'admin garde suspendre/réactiver/ré-synchroniser).
-        // Un produit sans pack (ex. Installation Fees) ne crée pas d'abonnement.
-        let subscription: { id: string } | null = null;
-        let subscriptionAction: 'upgraded' | 'created' | null = null;
-        if (product.packId) {
-          const active = await tx.subscription.findFirst({
-            where: { userId: user.id, status: SubscriptionStatus.ACTIVE },
-            orderBy: { createdAt: 'desc' },
-          });
-          if (active) {
-            // Upgrade : repointe la MÊME ligne (données/apps/sous-domaines
-            // préservés), relie la commande à l'origine de l'upgrade.
-            subscription = await tx.subscription.update({
-              where: { id: active.id },
-              data: { productId: product.id, orderId: order.id },
-            });
-            subscriptionAction = 'upgraded';
-          } else {
-            subscription = await tx.subscription.create({
-              data: {
-                userId: user.id,
-                productId: product.id,
-                status: SubscriptionStatus.ACTIVE,
-                orderId: order.id,
-              },
-            });
-            subscriptionAction = 'created';
-          }
-        }
-
-        return { user, order, invoice, billing, subscription, subscriptionAction };
+        return { user, order, invoice, billing };
       });
 
-      await this.traceAudit(product.id, created.order.id, amountTtcCents, method.id, true);
+      await this.traceAudit(product.id, created.order.id, amountTtcCents, method.id, true, undefined, {
+        stage: 'order-created',
+        status: OrderStatus.PENDING_PAYMENT,
+        methodType: method.type,
+      });
 
-      // 7. Email best-effort : compte créé (mot de passe temporaire) OU
-      //    confirmation d'abonnement mis à jour (membre) — jamais bloquant.
-      await this.sendPostCheckoutEmail(
-        receiptEmail,
-        receiptName,
-        tempPassword,
-        created.billing.invoiceNumber,
-        created.subscriptionAction,
-      ).catch((e) => this.traceAudit(product.id, created.order.id, amountTtcCents, method.id, false, String(e)));
+      const invoiceNumber = created.billing.invoiceNumber;
 
-      // 8. Provisioning réel, fire-and-forget, jamais bloquant (§10). Les échecs de
-      //    lancement ne sont JAMAIS avalés silencieusement : la commande reste alors
-      //    PAID (jamais faussement confirmée) et est tracée pour une relance admin.
-      if (created.subscriptionAction === 'upgraded') {
-        this.provisioning.syncAppLimits(created.subscription!.id).catch((e) => {
-          this.log.warn(`checkout order=${created.order.id}: syncAppLimits launch failed: ${String(e)}`);
-        });
+      // 7. Règle EXPLICITE commande gratuite (total 0) : confirmation immédiate,
+      //    SANS fabriquer d'encaissement (aucun mouvement de portefeuille, aucun
+      //    paiement simulé — le montant est réellement nul). Échec de la
+      //    confirmation → la commande reste PENDING_PAYMENT (honnête) + audit.
+      if (amountTtcCents === 0) {
+        try {
+          const confirmed = await this.confirmOrderPaid(created.order.id, {
+            source: 'free',
+            actorEmail: receiptEmail,
+            email: { to: receiptEmail, name: receiptName, tempPassword },
+          });
+          if (confirmed.alreadyConfirmed) {
+            // Ne devrait pas arriver (commande fraîche) — comportement honnête.
+            this.log.warn(`checkout order=${created.order.id}: free order already confirmed`);
+          }
+          // Email de confirmation complet (identifiants invité + mot de passe
+          // temporaire inclus) — best-effort : un échec est tracé en audit et
+          // n'invalide jamais la commande (l'admin peut récupérer l'accès).
+          await this.sendPostCheckoutEmail(
+            receiptEmail,
+            receiptName,
+            tempPassword,
+            invoiceNumber,
+            confirmed.subscriptionAction ?? null,
+            { phase: 'confirmed' },
+          ).catch((e) =>
+            this.traceAudit(product.id, created.order.id, amountTtcCents, method.id, false, String(e), {
+              stage: 'free-confirm-email',
+            }),
+          );
+          return {
+            orderId: created.order.id,
+            invoiceNumber,
+            email: receiptEmail,
+            nextStep: 'provisioning-pending',
+          };
+        } catch (e) {
+          await this.traceAudit(product.id, created.order.id, amountTtcCents, method.id, false, String(e), {
+            stage: 'free-confirm-failed',
+          });
+          // Chute honnête : règlement à confirmer plus tard, aucun droit ouvert.
+        }
       }
-      if (requestedSubdomain || created.subscriptionAction !== 'upgraded') {
-        this.provisioning.provisionOrder(created.order.id).catch((e) => {
-          this.log.warn(`checkout order=${created.order.id}: provisionOrder launch failed: ${String(e)}`);
-          this.audit.record({
-            action: 'provision.launch_failed',
-            resourceType: 'order',
-            resourceId: created.order.id,
-            details: { error: String(e) },
-          }).catch(() => {});
-        });
-      }
+
+      // 8. Email best-effort : règlement EN ATTENTE (aucune promesse d'activation).
+      //    Invité : identifiants + mot de passe temporaire (le compte existe).
+      await this.sendPostCheckoutEmail(receiptEmail, receiptName, tempPassword, invoiceNumber, null, {
+        phase: 'pending',
+        methodLabel: method.name,
+      }).catch((e) =>
+        this.traceAudit(product.id, created.order.id, amountTtcCents, method.id, false, String(e), {
+          stage: 'pending-email',
+        }),
+      );
 
       return {
         orderId: created.order.id,
-        invoiceNumber: created.billing.invoiceNumber,
+        invoiceNumber,
         email: receiptEmail,
-        nextStep: 'provisioning-pending',
+        nextStep: 'payment-pending',
       };
     } catch (e) {
       // Double-clic concurrent détecté SOUS verrou (17B.4F-C3) : renvoie la
@@ -536,36 +558,20 @@ export class CheckoutService {
           where: { id: e.orderId },
         });
         if (existing) {
-          const inv = await this.prisma.invoice.findUnique({
-            where: { orderId: existing.id },
-          });
-          return {
-            orderId: existing.id,
-            invoiceNumber: inv?.number ?? '',
-            email: receiptEmail,
-            nextStep: 'provisioning-pending',
-          };
+          return this.replayResult(existing, receiptEmail);
         }
         throw e;
       }
-      // Double-clic / retry concurrent : la commande identique existe déjà.
+      // Double-clic / retry concurrent : la commande identique existe déjà
+      // (contrainte unique `idempotencyKey`/`clientKey`) — résolution honnête
+      // par la même intention (un conflit de clé client ressort en 409).
       if (
         e instanceof Prisma.PrismaClientKnownRequestError &&
         e.code === 'P2002'
       ) {
-        const existing = await this.prisma.order.findUnique({
-          where: { idempotencyKey: key },
-        });
-        if (existing) {
-          const inv = await this.prisma.invoice.findUnique({
-            where: { orderId: existing.id },
-          });
-          return {
-            orderId: existing.id,
-            invoiceNumber: inv?.number ?? '',
-            email: receiptEmail,
-            nextStep: 'provisioning-pending',
-          };
+        const again = await this.resolveIntention(baseKey, clientKey);
+        if (again.replay) {
+          return this.replayResult(again.replay, receiptEmail);
         }
         throw new ConflictException(
           'Un compte existe déjà avec cet email — connectez-vous pour commander.',
@@ -573,6 +579,426 @@ export class CheckoutService {
       }
       throw e;
     }
+  }
+
+  /**
+   * Idempotence (§7) — résolution de l'intention AVANT toute écriture :
+   * - clé client fournie : commande portant CETTE clé ; contenu identique
+   *   obligatoire (`clientKeyHash`) sinon 409 « même clé, contenu différent » ;
+   *   le résultat est le retour honnête de la commande existante (statut
+   *   compris) — jamais de création silencieuse.
+   * - sans clé client : dernière commande de l'intention (hash de base) ;
+   *   vivante → replay ; CANCELLED/REFUNDED → `chainFrom` (nouveau départ avec
+   *   clé chaînée, les anciennes clés sont JAMAIS supprimées).
+   */
+  private async resolveIntention(
+    baseKey: string,
+    clientKey: string | null,
+  ): Promise<{
+    replay: { id: string; status: OrderStatus } | null;
+    chainFrom: { id: string } | null;
+  }> {
+    if (clientKey) {
+      const o = await this.prisma.order.findUnique({
+        where: { clientKey },
+        select: { id: true, status: true, clientKeyHash: true },
+      });
+      if (o) {
+        if (o.clientKeyHash !== baseKey) {
+          throw new ConflictException(
+            'Idempotency-Key déjà utilisée avec un contenu différent.',
+          );
+        }
+        return { replay: o, chainFrom: null };
+      }
+      return { replay: null, chainFrom: null };
+    }
+    const rows = await this.prisma.order.findMany({
+      where: { OR: [{ idempotencyKey: baseKey }, { idempotencyBase: baseKey }] },
+      orderBy: { createdAt: 'desc' },
+      take: 1,
+      select: { id: true, status: true },
+    });
+    const last = rows[0] ?? null;
+    if (!last) return { replay: null, chainFrom: null };
+    if (last.status === OrderStatus.CANCELLED || last.status === OrderStatus.REFUNDED) {
+      return { replay: null, chainFrom: { id: last.id } };
+    }
+    return { replay: last, chainFrom: null };
+  }
+
+  /** Réponse de rejeu : honnête sur l'état RÉEL (payé → exécution, sinon attente). */
+  private async replayResult(
+    order: { id: string; status: OrderStatus },
+    receiptEmail: string,
+  ): Promise<CheckoutResult> {
+    const invoice = await this.prisma.invoice.findUnique({
+      where: { orderId: order.id },
+    });
+    const confirmed =
+      order.status === OrderStatus.PAID ||
+      order.status === OrderStatus.PROVISIONING ||
+      order.status === OrderStatus.ACTIVE ||
+      order.status === OrderStatus.SUSPENDED;
+    return {
+      orderId: order.id,
+      invoiceNumber: invoice?.number ?? '',
+      email: receiptEmail,
+      nextStep: confirmed ? 'provisioning-pending' : 'payment-pending',
+    };
+  }
+
+  /**
+   * CONFIRMATION SERVEUR d'une commande (seul point qui ouvre des droits) :
+   * `PENDING_PAYMENT → PAID` + facture `UNPAID → PAID` + abonnement (créé ou
+   * upgrade) + écritures C3 (intention + service) dans UNE transaction, puis
+   * lancement du provisioning APRÈS commit (fire-and-forget, jamais avalé —
+   * un lancement échoué laisse la commande PAID et est relancé par le sweep
+   * de reprise, `OrderLifecycleService`).
+   *
+   * Idempotence : un 2e appel sur une commande déjà confirmée ne réécrit RIEN
+   * (ni abonnement, ni écritures) et renvoie `alreadyConfirmed: true`.
+   * Une commande annulée/remboursée ne peut PAS être confirmée (409).
+   * Les conflits métier (ex. upgrade C3 refusé) font ROLLBACK complet : la
+   * commande reste PENDING_PAYMENT, l'échec est audible (jamais un succès
+   * annoncé à tort) et l'admin peut résoudre puis relancer.
+   */
+  async confirmOrderPaid(orderId: string, ctx: ConfirmPaidContext): Promise<ConfirmPaidResult> {
+    type TxOutcome = {
+      alreadyConfirmed: boolean;
+      order: {
+        id: string;
+        status: OrderStatus;
+        customerEmail: string;
+        customerName: string;
+        requestedSubdomain: string | null;
+        amountTtcCents: number;
+      };
+      subscriptionAction: 'created' | 'upgraded' | null;
+      userId: string | null;
+    };
+
+    let outcome: TxOutcome;
+    try {
+      outcome = await this.prisma.$transaction(async (tx): Promise<TxOutcome> => {
+        const order = await tx.order.findUnique({
+          where: { id: orderId },
+          include: { customer: { select: { userId: true } } },
+        });
+        if (!order) {
+          throw new NotFoundException('Commande introuvable.');
+        }
+        if (order.status !== OrderStatus.PENDING_PAYMENT) {
+          if (
+            order.status === OrderStatus.PAID ||
+            order.status === OrderStatus.PROVISIONING ||
+            order.status === OrderStatus.ACTIVE ||
+            order.status === OrderStatus.SUSPENDED
+          ) {
+            return {
+              alreadyConfirmed: true,
+              order,
+              subscriptionAction: null,
+              userId: order.customer.userId,
+            };
+          }
+          throw new ConflictException(
+            `Commande ${order.status} : confirmation de règlement impossible.`,
+          );
+        }
+
+        const now = new Date();
+        // CAS : seul PENDING_PAYMENT → PAID (deux confirmations concurrentes →
+        // une seule gagne, l'autre lit l'état committé ci-dessous).
+        const cas = await tx.order.updateMany({
+          where: { id: orderId, status: OrderStatus.PENDING_PAYMENT },
+          data: { status: OrderStatus.PAID, paidAt: now },
+        });
+        if (cas.count === 0) {
+          const cur = await tx.order.findUnique({
+            where: { id: orderId },
+            select: { id: true, status: true },
+          });
+          if (
+            cur &&
+            (cur.status === OrderStatus.PAID ||
+              cur.status === OrderStatus.PROVISIONING ||
+              cur.status === OrderStatus.ACTIVE ||
+              cur.status === OrderStatus.SUSPENDED)
+          ) {
+            return {
+              alreadyConfirmed: true,
+              order,
+              subscriptionAction: null,
+              userId: order.customer.userId,
+            };
+          }
+          throw new ConflictException('Confirmation concurrente impossible (état instable).');
+        }
+
+        await tx.invoice.updateMany({
+          where: { orderId, status: InvoiceStatus.UNPAID },
+          data: { status: InvoiceStatus.PAID, paidAt: now },
+        });
+
+        await tx.orderStatusHistory.create({
+          data: {
+            orderId,
+            status: OrderStatus.PAID,
+            note: this.confirmNote(ctx),
+            actorEmail: ctx.actorEmail ?? order.customerEmail,
+          },
+        });
+
+        const userId = order.customer.userId;
+        let subscriptionAction: 'created' | 'upgraded' | null = null;
+        if (order.packId) {
+          if (!userId) {
+            throw new ConflictException('Aucun compte lié à cette commande — abonnement impossible.');
+          }
+          // Bloc 1 — modèle d'abonnement order-driven : créé/upgradé ICI, au
+          // moment UNIQUE de la confirmation (aucun droit avant).
+          const active = await tx.subscription.findFirst({
+            where: { userId, status: SubscriptionStatus.ACTIVE },
+            orderBy: { createdAt: 'desc' },
+          });
+          if (active) {
+            if (isHostingC3Enabled()) {
+              throw new ConflictException(
+                'Abonnement actif existant : upgrade non pris en charge en C3 (contactez le support).',
+              );
+            }
+            await tx.subscription.update({
+              where: { id: active.id },
+              data: { productId: order.productId, orderId: order.id },
+            });
+            subscriptionAction = 'upgraded';
+          } else {
+            await tx.subscription.create({
+              data: {
+                userId,
+                productId: order.productId,
+                status: SubscriptionStatus.ACTIVE,
+                orderId: order.id,
+              },
+            });
+            subscriptionAction = 'created';
+          }
+        }
+
+        // C3 (ON) — intention figée + service acheté : écrits ICI, dans la MÊME
+        // transaction que la confirmation (un échec annule tout : jamais d'Order
+        // confirmée sans tracking, jamais de service sans commande confirmée).
+        if (isHostingC3Enabled() && order.packId && userId) {
+          const catalog = await this.loadC3Catalog(order.productId);
+          if (!catalog?.pack) {
+            throw new ConflictException('Pack produit introuvable (C3).');
+          }
+          const intent = this.buildC3Intent(
+            {
+              id: order.productId,
+              packId: order.packId,
+              billingCycle: order.billingCycle,
+            },
+            order,
+            catalog,
+          );
+          await tx.orderProvisioningTracking.create({
+            data: { orderId: order.id, intent: intent as unknown as Prisma.InputJsonValue },
+          });
+          const snapshots = snapshotsFromPack(catalog.pack, { name: order.productName });
+          await tx.hostingService.create({
+            data: {
+              userId,
+              orderId: order.id,
+              productId: order.productId,
+              packId: order.packId,
+              deploymentModuleId: catalog.pack.deploymentModuleId ?? null,
+              status: HostingServiceStatus.PROVISIONING,
+              maxAppsSnapshot: snapshots.maxAppsSnapshot,
+              ramMbSnapshot: snapshots.ramMbSnapshot,
+              cpuCoresSnapshot: snapshots.cpuCoresSnapshot,
+              storageLimitGbSnapshot: snapshots.storageLimitGbSnapshot,
+              packNameSnapshot: snapshots.packNameSnapshot,
+              productNameSnapshot: snapshots.productNameSnapshot,
+            },
+          });
+        }
+
+        return { alreadyConfirmed: false, order, subscriptionAction, userId };
+      });
+    } catch (e) {
+      await this.audit
+        .record({
+          action: 'payment.confirm_failed',
+          resourceType: 'order',
+          resourceId: orderId,
+          details: { source: ctx.source, error: String(e) },
+        })
+        .catch(() => {});
+      throw e;
+    }
+
+    if (outcome.alreadyConfirmed) {
+      return {
+        orderId,
+        status: outcome.order.status,
+        alreadyConfirmed: true,
+        subscriptionAction: null,
+      };
+    }
+
+    await this.audit.record({
+      action: 'payment.confirmed',
+      resourceType: 'order',
+      resourceId: orderId,
+      details: {
+        source: ctx.source,
+        reference: ctx.reference ?? undefined,
+        actorEmail: ctx.actorEmail ?? undefined,
+        amountTtcCents: outcome.order.amountTtcCents,
+        subscriptionAction: outcome.subscriptionAction,
+      },
+    });
+
+    // Email de confirmation — best-effort (la source `free` le gère côté
+    // checkout avec le mot de passe temporaire de l'invité).
+    if (ctx.source !== 'free') {
+      await this.sendPostCheckoutEmail(
+        outcome.order.customerEmail,
+        outcome.order.customerName,
+        null,
+        await this.invoiceNumberFor(orderId),
+        outcome.subscriptionAction,
+        { phase: 'confirmed' },
+      ).catch((e) =>
+        this.traceAudit('', orderId, outcome.order.amountTtcCents, '', false, String(e), {
+          stage: 'confirmed-email',
+        }),
+      );
+    }
+
+    // Lancement de l'exécution APRÈS commit (provisioning only once PAID) :
+    // fire-and-forget, échec JAMAIS avalé (audit + relance par le sweep).
+    if (outcome.subscriptionAction === 'upgraded') {
+      const active = await this.prisma.subscription.findFirst({
+        where: { orderId, status: SubscriptionStatus.ACTIVE },
+        select: { id: true },
+      });
+      if (active) {
+        this.provisioning.syncAppLimits(active.id).catch((e) => {
+          this.log.warn(`confirm order=${orderId}: syncAppLimits launch failed: ${String(e)}`);
+        });
+      }
+    }
+    if (
+      outcome.order.requestedSubdomain ||
+      outcome.subscriptionAction !== 'upgraded'
+    ) {
+      this.provisioning.provisionOrder(orderId).catch((e) => {
+        this.log.warn(`confirm order=${orderId}: provisionOrder launch failed: ${String(e)}`);
+        this.audit
+          .record({
+            action: 'provision.launch_failed',
+            resourceType: 'order',
+            resourceId: orderId,
+            details: { error: String(e) },
+          })
+          .catch(() => {});
+      });
+    }
+
+    return {
+      orderId,
+      status: OrderStatus.PAID,
+      alreadyConfirmed: false,
+      subscriptionAction: outcome.subscriptionAction,
+    };
+  }
+
+  /**
+   * Simulateur de paiement (RECETTE/TESTS uniquement — refus explicite en
+   * production et sans activation `PAYMENT_SIMULATOR_ENABLED=true`, cf.
+   * `config/payment-simulator.ts`). Aucun prestataire réel n'est appelé :
+   * - `success` → confirmation serveur complète (mêmes droits qu'un règlement) ;
+   * - `decline` → refus honnête, commande TOUTE CELLE qui reste en attente ;
+   * - `timeout` → résultat INCERTAIN : protections C4 conservées, AUCUN droit
+   *   ouvert, AUCUNE annonce de succès.
+   */
+  async simulatePaymentOutcome(
+    orderId: string,
+    outcome: 'success' | 'decline' | 'timeout',
+  ): Promise<{ status: OrderStatus; outcome: string }> {
+    if (!isPaymentSimulatorEnabled()) {
+      throw new BadRequestException(
+        'Simulateur de paiement désactivé (réservé aux tests et à la recette).',
+      );
+    }
+    const order = await this.prisma.order.findUnique({
+      where: { id: orderId },
+      include: { paymentMethod: { select: { type: true } } },
+    });
+    if (!order) {
+      throw new NotFoundException('Commande introuvable.');
+    }
+    if (order.paymentMethod?.type !== PaymentMethodType.CARD) {
+      throw new BadRequestException(
+        'Le simulateur ne s’applique qu’à une commande CARTe en attente de règlement.',
+      );
+    }
+    if (outcome === 'success') {
+      const res = await this.confirmOrderPaid(orderId, { source: 'card-simulator' });
+      return { status: res.status, outcome: res.alreadyConfirmed ? 'already-confirmed' : 'confirmed' };
+    }
+
+    const note =
+      outcome === 'decline'
+        ? 'Paiement refusé (simulateur) — commande toujours en attente de règlement.'
+        : 'Délai dépassé (simulateur) — résultat incertain, protections conservées : aucun droit ouvert.';
+    // CAS sous verrou (touch) : si la commande a basculé entre-temps (confirm
+    // concurrent), on retourne l'état réel sans écrire un historique faux.
+    const cas = await this.prisma.order.updateMany({
+      where: { id: orderId, status: OrderStatus.PENDING_PAYMENT },
+      data: { updatedAt: new Date() },
+    });
+    if (cas.count === 0) {
+      const cur = await this.prisma.order.findUnique({
+        where: { id: orderId },
+        select: { status: true },
+      });
+      return { status: cur?.status ?? order.status, outcome: 'state-changed' };
+    }
+    await this.prisma.orderStatusHistory.create({
+      data: { orderId, status: OrderStatus.PENDING_PAYMENT, note, actorEmail: null },
+    });
+    await this.audit.record({
+      action: `payment.simulate_${outcome}`,
+      resourceType: 'order',
+      resourceId: orderId,
+      details: { amountTtcCents: order.amountTtcCents },
+    });
+    return { status: OrderStatus.PENDING_PAYMENT, outcome };
+  }
+
+  /** Note d'historique de la confirmation (source + référence, traçable). */
+  private confirmNote(ctx: ConfirmPaidContext): string {
+    switch (ctx.source) {
+      case 'free':
+        return 'Commande gratuite (montant 0) — règle explicite, aucun encaissement fabriqué.';
+      case 'admin-transfer':
+        return `Règlement validé par l’administration${ctx.reference ? ` (réf. ${ctx.reference})` : ''}.`;
+      case 'card-simulator':
+        return 'Règlement confirmé (simulateur de recette — aucun prestataire réel).';
+    }
+  }
+
+  /** Numéro de facture de la commande (email de confirmation). */
+  private async invoiceNumberFor(orderId: string): Promise<string> {
+    const inv = await this.prisma.invoice.findUnique({
+      where: { orderId },
+      select: { number: true },
+    });
+    return inv?.number ?? '';
   }
 
   /**
@@ -745,7 +1171,7 @@ export class CheckoutService {
    * `claimToken`/lease sont ajoutés au runtime, jamais figés ici).
    */
   private buildC3Intent(
-    product: PublicProduct,
+    product: Pick<PublicProduct, 'id' | 'packId' | 'billingCycle'>,
     order: {
       id: string;
       amountTtcCents: number;
@@ -841,20 +1267,29 @@ export class CheckoutService {
     methodId: string,
     ok: boolean,
     error?: string,
+    extra?: Record<string, unknown>,
   ): Promise<void> {
     await this.audit.record({
-      action: ok ? 'payment.checkout' : 'payment.checkout.email',
+      action: ok ? 'payment.checkout' : 'payment.checkout.error',
       resourceType: 'order',
       resourceId: orderId,
-      details: { productId, amountTtcCents, methodId, ok, error: error ?? undefined },
+      details: {
+        productId,
+        amountTtcCents,
+        methodId,
+        ok,
+        error: error ?? undefined,
+        ...(extra ?? {}),
+      },
     });
   }
 
   /**
-   * Email de confirmation post-commande — best-effort, jamais bloquant.
-   * - Invité (nouveau compte) : identifiants + mot de passe temporaire.
-   * - Membre (upgrade) : confirmation que l'abonnement est mis à jour, données
-   *   et applications conservées.
+   * Email de commande — best-effort, jamais bloquant. DEUX phases honnêtes :
+   * - `pending` : commande enregistrée, règlement NON confirmé — AUCUNE
+   *   promesse d'activation ni d'accès ; l'invité reçoit ses identifiants
+   *   (le compte existe, il ne vaut pas confirmation).
+   * - `confirmed` : règlement confirmé, exécution lancée (promesses réelles).
    */
   private async sendPostCheckoutEmail(
     to: string,
@@ -862,23 +1297,35 @@ export class CheckoutService {
     tempPassword: string | null,
     invoiceNumber: string,
     subscriptionAction: 'upgraded' | 'created' | null,
+    opts?: { phase?: 'pending' | 'confirmed'; methodLabel?: string },
   ): Promise<void> {
+    const phase = opts?.phase ?? 'confirmed';
     const isUpgrade = subscriptionAction === 'upgraded';
     const isNewAccount = !!tempPassword;
     const lines: string[] = [
       `Bonjour ${name},`,
       '',
     ];
-    if (isUpgrade) {
+    if (phase === 'pending') {
       lines.push(
-        `Votre abonnement a été mis à jour (commande ${invoiceNumber}).`,
+        `Votre commande est enregistrée (facture ${invoiceNumber}). Le règlement`,
+        'n’est pas encore confirmé : votre abonnement sera activé et votre',
+        'application préparée dès que le règlement sera validé.',
+        '',
+      );
+      if (opts?.methodLabel) {
+        lines.push(`Moyen de paiement choisi : ${opts.methodLabel}.`, '');
+      }
+    } else if (isUpgrade) {
+      lines.push(
+        `Votre règlement est confirmé : votre abonnement a été mis à jour (facture ${invoiceNumber}).`,
         'Vos données et votre/vos application(s) sont conservées, et les ressources',
         'de votre nouveau plan ont été appliquées.',
         '',
       );
     } else {
       lines.push(
-        `Votre paiement a bien été validé (commande ${invoiceNumber}). Votre`,
+        `Votre règlement est confirmé (facture ${invoiceNumber}). Votre`,
         'abonnement est actif et votre application est en cours de préparation :',
         'vous recevrez son adresse (sous-domaine) par email dès qu’elle sera en ligne.',
         '',
@@ -903,7 +1350,7 @@ export class CheckoutService {
         'dans l’espace client pour suivre votre abonnement et votre application.',
         '',
       );
-    } else {
+    } else if (phase === 'confirmed') {
       lines.push(
         'Retrouvez votre abonnement, vos applications et vos factures dans l’espace client.',
         '',
@@ -912,9 +1359,12 @@ export class CheckoutService {
     lines.push('L’équipe Code Diali');
     await this.mail.sendPlain({
       to,
-      subject: isUpgrade
-        ? `Votre abonnement a été mis à jour — commande ${invoiceNumber}`
-        : `Vos accès Code Diali — commande ${invoiceNumber}`,
+      subject:
+        phase === 'pending'
+          ? `Commande en attente de règlement — ${invoiceNumber}`
+          : isUpgrade
+            ? `Votre abonnement a été mis à jour — commande ${invoiceNumber}`
+            : `Vos accès Code Diali — commande ${invoiceNumber}`,
       text: lines.join('\n'),
     });
   }

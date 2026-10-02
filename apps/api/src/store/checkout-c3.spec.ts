@@ -1,14 +1,22 @@
-import { ConflictException, ServiceUnavailableException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  ServiceUnavailableException,
+} from '@nestjs/common';
 import { CheckoutService, CheckoutReplaySignal } from './checkout.service';
 
 /**
- * 17B.4F-C3 — checkout sous garde ON : capability LIVE, fast-fails AVANT toute
- * écriture, verrou `User` + rejeu sous verrou + recheck d'abonnement DANS la
- * transaction, intention figée `OrderProvisioningTracking` + `HostingService`
- * (snapshots pack) écrits dans la MÊME transaction que la commande. OFF :
- * comportement legacy byte-identique (aucune écriture C3, aucune capability).
+ * 17B.4F-C3 + GO socle commercial — checkout sous garde ON :
+ * capability LIVE + fast-fails AVANT toute écriture, verrou `User` + rejeu
+ * sous verrou + recheck d'abonnement DANS la transaction.
+ *
+ * Sémantique de paiement (GO) : la commande est créée `PENDING_PAYMENT`
+ * SANS aucune écriture de droits (ni abonnement, ni tracking C3, ni service,
+ * ni provisioning). Les écritures de droits sont déplacées dans
+ * `confirmOrderPaid` (confirmation serveur) — testé ici en différé.
+ * OFF : comportement legacy inchangé (aucune écriture C3, aucune capability).
  */
-describe('checkout C3 (17B.4F-C3)', () => {
+describe('checkout C3 (17B.4F-C3) + confirmation de paiement', () => {
   const C3_ENV = 'HOSTING_C3_ENABLED';
 
   const product = {
@@ -52,25 +60,29 @@ describe('checkout C3 (17B.4F-C3)', () => {
   type State = {
     product: Record<string, unknown>;
     catalog: Record<string, unknown> | null;
-    preReplay: Record<string, unknown> | null;
+    intentOrders: Array<Record<string, unknown>>;
     ordersById: Record<string, Record<string, unknown>>;
     txDup: Record<string, unknown> | null;
+    txConfirmOrder: Record<string, any> | null;
     preSub: Record<string, unknown> | null;
     txSub: Record<string, unknown> | null;
     user: Record<string, unknown> | null;
     txUserLock: Array<{ id: string }>;
+    simulateOrder: Record<string, any> | null;
   };
 
   const defaultState = (): State => ({
     product,
     catalog,
-    preReplay: null,
+    intentOrders: [],
     ordersById: {},
     txDup: null,
+    txConfirmOrder: null,
     preSub: null,
     txSub: null,
     user: null,
     txUserLock: [{ id: 'u1' }],
+    simulateOrder: null,
   });
 
   let state: State;
@@ -90,10 +102,19 @@ describe('checkout C3 (17B.4F-C3)', () => {
         return [];
       }),
       order: {
-        findUnique: jest.fn(async ({ where }: any) =>
-          where.idempotencyKey ? state.txDup : null,
-        ),
+        findUnique: jest.fn(async ({ where }: any) => {
+          if (where.idempotencyKey) return state.txDup;
+          if (where.id) return state.txConfirmOrder;
+          return null;
+        }),
+        findMany: jest.fn(async () => []),
         create: jest.fn(async ({ data }: any) => ({ id: 'ord-new', ...data })),
+        updateMany: jest.fn(async ({ where, data }: any) => {
+          const o = state.txConfirmOrder;
+          if (!o || o.id !== where.id || o.status !== where.status) return { count: 0 };
+          Object.assign(o, data ?? {});
+          return { count: 1 };
+        }),
       },
       subscription: {
         findFirst: jest.fn(async () => state.txSub),
@@ -118,6 +139,7 @@ describe('checkout C3 (17B.4F-C3)', () => {
       },
       invoice: {
         create: jest.fn(async ({ data }: any) => ({ id: 'inv1', ...data })),
+        updateMany: jest.fn(async () => ({ count: 1 })),
       },
       orderStatusHistory: {
         create: jest.fn(async ({ data }: any) => ({ id: 'h1', ...data })),
@@ -131,9 +153,16 @@ describe('checkout C3 (17B.4F-C3)', () => {
       },
       order: {
         findUnique: jest.fn(async ({ where }: any) => {
-          if (where.idempotencyKey) return state.preReplay;
+          if (where.clientKey) return null;
           if (where.id) return state.ordersById[where.id] ?? null;
           return null;
+        }),
+        findMany: jest.fn(async () => state.intentOrders),
+        updateMany: jest.fn(async ({ where, data }: any) => {
+          const o = state.simulateOrder;
+          if (!o || o.id !== where.id || o.status !== where.status) return { count: 0 };
+          Object.assign(o, data ?? {});
+          return { count: 1 };
         }),
       },
       user: {
@@ -193,38 +222,69 @@ describe('checkout C3 (17B.4F-C3)', () => {
   /** JWT d'un membre connecté (authoritative `sub` du jeton). */
   const jwtMember = () => ({ sub: 'u1' }) as never;
 
+  /** Commande prête à confirmer (PENDING_PAYMENT, compte lié). */
+  const confirmable = (over: Record<string, unknown> = {}) => {
+    state.txConfirmOrder = {
+      id: 'ord-new',
+      status: 'PENDING_PAYMENT',
+      customerEmail: 'guest@example.com',
+      customerName: 'Guest',
+      productId: 'prod1',
+      productName: 'Site Starter',
+      packId: 'pack1',
+      billingCycle: 'MONTHLY',
+      currency: 'EUR',
+      amountHtCents: 4900,
+      taxAmountCents: 0,
+      amountTtcCents: 4900,
+      requestedSubdomain: null,
+      requestedDomainId: null,
+      customer: { userId: 'u-new' },
+      ...over,
+    } as any;
+    return state.txConfirmOrder;
+  };
+
   beforeEach(() => {
     delete process.env[C3_ENV];
+    delete process.env.PAYMENT_SIMULATOR_ENABLED;
     make();
   });
 
   afterEach(() => {
     delete process.env[C3_ENV];
+    delete process.env.PAYMENT_SIMULATOR_ENABLED;
   });
 
   const provisioning = () =>
     (svc as never as { provisioning: { provisionOrder: jest.Mock } }).provisioning;
 
-  // ── OFF : legacy inchangé ──────────────────────────────────────────────────
+  // ── OFF : aucune ouverture de droit au checkout ────────────────────────────
 
-  it('OFF : aucune capability, aucune écriture C3, checkout legacy intact', async () => {
+  it('OFF : commande PENDING_PAYMENT, AUCUNE écriture C3/droit, provisioning NON lancé', async () => {
     const out = await svc.checkoutGuest(dto());
     expect(out.orderId).toBe('ord-new');
+    expect(out.nextStep).toBe('payment-pending');
+    expect(state.product).toBeTruthy();
+    const created = tx.order.create.mock.calls[0][0].data;
+    expect(created.status).toBe('PENDING_PAYMENT');
     expect(c3.operational).not.toHaveBeenCalled();
     expect(tx.orderProvisioningTracking.create).not.toHaveBeenCalled();
     expect(tx.hostingService.create).not.toHaveBeenCalled();
+    expect(tx.subscription.create).not.toHaveBeenCalled();
     expect(prisma.product.findUnique).not.toHaveBeenCalled(); // pas de catalogue C3
-    expect(provisioning().provisionOrder).toHaveBeenCalledWith('ord-new');
+    expect(provisioning().provisionOrder).not.toHaveBeenCalled(); // après confirmation
+    expect(tx.invoice.create.mock.calls[0][0].data.status).toBe('UNPAID');
   });
 
-  // ── ON : fast-fails avant toute écriture ───────────────────────────────────
+  // ── ON : fast-fails avant toute écriture ──────────────────────────────────
 
   it('ON + schéma indisponible ⇒ 503 AVANT toute transaction', async () => {
     process.env[C3_ENV] = 'true';
     c3.operational.mockResolvedValue(false);
     await expect(svc.checkoutGuest(dto())).rejects.toThrow(ServiceUnavailableException);
     expect(prisma.$transaction).not.toHaveBeenCalled();
-    expect(prisma.product.findUnique).not.toHaveBeenCalled(); // stoppe dès la capability
+    expect(prisma.product.findUnique).not.toHaveBeenCalled();
   });
 
   it('ON + produit sans CREATE_APP ⇒ 409 (non provisionnable), 0 écriture', async () => {
@@ -258,22 +318,23 @@ describe('checkout C3 (17B.4F-C3)', () => {
     process.env[C3_ENV] = 'true';
     member();
     state.preSub = { id: 'sub-actif', status: 'ACTIVE' }; // refuserait…
-    state.preReplay = { id: 'ord-exist', status: 'PAID' };
+    state.intentOrders = [{ id: 'ord-exist', status: 'PENDING_PAYMENT' }];
     const out = await svc.checkoutGuest(dto(), undefined, jwtMember());
     expect(out.orderId).toBe('ord-exist'); // …mais le rejeu gagne
-    expect(c3.operational).not.toHaveBeenCalled(); // ni capability, ni refus
+    expect(out.nextStep).toBe('payment-pending'); // honnête : pas encore payée
+    expect(c3.operational).not.toHaveBeenCalled();
     expect(prisma.$transaction).not.toHaveBeenCalled();
   });
 
   it('double-clic concurrent (dup détecté SOUS verrou) ⇒ rejeu, pas de refus', async () => {
     process.env[C3_ENV] = 'true';
     member();
-    state.txDup = { id: 'ord-tx', status: 'PAID' };
-    state.ordersById['ord-tx'] = { id: 'ord-tx', status: 'PAID' };
+    state.txDup = { id: 'ord-tx', status: 'PENDING_PAYMENT' };
+    state.ordersById['ord-tx'] = { id: 'ord-tx', status: 'PENDING_PAYMENT' };
     const out = await svc.checkoutGuest(dto(), undefined, jwtMember());
     expect(out.orderId).toBe('ord-tx');
     expect(tx.order.create).not.toHaveBeenCalled();
-    expect(tx.orderProvisioningTracking.create).not.toHaveBeenCalled();
+    expect(provisioning().provisionOrder).not.toHaveBeenCalled();
     expect(prisma.$transaction).toHaveBeenCalled(); // la garde a bien tourné
     const lockSql = (tx.$queryRaw.mock.calls[0] as TemplateStringsArray[])[0]?.join(' ') ?? '';
     expect(lockSql).toContain('FOR UPDATE'); // verrou User du compte
@@ -288,17 +349,52 @@ describe('checkout C3 (17B.4F-C3)', () => {
       /upgrade non pris en charge/,
     );
     expect(tx.order.create).not.toHaveBeenCalled();
-    expect(tx.orderProvisioningTracking.create).not.toHaveBeenCalled();
-    expect(tx.hostingService.create).not.toHaveBeenCalled();
   });
 
-  // ── ON : écritures dans la transaction ─────────────────────────────────────
+  // ── Droits DÉLÉGUÉS à la confirmation ──────────────────────────────────────
 
-  it('ON + invité pack : intention figée + HostingService dans la MÊME transaction', async () => {
+  it('ON + invité pack : checkout SANS tracking/service/abonnement (tout en différé)', async () => {
     process.env[C3_ENV] = 'true';
     const out = await svc.checkoutGuest(dto({ subdomain: undefined }));
     expect(out.orderId).toBe('ord-new');
+    expect(out.nextStep).toBe('payment-pending');
+    expect(tx.orderProvisioningTracking.create).not.toHaveBeenCalled();
+    expect(tx.hostingService.create).not.toHaveBeenCalled();
+    expect(tx.subscription.create).not.toHaveBeenCalled();
+    expect(provisioning().provisionOrder).not.toHaveBeenCalled();
+    // Le catalogue n'est lu que pour les fast-fails (aucune écriture en découle) ;
+    // le provisioning relira lui-même le catalogue à la confirmation.
+    expect(prisma.product.findUnique).toHaveBeenCalled();
+    expect(tx.orderProvisioningTracking.create).not.toHaveBeenCalled();
+  });
 
+  it('confirmOrderPaid : PENDING→PAID + facture + abonnement + intention + service, puis lancement', async () => {
+    process.env[C3_ENV] = 'true';
+    confirmable();
+    const res = await svc.confirmOrderPaid('ord-new', {
+      source: 'admin-transfer',
+      actorEmail: 'admin@example.com',
+      reference: 'VIR-2026-01',
+    });
+    expect(res.alreadyConfirmed).toBe(false);
+    expect(res.status).toBe('PAID');
+    expect(res.subscriptionAction).toBe('created');
+
+    expect(tx.order.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: 'ord-new', status: 'PENDING_PAYMENT' },
+        data: expect.objectContaining({ status: 'PAID' }),
+      }),
+    );
+    expect(tx.invoice.updateMany).toHaveBeenCalled();
+    expect(tx.subscription.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({ userId: 'u-new', orderId: 'ord-new' }),
+    });
+    expect(tx.orderStatusHistory.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ note: expect.stringContaining('VIR-2026-01') }),
+      }),
+    );
     expect(tx.orderProvisioningTracking.create).toHaveBeenCalledWith({
       data: {
         orderId: 'ord-new',
@@ -324,7 +420,6 @@ describe('checkout C3 (17B.4F-C3)', () => {
         },
       },
     });
-
     expect(tx.hostingService.create).toHaveBeenCalledWith({
       data: expect.objectContaining({
         userId: 'u-new',
@@ -341,27 +436,35 @@ describe('checkout C3 (17B.4F-C3)', () => {
         productNameSnapshot: 'Site Starter',
       }),
     });
-
-    // Écritures dans l'ordre : commande → tracking → service → facture.
-    const orderIdx = tx.order.create.mock.invocationCallOrder[0];
-    const trkIdx = tx.orderProvisioningTracking.create.mock.invocationCallOrder[0];
-    const svcIdx = tx.hostingService.create.mock.invocationCallOrder[0];
-    const invIdx = tx.invoice.create.mock.invocationCallOrder[0];
-    expect(orderIdx).toBeLessThan(trkIdx);
-    expect(trkIdx).toBeLessThan(svcIdx);
-    expect(svcIdx).toBeLessThan(invIdx);
-
+    expect(prisma.product.findUnique).toHaveBeenCalled(); // catalogue relu en confirm
     expect(provisioning().provisionOrder).toHaveBeenCalledWith('ord-new');
-    expect(prisma.product.findUnique).toHaveBeenCalled(); // catalogue C3 lu sous ON
   });
 
-  it('ON + membre pack : verrou User + aucun upgrade, abonnement créé, tracking u1', async () => {
+  it('confirmOrderPaid idempotent : déjà confirmée ⇒ alreadyConfirmed, AUCUNE réécriture', async () => {
+    confirmable({ status: 'ACTIVE' });
+    const res = await svc.confirmOrderPaid('ord-new', { source: 'admin-transfer' });
+    expect(res.alreadyConfirmed).toBe(true);
+    expect(tx.order.updateMany).not.toHaveBeenCalled();
+    expect(tx.subscription.create).not.toHaveBeenCalled();
+    expect(tx.orderProvisioningTracking.create).not.toHaveBeenCalled();
+    expect(provisioning().provisionOrder).not.toHaveBeenCalled();
+  });
+
+  it('confirmOrderPaid sur commande annulée ⇒ 409 (aucun droit rétroactif)', async () => {
+    confirmable({ status: 'CANCELLED' });
+    await expect(
+      svc.confirmOrderPaid('ord-new', { source: 'admin-transfer' }),
+    ).rejects.toThrow(ConflictException);
+    expect(tx.subscription.create).not.toHaveBeenCalled();
+    expect(provisioning().provisionOrder).not.toHaveBeenCalled();
+  });
+
+  it('ON + membre pack confirmé : abonnement créé pour u1, service userId u1', async () => {
     process.env[C3_ENV] = 'true';
     member();
-    const out = await svc.checkoutGuest(dto(), undefined, jwtMember());
-    expect(out.orderId).toBe('ord-new');
-    const lockSql = (tx.$queryRaw.mock.calls[0] as TemplateStringsArray[])[0]?.join(' ') ?? '';
-    expect(lockSql).toContain('FOR UPDATE');
+    confirmable({ customer: { userId: 'u1' } });
+    const res = await svc.confirmOrderPaid('ord-new', { source: 'admin-transfer' });
+    expect(res.subscriptionAction).toBe('created');
     expect(tx.subscription.create).toHaveBeenCalledWith({
       data: expect.objectContaining({ userId: 'u1', orderId: 'ord-new' }),
     });
@@ -370,15 +473,37 @@ describe('checkout C3 (17B.4F-C3)', () => {
     });
   });
 
-  it('ON + produit sans pack (frais) : ON validé mais AUCUNE écriture C3', async () => {
+  it('ON + produit sans pack confirmé : abonnement ni écriture C3', async () => {
     process.env[C3_ENV] = 'true';
-    state.product = { ...product, packId: null, priceHtCents: 990, name: 'Installation' };
-    const out = await svc.checkoutGuest(dto());
-    expect(out.orderId).toBe('ord-new');
-    expect(c3.operational).toHaveBeenCalled();
+    confirmable({ packId: null });
+    const res = await svc.confirmOrderPaid('ord-new', { source: 'admin-transfer' });
+    expect(res.subscriptionAction).toBeNull();
+    expect(tx.subscription.create).not.toHaveBeenCalled();
     expect(tx.orderProvisioningTracking.create).not.toHaveBeenCalled();
     expect(tx.hostingService.create).not.toHaveBeenCalled();
-    expect(tx.subscription.create).not.toHaveBeenCalled();
+  });
+
+  // ── Simulateur (gate explicite) ────────────────────────────────────────────
+
+  it('simulateur sans activation explicite ⇒ refus net', async () => {
+    await expect(
+      svc.simulatePaymentOutcome('ord-x', 'success'),
+    ).rejects.toThrow(BadRequestException);
+    expect(prisma.order.findUnique).not.toHaveBeenCalled();
+  });
+
+  it('simulateur désactivé EN PRODUCTION même si l’env est posé ⇒ refus', async () => {
+    const prev = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'production';
+    process.env.PAYMENT_SIMULATOR_ENABLED = 'true';
+    try {
+      await expect(svc.simulatePaymentOutcome('ord-x', 'success')).rejects.toThrow(
+        BadRequestException,
+      );
+    } finally {
+      process.env.NODE_ENV = prev;
+      delete process.env.PAYMENT_SIMULATOR_ENABLED;
+    }
   });
 
   it('signal de rejeu in-tx est reconnu (classe exportée)', () => {

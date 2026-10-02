@@ -9,11 +9,13 @@ import { MailModule } from '../mail/mail.module';
 import { ProductsModule } from '../products/products.module';
 import { PanelTransportFactory } from '../servers/panel-transport.factory';
 import { BillingPaymentAdminController } from './billing-payment.admin.controller';
+import { AdminOrdersController } from './admin-orders.controller';
 import { CheckoutController } from './checkout.controller';
 import { CheckoutService } from './checkout.service';
 import { DEPLOYMENT_EVIDENCE_CONNECTORS } from './deployment-evidence';
 import { DeploymentEvidenceService } from './deployment-evidence.service';
 import { OrderCancelService } from './order-cancel.service';
+import { OrderLifecycleService } from './order-lifecycle.service';
 import { PaymentMethodsController } from './payment-methods.controller';
 import { ProvisioningService } from './provisioning.service';
 import { ReconcileRunnerService } from './reconcile.runner.service';
@@ -39,6 +41,7 @@ import { StoreSubdomainController } from './store-subdomain.controller';
   controllers: [
     PaymentMethodsController,
     BillingPaymentAdminController,
+    AdminOrdersController,
     CheckoutController,
     StoreProvisioningAdminController,
     StoreSubdomainController,
@@ -48,6 +51,7 @@ import { StoreSubdomainController } from './store-subdomain.controller';
     CheckoutService,
     ProvisioningService,
     OrderCancelService,
+    OrderLifecycleService,
     PanelTransportFactory,
     HttpAvailabilityService,
     ReconcileSettingsService,

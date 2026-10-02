@@ -56,6 +56,9 @@ import {
  */
 describe('Provisioning C3 — e2e base isolée (HOSTING_C3_ENABLED=true)', () => {
   process.env.HOSTING_C3_ENABLED = 'true';
+  // Sweep de reprise (P2) : désactivé — il relancerait des provisionOrder derrière
+  // le dos des baselines de compteurs provider de cette suite.
+  process.env.ORDER_SWEEP_ENABLED = 'false';
   installFingerprintEnv();
 
   let app: INestApplication;
@@ -69,9 +72,11 @@ describe('Provisioning C3 — e2e base isolée (HOSTING_C3_ENABLED=true)', () =>
 
   const memberEmail = `c3member_${stamp}@example.com`;
   const member2Email = `c3member2_${stamp}@example.com`;
+  const adminEmail = `c3admin_${stamp}@example.com`;
   const password = 'password123';
   let memberToken = '';
   let member2Token = '';
+  let adminToken = '';
   let memberUserId = '';
 
   let srvId = '';
@@ -151,6 +156,15 @@ describe('Provisioning C3 — e2e base isolée (HOSTING_C3_ENABLED=true)', () =>
     const req = request(app.getHttpServer()).post(`/${GlobalPrefix}/store/checkout`).send(body);
     if (token) req.set('Authorization', `Bearer ${token}`);
     return req;
+  }
+
+  /** Confirmation ADMIN du règlement : SEUL déclencheur des droits C3 (P2). */
+  async function confirmOrder(orderId: string): Promise<void> {
+    await request(app.getHttpServer())
+      .post(`/${GlobalPrefix}/store/admin/orders/${orderId}/confirm-payment`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ reference: 'RECETTE' })
+      .expect(201);
   }
 
   /** Commande C3 pré-checkout (mêmes écrits que checkout.service, sans fire-and-forget). */
@@ -261,6 +275,13 @@ describe('Provisioning C3 — e2e base isolée (HOSTING_C3_ENABLED=true)', () =>
         role: Role.USER,
       },
     });
+    await prisma.user.create({
+      data: {
+        email: adminEmail,
+        passwordHash: await bcrypt.hash(password, 10),
+        role: Role.ADMIN,
+      },
+    });
     const member = await prisma.user.findUniqueOrThrow({ where: { email: memberEmail } });
     memberUserId = member.id;
     memberToken = (
@@ -275,8 +296,15 @@ describe('Provisioning C3 — e2e base isolée (HOSTING_C3_ENABLED=true)', () =>
         .send({ email: member2Email, password })
         .expect(201)
     ).body.accessToken as string;
+    adminToken = (
+      await request(app.getHttpServer())
+        .post(`/${GlobalPrefix}/auth/login`)
+        .send({ email: adminEmail, password })
+        .expect(201)
+    ).body.accessToken as string;
     expect(memberToken).toBeTruthy();
     expect(member2Token).toBeTruthy();
+    expect(adminToken).toBeTruthy();
 
     const server = await prisma.server.create({
       data: {
@@ -327,7 +355,9 @@ describe('Provisioning C3 — e2e base isolée (HOSTING_C3_ENABLED=true)', () =>
     provId = prov.id;
 
     const pm = await prisma.paymentMethod.create({
-      data: { name: `CB-${stamp}`, type: PaymentMethodType.CARD, isActive: true },
+      // BANK_TRANSFER : la méthode CARTe est refusée au checkout sans simulateur
+      // de paiement activé (règle P2) — voir store-payment-confirmation e2e.
+      data: { name: `VIR-${stamp}`, type: PaymentMethodType.BANK_TRANSFER, isActive: true },
     });
     pmId = pm.id;
 
@@ -377,7 +407,7 @@ describe('Provisioning C3 — e2e base isolée (HOSTING_C3_ENABLED=true)', () =>
       .deleteMany({ where: { email: { in: [...guestEmails, memberEmail, member2Email] } } })
       .catch(() => {});
     await prisma.user
-      .deleteMany({ where: { email: { in: [...guestEmails, memberEmail, member2Email] } } })
+      .deleteMany({ where: { email: { in: [...guestEmails, memberEmail, member2Email, adminEmail] } } })
       .catch(() => {});
     await prisma.product.deleteMany({ where: { id: { in: [prodAId, prodBId, prodCId] } } }).catch(() => {});
     await prisma.provisionMethod.deleteMany({ where: { id: provId } }).catch(() => {});
@@ -404,6 +434,18 @@ describe('Provisioning C3 — e2e base isolée (HOSTING_C3_ENABLED=true)', () =>
       s0OrderId = res.body.orderId as string;
       allOrderIds.push(s0OrderId);
 
+      // P2 : checkout payant = PENDING_PAYMENT, AUCUN droit C3 avant confirmation
+      // du règlement (ni service, ni abonnement, ni tracking, ni provisioning).
+      expect(res.body.nextStep).toBe('payment-pending');
+      const pending = await prisma.order.findUniqueOrThrow({ where: { id: s0OrderId } });
+      expect(pending.status).toBe(OrderStatus.PENDING_PAYMENT);
+      expect(await prisma.hostingService.count({ where: { orderId: s0OrderId } })).toBe(0);
+      expect(
+        await prisma.orderProvisioningTracking.count({ where: { orderId: s0OrderId } }),
+      ).toBe(0);
+      expect(await prisma.subscription.count({ where: { user: { email: memberEmail } } })).toBe(0);
+
+      await confirmOrder(s0OrderId);
       await waitOrderActive(s0OrderId);
 
       const order = await prisma.order.findUniqueOrThrow({ where: { id: s0OrderId } });
@@ -487,6 +529,11 @@ describe('Provisioning C3 — e2e base isolée (HOSTING_C3_ENABLED=true)', () =>
       const order = await prisma.order.findUniqueOrThrow({ where: { id: orderId } });
       const rowCount = await prisma.order.count({ where: { idempotencyKey: order.idempotencyKey } });
       expect(rowCount).toBe(1);
+      // P2 : les deux rejeux n'ont ouvert AUCUN droit — UNE commande en attente.
+      expect(order.status).toBe(OrderStatus.PENDING_PAYMENT);
+      expect(await prisma.hostingService.count({ where: { orderId } })).toBe(0);
+
+      await confirmOrder(orderId);
       const svcCount = await prisma.hostingService.count({ where: { orderId } });
       expect(svcCount).toBe(1);
 

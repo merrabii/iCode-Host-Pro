@@ -1,33 +1,43 @@
 import {
+  BadRequestException,
+  Body,
   Controller,
   Get,
+  Headers,
   HttpException,
   HttpStatus,
   Ip,
   Param,
   Post,
-  Body,
   Req,
   Res,
   UseGuards,
 } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import type { Response } from 'express';
+import { IsIn } from 'class-validator';
 import { CheckoutService, CheckoutResult } from './checkout.service';
 import { CheckoutDto } from './dto/checkout.dto';
 import { OptionalJwtAuthGuard } from '../auth/guards/optional-jwt-auth.guard';
 import { AuthedRequest } from '../auth/guards/jwt-auth.guard';
 import { PrismaService } from '../prisma/prisma.service';
-import { rateKey, SaRateLimiter } from '../auth/rate-limiter';
+import { rateKey, RATE, SaRateLimiter } from '../auth/rate-limiter';
 import { SecuritySettingsService } from '../auth/security/security-settings.service';
 
+/** Corps du simulateur de paiement (recette/tests — jamais la production). */
+class SimulatePaymentDto {
+  @IsIn(['success', 'decline', 'timeout'])
+  outcome!: 'success' | 'decline' | 'timeout';
+}
+
 /**
- * PUBLIC — tunnel de commande UNIQUE (Bloc C + Bloc 2). Paiement simulé
- * instantané : aucune saisie de carte, aucun secret. Accepte à la fois le
- * visiteur invité (aucun token → compte créé) et le membre connecté
- * (OptionalJwtAuthGuard → upgrade order-driven, compte et abonnement réutilisés,
- * données préservées). La configuration + les montants sont recalculés côté
- * serveur (le client ne fie jamais le prix). Rate-limité (§7).
+ * PUBLIC — tunnel de commande UNIQUE (Bloc C + Bloc 2). AUCUN paiement
+ * simulé implicite : la commande payante est créée `PENDING_PAYMENT` et
+ * n'ouvre aucun droit avant confirmation serveur (admin sur virement,
+ * simulateur explicitement activé en recette, règle commande gratuite).
+ * Accepte à la fois le visiteur invité (aucun token → compte créé) et le
+ * membre connecté (OptionalJwtAuthGuard → upgrade order-driven). Les montants
+ * sont recalculés côté serveur (le client ne fie jamais le prix). Rate-limité.
  */
 @ApiTags('store/checkout')
 @Controller('store')
@@ -42,10 +52,49 @@ export class CheckoutController {
   @Post('checkout')
   @UseGuards(OptionalJwtAuthGuard)
   @ApiOperation({
-    summary: 'Commander (invité → compte créé ; membre → upgrade) — crée/upgrade commande + facture + abonnement',
+    summary:
+      'Commander (invité → compte créé ; membre → upgrade) — commande en attente de règlement, droits après confirmation serveur',
   })
-  async placeOrder(@Body() dto: CheckoutDto, @Ip() ip: string, @Req() req: AuthedRequest): Promise<CheckoutResult> {
-    return this.checkout.checkoutGuest(dto, ip, req.user ?? null);
+  async placeOrder(
+    @Body() dto: CheckoutDto,
+    @Ip() ip: string,
+    @Req() req: AuthedRequest,
+    @Headers() headers: Record<string, string | undefined>,
+  ): Promise<CheckoutResult> {
+    const rawKey = headers['idempotency-key'] ?? headers['Idempotency-Key'];
+    return this.checkout.checkoutGuest(dto, ip, req.user ?? null, {
+      idempotencyKey: rawKey ?? null,
+    });
+  }
+
+  /**
+   * Simulateur de paiement (RECETTE/TESTS) — refusé sans activation explicite
+   * `PAYMENT_SIMULATOR_ENABLED=true` et TOUJOURS refusé en production
+   * (`config/payment-simulator.ts`). Le `success` passe par la même
+   * confirmation serveur qu'un règlement valide (aucun droit de court-circuit).
+   */
+  @Post('orders/:id/simulate-payment')
+  @ApiOperation({ summary: 'Simulateur de paiement (recette/tests uniquement)' })
+  async simulatePayment(
+    @Param('id') id: string,
+    @Body() body: SimulatePaymentDto,
+    @Ip() ip: string,
+  ) {
+    const rl = this.limiter.consume(
+      rateKey(ip, 'store-pay-sim'),
+      RATE.checkoutIntent.limit,
+      RATE.checkoutIntent.windowMs,
+    );
+    if (!rl.allowed) {
+      throw new HttpException(
+        `Trop de demandes. Réessayez dans ${Math.ceil(rl.retryAfterMs / 1000)} s.`,
+        HttpStatus.TOO_MANY_REQUESTS,
+      );
+    }
+    if (!body || typeof body.outcome !== 'string') {
+      throw new BadRequestException('outcome requis (success | decline | timeout).');
+    }
+    return this.checkout.simulatePaymentOutcome(id, body.outcome);
   }
 
   /** Statut public d'une commande (suivi invité par orderId, délibérément

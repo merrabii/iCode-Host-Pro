@@ -1312,6 +1312,17 @@ model Order {
   // Hash déterministe (email + config + montant + moyen) — garantit qu'un
   // double-clic / retry identique ne crée qu'UNE commande (§7 idempotence).
   idempotencyKey    String?           @unique
+  // Socle commercial — confirmation de paiement :
+  // `paidAt` = instant T où le règlement a été CONFIRMÉ côté serveur (jamais
+  // inféré d'une méthode active). `idempotencyBase` = hash d'intention de
+  // contenu : le 1er achat porte idempotencyKey = base ; un rachat APRÈS
+  // annulation crée une NOUVELLE clé (hash(base|ancienneCommande)) sans
+  // jamais supprimer les anciennes clés. `clientKey` (header Idempotency-Key
+  // fourni par le client) : même clé + contenu différent = conflit (409).
+  paidAt            DateTime?
+  idempotencyBase   String?
+  clientKey         String?           @unique
+  clientKeyHash     String?
   customerId        String
   customer          Customer          @relation(fields: [customerId], references: [id], onDelete: Cascade)
   customerName      String // snapshot
@@ -1383,6 +1394,7 @@ model Order {
   @@index([customerId])
   @@index([status])
   @@index([productId])
+  @@index([idempotencyBase])
 }
 
 // ── Historique des statuts d'une commande ──────────────────────────────────

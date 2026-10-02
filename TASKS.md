@@ -1484,3 +1484,25 @@ Suite de 17B.4F-C1 (moteur de réservation transactionnel, revue faite, non comm
 
 ### 7. État final
 - **ARRÊT** : 23 chemins (15 M + 8 ??), **staging vide, aucun commit, aucun push** ; HEAD = origin/main = `1fe8241` (0/0) ; `HOSTING_C4_ENABLED` **absente des deux `.env` (OFF partout)** ; zéro écriture live, zéro provider/DNS réel, aucune activation ; bases `c4test`/`c4premig`/`c3test`/`c1_test` **conservées** ; validations = **tsc 0 · build 0 · unit 969/969 · e2e 173/173 (12 suites)**.
+
+
+# GO SOCLE COMMERCIAL (2026-10-02) — chantier autonomie, branche `feat/socle-commercial` (en cours, ARRÊT final pour revue owner)
+
+## 2026-10-02 — Lot P0 : préparation du chantier (base dédiée, branche)
+- Action: état des lieux (HEAD `3245694`, propre, aucun service sur 3000/3001), branche `feat/socle-commercial` créée, base dédiée `icode_host_pro_socle` créée sur `icode-postgres` + 48 migrations déployées, `apps/api/.env` du worktree recréé (copie du `.env` principal, DATABASE_URL → socle, gitignored), `.env.example` vérifié.
+- Files: apps/api/.env (gitignored), branche git.
+- Tests: `prisma migrate status` = up to date.
+
+## 2026-10-02 — Lot P1 : RBAC des lectures admin de modules de déploiement (audit C-02) [x]
+- Action: `RolesGuard` + `@Roles(ADMIN)` ajoutés sur les 3 lectures publiques du controller (`GET /`, `GET /:id`, `GET /:id/projects`); e2e permanent `rbac-deployment-modules.e2e-spec.ts` écrit et exécuté.
+- Reason: audit C-02 — la config interne des modules de déploiement (serveurs/UUID/routes) était lisible par tout USER; seuls les consommateurs légitimes (UI admin) restent servis.
+- Files modified: apps/api/src/store/deployment-modules.controller.ts; created: apps/api/test/rbac-deployment-modules.e2e-spec.ts.
+- Tests: e2e **7/7 PASS** (401 anonyme ×3, 403 USER ×3, 403 SUPPORT_L1, 200 ADMIN, 403 mutation USER, compteur panneau 0/1, zéro donnée sensible); `tsc --noEmit` PASS; scan global des contrôleurs OK.
+- Commit local: `86c9f61` `fix(api): restrict deployment-module reads to ADMIN (audit C-02)`.
+
+## 2026-10-02 — Lot P2 : confirmation de paiement (aucun droit avant règlement) [x]
+- Action: migration additive + checkout `PENDING_PAYMENT` sans droits + `confirmOrderPaid` idempotent + endpoint ADMIN `confirm-payment` + simulateur de recette (gate strict, refus production) + masquage CARTe publique + sweep de reprise (`OrderLifecycleService`) + email gratuit corrigé (l'invité recevait JAMAIS son mot de passe temporaire) + idempotence clé cliente (`Idempotency-Key`) et chaînage post-annulation + `.env.example`.
+- Reason: GO socle commercial — aucune méthode active n'est une preuve de paiement; aucune souscription/service/provisioning avant confirmation serveur tracée; reprise durable des commandes figées; refus honnête du paiement carte tant qu'aucun prestataire n'est choisi.
+- Files: schema.prisma + migration `20261002000000_add_payment_confirmation`; src/config/payment-simulator.ts (nouveau); src/store/checkout.service.ts, checkout.controller.ts, payment-methods.controller.ts, store.module.ts; src/store/admin-orders.controller.ts (nouveau); src/store/order-lifecycle.service.ts (nouveau); .env.example; specs: checkout-c3.spec.ts (réécrit), test/store-payment-confirmation.e2e-spec.ts (nouveau), test/store-checkout-domains.e2e-spec.ts + test/c3-provisioning.e2e-spec.ts (adaptés).
+- Tests: e2e nouveau **25/25 PASS**; e2e adaptés **21/21 + 8/8 PASS**; unit complet **1001/1001 PASS (56 suites)** (checkout-c3 17/17); `tsc --noEmit` PASS; lint = eslint absent du workspace (préexistant, non bloquant).
+- Validations croisées: C1 401/403/201 RBAC, idempotence confirm, rollback conflit métier, refus production simulateur, expiration+chaînage, relance PAID — toutes prouvées sur PG réel (base socle).
