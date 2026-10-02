@@ -22,7 +22,9 @@ import {
 } from './dto/upsert-deployment-module.dto';
 
 // Phase 13 — modules/méthodes de déploiement gérés par l'admin (page Packs →
-// « Configuration de déploiement »). Mutations ADMIN-only, lecture authentifiée.
+// « Configuration de déploiement »). Lecture ET mutations ADMIN-only : les GET
+// exposent hostname/panelProvider et `GET :id/projects` déclenche un appel
+// panneau (CLAUDE.md §4) — aucune route ne doit rester « authentifiée seule ».
 @ApiTags('admin')
 @ApiBearerAuth()
 @UseGuards(JwtAuthGuard)
@@ -39,13 +41,17 @@ export class DeploymentModulesController {
   }
 
   @Get()
-  @ApiOperation({ summary: 'List deployment modules (any authenticated)' })
+  @UseGuards(RolesGuard)
+  @Roles(Role.ADMIN)
+  @ApiOperation({ summary: 'List deployment modules (ADMIN)' })
   findAll() {
     return this.modules.findAll();
   }
 
   @Get(':id')
-  @ApiOperation({ summary: 'Get one deployment module (any authenticated)' })
+  @UseGuards(RolesGuard)
+  @Roles(Role.ADMIN)
+  @ApiOperation({ summary: 'Get one deployment module (ADMIN)' })
   findOne(@Param('id') id: string) {
     return this.modules.findOne(id);
   }
@@ -72,6 +78,8 @@ export class DeploymentModulesController {
 
   // Liste LIVE des projets Coolify du serveur du module (choix du projet partagé A).
   @Get(':id/projects')
+  @UseGuards(RolesGuard)
+  @Roles(Role.ADMIN)
   @ApiOperation({ summary: 'Live Coolify projects of a module’s server — ADMIN' })
   listProjects(@Param('id') id: string) {
     return this.modules.listProjects(id);
