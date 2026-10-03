@@ -89,6 +89,10 @@ export type ConfirmSource = 'free' | 'admin-transfer' | 'card-simulator' | 'wall
 export interface ConfirmPaidContext {
   source: ConfirmSource;
   actorEmail?: string | null;
+  /** P9 (E1) : identifiant de l'acteur déclencheur (admin) pour l'audit —
+   *  absent pour un déclencheur système/invité (l'acteur devient alors le
+   *  propriétaire du compte). */
+  actorId?: string | null;
   reference?: string | null;
   /** Payload email complet (invité) — uniquement pour la source `free`. */
   email?: { to: string; name: string; tempPassword: string | null };
@@ -505,7 +509,7 @@ export class CheckoutService {
         stage: 'order-created',
         status: OrderStatus.PENDING_PAYMENT,
         methodType: method.type,
-      });
+      }, { id: created.user?.id ?? null, email: billingEmail });
 
       const invoiceNumber = created.billing.invoiceNumber;
 
@@ -537,7 +541,7 @@ export class CheckoutService {
           ).catch((e) =>
             this.traceAudit(product.id, created.order.id, amountTtcCents, method.id, false, String(e), {
               stage: 'free-confirm-email',
-            }),
+            }, { id: created.user?.id ?? null, email: receiptEmail }),
           );
           return {
             orderId: created.order.id,
@@ -548,7 +552,7 @@ export class CheckoutService {
         } catch (e) {
           await this.traceAudit(product.id, created.order.id, amountTtcCents, method.id, false, String(e), {
             stage: 'free-confirm-failed',
-          });
+          }, { id: created.user?.id ?? null, email: receiptEmail });
           // Chute honnête : règlement à confirmer plus tard, aucun droit ouvert.
         }
       }
@@ -561,7 +565,7 @@ export class CheckoutService {
       }).catch((e) =>
         this.traceAudit(product.id, created.order.id, amountTtcCents, method.id, false, String(e), {
           stage: 'pending-email',
-        }),
+        }, { id: created.user?.id ?? null, email: receiptEmail }),
       );
 
       return {
@@ -910,7 +914,13 @@ export class CheckoutService {
       };
     }
 
+    // P9 (E1/M-05) : l'acteur remonte au niveau de l'enregistrement (actorId =
+    // admin déclencheur, sinon propriétaire du compte) et l'audit porte la
+    // transition d'état (from → to) dans ses détails.
+    const confirmedTo = outcome.renewal ? OrderStatus.ACTIVE : OrderStatus.PAID;
     await this.audit.record({
+      actorId: ctx.actorId ?? outcome.userId,
+      actorEmail: ctx.actorEmail ?? outcome.order.customerEmail,
       action: 'payment.confirmed',
       resourceType: 'order',
       resourceId: orderId,
@@ -920,8 +930,20 @@ export class CheckoutService {
         actorEmail: ctx.actorEmail ?? undefined,
         amountTtcCents: outcome.order.amountTtcCents,
         subscriptionAction: outcome.subscriptionAction,
+        from: OrderStatus.PENDING_PAYMENT,
+        to: confirmedTo,
         ...(outcome.renewal ? { renewal: true } : {}),
       },
+    });
+    // P9 (E1/M-05) — LA transition de bascule (PENDING_PAYMENT → PAID/ACTIVE)
+    // journalisée dans l'AuditLog, avec l'acteur (meilleur effort).
+    await this.audit.record({
+      actorId: ctx.actorId ?? outcome.userId,
+      actorEmail: ctx.actorEmail ?? outcome.order.customerEmail,
+      action: 'order.transition',
+      resourceType: 'order',
+      resourceId: orderId,
+      details: { from: OrderStatus.PENDING_PAYMENT, to: confirmedTo, source: ctx.source },
     });
 
     // Email de confirmation — best-effort (la source `free` le gère côté
@@ -937,7 +959,7 @@ export class CheckoutService {
       ).catch((e) =>
         this.traceAudit('', orderId, outcome.order.amountTtcCents, '', false, String(e), {
           stage: 'confirmed-email',
-        }),
+        }, { id: outcome.userId, email: ctx.actorEmail ?? outcome.order.customerEmail }),
       );
     }
 
@@ -1391,7 +1413,10 @@ export class CheckoutService {
     return claimInvoiceSequence(tx);
   }
 
-  /** Audit des étapes paiement/commande (jamais le mot de passe en clair). */
+  /** Audit des étapes paiement/commande (jamais le mot de passe en clair).
+   *  P9 (E1/M-05) : `payment.checkout` porte MAINTENANT l'acteur (id +
+   *  email) — créateur de compte pour un achat, propriétaire du compte pour
+   *  une confirmation. */
   private async traceAudit(
     productId: string,
     orderId: string,
@@ -1400,9 +1425,12 @@ export class CheckoutService {
     ok: boolean,
     error?: string,
     extra?: Record<string, unknown>,
+    actor?: { id?: string | null; email?: string | null },
   ): Promise<void> {
     await this.audit.record({
       action: ok ? 'payment.checkout' : 'payment.checkout.error',
+      actorId: actor?.id ?? null,
+      actorEmail: actor?.email ?? null,
       resourceType: 'order',
       resourceId: orderId,
       details: {

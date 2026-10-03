@@ -324,6 +324,14 @@ describe('ProvisioningService — actionCreateApp (choix du projet A/B voie stor
     expect(transport.createGitApp).not.toHaveBeenCalled();
     // CREATE_APP attendue mais aucune app créée → PROVISIONING (jamais de faux ACTIVE).
     expect(out.status).toBe('PROVISIONING');
+    // P9 (E1/M-05) — transition legacy PAID → PROVISIONING journalisée.
+    expect(audit.record).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: 'order.transition',
+        resourceId: 'ord1',
+        details: expect.objectContaining({ from: 'PAID', to: 'PROVISIONING', via: 'provision_legacy' }),
+      }),
+    );
   });
 
   it('fix prod — NOUVELLE commande ⇒ row Deployment créée liée à SA commande (orderId), pas réutilisée par repo', async () => {
@@ -1271,6 +1279,18 @@ describe('ProvisioningService — activateOrderAfterProof (17B.3B)', () => {
     expect(mail.sendPlain).toHaveBeenCalledWith(expect.objectContaining({ to: 'cl@exemple.com' }));
     expect(audit.record).toHaveBeenCalledWith(
       expect.objectContaining({ action: 'provision.deployment_active', details: expect.objectContaining({ ok: true }) }),
+    );
+    // P9 (E1/M-05) — la transition d'état est journalisée dans l'AuditLog.
+    expect(audit.record).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: 'order.transition',
+        resourceId: 'ord1',
+        details: expect.objectContaining({
+          from: 'PROVISIONING',
+          to: 'ACTIVE',
+          via: 'activation_proof',
+        }),
+      }),
     );
   });
 

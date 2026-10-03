@@ -118,6 +118,7 @@ describe('provisionC3 / routage C3 (17B.4F-C3)', () => {
   let transport: Record<string, any>;
   let hosting: Record<string, jest.Mock>;
   let svc: ProvisioningService;
+  let auditMock: { record: jest.Mock };
   let txDepth: number;
   let providerTxDepth: number[];
 
@@ -276,9 +277,10 @@ describe('provisionC3 / routage C3 (17B.4F-C3)', () => {
       },
     };
 
+    auditMock = { record: jest.fn() };
     svc = new ProvisioningService(
       prisma as never,
-      { record: jest.fn() } as never,
+      auditMock as never,
       { decrypt: () => 'tok', encrypt: jest.fn() } as never,
       { sendPlain: jest.fn() } as never,
       {
@@ -601,6 +603,21 @@ describe('provisionC3 / routage C3 (17B.4F-C3)', () => {
         where: { id: 'hs1', status: 'PROVISIONING' },
         data: { status: 'ACTIVE' },
       });
+      // P9 (E1/M-05) — transitions claim + activation journalisées (AuditLog).
+      expect(auditMock.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'order.transition',
+          resourceId: 'ord1',
+          details: expect.objectContaining({ from: 'PAID', to: 'PROVISIONING', via: 'c3_claim' }),
+        }),
+      );
+      expect(auditMock.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'order.transition',
+          resourceId: 'ord1',
+          details: expect.objectContaining({ from: 'PROVISIONING', to: 'ACTIVE', via: 'activation_proof' }),
+        }),
+      );
     });
 
     it('retry après crash (activation déjà committée) ⇒ flip idempotent du service', async () => {

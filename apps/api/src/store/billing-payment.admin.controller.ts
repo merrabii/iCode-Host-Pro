@@ -91,6 +91,11 @@ export class BillingPaymentAdminController {
         isActive: updated.isActive,
         displayOrder: updated.displayOrder,
         feeType: updated.feeType,
+        // P9 (E1/M-05) : les VALEURS de frais sont journalisées (pas seulement
+        // le type) — une modification de tarification est traçable dans le
+        // journal d'audit.
+        feePercent: updated.feePercent?.toString() ?? null,
+        feeFixedCents: updated.feeFixedCents,
         hasConfigEnc: !!updated.configEnc,
       },
     });

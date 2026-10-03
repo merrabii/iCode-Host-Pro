@@ -243,10 +243,12 @@ export class ProvisioningService {
     // Aucune méthode configurée → rien à provisionner : on passe ACTIVE direct.
     if (!method || actions.length === 0) {
       await this.setOrderStatus(orderId, OrderStatus.ACTIVE, 'Aucune action de provisioning configurée.');
+      await this.recordOrderTransition(orderId, order.status, OrderStatus.ACTIVE, 'provision_no_method');
       return { orderId, status: OrderStatus.ACTIVE, fqdn: order.domainValue ?? null, steps: [] };
     }
 
     await this.setOrderStatus(orderId, OrderStatus.PROVISIONING, `Provisioning lancé (${method.name}).`);
+    await this.recordOrderTransition(orderId, order.status, OrderStatus.PROVISIONING, 'provision_legacy');
 
     let fqdn: string | null = order.domainValue ?? null;
     let appUuid: string | null = null;
@@ -639,6 +641,7 @@ export class ProvisioningService {
       }
 
       // ⑧ Order → PROVISIONING (la commande payée entre dans le parcours).
+      let transitionedFrom: OrderStatus | null = null;
       if (liveStatus !== OrderStatus.PROVISIONING && liveStatus !== OrderStatus.ACTIVE) {
         await tx.order.update({
           where: { id: order.id },
@@ -651,6 +654,7 @@ export class ProvisioningService {
             note: `Provisioning C3 lancé (${order.product.provisionModule?.name ?? 'module'}).`,
           },
         });
+        transitionedFrom = liveStatus;
       }
 
       // ⑨ intention provider — DERNIÈRE étape avant commit (aucune écriture
@@ -664,7 +668,7 @@ export class ProvisioningService {
           `Intention provider non applicable (${intentRes.reason}) : réservation conservée, aucune reprise automatique.`,
         );
       }
-      return { kind: 'claimed' as const, token, allocationId };
+      return { kind: 'claimed' as const, token, allocationId, transitionedFrom };
     });
 
     // ── Décisions non-gagnées : lecture seule ou refus explicite (0 provider) ─
@@ -689,6 +693,12 @@ export class ProvisioningService {
         default:
           throw new ConflictException('État de provisioning C3 non reconnu — support requis.');
       }
+    }
+
+    // P9 (E1/M-05) — transition PAID/… → PROVISIONING tracée dans l'AuditLog
+    // (post-commit : le claim TX-A est committé ici, best-effort).
+    if (claim.transitionedFrom) {
+      await this.recordOrderTransition(order.id, claim.transitionedFrom, OrderStatus.PROVISIONING, 'c3_claim');
     }
 
     const guard = this.c3Guard(order.id, claim.token);
@@ -1208,6 +1218,32 @@ export class ProvisioningService {
   }
 
   /**
+   * P9 (E1/M-05) — transition d'état de commande journalisée dans
+   * l'AuditLog (`order.transition` : from → to + origine). TOUJOURS appelée
+   * post-commit (l'audit ne ment jamais sur un rollback) et best-effort :
+   * un échec d'écriture d'audit ne casse jamais la mutation métier.
+   */
+  private async recordOrderTransition(
+    orderId: string,
+    from: OrderStatus,
+    to: OrderStatus,
+    via: string,
+  ): Promise<void> {
+    if (from === to) return;
+    try {
+      await this.audit.record({
+        action: 'order.transition',
+        resourceType: 'order',
+        resourceId: orderId,
+        details: { from, to, via },
+      });
+    } catch {
+      // Best-effort au sens strict (couvre aussi un audit mocké en échec) :
+      // la mutation d'état reste servie, jamais rejetée par la journalisation.
+    }
+  }
+
+  /**
    * 17B.3B — couture publique d'activation ATOMIQUE post-preuve de mise en
    * ligne, réutilisée par le proof-gate (provisionOrder) et, plus tard, par le
    * réconciliateur (17B.4+). Dans UNE transaction interactive :
@@ -1325,6 +1361,9 @@ export class ProvisioningService {
         }
       }
       if (outcome.orderActivated) {
+        // P9 (E1/M-05) — transition PROVISIONING → ACTIVE journalisée dans
+        // l'AuditLog (post-commit partagé : proof-gate, TX-B C3 et finalize).
+        await this.recordOrderTransition(orderId, OrderStatus.PROVISIONING, OrderStatus.ACTIVE, 'activation_proof');
         try {
           // Relecture APRÈS commit : les données de l'email viennent de l'Order —
           // Order.domainValue est le fqdn store réel, jamais un champ Order.fqdn.

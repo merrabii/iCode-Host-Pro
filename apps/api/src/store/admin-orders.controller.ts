@@ -150,6 +150,7 @@ export class AdminOrdersController {
     }
     const result = await this.checkout.confirmOrderPaid(id, {
       source: 'admin-transfer',
+      actorId: actor.sub,
       actorEmail: actor.email,
       reference: dto?.reference?.trim() || null,
     });

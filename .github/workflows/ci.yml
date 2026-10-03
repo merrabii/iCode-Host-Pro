@@ -1,0 +1,83 @@
+# CI (GO socle P9 / lot E1) — pipeline exécutant les tests UNITAIRES puis
+# les tests d'intégration e2e contre un PostgreSQL de service isolé.
+#
+# Notes de chantier :
+#  - aucune seed n'est nécessaire : chaque spec crée ses fixtures ;
+#  - MailTransportFactory / PanelTransportFactory sont stubbés dans les specs
+#    (aucun SMTP ni panneau réel) ;
+#  - les timers (sweep commande + renouvellement) sont désactivés ci-dessous :
+#    les specs pilotent les sweeps à la main ;
+#  - PAYMENT_SIMULATOR_ENABLED n'est PAS défini : les specs le pilotent elles-
+#    mêmes (activation/refus) ;
+#  - `next build` n'est PAS exécuté (voir mémoire de chantier) : la validation
+#    TypeScript du web = tsc --noEmit.
+name: CI
+
+on:
+  push:
+    branches: [main, 'feat/**']
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Unit + e2e (Postgres)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: icode
+          POSTGRES_PASSWORD: icode
+          POSTGRES_DB: icode_host_pro_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      DATABASE_URL: postgresql://icode:icode@localhost:5432/icode_host_pro_ci
+      PORT: 3000
+      JWT_SECRET: ci-only-jwt-secret-not-for-production
+      ORDER_SWEEP_ENABLED: 'false'
+      RENEWAL_SWEEP_ENABLED: 'false'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # La version de pnpm est déduite du champ `packageManager` de la racine.
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install (lockfile figé)
+        run: pnpm install --frozen-lockfile
+
+      - name: Prisma generate
+        run: pnpm -C apps/api exec prisma generate
+
+      - name: Migrations (schéma complet)
+        run: pnpm -C apps/api exec prisma migrate deploy
+
+      - name: Typecheck API
+        run: pnpm -C apps/api exec tsc --noEmit -p tsconfig.json
+
+      - name: Typecheck Web
+        run: pnpm -C apps/web exec tsc --noEmit -p tsconfig.json
+
+      - name: Tests unitaires (API)
+        run: pnpm -C apps/api exec jest src --maxWorkers=4
+
+      - name: Tests e2e (API, base CI isolée)
+        run: pnpm -C apps/api exec jest --config ./test/jest-e2e.json --runInBand

@@ -2,6 +2,12 @@
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
+  adminCancelProvisioning,
+  adminFinalizeOrder,
+  adminProvisionOrder,
+  adminResyncLimits,
+  adminTerminateOrder,
+  apiError,
   confirmAdminOrderPayment,
   formatCents,
   getAdminOrder,
@@ -9,6 +15,7 @@ import {
   ORDER_STATUS_LABEL,
   ORDER_STATUS_TONE,
   type AdminOrderListItem,
+  type ApiResult,
   type OrderDetail,
   type OrderListPage,
 } from '@/lib/api';
@@ -35,6 +42,13 @@ type Phase = 'loading' | 'denied' | 'ready';
 const PER_PAGE = 20;
 
 /**
+ * GO P9 (lot E1 / M-06) — une des 5 actions admin sur commande. `needsReason`
+ * impose un motif ≥ 8 caractères (les DTO serveur l'exigent déjà : tracé dans
+ * OrderStatusHistory + AuditLog).
+ */
+type OrderActionDef = { key: string; label: string; hint: string; needsReason: boolean };
+
+/**
  * GO P4 (lot B1) — Commandes (ADMIN) : liste globale paginée + KPI agrégés
  * (compteurs et CA par statut) + détail avec confirmation de règlement
  * (virement rapproché) directement depuis l'UI — l'endpoint existait mais
@@ -52,6 +66,119 @@ export default function ManagerOrdersPage() {
   const [detail, setDetail] = useState<OrderDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [confirming, setConfirming] = useState(false);
+  // P9 (E1) — sélection d'une action admin à motif (annulation/terminaison/
+  // finalisation), le reste s'exécute directement au clic.
+  const [pendingAction, setPendingAction] = useState<OrderActionDef | null>(null);
+  const [actionReason, setActionReason] = useState('');
+  const [actionBusy, setActionBusy] = useState(false);
+
+  /** Les 5 actions admin (M-06) exposées selon l'état réel de la commande. */
+  const actionsFor = (o: OrderDetail): OrderActionDef[] => {
+    const list: OrderActionDef[] = [];
+    if (o.status === 'PAID') {
+      list.push({
+        key: 'provision',
+        label: 'Relancer le provisioning',
+        hint: 'Réessaie l’exécution de la commande payée (idempotent).',
+        needsReason: false,
+      });
+      list.push({
+        key: 'finalize',
+        label: 'Finaliser (C4)',
+        hint: 'Finalisation d’une commande C3 prête : la preuve provider est relue côté serveur.',
+        needsReason: true,
+      });
+    }
+    if (o.status === 'PROVISIONING') {
+      list.push({
+        key: 'force-provision',
+        label: 'Relancer le provisioning (forcé)',
+        hint: 'Rejoue les actions même si un provisioning est déjà en cours.',
+        needsReason: false,
+      });
+      list.push({
+        key: 'cancel-provisioning',
+        label: 'Annuler le provisioning',
+        hint: 'Rollback idempotent d’un provisioning incomplet (facture PAID jamais modifiée).',
+        needsReason: true,
+      });
+      list.push({
+        key: 'finalize',
+        label: 'Finaliser (C4)',
+        hint: 'Reprise d’une fenêtre C4 (preuve provider relue côté serveur).',
+        needsReason: true,
+      });
+    }
+    if (o.status === 'ACTIVE') {
+      list.push({
+        key: 'terminate',
+        label: 'Terminer le service',
+        hint: 'Arrêt idempotent du service actif (facture et projet conservés).',
+        needsReason: true,
+      });
+      if (o.subscription) {
+        list.push({
+          key: 'resync-limits',
+          label: 'Ré-synchroniser les limites',
+          hint: 'Ré-applique les limites du pack courant aux apps déployées (upgrades).',
+          needsReason: false,
+        });
+      }
+    }
+    return list;
+  };
+
+  const runAction = async (a: OrderActionDef) => {
+    if (!detail) return;
+    const reason = actionReason.trim();
+    if (a.needsReason && reason.length < 8) {
+      toast.error('Le motif doit faire au moins 8 caractères.');
+      return;
+    }
+    setActionBusy(true);
+    let res: ApiResult;
+    switch (a.key) {
+      case 'provision':
+        res = await adminProvisionOrder(token, detail.id);
+        break;
+      case 'force-provision':
+        res = await adminProvisionOrder(token, detail.id, true);
+        break;
+      case 'cancel-provisioning':
+        res = await adminCancelProvisioning(token, detail.id, reason);
+        break;
+      case 'terminate':
+        res = await adminTerminateOrder(token, detail.id, reason);
+        break;
+      case 'finalize':
+        res = await adminFinalizeOrder(token, detail.id, reason);
+        break;
+      case 'resync-limits':
+        res = await adminResyncLimits(token, detail.id);
+        break;
+      default:
+        res = { ok: false, status: 0, data: null };
+    }
+    setActionBusy(false);
+    if (!res.ok) {
+      toast.error(apiError(res, `L’action « ${a.label} » a échoué.`));
+      return;
+    }
+    toast.ok(`« ${a.label} » exécutée.`);
+    setPendingAction(null);
+    setActionReason('');
+    await load(token, page, status, q);
+    await openDetail(detail.id);
+  };
+
+  const pickAction = (a: OrderActionDef) => {
+    if (a.needsReason) {
+      setPendingAction(a);
+      setActionReason('');
+      return;
+    }
+    void runAction(a);
+  };
 
   const load = useCallback(
     async (t: string, p: number, st: string, search: string) => {
@@ -345,6 +472,61 @@ export default function ManagerOrdersPage() {
                 </ol>
               )}
             </Panel>
+
+            {actionsFor(detail).length > 0 && (
+              <Panel title="Actions administrateur">
+                <div className="row" style={{ flexWrap: 'wrap', gap: 8 }}>
+                  {actionsFor(detail).map((a) => (
+                    <Button
+                      key={a.key}
+                      size="sm"
+                      variant="secondary"
+                      disabled={actionBusy || pendingAction !== null}
+                      onClick={() => pickAction(a)}
+                    >
+                      {a.label}
+                    </Button>
+                  ))}
+                </div>
+                <p className="muted cell-sub" style={{ marginTop: 8 }}>
+                  {pendingAction
+                    ? pendingAction.hint
+                    : 'Chaque action est tracée (acteur + motif) dans le journal d’audit — serveur faisant foi des gardes d’état.'}
+                </p>
+                {pendingAction && (
+                  <div className="mt">
+                    <Field label={`Motif — ${pendingAction.label}`}>
+                      <Input
+                        value={actionReason}
+                        maxLength={500}
+                        placeholder="Au moins 8 caractères (audit + historique)"
+                        onChange={(e) => setActionReason(e.target.value)}
+                      />
+                    </Field>
+                    <div className="row">
+                      <Button
+                        size="sm"
+                        disabled={actionBusy || actionReason.trim().length < 8}
+                        onClick={() => void runAction(pendingAction)}
+                      >
+                        {actionBusy ? 'Exécution…' : 'Valider'}
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="secondary"
+                        disabled={actionBusy}
+                        onClick={() => {
+                          setPendingAction(null);
+                          setActionReason('');
+                        }}
+                      >
+                        Annuler
+                      </Button>
+                    </div>
+                  </div>
+                )}
+              </Panel>
+            )}
 
             <Panel title="Client & commande">
               <ul style={{ listStyle: 'none', padding: 0, margin: 0, fontSize: 14 }}>

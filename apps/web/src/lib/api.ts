@@ -656,6 +656,73 @@ export const confirmAdminOrderPayment = (
     method: 'POST',
     body: JSON.stringify(body),
   });
+
+// GO P9 (lot E1 / M-06) — les 5 actions admin sur commande : endpoints déjà
+// existants côté API (store-provisioning.admin.controller), désormais
+// atteignables depuis l'UI /manager/commandes.
+export const adminProvisionOrder = (t: string, id: string, force = false) =>
+  apiJson(
+    `/api/store/admin/orders/${encodeURIComponent(id)}/provision${force ? '?force=1' : ''}`,
+    t,
+    { method: 'POST' },
+  );
+export const adminCancelProvisioning = (t: string, id: string, reason: string) =>
+  apiJson(`/api/store/admin/orders/${encodeURIComponent(id)}/cancel-provisioning`, t, {
+    method: 'POST',
+    body: JSON.stringify({ reason }),
+  });
+export const adminTerminateOrder = (t: string, id: string, reason: string) =>
+  apiJson(`/api/store/admin/orders/${encodeURIComponent(id)}/terminate`, t, {
+    method: 'POST',
+    body: JSON.stringify({ reason }),
+  });
+export const adminFinalizeOrder = (t: string, id: string, reason: string) =>
+  apiJson(`/api/store/admin/orders/${encodeURIComponent(id)}/finalize`, t, {
+    method: 'POST',
+    body: JSON.stringify({ reason }),
+  });
+export const adminResyncLimits = (t: string, id: string) =>
+  apiJson(`/api/store/admin/orders/${encodeURIComponent(id)}/resync-limits`, t, {
+    method: 'POST',
+  });
+
+// GO P9 (lot E1 / M-06) — écran « moyens de paiement » : la gestion admin
+// (activation, ordre, config d'affichage, frais) n'avait AUCUNE interface.
+// `configEnc` (secrets carte) n'est jamais exposé : seul `hasConfigEnc`.
+export interface AdminPaymentMethod {
+  id: string;
+  name: string;
+  type: string;
+  isActive: boolean;
+  displayOrder: number;
+  config: Record<string, unknown> | null;
+  hasConfigEnc: boolean;
+  feeType: string;
+  feePercent: string | null;
+  feeFixedCents: number;
+  createdAt: string;
+  updatedAt: string;
+}
+export const listAdminPaymentMethods = (t: string) =>
+  apiJson('/api/store/admin/payment-methods', t) as Promise<
+    ApiResult<AdminPaymentMethod[]>
+  >;
+export const updateAdminPaymentMethod = (
+  t: string,
+  id: string,
+  body: {
+    isActive?: boolean;
+    displayOrder?: number;
+    config?: Record<string, unknown>;
+    feeType?: string;
+    feePercent?: number;
+    feeFixedCents?: number;
+  },
+) =>
+  apiJson(`/api/store/admin/payment-methods/${encodeURIComponent(id)}`, t, {
+    method: 'PATCH',
+    body: JSON.stringify(body),
+  }) as Promise<ApiResult<AdminPaymentMethod>>;
 export const listAdminInvoices = (t: string, query: ListQuery = {}) =>
   apiJson(`/api/store/admin/invoices${listQs(query)}`, t) as Promise<
     ApiResult<InvoiceListPage<AdminInvoiceListItem>>
