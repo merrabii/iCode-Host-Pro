@@ -33,6 +33,7 @@ export const ADMIN_NAV: NavSection[] = [
       { label: 'Utilisateurs', href: '/manager/utilisateurs', icon: IconUsers },
       { label: 'Commandes', href: '/manager/commandes', icon: IconBox },
       { label: 'Factures', href: '/manager/factures', icon: IconFileText },
+      { label: 'Taux de taxe', href: '/manager/taxe', icon: IconChartBar },
       { label: 'Souscriptions & services', href: '/manager/subscriptions', icon: IconBoxes },
       { label: 'Invitations', href: '/manager/invitations', icon: IconMail },
       { label: 'Configuration mail', href: '/manager/mail', icon: IconMail },

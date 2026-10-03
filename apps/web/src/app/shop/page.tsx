@@ -6,25 +6,27 @@ import { StoreShell } from '@/components/store-shell';
 import { useBrand } from '@/components/brand-provider';
 import { IconCheck, IconChevronRight, IconSearch } from '@/components/icons';
 import {
+  activePriceCents,
   apiError,
   billingCycleLabel,
   formatCents,
   listPublicProducts,
+  promoActive,
   type PublicProduct,
 } from '@/lib/api';
 
-/** Prix de la carte : promo barrée si présente, sinon prix HT, sinon "Sur devis". */
+/** Prix de la carte : prix ACTIF en grand (promo facturée, §6-2a) + prix
+ *  catalogue barré quand la promo est active ; sinon prix HT ; sinon "Sur devis". */
 function PriceTag({ p }: { p: PublicProduct }) {
-  const hasPromo =
-    p.promoPriceHtCents != null && p.priceHtCents != null && p.promoPriceHtCents < p.priceHtCents;
+  const hasPromo = promoActive(p);
   if (!p.priceHtCents && !p.promoPriceHtCents) return <span className="muted" style={{ fontSize: 13 }}>Sur devis</span>;
   return (
     <div className="store-price">
-      <span className="store-price-num">{formatCents(p.priceHtCents)}</span>
+      <span className="store-price-num">{formatCents(activePriceCents(p))}</span>
       <span className="store-price-meta">
         {billingCycleLabel(p.billingCycle)}
-        {hasPromo && p.promoPriceHtCents != null && (
-          <><s className="store-price-old">{formatCents(p.promoPriceHtCents)}</s></>
+        {hasPromo && p.priceHtCents != null && (
+          <><s className="store-price-old">{formatCents(p.priceHtCents)}</s></>
         )}
       </span>
     </div>

@@ -644,6 +644,115 @@ export const listAdminCustomers = (t: string, query: ListQuery = {}) =>
     ApiResult<CustomerListPage>
   >;
 
+// ── GO P5 (lot B2) — cohérence tarifaire : règle promo unique + devis + taux ─
+/**
+ * Règle promo unique côté client — MIROIR exact de `CheckoutService.activeBasePrice`
+ * (décision §6-2a, GO P5) : le prix actif est le prix promo quand il existe et
+ * est strictement inférieur au prix catalogue, sinon le prix catalogue.
+ * Prix affiché = prix débité (le serveur recalcule de toute façon à chaque appel).
+ */
+export function activePriceCents(p: {
+  priceHtCents?: number | null;
+  promoPriceHtCents?: number | null;
+}): number {
+  const list = p.priceHtCents ?? 0;
+  const promo = p.promoPriceHtCents;
+  if (promo !== null && promo !== undefined && promo >= 0 && promo < list) {
+    return promo;
+  }
+  return list;
+}
+
+/** Une promo est-elle active pour ce produit ? (prix catalogue à barrer) */
+export function promoActive(p: {
+  priceHtCents?: number | null;
+  promoPriceHtCents?: number | null;
+}): boolean {
+  return activePriceCents(p) !== (p.priceHtCents ?? 0);
+}
+
+export interface QuoteLine {
+  kind: string;
+  label: string;
+  unitPriceHtCents: number;
+  taxRatePercent: number;
+  taxAmountCents: number;
+  totalTtcCents: number;
+}
+export interface QuoteResult {
+  lines: QuoteLine[];
+  amountHtCents: number;
+  taxAmountCents: number;
+  amountTtcCents: number;
+  taxRatePercent: number;
+  product: {
+    name: string;
+    priceHtCents: number;
+    promoPriceHtCents: number | null;
+    activePriceHtCents: number;
+  };
+}
+
+/** Devis public (POST /store/quote) — re-fetch des prix du panier : mêmes
+ *  lignes/totaux que la commande, aucun montant reçu du client. */
+export async function quoteCart(body: {
+  productSlug: string;
+  options?: { optionId: string; choiceId: string }[];
+  addonIds?: string[];
+}): Promise<ApiResult<QuoteResult>> {
+  try {
+    const res = await fetch('/api/store/quote', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    let data: QuoteResult | null = null;
+    try {
+      data = (await res.json()) as QuoteResult;
+    } catch {
+      /* non-JSON */
+    }
+    return { ok: res.ok, status: res.status, data };
+  } catch {
+    return { ok: false, status: 0, data: null };
+  }
+}
+
+/** Taux de taxe (ADMIN, page /manager/taxe) — `ratePercent` arrivant en string
+ *  (Decimal Prisma) : parsez avec `Number(r.ratePercent)` côté UI. */
+export interface TaxRateItem {
+  id: string;
+  name: string;
+  ratePercent: string | number;
+  isDefault: boolean;
+  createdAt?: string;
+  updatedAt?: string;
+  _count?: { products: number };
+}
+export const listTaxRates = (t: string) =>
+  apiJson('/api/store/admin/tax-rates', t) as Promise<ApiResult<TaxRateItem[]>>;
+export const createTaxRate = (
+  t: string,
+  body: { name: string; ratePercent: number; isDefault?: boolean },
+) =>
+  apiJson('/api/store/admin/tax-rates', t, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  }) as Promise<ApiResult<TaxRateItem>>;
+export const updateTaxRate = (
+  t: string,
+  id: string,
+  body: { name?: string; ratePercent?: number; isDefault?: boolean },
+) =>
+  apiJson(`/api/store/admin/tax-rates/${encodeURIComponent(id)}`, t, {
+    method: 'PATCH',
+    body: JSON.stringify(body),
+  }) as Promise<ApiResult<TaxRateItem>>;
+export const deleteTaxRate = (t: string, id: string) =>
+  apiJson(`/api/store/admin/tax-rates/${encodeURIComponent(id)}`, t, {
+    method: 'DELETE',
+  });
+
 // ── Phase 6 (ADR-022) — mail settings + invitation emails ────────────────────
 /** Masked view of the SMTP settings — the stored password is NEVER exposed. */
 export interface MailSettings {

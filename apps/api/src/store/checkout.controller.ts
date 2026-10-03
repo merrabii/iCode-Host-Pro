@@ -17,7 +17,7 @@ import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import type { Response } from 'express';
 import { IsIn } from 'class-validator';
 import { CheckoutService, CheckoutResult } from './checkout.service';
-import { CheckoutDto } from './dto/checkout.dto';
+import { CheckoutDto, QuoteDto } from './dto/checkout.dto';
 import { OptionalJwtAuthGuard } from '../auth/guards/optional-jwt-auth.guard';
 import { AuthedRequest } from '../auth/guards/jwt-auth.guard';
 import { PrismaService } from '../prisma/prisma.service';
@@ -48,6 +48,15 @@ export class CheckoutController {
     private readonly limiter: SaRateLimiter,
     private readonly settings: SecuritySettingsService,
   ) {}
+
+  @Post('quote')
+  @ApiOperation({
+    summary:
+      'Devis — re-fetch des prix du panier côté serveur (B2) : mêmes lignes/totaux que la commande, aucune écriture',
+  })
+  async quote(@Body() dto: QuoteDto) {
+    return this.checkout.quote(dto);
+  }
 
   @Post('checkout')
   @UseGuards(OptionalJwtAuthGuard)

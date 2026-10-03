@@ -19,6 +19,7 @@ import {
   IconShield,
 } from '@/components/icons';
 import {
+  activePriceCents,
   apiError,
   billingCycleLabel,
   checkStoreSubdomain,
@@ -26,6 +27,7 @@ import {
   formatCents,
   getPublicProduct,
   getSessionToken,
+  promoActive,
   type Me,
   type PublicProduct,
 } from '@/lib/api';
@@ -504,7 +506,9 @@ function PurchasePanel({
     return acc;
   }, [product, addons]);
 
-  const base = product.priceHtCents ?? 0;
+  // Prix actif (règle promo unique §6-2a, GO P5) : miroir exact du serveur.
+  const base = activePriceCents(product);
+  const baseStruck = promoActive(product) ? (product.priceHtCents ?? null) : null;
   const total = base + optionsHt + addonsHt;
 
   /** "Continuer" → mémorise la config (dont le sous-domaine) dans le panier puis /cart. */
@@ -573,7 +577,15 @@ function PurchasePanel({
         <h3>{product.name}</h3>
         <p className="muted" style={{ fontSize: 12.5 }}>{billingCycleLabel(product.billingCycle)}</p>
         <ul className="store-totals">
-          <li><span>Souscription</span><span>{formatCents(base)}</span></li>
+          <li>
+            <span>Souscription</span>
+            <span>
+              {baseStruck != null && (
+                <s className="store-price-old" style={{ marginRight: 6 }}>{formatCents(baseStruck)}</s>
+              )}
+              {formatCents(base)}
+            </span>
+          </li>
           {isFree && <li><span>À la souscription</span><span>{formatCents(0)}</span></li>}
           {optionsHt !== 0 && <li><span>Options</span><span>+{formatCents(optionsHt)}</span></li>}
           {addonsHt !== 0 && <li><span>Suppléments</span><span>+{formatCents(addonsHt)}</span></li>}

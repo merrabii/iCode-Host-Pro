@@ -27,6 +27,7 @@ import { ReconcileSettingsService } from './reconcile-settings.service';
 import { CoolifyEvidenceConnector } from './evidence-connectors/coolify-evidence.connector';
 import { StoreProvisioningAdminController } from './store-provisioning.admin.controller';
 import { StoreSubdomainController } from './store-subdomain.controller';
+import { TaxRatesAdminController } from './tax-rates.admin.controller';
 
 /**
  * Bloc C/D — module store (tunnel d'achat sans compte, paiement simulé, provisioning).
@@ -49,6 +50,7 @@ import { StoreSubdomainController } from './store-subdomain.controller';
     CheckoutController,
     StoreProvisioningAdminController,
     StoreSubdomainController,
+    TaxRatesAdminController,
     ReconcileSettingAdminController,
   ],
   providers: [

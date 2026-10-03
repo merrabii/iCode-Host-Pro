@@ -1119,3 +1119,12 @@ npx prisma migrate deploy          -- base icode_host_pro_socle (49e migration :
 --   Base inchangée (49e migration P3).
 -- Recette e2e sur base icode_host_pro_socle :
 --   npx jest --config ./test/jest-e2e.json visibility-lists --runInBand  (15/15)
+--
+-- Lot P5 (GO socle, audit B2 -> coherence tarifaire) : AUCUNE migration.
+--   100 % code : regle promo unique (prix actif facture), devis public
+--   POST /api/store/quote (meme buildPricing que la commande), CRUD taux
+--   /api/store/admin/tax-rates (ADMIN) + page /manager/taxe.
+--   Base inchangee (49e migration P3).
+-- Recette e2e sur base icode_host_pro_socle :
+--   npx jest --config ./test/jest-e2e.json pricing-consistency --runInBand  (12/12)
+--   unit : npx jest src/store/checkout-pricing.spec.ts  (21/21)

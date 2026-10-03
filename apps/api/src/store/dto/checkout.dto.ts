@@ -109,3 +109,30 @@ export class PaymentMethodPublicView {
   type!: string;
   config?: Record<string, unknown> | null;
 }
+
+/**
+ * Corps du devis / re-fetch des prix du panier (GO P5, lot B2) : la config
+ * d’achat du checkout SANS coordonnées ni moyen de paiement — aucun montant
+ * n’est jamais reçu du client (tout est recalculé serveur, même `buildPricing`
+ * que la commande).
+ */
+export class QuoteDto {
+  @ApiProperty({ description: 'slug du produit (ex "managed-wp")' })
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(120)
+  productSlug!: string;
+
+  @ApiPropertyOptional({ type: [CheckoutOptionDto] })
+  @IsOptional()
+  @IsArray()
+  @ValidateNested({ each: true })
+  @Type(() => CheckoutOptionDto)
+  options?: CheckoutOptionDto[];
+
+  @ApiPropertyOptional({ type: [String], description: 'ids des add-ons sélectionnés' })
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  addonIds?: string[];
+}

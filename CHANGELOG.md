@@ -1,5 +1,20 @@
 # CHANGELOG
 
+## 2026-10-03 — **GO socle commercial — P5 (cohérence tarifaire : prix promo facturé + devis re-fetch + page taux, audit B2)** (branche `feat/socle-commercial`, checkpoints locaux, aucun push)
+### Lot B2 — tarifs (audit §5, décisions owner §6-2a + §6-6)
+- **Aucune migration** : lot 100 % code, base `icode_host_pro_socle` inchangée (49e migration P3).
+- **Règle promo unique (§6-2a, prix affiché = prix débité)** : `CheckoutService.activeBasePrice` — le prix actif = promo si elle existe et est **strictement inférieure** au prix catalogue, sinon le catalogue ; **promo ≥ catalogue ignorée** (jamais de prix facturé supérieur), promo 0 valide, négative ignorée. `buildPricing` n'utilise plus `priceHtCents` brut.
+- **Devis public `POST /store/quote`** (`QuoteDto` = slug + options + addons, **aucun montant reçu**) : réutilise **exactement** `buildPricing` (mêmes lignes/totaux que la commande) et renvoie `product{priceHtCents, promoPriceHtCents, activePriceHtCents}` ; sans auth, sans rate-limit (lecture pure), option requise manquante → 400, slug inconnu → 404. Export `InvoiceLineInput` (fix TS4053).
+- **CRUD taux de taxe (§6-6, page dédiée)** : nouveau `TaxRatesAdminController` (`GET/POST/PATCH/DELETE store/admin/tax-rates`, `JwtAuthGuard + RolesGuard + @Roles(ADMIN)`) + `tax-rate.dto.ts` (`ratePercent` 0..100 `@Type(Number)`) : nom unique → 409, **un seul `isDefault`** (bascule en transaction), suppression → **409 si produit rattaché** (404 inconnu), audit `taxrate.create/update/delete`.
+- **Web** : `activePriceCents`/`promoActive` (miroir client de la règle) + helpers `quoteCart`, `listTaxRates/createTaxRate/updateTaxRate/deleteTaxRate` dans `api.ts` ; `PriceTag` boutique et carte accueil affichent le **prix actif en grand + prix catalogue barré** (l'inverse auparavant : prix plein en grand, promo barrée) ; fiche produit `base = prix actif` + catalogue barré dans le récap ; panier **re-fetch `POST /store/quote` à chaque changement** (souscription/Taxe/Total depuis le devis serveur, repli local silencieux), `cartHtCents` sur prix actif ; page **`/manager/taxe`** (CRUD complet, badge « Par défaut », compte de produits liés) + entrée **« Taux de taxe »** dans `ADMIN_NAV`.
+
+### Tests P5
+- **Nouveau** `src/store/checkout-pricing.spec.ts` : **21/21 PASS** — règle promo (9 cas : strictement inférieur, égal, supérieur, 0, null/undefined, catalogue absent, négatif) + `buildPricing` (prix actif en ligne, sommes strictes, **arrondi PAR LIGNE 19,6 % : 130 ≠ 131 global**, installation jamais taxée, taux par défaut 0, 4 rejets BadRequest) + `quote() === buildPricing`.
+- **Nouveau** `test/pricing-consistency.e2e-spec.ts` : **12/12 PASS** — A devis public (promo facturée + lignes/total stricts, **0 écart devis ↔ commande persistée**, promo = catalogue ignorée, arrondi ligne 130 ≠ 131, option requise 400, slug inconnu 404, taux 5,5 % appliqué puis retiré) ; B CRUD (RBAC 401/403/200, doublon 409, hors bornes 400, **un seul isDefault** + restauration, suppression rattachée 409, libre OK, 404 inconnu).
+- **Smoke de non-régression** : `store-payment-confirmation` (25) + `account-recovery` (16) + `rbac-deployment-modules` (7) + `visibility-lists` (15) = **63/63 PASS**.
+- **Unit API complet : 1036/1036 PASS (57 suites)** ; `tsc --noEmit` API **et** Web PASS.
+- **Lint** : `eslint` toujours absent du workspace (préexistant, non bloquant).
+
 ## 2026-10-02 — **GO socle commercial — P4 (visibilité : mes commandes / mes factures + listes admin, audit B1)** (branche `feat/socle-commercial`, checkpoints locaux, aucun push)
 ### Lot B1 — vues client + listes d'exploitation (audit §1.1, §5, E-03/E-07)
 - **Aucune migration** : lot 100 % code (lectures + UI), base `icode_host_pro_socle` inchangée (49e migration P3).

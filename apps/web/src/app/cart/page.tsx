@@ -8,7 +8,17 @@ import { useCart } from '@/components/cart-provider';
 import { useToast } from '@/components/toast';
 import { Field, Input } from '@/components/ui';
 import { IconChevronLeft, IconChevronRight, IconMail, IconShield } from '@/components/icons';
-import { billingCycleLabel, fetchMe, formatCents, getSessionToken, type Me } from '@/lib/api';
+import {
+  activePriceCents,
+  billingCycleLabel,
+  fetchMe,
+  formatCents,
+  getSessionToken,
+  promoActive,
+  quoteCart,
+  type Me,
+  type QuoteResult,
+} from '@/lib/api';
 import { buyerStorage } from '@/lib/cart';
 
 type FieldDef = {
@@ -39,6 +49,31 @@ function CartView() {
 
   const [values, setValues] = useState<Record<string, string>>({});
   const [errors, setErrors] = useState<Record<string, string>>({});
+
+  // GO P5 (§6-2a) — devis public re-fetché à chaque changement du panier :
+  // totaux affichés = totaux facturés (0 écart), prix actif promo compris.
+  // Repli local silencieux si le devis échoue (option requise absente, …).
+  const [quote, setQuote] = useState<QuoteResult | null>(null);
+  useEffect(() => {
+    const slug = item?.product.slug;
+    if (!ready || !slug) {
+      setQuote(null);
+      return;
+    }
+    let cancelled = false;
+    const options = Object.entries(item.options ?? {}).map(([optionId, c]) => ({
+      optionId,
+      choiceId: c.id,
+    }));
+    const addonIds = Object.keys(item.addons ?? {});
+    void (async () => {
+      const res = await quoteCart({ productSlug: slug, options, addonIds });
+      if (!cancelled) setQuote(res.ok && res.data ? res.data : null);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [ready, item]);
 
   // Point 6 — membre connecté : choix du détail de facturation.
   //   'account' (défaut) = utiliser les coordonnées du compte ;
@@ -96,16 +131,24 @@ function CartView() {
 
   const subtotal = useMemo(() => {
     if (!item) return 0;
-    let acc = item.product.priceHtCents ?? 0;
+    let acc = activePriceCents(item.product);
     for (const o of Object.values(item.options ?? {})) acc += o.priceDeltaHtCents;
     for (const a of Object.values(item.addons ?? {})) acc += a.priceHtCents;
     return acc;
   }, [item]);
 
   const installation = item?.product.installationFeeCents ?? 0;
-  const taxRate = item?.product.taxRatePercent ?? 0; // %
-  const tax = Math.round((subtotal * taxRate) / 100);
-  const total = subtotal + installation + tax;
+  // Totaux autoritatifs depuis le devis serveur (lignes + taxe + TTC) ;
+  // repli local identique à l'ancien calcul si le devis n'est pas disponible.
+  const taxRate = quote ? Number(quote.taxRatePercent) : item?.product.taxRatePercent ?? 0; // %
+  const tax = quote ? quote.taxAmountCents : Math.round((subtotal * taxRate) / 100);
+  const total = quote ? quote.amountTtcCents : subtotal + installation + tax;
+  const subDisplay = quote
+    ? (quote.lines.find((l) => l.kind === 'PRODUCT')?.unitPriceHtCents ?? 0)
+    : activePriceCents(item?.product ?? {});
+  const installationDisplay = quote
+    ? (quote.lines.find((l) => l.kind === 'ADJUSTMENT')?.unitPriceHtCents ?? installation)
+    : installation;
 
   const allowEdit = item?.product.allowEditConfig ?? true;
 
@@ -296,7 +339,17 @@ function CartView() {
             )}
 
             <ul className="store-totals">
-              <li><span>Souscription</span><span>{formatCents(item.product.priceHtCents)}</span></li>
+              <li>
+                <span>Souscription</span>
+                <span>
+                  {promoActive(item.product) && item.product.priceHtCents != null && (
+                    <s className="store-price-old" style={{ marginRight: 6 }}>
+                      {formatCents(item.product.priceHtCents)}
+                    </s>
+                  )}
+                  {formatCents(subDisplay)}
+                </span>
+              </li>
             </ul>
 
             {optionsList.length > 0 && (
@@ -330,7 +383,7 @@ function CartView() {
             <ul className="store-totals" style={{ marginTop: 6 }}>
               <li>
                 <span>Prix d'installation</span>
-                <span>{formatCents(installation)}</span>
+                <span>{formatCents(installationDisplay)}</span>
               </li>
               <li>
                 <span>Taxe {taxRate > 0 ? `(${taxRate} %)` : ''}</span>

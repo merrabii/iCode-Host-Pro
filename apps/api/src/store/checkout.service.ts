@@ -29,7 +29,7 @@ import { isPaymentSimulatorEnabled } from '../config/payment-simulator';
 import { regexFromRejectPattern } from './subdomain.util';
 import { clientAreaUrl, loginUrl } from './web-links';
 import { ProductsService, PublicProduct } from '../products/products.service';
-import { CheckoutDto } from './dto/checkout.dto';
+import { CheckoutDto, QuoteDto } from './dto/checkout.dto';
 import { ProvisioningService } from './provisioning.service';
 import { isHostingC3Enabled } from '../hosting/c3-flag';
 import { C3CapabilityService } from '../hosting/c3-capability.service';
@@ -99,7 +99,7 @@ export interface ConfirmPaidResult {
 }
 
 /** Ligne de facture construite côté serveur (d'où dérivent les totaux). */
-interface InvoiceLineInput {
+export interface InvoiceLineInput {
   kind: InvoiceLineKind;
   label: string;
   unitPriceHtCents: number;
@@ -1002,13 +1002,75 @@ export class CheckoutService {
   }
 
   /**
+   * Prix actif d'un produit — RÈGLE PROMO UNIQUE (décision §6-2a, GO P5) :
+   * la promo n'est facturée QUE si elle existe, est ≥ 0 et strictement
+   * inférieure au prix catalogue ; sinon prix catalogue. Une seule source de
+   * vérité, partagée par le devis, le checkout, l'Order et l'Invoice.
+   */
+  private static activeBasePrice(
+    product: Pick<PublicProduct, 'priceHtCents' | 'promoPriceHtCents'>,
+  ): number {
+    const listPrice = product.priceHtCents ?? 0;
+    const promo = product.promoPriceHtCents;
+    if (
+      promo !== null &&
+      promo !== undefined &&
+      promo >= 0 &&
+      promo < listPrice
+    ) {
+      return promo;
+    }
+    return listPrice;
+  }
+
+  /**
+   * POST /store/quote — re-fetch des prix du panier (B2) : recharge la
+   * configuration vendable et recalcule EXACTEMENT les mêmes lignes/totaux que
+   * le checkout (mème `buildPricing`), sans aucune écriture et sans jamais
+   * recevoir de montant du client. C'est la référence affichée au panier :
+   * prix affiché = prix débité, zéro écart client/serveur.
+   */
+  async quote(dto: QuoteDto): Promise<{
+    lines: InvoiceLineInput[];
+    amountHtCents: number;
+    taxAmountCents: number;
+    amountTtcCents: number;
+    taxRatePercent: number;
+    product: {
+      name: string;
+      priceHtCents: number;
+      promoPriceHtCents: number | null;
+      activePriceHtCents: number;
+    };
+  }> {
+    const product = await this.products.findPublicBySlug(dto.productSlug);
+    const pricing = this.buildPricing(product, dto);
+    return {
+      ...pricing,
+      product: {
+        name: product.name,
+        priceHtCents: product.priceHtCents ?? 0,
+        promoPriceHtCents: product.promoPriceHtCents ?? null,
+        activePriceHtCents: CheckoutService.activeBasePrice(product),
+      },
+    };
+  }
+
+  /**
    * Construit les lignes de facture + les totaux (HT / taxe / TTC). La taxe est
-   * arrondie PAR LIGNE (produit, options, suppléments) ; le prix d'installation
-   * n'est jamais taxé. Order et Invoice dérivent des mêmes totaux (cohérence).
+   * arrondie PAR LIGNE (produit, options, suppléments) — arrondi serveur
+   * UNIQUE (B2) ; le prix d'installation n'est jamais taxé. Order et Invoice
+   * dérivent des mêmes totaux (cohérence), et le devis `quote()` utilise
+   * EXACTEMENT cette fonction : prix affiché = prix débité, zéro écart client.
+   *
+   * Règle promo (décision §6-2a, GO P5) : le prix actif du produit est le prix
+   * promo quand celui-ci existe et est strictement inférieur au prix catalogue
+   * (un promo ≥ catalogue est ignoré — jamais de prix facturé supérieur au
+   * prix affiché).
    */
   private buildPricing(
     product: PublicProduct,
-    dto: CheckoutDto,
+    dto: Pick<CheckoutDto, 'options' | 'addonIds'>,
   ): {
     lines: InvoiceLineInput[];
     amountHtCents: number;
@@ -1023,7 +1085,7 @@ export class CheckoutService {
 
     const lines: InvoiceLineInput[] = [];
 
-    const base = product.priceHtCents ?? 0;
+    const base = CheckoutService.activeBasePrice(product);
     lines.push({
       kind: InvoiceLineKind.PRODUCT,
       label: product.name,

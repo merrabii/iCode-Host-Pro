@@ -1,5 +1,7 @@
 'use client';
 
+import { activePriceCents } from '@/lib/api';
+
 /**
  * Panier — 100 % navigateur (localStorage), aucune persistance serveur avant
  * paiement validé (§10, choix owner : « si paiement annulé, aucune donnée
@@ -73,11 +75,12 @@ export const cartStorage = {
   clear: () => safeWrite(null),
 };
 
-/** Prix HT total du panier : produit + options + suppléments (le taux de taxe
+/** Prix HT total du panier : produit (prix ACTIF — règle promo unique §6-2a,
+ *  miroir de `buildPricing`, GO P5) + options + suppléments (le taux de taxe
  *  est recalculé côté serveur au paiement — pas besoin ici). */
 export function cartHtCents(item: CartItem | null): number {
   if (!item) return 0;
-  const base = item.product.priceHtCents ?? 0;
+  const base = activePriceCents(item.product);
   const opts = Object.values(item.options ?? {}).reduce((a, o) => a + o.priceDeltaHtCents, 0);
   const addons = Object.values(item.addons ?? {}).reduce((a, ad) => a + ad.priceHtCents, 0);
   return base + opts + addons;

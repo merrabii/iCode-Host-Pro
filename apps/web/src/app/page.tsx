@@ -14,10 +14,12 @@ import {
   IconShield,
 } from '@/components/icons';
 import {
+  activePriceCents,
   apiError,
   billingCycleLabel,
   formatCents,
   listPublicProducts,
+  promoActive,
   type PublicProduct,
 } from '@/lib/api';
 
@@ -101,25 +103,32 @@ const FAQ = [
 ] as const;
 
 type PriceState =
-  | { kind: 'amount'; cents: number }
+  | { kind: 'amount'; cents: number; struck?: number | null }
   | { kind: 'zero' }
   | { kind: 'absent' };
 
 /**
- * Prix affiché sur l'accueil : UNIQUEMENT `priceHtCents`, le prix actuellement
- * facturé (fiche `/shop/[slug]` et checkout API : `base = priceHtCents ?? 0`).
- * `promoPriceHtCents` n'est pas affiché ici, même barré : l'incohérence promo
- * entre administration, boutique et facturation est documentée séparément et
- * non reproduite sur cette page (rapport recette §10).
+ * Prix affiché sur l'accueil : le prix ACTUELLEMENT facturé — règle promo
+ * unique §6-2a (GO P5, `activePriceCents` : promo si active, sinon prix
+ * catalogue), le miroir exact de `buildPricing` serveur : prix affiché =
+ * prix débité. Quand la promo est active, le prix catalogue est barré à côté.
  * Trois états explicites — jamais un test de vérité/faux des nombres :
  * positif → montant + cycle ; zéro → montant zéro + cycle ; absent → « Tarif
  * à consulter » (la carte est elle-même le lien vers la fiche produit).
  */
 function priceState(p: PublicProduct): PriceState {
   const price = p.priceHtCents;
-  if (price === null || price === undefined) return { kind: 'absent' };
-  if (price === 0) return { kind: 'zero' };
-  return { kind: 'amount', cents: price };
+  const promo = p.promoPriceHtCents;
+  if ((price === null || price === undefined) && (promo === null || promo === undefined)) {
+    return { kind: 'absent' };
+  }
+  const active = activePriceCents(p);
+  if (active === 0) return { kind: 'zero' };
+  return {
+    kind: 'amount',
+    cents: active,
+    struck: promoActive(p) ? (p.priceHtCents ?? null) : null,
+  };
 }
 
 /** Carte offre — prix et cycle lus sur le catalogue public (mêmes helpers que /shop). */
@@ -156,7 +165,12 @@ function OfferCard({ p }: { p: PublicProduct }) {
         ) : (
           <div className="store-price">
             <span className="store-price-num">{formatCents(price.kind === 'zero' ? 0 : price.cents)}</span>
-            <span className="store-price-meta">{billingCycleLabel(p.billingCycle)}</span>
+            <span className="store-price-meta">
+              {billingCycleLabel(p.billingCycle)}
+              {price.kind === 'amount' && price.struck != null && (
+                <s className="store-price-old">{formatCents(price.struck)}</s>
+              )}
+            </span>
           </div>
         )}
         <span className="store-card-view">
