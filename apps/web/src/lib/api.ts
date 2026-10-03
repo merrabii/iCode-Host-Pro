@@ -595,6 +595,29 @@ export const INVOICE_STATUS_TONE: Record<
   CREDITED: 'blue',
 };
 
+// ═══ GO P6 (lot C2 + C3a) — libellés portefeuille ═══════════════════════════
+export const WALLET_STATUS_LABEL: Record<string, string> = {
+  PENDING: 'En attente',
+  SUCCEEDED: 'Créditée',
+  FAILED: 'Échec',
+  CANCELED: 'Rejetée',
+};
+export const WALLET_STATUS_TONE: Record<
+  string,
+  'green' | 'amber' | 'red' | 'neutral'
+> = {
+  PENDING: 'amber',
+  SUCCEEDED: 'green',
+  FAILED: 'red',
+  CANCELED: 'red',
+};
+export const WALLET_TYPE_LABEL: Record<string, string> = {
+  CREDIT: 'Recharge',
+  DEBIT: 'Débit',
+  REFUND: 'Remboursement',
+  ADJUSTMENT: 'Ajustement',
+};
+
 // Client — isolation portée par l'API (filtre propriétaire + 404 au détail).
 export const listMyOrders = (t: string, query: ListQuery = {}) =>
   apiJson(`/api/client/orders${listQs(query)}`, t) as Promise<
@@ -2336,5 +2359,149 @@ export async function uploadBrandLogo(token: string, file: File): Promise<ApiRes
   if (first.status !== 401) return first;
   const fresh = await getAccessToken();
   if (fresh && fresh !== token) return doUpload(fresh);
+  return first;
+}
+
+// ═══ GO P6 (lots C2 + C3a) — Portefeuille & recharge par virement ═══════════
+export interface WalletBalance {
+  customerEmail: string;
+  balanceCents: number;
+  currency: string;
+}
+export type WalletTxStatus = 'PENDING' | 'SUCCEEDED' | 'FAILED' | 'CANCELED';
+export type WalletTxType = 'CREDIT' | 'DEBIT' | 'REFUND' | 'ADJUSTMENT';
+export interface WalletTxItem {
+  id: string;
+  type: WalletTxType;
+  status: WalletTxStatus;
+  amountCents: number;
+  reference: string | null;
+  note: string | null;
+  methodName: string | null;
+  proofFileName: string | null;
+  orderId: string | null;
+  invoiceId: string | null;
+  createdAt: string;
+  processedAt: string | null;
+}
+export interface WalletTxPage {
+  items: WalletTxItem[];
+  total: number;
+  page: number;
+  perPage: number;
+}
+export interface RechargeItem {
+  id: string;
+  type: WalletTxType;
+  amountCents: number;
+  currency: string;
+  status: WalletTxStatus;
+  reference: string;
+  methodName: string | null;
+  proofFileName: string | null;
+  note: string | null;
+  adminActorEmail: string | null;
+  createdAt: string;
+  processedAt: string | null;
+  customer: {
+    id: string;
+    email: string;
+    name: string | null;
+    walletBalanceCents: number;
+  };
+}
+export interface RechargePage {
+  items: RechargeItem[];
+  total: number;
+  page: number;
+  perPage: number;
+}
+export const getMyWallet = (t: string) =>
+  apiJson('/api/client/wallet', t) as Promise<ApiResult<WalletBalance>>;
+export const listMyWalletTransactions = (t: string, page = 1, perPage = 20) =>
+  apiJson(
+    `/api/client/wallet/transactions?page=${page}&perPage=${perPage}`,
+    t,
+  ) as Promise<ApiResult<WalletTxPage>>;
+/**
+ * Dépôt d'une recharge par virement (multipart : `amountCents`, `note?`,
+ * justificatif `proof` PNG/JPEG/WebP/PDF ≤ 5 Mo OBLIGATOIRE). La ligne revient
+ * `PENDING` : AUCUN crédit avant validation admin.
+ */
+export async function createWalletRecharge(
+  token: string,
+  input: { amountCents: number; note?: string; proof: File },
+): Promise<ApiResult<RechargeItem>> {
+  const doUpload = async (tok: string): Promise<ApiResult<RechargeItem>> => {
+    const fd = new FormData();
+    fd.append('amountCents', String(input.amountCents));
+    if (input.note) fd.append('note', input.note);
+    fd.append('proof', input.proof);
+    const res = await fetch('/api/client/wallet/recharges', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${tok}` },
+      body: fd,
+    });
+    let data: RechargeItem | null = null;
+    try {
+      data = (await res.json()) as RechargeItem;
+    } catch {
+      /* non-JSON body */
+    }
+    return { ok: res.ok, status: res.status, data };
+  };
+  const first = await doUpload(token);
+  if (first.status !== 401) return first;
+  const fresh = await getAccessToken();
+  if (fresh && fresh !== token) return doUpload(fresh);
+  return first;
+}
+export const listAdminRecharges = (
+  t: string,
+  query: { page?: number; perPage?: number; status?: WalletTxStatus; q?: string } = {},
+) => {
+  const qs = new URLSearchParams();
+  if (query.page) qs.set('page', String(query.page));
+  if (query.perPage) qs.set('perPage', String(query.perPage));
+  if (query.status) qs.set('status', query.status);
+  if (query.q) qs.set('q', query.q);
+  const suffix = qs.toString();
+  return apiJson(
+    `/api/store/admin/wallet/recharges${suffix ? `?${suffix}` : ''}`,
+    t,
+  ) as Promise<ApiResult<RechargePage>>;
+};
+export const validateAdminRecharge = (t: string, id: string) =>
+  apiJson(
+    `/api/store/admin/wallet/recharges/${encodeURIComponent(id)}/validate`,
+    t,
+    { method: 'POST' },
+  ) as Promise<ApiResult<{ ok: boolean; balanceCents: number; replayed?: boolean }>>;
+export const rejectAdminRecharge = (t: string, id: string, reason?: string) =>
+  apiJson(
+    `/api/store/admin/wallet/recharges/${encodeURIComponent(id)}/reject`,
+    t,
+    { method: 'POST', body: JSON.stringify({ reason }) },
+  ) as Promise<ApiResult<{ ok: boolean }>>;
+/**
+ * Justificatif d'une recharge (ADMIN, flux binaire) — réessaie une fois après
+ * rotation du jeton (401). Retourne le blob à ouvrir dans un onglet (inline).
+ */
+export async function fetchRechargeProofBlob(
+  token: string,
+  id: string,
+): Promise<{ ok: boolean; blob: Blob | null }> {
+  const doGet = async (tok: string): Promise<{ ok: boolean; blob: Blob | null }> => {
+    const res = await fetch(
+      `/api/store/admin/wallet/recharges/${encodeURIComponent(id)}/proof`,
+      { headers: { Authorization: `Bearer ${tok}` } },
+    );
+    if (!res.ok) return { ok: false, blob: null };
+    return { ok: true, blob: await res.blob() };
+  };
+  const first = await doGet(token);
+  if (first.ok) return first;
+  const fresh = await getAccessToken();
+  if (fresh && fresh !== token) return doGet(fresh);
   return first;
 }

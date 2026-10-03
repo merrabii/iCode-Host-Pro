@@ -297,3 +297,11 @@ export const IconCart = ({ size = 16, className }: IconProps) => (
     <path d="M2.05 2.05h2l2.66 12.42a2 2 0 0 0 2 1.58h9.78a2 2 0 0 0 1.95-1.57l1.65-7.43H5.12" />
   </svg>
 );
+
+export const IconWallet = ({ size = 16, className }: IconProps) => (
+  <svg {...base(size)} className={className} data-icon="wallet">
+    <path d="M21 12V7H5a2 2 0 0 1 0-4h14v4" />
+    <path d="M3 5v14a2 2 0 0 0 2 2h16v-5" />
+    <path d="M18 12a2 2 0 0 0 0 4h4v-4Z" />
+  </svg>
+);

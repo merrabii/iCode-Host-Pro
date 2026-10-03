@@ -17,6 +17,7 @@ import {
   IconServer,
   IconShield,
   IconUsers,
+  IconWallet,
 } from '@/components/icons';
 import { isAdminRole, isSupportRole } from '@/lib/session';
 
@@ -34,6 +35,7 @@ export const ADMIN_NAV: NavSection[] = [
       { label: 'Commandes', href: '/manager/commandes', icon: IconBox },
       { label: 'Factures', href: '/manager/factures', icon: IconFileText },
       { label: 'Taux de taxe', href: '/manager/taxe', icon: IconChartBar },
+      { label: 'Recharges', href: '/manager/recharges', icon: IconWallet },
       { label: 'Souscriptions & services', href: '/manager/subscriptions', icon: IconBoxes },
       { label: 'Invitations', href: '/manager/invitations', icon: IconMail },
       { label: 'Configuration mail', href: '/manager/mail', icon: IconMail },
@@ -85,6 +87,7 @@ export const CLIENT_NAV: NavSection[] = [
       { label: 'Mes applications', href: '/client?rub=apps', icon: IconServer },
       { label: 'Mes commandes', href: '/client/commandes', icon: IconBox },
       { label: 'Mes factures', href: '/client/factures', icon: IconFileText },
+      { label: 'Portefeuille', href: '/client/portefeuille', icon: IconWallet },
       { label: 'Hébergement', href: '/client?rub=host', icon: IconBoxes },
       { label: 'Assistance', href: '/client?rub=help', icon: IconLifeBuoy },
       { label: 'Mon profil', href: '/profil', icon: IconKey },

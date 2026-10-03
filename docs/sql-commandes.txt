@@ -1128,3 +1128,16 @@ npx prisma migrate deploy          -- base icode_host_pro_socle (49e migration :
 -- Recette e2e sur base icode_host_pro_socle :
 --   npx jest --config ./test/jest-e2e.json pricing-consistency --runInBand  (12/12)
 --   unit : npx jest src/store/checkout-pricing.spec.ts  (21/21)
+--
+-- Lot P6 (GO socle, audit C2 + C3a -> portefeuille & recharge virement) :
+--   AUCUNE migration. 100 % code : WalletService (SEUL ecrivain de
+--   Customer.walletBalanceCents, FOR UPDATE + anti-negatif + idempotence),
+--   depot CREDIT/PENDING avec justificatif disque public/wallet-proofs/,
+--   validation/rejet admin CAS PENDING->SUCCEEDED|CANCELED (credit unique).
+--   Modele WalletTransaction + enums deja presents (aucun ALTER).
+--   Base inchangee (49e migration P3).
+-- Recette e2e sur base icode_host_pro_socle :
+--   npx jest --config ./test/jest-e2e.json wallet-recharge --runInBand  (12/12)
+--   unit : npx jest src/wallet/wallet.service.spec.ts  (19/19)
+--   preuves disque : <apps/api>/public/wallet-proofs/proof-*.pdf (nettoyees
+--   par le afterAll du e2e).

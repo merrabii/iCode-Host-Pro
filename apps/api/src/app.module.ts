@@ -21,6 +21,7 @@ import { CloudflareModule } from './cloudflare/cloudflare.module';
 import { MonitoringModule } from './monitoring/monitoring.module';
 import { BrandingModule } from './branding/branding.module';
 import { StoreModule } from './store/store.module';
+import { WalletModule } from './wallet/wallet.module';
 import { loadAppConfig } from './config/configuration';
 
 @Module({
@@ -52,6 +53,7 @@ import { loadAppConfig } from './config/configuration';
     MonitoringModule,
     BrandingModule,
     StoreModule,
+    WalletModule,
   ],
 })
 export class AppModule {}
