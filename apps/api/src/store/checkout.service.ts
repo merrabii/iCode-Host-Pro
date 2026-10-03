@@ -8,6 +8,7 @@ import {
   ServiceUnavailableException,
 } from '@nestjs/common';
 import {
+  BillingSetting,
   CustomerAccountType,
   HostingServiceStatus,
   InvoiceLineKind,
@@ -401,7 +402,8 @@ export class CheckoutService {
             },
           });
         }
-        const billing = await this.claimInvoiceSequence(tx);
+        const claim = await this.claimInvoiceSequence(tx);
+        const billing = claim.billing; // ligne BillingSetting figée (D1)
         // Commande payante créée EN ATTENTE de règlement : aucun droit ouvert
         // ici (aucune souscription, aucun tracking C3, aucun service). Les
         // droits partent de `confirmOrderPaid` (confirmation serveur valide).
@@ -416,7 +418,7 @@ export class CheckoutService {
             packId: product.packId ?? null,
             status: OrderStatus.PENDING_PAYMENT,
             billingCycle: product.billingCycle,
-            currency: billing.currency,
+            currency: claim.currency,
             taxRatePercent: new Prisma.Decimal(taxRatePercent),
             amountHtCents,
             taxAmountCents,
@@ -438,17 +440,32 @@ export class CheckoutService {
           },
         });
 
+        const issuedAt = new Date();
+        const dueDays = Math.min(Math.max(0, billing.invoiceDueDays ?? 14), 3650);
         const invoice = await tx.invoice.create({
           data: {
-            number: billing.invoiceNumber,
+            number: claim.invoiceNumber,
             orderId: order.id,
             customerId: customer.id,
             status: InvoiceStatus.UNPAID,
-            currency: billing.currency,
+            currency: claim.currency,
             taxRatePercent: new Prisma.Decimal(taxRatePercent),
             amountHtCents,
             taxAmountCents,
             amountTtcCents,
+            // D1 : échéance + mentions figées à l'émission (jamais relues).
+            issuedAt,
+            dueDate: new Date(issuedAt.getTime() + dueDays * 86_400_000),
+            legalMentionsSnapshot: {
+              companyName: billing.companyName || null,
+              companyAddress: billing.companyAddress,
+              companyTaxId: billing.companyTaxId,
+              companyEmail: billing.companyEmail,
+              mentions: Array.isArray(billing.legalMentions)
+                ? (billing.legalMentions as string[])
+                : null,
+              invoiceDueDays: billing.invoiceDueDays,
+            },
             billingAddress: {
               name: billingName,
               email: billingEmail,
@@ -478,7 +495,7 @@ export class CheckoutService {
           },
         });
 
-        return { user, order, invoice, billing };
+        return { user, order, invoice, billing: claim };
       });
 
       await this.traceAudit(product.id, created.order.id, amountTtcCents, method.id, true, undefined, {
@@ -1300,14 +1317,35 @@ export class CheckoutService {
     return createHash('sha256').update(payload).digest('hex');
   }
 
-  /** Réserve atomiquement le prochain numéro de facture « YYYY-<seq> » (row lock). */
+  /**
+   * Réserve atomiquement le prochain numéro de facture « YYYY-<seq> » (row lock).
+   * P7 (R-FAC-01) : singleton sûr sous concurrence — création **idempotente**
+   * `INSERT … ON CONFLICT ("id") DO NOTHING` (jamais d'erreur P2002 : la
+   * transaction reste valide, contrairement à create+catch qui laisserait une
+   * tx Postgres avortée → 25P02), puis relecture ; deux checkouts simultanés
+   * ne peuvent créer qu'UNE ligne, la PK `billing-settings` tranche. Lignes
+   * legacy (cuid) gardées telles quelles, toujours lues dans l'ordre
+   * `createdAt`. Retourne aussi la ligne figée (mentions/entreprise/échéance)
+   * pour le snapshot de la facture.
+   */
   private async claimInvoiceSequence(
     tx: Prisma.TransactionClient,
-  ): Promise<{ currency: string; invoiceNumber: string }> {
-    let billing = await tx.billingSetting.findFirst();
+  ): Promise<{
+    currency: string;
+    invoiceNumber: string;
+    billing: BillingSetting;
+  }> {
+    let billing = await tx.billingSetting.findFirst({
+      orderBy: { createdAt: 'asc' },
+    });
     if (!billing) {
-      billing = await tx.billingSetting.create({
-        data: { currency: 'USD', companyName: 'Code Diali' },
+      await tx.$queryRaw`
+        INSERT INTO "BillingSetting" ("id", "currency", "companyName", "createdAt", "updatedAt")
+        VALUES ('billing-settings', 'USD', 'Code Diali', NOW(), NOW())
+        ON CONFLICT ("id") DO NOTHING
+      `;
+      billing = await tx.billingSetting.findFirstOrThrow({
+        orderBy: { createdAt: 'asc' },
       });
     }
     const rows = await tx.$queryRaw<{ next: number }[]>`
@@ -1318,7 +1356,7 @@ export class CheckoutService {
     `;
     const seq = Number(rows[0]?.next ?? 1) - 1;
     const invoiceNumber = `${new Date().getFullYear()}-${String(seq).padStart(4, '0')}`;
-    return { currency: billing.currency, invoiceNumber };
+    return { currency: billing.currency, invoiceNumber, billing };
   }
 
   /** Audit des étapes paiement/commande (jamais le mot de passe en clair). */

@@ -1141,3 +1141,17 @@ npx prisma migrate deploy          -- base icode_host_pro_socle (49e migration :
 --   unit : npx jest src/wallet/wallet.service.spec.ts  (19/19)
 --   preuves disque : <apps/api>/public/wallet-proofs/proof-*.pdf (nettoyees
 --   par le afterAll du e2e).
+
+-- Lot P7 (GO socle, audit D1 -> facturation PDF + echeance + mentions) :
+--   51e migration : 20261003000000_add_invoice_billing_terms
+--     ALTER TABLE "BillingSetting" ADD COLUMN "invoiceDueDays" INTEGER NOT NULL DEFAULT 14;
+--   (apply deja fait : npx prisma migrate deploy -> 51 migrations)
+--   + dependance pdfkit (+ @types/pdfkit) via pnpm --filter @codediali/api add pdfkit
+--   API : InvoicePdfService (render fige + ensurePdf public/invoices/<id>.pdf),
+--   GET/PATCH store/admin/billing-settings, GET store/admin/invoices/:id/pdf,
+--   GET client/invoices/:id/pdf (isolation proprio 404).
+-- Recette e2e sur base icode_host_pro_socle :
+--   npx jest --config ./test/jest-e2e.json invoice-billing --runInBand  (11/11)
+--   unit : npx jest src/store/invoice-pdf.service.spec.ts  (5/5)
+--   preuve disque : <apps/api>/public/invoices/<invoiceId>.pdf (nettoyee par
+--   le afterAll du e2e).

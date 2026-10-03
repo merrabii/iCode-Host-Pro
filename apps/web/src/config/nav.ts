@@ -34,6 +34,7 @@ export const ADMIN_NAV: NavSection[] = [
       { label: 'Utilisateurs', href: '/manager/utilisateurs', icon: IconUsers },
       { label: 'Commandes', href: '/manager/commandes', icon: IconBox },
       { label: 'Factures', href: '/manager/factures', icon: IconFileText },
+      { label: 'Paramètres facturation', href: '/manager/facturation', icon: IconFileText },
       { label: 'Taux de taxe', href: '/manager/taxe', icon: IconChartBar },
       { label: 'Recharges', href: '/manager/recharges', icon: IconWallet },
       { label: 'Souscriptions & services', href: '/manager/subscriptions', icon: IconBoxes },

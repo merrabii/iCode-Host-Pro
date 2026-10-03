@@ -2505,3 +2505,79 @@ export async function fetchRechargeProofBlob(
   if (fresh && fresh !== token) return doGet(fresh);
   return first;
 }
+
+// ═══ GO P7 (lot D1) — facturation : PDF + paramètres d'édition ═════════════
+export interface BillingSettings {
+  id: string;
+  currency: string;
+  companyName: string;
+  companyAddress: string | null;
+  companyTaxId: string | null;
+  companyEmail: string | null;
+  legalMentions: string[] | null;
+  invoiceSequence: number;
+  invoiceDueDays: number;
+  dunningReminderDays: number;
+  dunningGraceDays: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export const getBillingSettings = (t: string) =>
+  apiJson('/api/store/admin/billing-settings', t) as Promise<
+    ApiResult<BillingSettings>
+  >;
+
+export const updateBillingSettings = (
+  t: string,
+  dto: Partial<
+    Pick<
+      BillingSettings,
+      | 'companyName'
+      | 'companyAddress'
+      | 'companyTaxId'
+      | 'companyEmail'
+      | 'invoiceDueDays'
+    > & { legalMentions: string[] }
+  >,
+) =>
+  apiJson('/api/store/admin/billing-settings', t, {
+    method: 'PATCH',
+    body: JSON.stringify(dto),
+  }) as Promise<ApiResult<BillingSettings>>;
+
+/**
+ * Téléchargement du PDF d'une facture (client ou admin) : flux binaire + une
+ * rotation de jeton sur 401 (même contrat que `fetchRechargeProofBlob`), puis
+ * déclenchement du téléchargement navigateur `facture-<num>.pdf`. Le PDF est
+ * généré à la première demande puis servi figé (figé à l'émission).
+ */
+export async function downloadInvoicePdf(
+  token: string,
+  scope: 'client' | 'admin',
+  invoice: { id: string; number: string },
+): Promise<{ ok: boolean; status: number }> {
+  const doGet = async (tok: string): Promise<{ ok: boolean; status: number }> => {
+    const url =
+      scope === 'client'
+        ? `/api/client/invoices/${encodeURIComponent(invoice.id)}/pdf`
+        : `/api/store/admin/invoices/${encodeURIComponent(invoice.id)}/pdf`;
+    const res = await fetch(url, { headers: { Authorization: `Bearer ${tok}` } });
+    if (!res.ok) return { ok: false, status: res.status };
+    const blob = await res.blob();
+    const objectUrl = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = objectUrl;
+    a.download = `facture-${invoice.number}.pdf`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    window.setTimeout(() => URL.revokeObjectURL(objectUrl), 10_000);
+    return { ok: true, status: res.status };
+  };
+  const first = await doGet(token);
+  if (first.ok || first.status !== 401) return first;
+  const fresh = await getAccessToken();
+  if (fresh && fresh !== token) return doGet(fresh);
+  return first;
+}

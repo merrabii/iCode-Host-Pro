@@ -16,6 +16,7 @@ import { CheckoutService } from './checkout.service';
 import { ClientStoreController } from './client-store.controller';
 import { DEPLOYMENT_EVIDENCE_CONNECTORS } from './deployment-evidence';
 import { DeploymentEvidenceService } from './deployment-evidence.service';
+import { InvoicePdfService } from './invoice-pdf.service';
 import { OrderCancelService } from './order-cancel.service';
 import { OrderLifecycleService } from './order-lifecycle.service';
 import { PaymentMethodsController } from './payment-methods.controller';
@@ -55,6 +56,7 @@ import { TaxRatesAdminController } from './tax-rates.admin.controller';
   ],
   providers: [
     CheckoutService,
+    InvoicePdfService,
     ProvisioningService,
     OrderCancelService,
     OrderLifecycleService,

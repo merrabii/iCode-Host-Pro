@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import {
+  downloadInvoicePdf,
   formatCents,
   getAdminInvoice,
   listAdminInvoices,
@@ -86,6 +87,15 @@ export default function ManagerInvoicesPage() {
     setDetail(null);
     window.history.replaceState(null, '', '/manager/factures');
   }, []);
+
+  // GO P7 (D1) : PDF figé à l'émission, généré à la première demande.
+  const downloadPdf = useCallback(
+    async (inv: { id: string; number: string }) => {
+      const r = await downloadInvoicePdf(token, 'admin', inv);
+      if (!r.ok) toast.error('Téléchargement du PDF impossible.');
+    },
+    [token, toast],
+  );
 
   useEffect(() => {
     if (sessionPhase === 'loading') return;
@@ -204,11 +214,24 @@ export default function ManagerInvoicesPage() {
                         </td>
                         <td className="muted nowrap">
                           {new Date(inv.issuedAt).toLocaleDateString()}
+                          {inv.dueDate && (
+                            <>
+                              <br />
+                              <span className="cell-sub">
+                                Éché. {new Date(inv.dueDate).toLocaleDateString()}
+                              </span>
+                            </>
+                          )}
                         </td>
                         <td className="nowrap" style={{ textAlign: 'right' }}>
-                          <Button size="sm" variant="secondary" onClick={() => void openDetail(inv.id)}>
-                            Détail
-                          </Button>
+                          <span className="row" style={{ justifyContent: 'flex-end', gap: 6 }}>
+                            <Button size="sm" variant="secondary" onClick={() => void openDetail(inv.id)}>
+                              Détail
+                            </Button>
+                            <Button size="sm" variant="secondary" onClick={() => void downloadPdf(inv)}>
+                              PDF
+                            </Button>
+                          </span>
                         </td>
                       </tr>
                     ))}
@@ -268,7 +291,10 @@ export default function ManagerInvoicesPage() {
                 <Badge tone={INVOICE_STATUS_TONE[detail.status] ?? 'neutral'}>
                   {INVOICE_STATUS_LABEL[detail.status] ?? detail.status}
                 </Badge>
-                {detail.hasPdf && <span className="muted cell-sub">PDF disponible</span>}
+                <Button size="sm" variant="secondary" onClick={() => void downloadPdf(detail)}>
+                  Télécharger le PDF
+                </Button>
+                {detail.hasPdf && <span className="muted cell-sub">PDF déjà généré</span>}
               </div>
               <ul style={{ listStyle: 'none', padding: 0, margin: 0, fontSize: 14 }}>
                 <li className="row" style={{ justifyContent: 'space-between', padding: '6px 0' }}>
@@ -287,6 +313,12 @@ export default function ManagerInvoicesPage() {
                   <li className="row" style={{ justifyContent: 'space-between', padding: '6px 0' }}>
                     <span className="muted">Commande</span>
                     <span>{detail.order.productName}</span>
+                  </li>
+                )}
+                {detail.dueDate && (
+                  <li className="row" style={{ justifyContent: 'space-between', padding: '6px 0' }}>
+                    <span className="muted">Échéance</span>
+                    <span>{new Date(detail.dueDate).toLocaleDateString()}</span>
                   </li>
                 )}
                 {detail.paidAt && (

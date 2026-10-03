@@ -1530,6 +1530,7 @@ model BillingSetting {
   companyEmail        String?
   legalMentions       Json? // mentions complémentaires (lignes de pied de facture)
   invoiceSequence     Int      @default(1) // prochain n° — format « YYYY-<seq> »
+  invoiceDueDays      Int      @default(14) // échéance de paiement (D1) — jours après émission
   dunningReminderDays Int      @default(3) // rappel avant échéance J-3
   dunningGraceDays    Int      @default(14) // délai avant suspension (J+14)
   createdAt           DateTime @default(now())

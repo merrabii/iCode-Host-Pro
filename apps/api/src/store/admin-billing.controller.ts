@@ -1,17 +1,28 @@
 import {
+  Body,
   Controller,
   Get,
   NotFoundException,
   Param,
+  Patch,
   Query,
+  Res,
+  StreamableFile,
   UseGuards,
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
-import { Prisma, Role } from '@prisma/client';
+import { BillingSetting, Prisma, Role } from '@prisma/client';
+import type { Response } from 'express';
+import * as fs from 'node:fs';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
 import { Roles } from '../auth/decorators/roles.decorator';
+import { CurrentUser } from '../auth/decorators/current-user.decorator';
+import { JwtPayload } from '../auth/types';
+import { AuditService } from '../audit/audit.service';
 import { PrismaService } from '../prisma/prisma.service';
+import { InvoicePdfService } from './invoice-pdf.service';
+import { UpdateBillingSettingsDto } from './dto/billing-settings.dto';
 import {
   CustomerListQueryDto,
   InvoiceListQueryDto,
@@ -22,6 +33,8 @@ import {
  * factures et des clients. Lecture strictement ADMIN (RolesGuard) : côté
  * client, les mêmes données passent par `ClientStoreController` filtré par
  * propriétaire. Le chemin PDF disque n'est jamais exposé brut (`hasPdf`).
+ * P7 (lot D1) : téléchargement du PDF + paramètres d'édition (mentions
+ * légales figées à l'émission, échéance `invoiceDueDays`).
  */
 @ApiTags('store/admin')
 @ApiBearerAuth()
@@ -29,7 +42,107 @@ import {
 @Roles(Role.ADMIN)
 @Controller('store/admin')
 export class AdminBillingController {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly pdf: InvoicePdfService,
+    private readonly audit: AuditService,
+  ) {}
+
+  /** Singleton des paramètres de facturation (création sûre sous concurrence). */
+  private async ensureSettings(): Promise<BillingSetting> {
+    const existing = await this.prisma.billingSetting.findFirst({
+      orderBy: { createdAt: 'asc' },
+    });
+    if (existing) return existing;
+    try {
+      return await this.prisma.billingSetting.create({
+        data: { id: 'billing-settings', currency: 'USD', companyName: 'Code Diali' },
+      });
+    } catch (e) {
+      if (
+        e instanceof Prisma.PrismaClientKnownRequestError &&
+        e.code === 'P2002'
+      ) {
+        return await this.prisma.billingSetting.findFirstOrThrow({
+          orderBy: { createdAt: 'asc' },
+        });
+      }
+      throw e;
+    }
+  }
+
+  private shape(row: BillingSetting) {
+    const { legalMentions, ...rest } = row;
+    return {
+      ...rest,
+      legalMentions: Array.isArray(legalMentions) ? (legalMentions as string[]) : null,
+    };
+  }
+
+  /** Paramètres d'édition de facture (mentions, échéance, identité émetteur). */
+  @Get('billing-settings')
+  @ApiOperation({ summary: 'Paramètres de facturation (ADMIN)' })
+  async getSettings() {
+    return this.shape(await this.ensureSettings());
+  }
+
+  @Patch('billing-settings')
+  @ApiOperation({ summary: 'Modifier les paramètres de facturation (ADMIN)' })
+  async updateSettings(
+    @Body() dto: UpdateBillingSettingsDto,
+    @CurrentUser() actor: JwtPayload,
+  ) {
+    const current = await this.ensureSettings();
+    const data: Prisma.BillingSettingUpdateInput = {};
+    if (dto.companyName !== undefined) data.companyName = dto.companyName.trim();
+    if (dto.companyAddress !== undefined)
+      data.companyAddress = dto.companyAddress.trim() || null;
+    if (dto.companyTaxId !== undefined)
+      data.companyTaxId = dto.companyTaxId.trim() || null;
+    if (dto.companyEmail !== undefined)
+      data.companyEmail = dto.companyEmail.trim() || null;
+    if (dto.legalMentions !== undefined) {
+      const lines = dto.legalMentions.map((m) => m.trim()).filter(Boolean);
+      data.legalMentions = lines.length
+        ? (lines as unknown as Prisma.InputJsonValue)
+        : Prisma.JsonNull;
+    }
+    if (dto.invoiceDueDays !== undefined) data.invoiceDueDays = dto.invoiceDueDays;
+
+    const updated = await this.prisma.billingSetting.update({
+      where: { id: current.id },
+      data,
+    });
+    await this.audit.record({
+      actorId: actor.sub,
+      actorEmail: actor.email,
+      action: 'billing.settings.update',
+      resourceType: 'billingSetting',
+      resourceId: updated.id,
+      details: { fields: Object.keys(data) },
+    });
+    return this.shape(updated);
+  }
+
+  /** PDF d'une facture (ADMIN, flux) — rendu figé à l'émission. */
+  @Get('invoices/:id/pdf')
+  @ApiOperation({ summary: 'Télécharger le PDF d’une facture (ADMIN)' })
+  async invoicePdf(
+    @Param('id') id: string,
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<StreamableFile> {
+    const invoice = await this.prisma.invoice.findUnique({
+      where: { id },
+      select: { id: true, number: true },
+    });
+    if (!invoice) throw new NotFoundException('Facture introuvable.');
+    const { absPath, fileName } = await this.pdf.ensurePdf(invoice.id);
+    res.set({
+      'Content-Type': 'application/pdf',
+      'Content-Disposition': `attachment; filename="${fileName}"`,
+    });
+    return new StreamableFile(fs.createReadStream(absPath));
+  }
 
   /** Liste globale des factures (paginée, filtre statut + recherche numéro/email). */
   @Get('invoices')

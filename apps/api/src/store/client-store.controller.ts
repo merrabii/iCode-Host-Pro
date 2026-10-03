@@ -4,14 +4,19 @@ import {
   NotFoundException,
   Param,
   Query,
+  Res,
+  StreamableFile,
   UseGuards,
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { Prisma } from '@prisma/client';
+import type { Response } from 'express';
+import * as fs from 'node:fs';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import { JwtPayload } from '../auth/types';
 import { PrismaService } from '../prisma/prisma.service';
+import { InvoicePdfService } from './invoice-pdf.service';
 import { InvoiceListQueryDto, OrderListQueryDto } from './dto/store-lists.dto';
 
 /**
@@ -30,7 +35,10 @@ import { InvoiceListQueryDto, OrderListQueryDto } from './dto/store-lists.dto';
 @UseGuards(JwtAuthGuard)
 @Controller('client')
 export class ClientStoreController {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly pdf: InvoicePdfService,
+  ) {}
 
   /** Propriétaire du dossier : compte lié (userId) OU client au même email. */
   private ownedBy(user: JwtPayload): Prisma.CustomerWhereInput {
@@ -160,6 +168,31 @@ export class ClientStoreController {
     if (!invoice) throw new NotFoundException('Facture introuvable.');
     const { pdfPath, ...rest } = invoice;
     return { ...rest, hasPdf: pdfPath !== null };
+  }
+
+  /**
+   * PDF de ma facture (D1) — même isolation que le détail (404 si le compte
+   * n'en est pas propriétaire). Rendu figé à l'émission, jamais régénéré à
+   * partir des paramètres courants.
+   */
+  @Get('invoices/:id/pdf')
+  @ApiOperation({ summary: 'Télécharger le PDF de ma facture (client)' })
+  async getMyInvoicePdf(
+    @CurrentUser() user: JwtPayload,
+    @Param('id') id: string,
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<StreamableFile> {
+    const invoice = await this.prisma.invoice.findFirst({
+      where: { id, customer: this.ownedBy(user) },
+      select: { id: true, number: true },
+    });
+    if (!invoice) throw new NotFoundException('Facture introuvable.');
+    const { absPath, fileName } = await this.pdf.ensurePdf(invoice.id);
+    res.set({
+      'Content-Type': 'application/pdf',
+      'Content-Disposition': `attachment; filename="${fileName}"`,
+    });
+    return new StreamableFile(fs.createReadStream(absPath));
   }
 }
 
