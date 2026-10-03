@@ -1155,3 +1155,24 @@ npx prisma migrate deploy          -- base icode_host_pro_socle (49e migration :
 --   unit : npx jest src/store/invoice-pdf.service.spec.ts  (5/5)
 --   preuve disque : <apps/api>/public/invoices/<invoiceId>.pdf (nettoyee par
 --   le afterAll du e2e).
+
+-- Lot P8 (GO socle, audit D2 -> abonnements recurrets / renouvellement) :
+--   52e migration : 20261003000001_add_invoice_dunning
+--     ALTER TABLE "Invoice" ADD COLUMN "dunningRemindedAt" TIMESTAMP(3);
+--   (apply deja fait : npx prisma migrate deploy -> 52 migrations)
+--   + RenewalService (4 passes idempotentes : renouvellement des echeances
+--     via NOUVELLE commande renewsOrderId + NOUVELLE facture, reprise de
+--     paiement, dunning J-3 via CAS dunningRemindedAt, suspension J+14
+--     ACTIVE->SUSPENDED = STATUT SEUL, aucun appel infra - 6-4 BLOQUE)
+--   + encaissement du renouvellement par SOLDE (WalletService.debit,
+--     cle idempotente renewal:<orderId>), ConfirmSource 'wallet',
+--     confirmOrderPaid pose autoRenew + nextBillingDate sur cycle recurrent.
+--   + endpoint ADMIN : POST /store/admin/renewal/sweep (declenchement
+--     manuel / recette ; timer prod : RENEWAL_SWEEP_MS defaut 60000,
+--     coupe RENEWAL_SWEEP_ENABLED=false ; ORDER_SWEEP_ENABLED=false en recette).
+--   + garde expiration : expireStalePending exclut renewsOrderId (48h) ;
+--     provisionOrder no-op sur commande de renouvellement.
+-- Recette e2e sur base icode_host_pro_socle :
+--   npx jest --config ./test/jest-e2e.json recurring-billing --runInBand  (9/9)
+--   unit : npx jest src/store/renewal.service.spec.ts  (17/17)
+--   non-regression : smoke 63/63 + invoice-billing 11/11 ; unit 1077/1077.

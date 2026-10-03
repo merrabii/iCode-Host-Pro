@@ -5,6 +5,7 @@ import {
   NotFoundException,
   Param,
   Patch,
+  Post,
   Query,
   Res,
   StreamableFile,
@@ -22,6 +23,7 @@ import { JwtPayload } from '../auth/types';
 import { AuditService } from '../audit/audit.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { InvoicePdfService } from './invoice-pdf.service';
+import { RenewalService } from './renewal.service';
 import { UpdateBillingSettingsDto } from './dto/billing-settings.dto';
 import {
   CustomerListQueryDto,
@@ -46,6 +48,7 @@ export class AdminBillingController {
     private readonly prisma: PrismaService,
     private readonly pdf: InvoicePdfService,
     private readonly audit: AuditService,
+    private readonly renewal: RenewalService,
   ) {}
 
   /** Singleton des paramètres de facturation (création sûre sous concurrence). */
@@ -274,5 +277,17 @@ export class AdminBillingController {
       }),
     ]);
     return { items, total, page, perPage };
+  }
+
+  /**
+   * P8 (lot D2) — déclenche un passage du scheduler de renouvellement /
+   * dunning / suspension (idempotent, anti-chevauchement local). En prod le
+   * timer (`RENEWAL_SWEEP_ENABLED`, défaut actif) enchaîne ces passages ; cette
+   * route permet l'horloge accélérée des recettes et la relance manuelle.
+   */
+  @Post('renewal/sweep')
+  @ApiOperation({ summary: 'Déclenche un passage renouvellement/dunning (P8)' })
+  async renewalSweep() {
+    return this.renewal.sweep();
   }
 }

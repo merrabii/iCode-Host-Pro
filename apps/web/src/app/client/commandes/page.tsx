@@ -191,12 +191,13 @@ export default function ClientOrdersPage() {
                 <table className="table">
                   <thead>
                     <tr>
-                      <th>Référence</th>
-                      <th>Produit</th>
-                      <th>Montant TTC</th>
-                      <th>Statut</th>
-                      <th>Date</th>
-                      <th />
+                  <th>Référence</th>
+                  <th>Produit</th>
+                  <th>Montant TTC</th>
+                  <th>Abonnement</th>
+                  <th>Statut</th>
+                  <th>Date</th>
+                  <th />
                     </tr>
                   </thead>
                   <tbody>
@@ -207,6 +208,17 @@ export default function ClientOrdersPage() {
                         <td className="nowrap">
                           {formatCents(o.amountTtcCents)}{' '}
                           <span className="muted">{o.currency}</span>
+                        </td>
+                        <td className="nowrap">
+                          {o.billingCycle === 'ONETIME' ? (
+                            <span className="muted">—</span>
+                          ) : o.autoRenew && o.nextBillingDate ? (
+                            <Badge tone="info">
+                              Auto · {new Date(o.nextBillingDate).toLocaleDateString()}
+                            </Badge>
+                          ) : (
+                            <Badge tone="neutral">Renouvellement arrêté</Badge>
+                          )}
                         </td>
                         <td>
                           <Badge tone={ORDER_STATUS_TONE[o.status] ?? 'neutral'}>
@@ -318,6 +330,34 @@ export default function ClientOrdersPage() {
                   <span className="muted">Cycle de facturation</span>
                   <span>{detail.billingCycle}</span>
                 </li>
+                <li className="row" style={{ justifyContent: 'space-between', padding: '6px 0' }}>
+                  <span className="muted">Renouvellement automatique</span>
+                  <span>
+                    {detail.billingCycle === 'ONETIME' ? (
+                      <span className="muted">—</span>
+                    ) : detail.autoRenew ? (
+                      <Badge tone="info">Activé</Badge>
+                    ) : (
+                      <Badge tone="neutral">Arrêté</Badge>
+                    )}
+                  </span>
+                </li>
+                {detail.autoRenew && detail.nextBillingDate && (
+                  <li className="row" style={{ justifyContent: 'space-between', padding: '6px 0' }}>
+                    <span className="muted">Prochaine échéance</span>
+                    <span className="nowrap">
+                      {new Date(detail.nextBillingDate).toLocaleDateString('fr-FR')}
+                    </span>
+                  </li>
+                )}
+                {detail.renewsOrderId && (
+                  <li className="row" style={{ justifyContent: 'space-between', padding: '6px 0' }}>
+                    <span className="muted">Renouvellement de la commande</span>
+                    <span className="muted nowrap" title={detail.renewsOrderId}>
+                      {detail.renewsOrderId.slice(0, 10)}…
+                    </span>
+                  </li>
+                )}
                 <li className="row" style={{ justifyContent: 'space-between', padding: '6px 0' }}>
                   <span className="muted">Moyen de paiement</span>
                   <span>{detail.paymentMethodName ?? '—'}</span>

@@ -29,6 +29,8 @@ import { CoolifyEvidenceConnector } from './evidence-connectors/coolify-evidence
 import { StoreProvisioningAdminController } from './store-provisioning.admin.controller';
 import { StoreSubdomainController } from './store-subdomain.controller';
 import { TaxRatesAdminController } from './tax-rates.admin.controller';
+import { WalletModule } from '../wallet/wallet.module';
+import { RenewalService } from './renewal.service';
 
 /**
  * Bloc C/D — module store (tunnel d'achat sans compte, paiement simulé, provisioning).
@@ -41,7 +43,16 @@ import { TaxRatesAdminController } from './tax-rates.admin.controller';
  * C3) : sans cycle (HostingModule n'importe que PrismaModule).
  */
 @Module({
-  imports: [AuthModule, CloudflareModule, CryptoModule, DeploymentsModule, HostingModule, MailModule, ProductsModule],
+  imports: [
+    AuthModule,
+    CloudflareModule,
+    CryptoModule,
+    DeploymentsModule,
+    HostingModule,
+    MailModule,
+    ProductsModule,
+    WalletModule,
+  ],
   controllers: [
     PaymentMethodsController,
     BillingPaymentAdminController,
@@ -72,6 +83,7 @@ import { TaxRatesAdminController } from './tax-rates.admin.controller';
     },
     ReconcileService,
     ReconcileRunnerService,
+    RenewalService,
   ],
   exports: [
     ProvisioningService,

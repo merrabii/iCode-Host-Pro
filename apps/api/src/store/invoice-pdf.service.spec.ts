@@ -43,6 +43,7 @@ describe('InvoicePdfService (D1)', () => {
       amountTtcCents: 12_000,
       issuedAt: new Date('2026-10-03T10:00:00.000Z'),
       dueDate: new Date('2026-10-17T10:00:00.000Z'),
+      dunningRemindedAt: null,
       paidAt: null,
       walletTransactionId: null,
       pdfPath: null,

@@ -467,6 +467,8 @@ export interface OrderDetail extends AdminOrderListItem {
   domainType?: string;
   domainValue?: string | null;
   requestedSubdomain?: string | null;
+  /** P8 (D2) : commande mère renouvelée (chaîne d'abonnement récurrent). */
+  renewsOrderId?: string | null;
   paymentMethod?: { id: string; name: string; type: string } | null;
   subscription?: {
     id: string;

@@ -1449,6 +1449,9 @@ model Invoice {
   amountTtcCents            Int
   issuedAt                  DateTime      @default(now())
   dueDate                   DateTime?
+  // P8 (lot D2 - dunning) : rappel d'impayé envoyé UNE fois (null = jamais
+  // rappelée) - idempotence du passage « relance » du scheduler de facturation.
+  dunningRemindedAt         DateTime?
   paidAt                    DateTime?
   walletTransactionId       String?       @unique // trace du règlement
   pdfPath                   String? // PDF généré (stocké, téléchargeable)

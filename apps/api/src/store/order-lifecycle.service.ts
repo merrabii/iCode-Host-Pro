@@ -79,8 +79,17 @@ export class OrderLifecycleService implements OnModuleInit, OnModuleDestroy {
     const hours = Number(process.env[PENDING_PAYMENT_TTL_HOURS_ENV] ?? 48);
     const ttlMs = (Number.isFinite(hours) && hours > 0 ? hours : 48) * 3_600_000;
     const cutoff = new Date(Date.now() - ttlMs);
+    // P8 (D2) : les commandes de RENOUVELLEMENT (renewsOrderId) ne expirent
+    // JAMAIS ici — leur facture UNPAID vit le cycle complet de dunning
+    // (rappel → suspension à dueDate + dunningGraceDays) ; les annuler à 48 h
+    // détruirait l'impayé avant sa relance. Leur résolution est celle de
+    // `RenewalService` (paiement tardif, suspension ou annulation admin).
     const stale = await this.prisma.order.findMany({
-      where: { status: OrderStatus.PENDING_PAYMENT, createdAt: { lt: cutoff } },
+      where: {
+        status: OrderStatus.PENDING_PAYMENT,
+        createdAt: { lt: cutoff },
+        renewsOrderId: null,
+      },
       select: { id: true, customerEmail: true },
       take: 25,
     });

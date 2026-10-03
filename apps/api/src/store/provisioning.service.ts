@@ -172,6 +172,16 @@ export class ProvisioningService {
     });
     if (!order) throw new NotFoundException('Commande introuvable.');
 
+    // P8 (D2) : commande de RENOUVELLEMENT → no-op BÉNIN (aucune écriture,
+    // aucun appel réseau) : elle ne livre rien de nouveau — le service de la
+    // commande mère court déjà, la commande ne sert qu'à la période de
+    // facturation. Vérrou défensif : le lancement est déjà skippé côté
+    // confirmOrderPaid et le sweep de reprise n'atteint jamais un renouvellement
+    // (il passe PAID → ACTIVE dans la même transaction).
+    if (order.renewsOrderId) {
+      return { orderId, status: order.status, fqdn: null, steps: [] };
+    }
+
     // 17B.4E-D-B1 — un Order CANCELLED/REFUNDED n'est JAMAIS re-provisionné,
     // même en force (sinon un cancel partiel serait réversible par un retry).
     if (order.status === OrderStatus.CANCELLED || order.status === OrderStatus.REFUNDED) {

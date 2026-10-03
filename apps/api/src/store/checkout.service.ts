@@ -8,6 +8,7 @@ import {
   ServiceUnavailableException,
 } from '@nestjs/common';
 import {
+  BillingCycle,
   BillingSetting,
   CustomerAccountType,
   HostingServiceStatus,
@@ -29,6 +30,8 @@ import { CloudflareService } from '../cloudflare/cloudflare.service';
 import { isPaymentSimulatorEnabled } from '../config/payment-simulator';
 import { regexFromRejectPattern } from './subdomain.util';
 import { clientAreaUrl, loginUrl } from './web-links';
+import { addBillingCycle } from './billing-cycle';
+import { claimInvoiceSequence } from './invoice-sequence';
 import { ProductsService, PublicProduct } from '../products/products.service';
 import { CheckoutDto, QuoteDto } from './dto/checkout.dto';
 import { ProvisioningService } from './provisioning.service';
@@ -80,7 +83,7 @@ export interface CheckoutResult {
 }
 
 /** Source d'une confirmation de règlement (traçabilité, audit). */
-export type ConfirmSource = 'free' | 'admin-transfer' | 'card-simulator';
+export type ConfirmSource = 'free' | 'admin-transfer' | 'card-simulator' | 'wallet';
 
 /** Contexte de confirmation serveur d'une commande. */
 export interface ConfirmPaidContext {
@@ -693,6 +696,9 @@ export class CheckoutService {
       };
       subscriptionAction: 'created' | 'upgraded' | null;
       userId: string | null;
+      /** P8 (D2) : commande de renouvellement (renewsOrderId) → pas de droits
+       *  ni de provisioning : la période est prolongée, le service est inchangé. */
+      renewal: boolean;
     };
 
     let outcome: TxOutcome;
@@ -705,6 +711,11 @@ export class CheckoutService {
         if (!order) {
           throw new NotFoundException('Commande introuvable.');
         }
+        // P8 (D2) : renouvellement = JEUX SPÉCIFIQUES (voir plus bas) : ni
+        // création/upgrade d'abonnement, ni tracking/service C3, ni lancement
+        // de provisioning — le service existant continue, seule la facture
+        // (nouvelle commande) est réglée.
+        const isRenewal = !!order.renewsOrderId;
         if (order.status !== OrderStatus.PENDING_PAYMENT) {
           if (
             order.status === OrderStatus.PAID ||
@@ -717,6 +728,7 @@ export class CheckoutService {
               order,
               subscriptionAction: null,
               userId: order.customer.userId,
+              renewal: isRenewal,
             };
           }
           throw new ConflictException(
@@ -727,9 +739,23 @@ export class CheckoutService {
         const now = new Date();
         // CAS : seul PENDING_PAYMENT → PAID (deux confirmations concurrentes →
         // une seule gagne, l'autre lit l'état committé ci-dessous).
+        // P8 (D2) : toute confirmation d'un cycle récurrent pose l'ÉCHÉANCE
+        // (`nextBillingDate`) et ouvre le renouvellement automatique — décision
+        // technique du lot : actif par défaut sur MONTHLY/YEARLY (aucun champ
+        // client n'influence le serveur).
+        const recurring = order.billingCycle !== BillingCycle.ONETIME;
         const cas = await tx.order.updateMany({
           where: { id: orderId, status: OrderStatus.PENDING_PAYMENT },
-          data: { status: OrderStatus.PAID, paidAt: now },
+          data: {
+            status: OrderStatus.PAID,
+            paidAt: now,
+            ...(recurring
+              ? {
+                  autoRenew: true,
+                  nextBillingDate: addBillingCycle(now, order.billingCycle),
+                }
+              : {}),
+          },
         });
         if (cas.count === 0) {
           const cur = await tx.order.findUnique({
@@ -748,6 +774,7 @@ export class CheckoutService {
               order,
               subscriptionAction: null,
               userId: order.customer.userId,
+              renewal: isRenewal,
             };
           }
           throw new ConflictException('Confirmation concurrente impossible (état instable).');
@@ -769,7 +796,25 @@ export class CheckoutService {
 
         const userId = order.customer.userId;
         let subscriptionAction: 'created' | 'upgraded' | null = null;
-        if (order.packId) {
+        // P8 (D2) : un renouvellement ne crée NI n'upgrade d'abonnement (la
+        // souscription court déjà) — le paiement prolonge la période et la
+        // commande passe directement PAID → ACTIVE (service inchangé), dans la
+        // MÊME transaction : aucun état PAID « orphelin » que le sweep de
+        // reprise tenterait de re-provisionner.
+        if (isRenewal) {
+          await tx.order.updateMany({
+            where: { id: orderId, status: OrderStatus.PAID },
+            data: { status: OrderStatus.ACTIVE },
+          });
+          await tx.orderStatusHistory.create({
+            data: {
+              orderId,
+              status: OrderStatus.ACTIVE,
+              note: 'Renouvellement réglé : période suivante ouverte, service inchangé (aucun nouveau provisioning).',
+              actorEmail: ctx.actorEmail ?? order.customerEmail,
+            },
+          });
+        } else if (order.packId) {
           if (!userId) {
             throw new ConflictException('Aucun compte lié à cette commande — abonnement impossible.');
           }
@@ -806,7 +851,7 @@ export class CheckoutService {
         // C3 (ON) — intention figée + service acheté : écrits ICI, dans la MÊME
         // transaction que la confirmation (un échec annule tout : jamais d'Order
         // confirmée sans tracking, jamais de service sans commande confirmée).
-        if (isHostingC3Enabled() && order.packId && userId) {
+        if (isHostingC3Enabled() && order.packId && userId && !isRenewal) {
           const catalog = await this.loadC3Catalog(order.productId);
           if (!catalog?.pack) {
             throw new ConflictException('Pack produit introuvable (C3).');
@@ -842,7 +887,7 @@ export class CheckoutService {
           });
         }
 
-        return { alreadyConfirmed: false, order, subscriptionAction, userId };
+        return { alreadyConfirmed: false, order, subscriptionAction, userId, renewal: isRenewal };
       });
     } catch (e) {
       await this.audit
@@ -875,6 +920,7 @@ export class CheckoutService {
         actorEmail: ctx.actorEmail ?? undefined,
         amountTtcCents: outcome.order.amountTtcCents,
         subscriptionAction: outcome.subscriptionAction,
+        ...(outcome.renewal ? { renewal: true } : {}),
       },
     });
 
@@ -887,7 +933,7 @@ export class CheckoutService {
         null,
         await this.invoiceNumberFor(orderId),
         outcome.subscriptionAction,
-        { phase: 'confirmed' },
+        { phase: 'confirmed', renewal: outcome.renewal },
       ).catch((e) =>
         this.traceAudit('', orderId, outcome.order.amountTtcCents, '', false, String(e), {
           stage: 'confirmed-email',
@@ -908,9 +954,12 @@ export class CheckoutService {
         });
       }
     }
+    // P8 (D2) : JAMAIS de provisioning sur un renouvellement (le service
+    // existe déjà ; la commande sert uniquement à la période de facturation).
     if (
-      outcome.order.requestedSubdomain ||
-      outcome.subscriptionAction !== 'upgraded'
+      !outcome.renewal &&
+      (outcome.order.requestedSubdomain ||
+        outcome.subscriptionAction !== 'upgraded')
     ) {
       this.provisioning.provisionOrder(orderId).catch((e) => {
         this.log.warn(`confirm order=${orderId}: provisionOrder launch failed: ${String(e)}`);
@@ -927,7 +976,7 @@ export class CheckoutService {
 
     return {
       orderId,
-      status: OrderStatus.PAID,
+      status: outcome.renewal ? OrderStatus.ACTIVE : OrderStatus.PAID,
       alreadyConfirmed: false,
       subscriptionAction: outcome.subscriptionAction,
     };
@@ -1006,6 +1055,8 @@ export class CheckoutService {
         return `Règlement validé par l’administration${ctx.reference ? ` (réf. ${ctx.reference})` : ''}.`;
       case 'card-simulator':
         return 'Règlement confirmé (simulateur de recette — aucun prestataire réel).';
+      case 'wallet':
+        return 'Prélevé sur le solde du portefeuille (renouvellement d\'abonnement - P8).';
     }
   }
 
@@ -1335,28 +1386,9 @@ export class CheckoutService {
     invoiceNumber: string;
     billing: BillingSetting;
   }> {
-    let billing = await tx.billingSetting.findFirst({
-      orderBy: { createdAt: 'asc' },
-    });
-    if (!billing) {
-      await tx.$queryRaw`
-        INSERT INTO "BillingSetting" ("id", "currency", "companyName", "createdAt", "updatedAt")
-        VALUES ('billing-settings', 'USD', 'Code Diali', NOW(), NOW())
-        ON CONFLICT ("id") DO NOTHING
-      `;
-      billing = await tx.billingSetting.findFirstOrThrow({
-        orderBy: { createdAt: 'asc' },
-      });
-    }
-    const rows = await tx.$queryRaw<{ next: number }[]>`
-      UPDATE "BillingSetting"
-      SET "invoiceSequence" = "invoiceSequence" + 1, "updatedAt" = NOW()
-      WHERE "id" = ${billing.id}
-      RETURNING "invoiceSequence" AS "next"
-    `;
-    const seq = Number(rows[0]?.next ?? 1) - 1;
-    const invoiceNumber = `${new Date().getFullYear()}-${String(seq).padStart(4, '0')}`;
-    return { currency: billing.currency, invoiceNumber, billing };
+    // P8 : implémentation partagée avec RenewalService (renouvellements D2) —
+    // un SEUL chemin d'acquisition de numéro pour tout le dépôt.
+    return claimInvoiceSequence(tx);
   }
 
   /** Audit des étapes paiement/commande (jamais le mot de passe en clair). */
@@ -1397,7 +1429,7 @@ export class CheckoutService {
     tempPassword: string | null,
     invoiceNumber: string,
     subscriptionAction: 'upgraded' | 'created' | null,
-    opts?: { phase?: 'pending' | 'confirmed'; methodLabel?: string },
+    opts?: { phase?: 'pending' | 'confirmed'; methodLabel?: string; renewal?: boolean },
   ): Promise<void> {
     const phase = opts?.phase ?? 'confirmed';
     const isUpgrade = subscriptionAction === 'upgraded';
@@ -1416,6 +1448,15 @@ export class CheckoutService {
       if (opts?.methodLabel) {
         lines.push(`Moyen de paiement choisi : ${opts.methodLabel}.`, '');
       }
+    } else if (opts?.renewal) {
+      // P8 (D2) : renouvellement — AUCUNE promesse de « nouvelle app » : le
+      // service existant continue, seule la période de facturation avance.
+      lines.push(
+        `Votre abonnement est renouvelé (facture ${invoiceNumber}). Votre`,
+        'application et vos données restent inchangées ; la facture de la',
+        'nouvelle période est disponible dans votre espace client.',
+        '',
+      );
     } else if (isUpgrade) {
       lines.push(
         `Votre règlement est confirmé : votre abonnement a été mis à jour (facture ${invoiceNumber}).`,
