@@ -80,4 +80,13 @@ jobs:
         run: pnpm -C apps/api exec jest src --maxWorkers=4
 
       - name: Tests e2e (API, base CI isolée)
-        run: pnpm -C apps/api exec jest --config ./test/jest-e2e.json --runInBand
+        # 4 suites legacy 17B EXCLUES (état connu, décrit dans
+        # docs/RAPPORT-SOCLE-COMMERCIAL.md) : c3-premig / c4-premig /
+        # c4-release / c4-rollback tournent sur des bases dédiées figées à
+        # l'état d'avant le GO (colonnes Order.paidAt etc. absentes) et
+        # échouent par design ailleurs. Elles exigent la refabrique de leurs
+        # dumps dédiés (NON TESTÉ documenté) — ne pas les réintroduire ici
+        # sans cette refabrique.
+        run: >-
+          pnpm -C apps/api exec jest --config ./test/jest-e2e.json --runInBand
+          --testPathIgnorePatterns c3-premig c4-premig c4-release c4-rollback

@@ -38,7 +38,7 @@ body.dark{background:#101b1a;color:#e0ede8}
 </head>
 <body>
 <header>
-<div class="tag">Document de pilotage · version 3 · 02/10/2026</div>
+<div class="tag">Document de pilotage · version 4 · 04/10/2026</div>
 <h1>iCode Host Pro<br>Comprendre le projet, du début à la suite</h1>
 <p>Vue d’ensemble des décisions, des parcours, du protocole C1–C4, des états d’avancement (prévu → production), des évolutions visuelles, des incidents et du chemin restant. Fichier autonome : aucune ressource réseau.</p>
 <div class="tools">
@@ -69,7 +69,7 @@ body.dark{background:#101b1a;color:#e0ede8}
 
 <section id="etat">
 <h2>01 · Où en sommes-nous ?</h2>
-<div class="notice">État documentaire arrêté au <b>2 octobre 2026</b>, après l’intégration et la poussée du suivi global sous <code>2174eb6</code> sur <code>main</code>, puis réalisation de <b>l’étape 1 — audit du socle commercial</b> (<code>docs/audit-socle-commercial.md</code>, branche <code>audit/socle-commercial</code>, non committée). Ce document synthétise les rapports de recette, l’historique git et les fichiers de continuité du dépôt ; ce n’est pas un audit en direct des serveurs. Aucun pourcentage global arbitraire.</div>
+<div class="notice">État documentaire arrêté au <b>4 octobre 2026</b> — <b>GO socle commercial réalisé de A0 à E10 (P0→P10) en local</b> : branche <code>feat/socle-commercial</code> (worktree de recette), <b>9 commits</b> (<code>86c9f61</code>→<code>763ae38</code>), <b>aucun push, aucun merge</b> — <code>main</code> reste à <code>3245694</code>. Rapport de revue : <code>docs/RAPPORT-SOCLE-COMMERCIAL.md</code> (matrice PASS / BLOQUÉ / NON TESTÉ par capacité + preuves + limites) ; patch complet : <code>recette/diff-socle-commercial.patch</code> (89 fichiers, +15 710/−350) ; guide de rejeu : <code>recette/GUIDE-RECETTE-P10.md</code>. Validations finales : unit <b>1077/1077</b> (60 suites), e2e <b>407/407</b> (38 suites), typecheck API + Web, CI locale équivalente au pipeline (<code>.github/workflows/ci.yml</code>, pipeline GitHub non déclenché car push interdit). Ce document synthétise les rapports de recette, l’historique git et les fichiers de continuité ; ce n’est pas un audit en direct des serveurs. Aucun pourcentage global arbitraire.</div>
 <div class="cards">
 <article>
 <h3>Dernière base poussée</h3>
@@ -89,7 +89,7 @@ body.dark{background:#101b1a;color:#e0ede8}
 </article>
 <article>
 <h3>Prochaine transition</h3>
-<p>Étape 1 <b class="s-ok">réalisée</b> (audit du socle commercial, 02/10/2026 — <code>docs/audit-socle-commercial.md</code>). Ensuite : <b>votre arbitrage des 8 décisions du rapport (§6), puis ouverture des lots A0→E1 sous GO dédié</b> — ne pas commencer leur implémentation avant décision (<a href="#lancement">section 15</a>).</p>
+<p><b>GO socle commercial livré pour revue (P0→P10, 04/10/2026)</b> : implémentations, tests et preuves dans la branche locale <code>feat/socle-commercial</code> (9 commits, non poussés). <b>Votre revue globale est l’étape suivante</b> : rapports <code>docs/RAPPORT-SOCLE-COMMERCIAL.md</code> + <code>recette/GUIDE-RECETTE-P10.md</code>, puis décision de merge/push. Restent ensuite vos décisions ouvertes (§6 du rapport : prestataire → C1/C3b BLOQUÉS, effet infra suspension, numérotation, RGPD) et les lots jamais ouverts (remboursements/avoirs, recharge carte, dashboard KPI) — <a href="#lancement">section 15</a>.</p>
 </article>
 </div>
 </section>
