@@ -19,6 +19,8 @@ import {
   Prisma,
   ProvisionAction,
   SubscriptionStatus,
+  WalletTransactionType,
+  WalletTxStatus,
 } from '@prisma/client';
 import * as bcrypt from 'bcryptjs';
 import { AuditService } from '../audit/audit.service';
@@ -26,6 +28,7 @@ import { JwtPayload } from '../auth/types';
 import { RATE, rateKey, SaRateLimiter } from '../auth/rate-limiter';
 import { MailSettingsService } from '../mail/mail-settings.service';
 import { PrismaService } from '../prisma/prisma.service';
+import { WalletService } from '../wallet/wallet.service';
 import { CloudflareService } from '../cloudflare/cloudflare.service';
 import { isPaymentSimulatorEnabled } from '../config/payment-simulator';
 import { regexFromRejectPattern } from './subdomain.util';
@@ -106,6 +109,37 @@ export interface ConfirmPaidResult {
   subscriptionAction?: 'created' | 'upgraded' | null;
 }
 
+/** Résultat interne d'une confirmation transactionnelle (tx → post-commit). */
+type ConfirmTxOutcome = {
+  alreadyConfirmed: boolean;
+  order: {
+    id: string;
+    status: OrderStatus;
+    customerEmail: string;
+    customerName: string;
+    requestedSubdomain: string | null;
+    amountTtcCents: number;
+  };
+  subscriptionAction: 'created' | 'upgraded' | null;
+  userId: string | null;
+  /** P8 (D2) : commande de renouvellement (renewsOrderId) → pas de droits
+   *  ni de provisioning : la période est prolongée, le service est inchangé. */
+  renewal: boolean;
+};
+
+/** Résultat d'un règlement par solde du portefeuille (Q-A, item 1). */
+export interface PayWithWalletResult {
+  orderId: string;
+  status: OrderStatus;
+  /** Solde APRÈS règlement (lecture post-commit). */
+  balanceCents: number;
+  amountTtcCents: number;
+  /** true = rejeu d'un règlement déjà abouti (aucun second effet). */
+  replayed: boolean;
+  alreadyConfirmed: boolean;
+  subscriptionAction?: 'created' | 'upgraded' | null;
+}
+
 /** Ligne de facture construite côté serveur (d'où dérivent les totaux). */
 export interface InvoiceLineInput {
   kind: InvoiceLineKind;
@@ -148,6 +182,7 @@ export class CheckoutService {
     private readonly provisioning: ProvisioningService,
     private readonly cloudflare: CloudflareService,
     private readonly c3: C3CapabilityService,
+    private readonly wallet: WalletService,
   ) {}
 
   /**
@@ -444,6 +479,15 @@ export class CheckoutService {
             clientKeyHash: clientKey ? baseKey : null,
             requestedSubdomain,
             requestedDomainId,
+            // Q-A (item 4) — consentement EXPLICITE au renouvellement
+            // automatique : enregistré et DATÉ au checkout (case dédiée),
+            // seulement pour un cycle récurrent. `null` = aucun consentement
+            // → aucun prélèvement automatique n'est jamais planifié.
+            renewalConsentAt:
+              product.billingCycle !== BillingCycle.ONETIME &&
+              dto.renewalConsent === true
+                ? new Date()
+                : null,
           },
         });
 
@@ -597,6 +641,16 @@ export class CheckoutService {
         if (again.replay) {
           return this.replayResult(again.replay, receiptEmail);
         }
+        // Clé client JAMAIS vue + contenu identique à une intention déjà
+        // existante : créer est impossible (clé d'intention unique) — rejeu
+        // HONNÊTE de cette intention plutôt qu'un refus au message trompeur
+        // (§7 : même contenu = même commande, statut compris).
+        if (clientKey) {
+          const byIntention = await this.resolveIntention(baseKey, null);
+          if (byIntention.replay) {
+            return this.replayResult(byIntention.replay, receiptEmail);
+          }
+        }
         throw new ConflictException(
           'Un compte existe déjà avec cet email — connectez-vous pour commander.',
         );
@@ -688,26 +742,58 @@ export class CheckoutService {
    * annoncé à tort) et l'admin peut résoudre puis relancer.
    */
   async confirmOrderPaid(orderId: string, ctx: ConfirmPaidContext): Promise<ConfirmPaidResult> {
-    type TxOutcome = {
-      alreadyConfirmed: boolean;
-      order: {
-        id: string;
-        status: OrderStatus;
-        customerEmail: string;
-        customerName: string;
-        requestedSubdomain: string | null;
-        amountTtcCents: number;
-      };
-      subscriptionAction: 'created' | 'upgraded' | null;
-      userId: string | null;
-      /** P8 (D2) : commande de renouvellement (renewsOrderId) → pas de droits
-       *  ni de provisioning : la période est prolongée, le service est inchangé. */
-      renewal: boolean;
-    };
-
-    let outcome: TxOutcome;
+    let outcome: ConfirmTxOutcome;
     try {
-      outcome = await this.prisma.$transaction(async (tx): Promise<TxOutcome> => {
+      outcome = await this.prisma.$transaction((tx) =>
+        this.confirmOrderInTx(tx, orderId, ctx),
+      );
+    } catch (e) {
+      await this.audit
+        .record({
+          action: 'payment.confirm_failed',
+          resourceType: 'order',
+          resourceId: orderId,
+          details: { source: ctx.source, error: String(e) },
+        })
+        .catch(() => {});
+      throw e;
+    }
+
+    if (outcome.alreadyConfirmed) {
+      return {
+        orderId,
+        status: outcome.order.status,
+        alreadyConfirmed: true,
+        subscriptionAction: null,
+      };
+    }
+
+    // Best-effort TOUJOURS : aucun échec d'effet après commit ne retourne une
+    // erreur (l'état committé est la vérité — jamais de re-crédit).
+    try {
+      await this.postConfirmEffects(outcome, orderId, ctx);
+    } catch (e) {
+      this.log.warn(`confirm order=${orderId}: post effects failed: ${String(e)}`);
+    }
+    return {
+      orderId,
+      status: outcome.renewal ? OrderStatus.ACTIVE : OrderStatus.PAID,
+      alreadyConfirmed: false,
+      subscriptionAction: outcome.subscriptionAction,
+    };
+  }
+
+  /**
+   * Corps TRANSACTIONNEL de la confirmation (Q-A) — réutilisé par le règlement
+   * portefeuille atomique `payOrderWithWallet` : même verrous, mêmes états,
+   * mêmes droits que tout autre règlement.
+   */
+  private async confirmOrderInTx(
+    tx: Prisma.TransactionClient,
+    orderId: string,
+    ctx: ConfirmPaidContext,
+  ): Promise<ConfirmTxOutcome> {
+    {
         const order = await tx.order.findUnique({
           where: { id: orderId },
           include: { customer: { select: { userId: true } } },
@@ -743,10 +829,9 @@ export class CheckoutService {
         const now = new Date();
         // CAS : seul PENDING_PAYMENT → PAID (deux confirmations concurrentes →
         // une seule gagne, l'autre lit l'état committé ci-dessous).
-        // P8 (D2) : toute confirmation d'un cycle récurrent pose l'ÉCHÉANCE
-        // (`nextBillingDate`) et ouvre le renouvellement automatique — décision
-        // technique du lot : actif par défaut sur MONTHLY/YEARLY (aucun champ
-        // client n'influence le serveur).
+        // Q-A (item 4) : le renouvellement automatique n'est ARMÉ que si le
+        // consentement explicite est enregistré (`renewalConsentAt`) — sans
+        // consentement, AUCUN prélèvement automatique n'est jamais planifié.
         const recurring = order.billingCycle !== BillingCycle.ONETIME;
         const cas = await tx.order.updateMany({
           where: { id: orderId, status: OrderStatus.PENDING_PAYMENT },
@@ -754,10 +839,12 @@ export class CheckoutService {
             status: OrderStatus.PAID,
             paidAt: now,
             ...(recurring
-              ? {
-                  autoRenew: true,
-                  nextBillingDate: addBillingCycle(now, order.billingCycle),
-                }
+              ? order.renewalConsentAt
+                ? {
+                    autoRenew: true,
+                    nextBillingDate: addBillingCycle(now, order.billingCycle),
+                  }
+                : { autoRenew: false, nextBillingDate: null }
               : {}),
           },
         });
@@ -800,6 +887,7 @@ export class CheckoutService {
 
         const userId = order.customer.userId;
         let subscriptionAction: 'created' | 'upgraded' | null = null;
+        let subId: string | null = null;
         // P8 (D2) : un renouvellement ne crée NI n'upgrade d'abonnement (la
         // souscription court déjà) — le paiement prolonge la période et la
         // commande passe directement PAID → ACTIVE (service inchangé), dans la
@@ -839,8 +927,9 @@ export class CheckoutService {
               data: { productId: order.productId, orderId: order.id },
             });
             subscriptionAction = 'upgraded';
+            subId = active.id;
           } else {
-            await tx.subscription.create({
+            const created = await tx.subscription.create({
               data: {
                 userId,
                 productId: order.productId,
@@ -849,6 +938,22 @@ export class CheckoutService {
               },
             });
             subscriptionAction = 'created';
+            subId = created.id;
+          }
+        }
+
+        // Q-A (item 4) — LA facture de l'échéance est LIÉE à son abonnement :
+        // nouvelle commande pack → abonnement ci-dessus ; renouvellement →
+        // abonnement de la CHAÎNE (renewsOrderId), jamais « le dernier
+        // abonnement actif » du compte. Sans abonnement → lien null (facture
+        // hors abonnement).
+        if (isRenewal || subId) {
+          const linked = subId ?? (await this.resolveSubscriptionIdForOrder(tx, order));
+          if (linked) {
+            await tx.invoice.updateMany({
+              where: { orderId },
+              data: { subscriptionId: linked },
+            });
           }
         }
 
@@ -892,28 +997,47 @@ export class CheckoutService {
         }
 
         return { alreadyConfirmed: false, order, subscriptionAction, userId, renewal: isRenewal };
+    }
+  }
+
+  /**
+   * Q-A (item 4) — abonnement facturé par une commande : résolution par la
+   * CHAÎNE de renouvellements (`renewsOrderId`, garde 50 maillons). Jamais de
+   * sélection « dernier abonnement actif » du compte.
+   */
+  private async resolveSubscriptionIdForOrder(
+    tx: Prisma.TransactionClient,
+    order: { id: string; renewsOrderId: string | null },
+  ): Promise<string | null> {
+    const chain: string[] = [order.id];
+    let cursor = order.renewsOrderId;
+    for (let guard = 0; cursor && guard < 50; guard++) {
+      chain.push(cursor);
+      const parent = await tx.order.findUnique({
+        where: { id: cursor },
+        select: { renewsOrderId: true },
       });
-    } catch (e) {
-      await this.audit
-        .record({
-          action: 'payment.confirm_failed',
-          resourceType: 'order',
-          resourceId: orderId,
-          details: { source: ctx.source, error: String(e) },
-        })
-        .catch(() => {});
-      throw e;
+      cursor = parent?.renewsOrderId ?? null;
     }
+    const sub = await tx.subscription.findFirst({
+      where: { orderId: { in: chain } },
+      select: { id: true },
+      orderBy: { createdAt: 'desc' },
+    });
+    return sub?.id ?? null;
+  }
 
-    if (outcome.alreadyConfirmed) {
-      return {
-        orderId,
-        status: outcome.order.status,
-        alreadyConfirmed: true,
-        subscriptionAction: null,
-      };
-    }
-
+  /**
+   * Effets POST-COMMIT d'une confirmation (Q-A) : audit, email, provisioning.
+   * Chaque effet est best-effort (`.catch`/try-catch) — un échec ne re-crédite
+   * JAMAIS, ne casse jamais l'état committé et ne retourne jamais une erreur
+   * après commit (les droits sont déjà ouverts, l'état est la vérité).
+   */
+  private async postConfirmEffects(
+    outcome: ConfirmTxOutcome,
+    orderId: string,
+    ctx: ConfirmPaidContext,
+  ): Promise<void> {
     // P9 (E1/M-05) : l'acteur remonte au niveau de l'enregistrement (actorId =
     // admin déclencheur, sinon propriétaire du compte) et l'audit porte la
     // transition d'état (from → to) dans ses détails.
@@ -934,7 +1058,7 @@ export class CheckoutService {
         to: confirmedTo,
         ...(outcome.renewal ? { renewal: true } : {}),
       },
-    });
+    }).catch((e) => this.log.warn(`confirm order=${orderId}: payment.confirmed audit failed: ${String(e)}`));
     // P9 (E1/M-05) — LA transition de bascule (PENDING_PAYMENT → PAID/ACTIVE)
     // journalisée dans l'AuditLog, avec l'acteur (meilleur effort).
     await this.audit.record({
@@ -944,36 +1068,44 @@ export class CheckoutService {
       resourceType: 'order',
       resourceId: orderId,
       details: { from: OrderStatus.PENDING_PAYMENT, to: confirmedTo, source: ctx.source },
-    });
+    }).catch((e) => this.log.warn(`confirm order=${orderId}: order.transition audit failed: ${String(e)}`));
 
     // Email de confirmation — best-effort (la source `free` le gère côté
     // checkout avec le mot de passe temporaire de l'invité).
     if (ctx.source !== 'free') {
-      await this.sendPostCheckoutEmail(
-        outcome.order.customerEmail,
-        outcome.order.customerName,
-        null,
-        await this.invoiceNumberFor(orderId),
-        outcome.subscriptionAction,
-        { phase: 'confirmed', renewal: outcome.renewal },
-      ).catch((e) =>
-        this.traceAudit('', orderId, outcome.order.amountTtcCents, '', false, String(e), {
-          stage: 'confirmed-email',
-        }, { id: outcome.userId, email: ctx.actorEmail ?? outcome.order.customerEmail }),
-      );
+      try {
+        await this.sendPostCheckoutEmail(
+          outcome.order.customerEmail,
+          outcome.order.customerName,
+          null,
+          await this.invoiceNumberFor(orderId),
+          outcome.subscriptionAction,
+          { phase: 'confirmed', renewal: outcome.renewal },
+        ).catch((e) =>
+          this.traceAudit('', orderId, outcome.order.amountTtcCents, '', false, String(e), {
+            stage: 'confirmed-email',
+          }, { id: outcome.userId, email: ctx.actorEmail ?? outcome.order.customerEmail }),
+        );
+      } catch (e) {
+        this.log.warn(`confirm order=${orderId}: confirmed-email failed: ${String(e)}`);
+      }
     }
 
     // Lancement de l'exécution APRÈS commit (provisioning only once PAID) :
     // fire-and-forget, échec JAMAIS avalé (audit + relance par le sweep).
     if (outcome.subscriptionAction === 'upgraded') {
-      const active = await this.prisma.subscription.findFirst({
-        where: { orderId, status: SubscriptionStatus.ACTIVE },
-        select: { id: true },
-      });
-      if (active) {
-        this.provisioning.syncAppLimits(active.id).catch((e) => {
-          this.log.warn(`confirm order=${orderId}: syncAppLimits launch failed: ${String(e)}`);
+      try {
+        const active = await this.prisma.subscription.findFirst({
+          where: { orderId, status: SubscriptionStatus.ACTIVE },
+          select: { id: true },
         });
+        if (active) {
+          this.provisioning.syncAppLimits(active.id).catch((e) => {
+            this.log.warn(`confirm order=${orderId}: syncAppLimits launch failed: ${String(e)}`);
+          });
+        }
+      } catch (e) {
+        this.log.warn(`confirm order=${orderId}: syncAppLimits lookup failed: ${String(e)}`);
       }
     }
     // P8 (D2) : JAMAIS de provisioning sur un renouvellement (le service
@@ -995,12 +1127,200 @@ export class CheckoutService {
           .catch(() => {});
       });
     }
+  }
 
+  /**
+   * Q-A (item 1) — RÈGLEMENT ATOMIQUE PAR SOLDE : débit portefeuille +
+   * confirmation de commande dans UNE transaction (verrou commande puis
+   * client), effets post-commit best-effort ensuite. Jamais de débit sans
+   * confirmation committée, jamais de confirmation sans débit committé, et
+   * JAMAIS de crédit compensatoire a posteriori (le rollback est le seul
+   * compensateur).
+   *
+   * Idempotence : clé `wallet-pay:<orderId>` + verrou `FOR UPDATE` (double-
+   * clic concurrent sérialisé) ; rejeu = lecture d'abord avec identité
+   * stricte (`wallet.service`). Propriétaire : `customer.userId === user.sub`
+   * STRICT (aucun dossier invité non lié, aucun autre compte) — sinon 404
+   * (jamais de fuite d'existence). Devise : USD uniquement.
+   */
+  async payOrderWithWallet(orderId: string, user: JwtPayload): Promise<PayWithWalletResult> {
+    const key = `wallet-pay:${orderId}`;
+    const preview = await this.prisma.order.findUnique({
+      where: { id: orderId },
+      include: { customer: { select: { id: true, userId: true, walletBalanceCents: true } } },
+    });
+    if (!preview || !preview.customer.userId || preview.customer.userId !== user.sub) {
+      throw new NotFoundException('Commande introuvable.');
+    }
+    if (preview.currency !== 'USD') {
+      throw new ConflictException(
+        `Devise ${preview.currency} non prise en charge par le portefeuille (USD).`,
+      );
+    }
+    const debitInput = {
+      amountCents: preview.amountTtcCents,
+      idempotencyKey: key,
+      currency: preview.currency,
+      orderId,
+      note: 'Règlement commande par solde',
+      methodName: 'Solde du portefeuille',
+    };
+
+    // Rejeu propre : déjà réglé + débit wallet abouti de même identité = succès
+    // neutre (aucun second effet). Déjà réglé par un AUTRE moyen = conflit.
+    if (preview.status !== OrderStatus.PENDING_PAYMENT) {
+      const prior = await this.prisma.walletTransaction.findUnique({
+        where: { idempotencyKey: key },
+      });
+      if (
+        prior &&
+        prior.customerId === preview.customer.id &&
+        prior.type === WalletTransactionType.DEBIT &&
+        prior.amountCents === preview.amountTtcCents &&
+        prior.currency === preview.currency &&
+        prior.status === WalletTxStatus.SUCCEEDED
+      ) {
+        return {
+          orderId,
+          status: preview.status,
+          balanceCents: preview.customer.walletBalanceCents,
+          amountTtcCents: preview.amountTtcCents,
+          replayed: true,
+          alreadyConfirmed: true,
+        };
+      }
+      throw new ConflictException(
+        `Commande ${preview.status} : règlement impossible.`,
+      );
+    }
+
+    const ctx: ConfirmPaidContext = {
+      source: 'wallet',
+      actorId: user.sub,
+      actorEmail: user.email,
+      reference: key,
+    };
+
+    type WalletTxOutcome = {
+      replayed: boolean;
+      balanceCents: number;
+      status: OrderStatus;
+      conf: ConfirmTxOutcome | null;
+    };
+
+    let out: WalletTxOutcome;
+    try {
+      out = await this.prisma.$transaction(async (tx): Promise<WalletTxOutcome> => {
+        // 1) verrou COMMANDE : sérialise double-clic / courses concurrentes.
+        const rows = await tx.$queryRaw<
+          { id: string; status: OrderStatus; amountTtcCents: number; currency: string }[]
+        >`
+          SELECT id, status, "amountTtcCents", currency FROM "Order"
+          WHERE id = ${orderId} FOR UPDATE`;
+        if (rows.length === 0) throw new NotFoundException('Commande introuvable.');
+        if (rows[0].status !== OrderStatus.PENDING_PAYMENT) {
+          // Le concurrent a gagné entre le preview et le verrou : si SON débit
+          // wallet abouti couvre ce règlement, c'est un REJEU (201 neutre),
+          // sinon conflit honnête.
+          const prior = await tx.walletTransaction.findUnique({
+            where: { idempotencyKey: key },
+          });
+          if (
+            prior &&
+            prior.customerId === preview.customer.id &&
+            prior.type === WalletTransactionType.DEBIT &&
+            prior.amountCents === rows[0].amountTtcCents &&
+            prior.currency === rows[0].currency &&
+            prior.status === WalletTxStatus.SUCCEEDED
+          ) {
+            const customer = await tx.customer.findUnique({
+              where: { id: preview.customer.id },
+              select: { walletBalanceCents: true },
+            });
+            return {
+              replayed: true,
+              balanceCents: customer?.walletBalanceCents ?? 0,
+              status: rows[0].status,
+              conf: null,
+            };
+          }
+          throw new ConflictException(
+            `Commande ${rows[0].status} : règlement impossible.`,
+          );
+        }
+        const amountTtcCents = rows[0].amountTtcCents;
+
+        // 2) récupération split legacy (débit fait SANS confirmation atomique,
+        //    bug ancien) : net = débits aboutis − crédits pour CETTE commande.
+        const wtx = await tx.walletTransaction.findMany({
+          where: { customerId: preview.customer.id, orderId },
+          select: { type: true, status: true, amountCents: true },
+        });
+        const netDebited = wtx
+          .filter((w) => w.status === WalletTxStatus.SUCCEEDED)
+          .reduce((s, w) => s + (w.type === WalletTransactionType.DEBIT ? w.amountCents : -w.amountCents), 0);
+
+        if (netDebited >= amountTtcCents) {
+          // Débit (legacy) non compensé couvrant déjà ce règlement →
+          // confirmation SEULE (jamais un 2e débit pour le même règlement).
+        } else if (netDebited > 0) {
+          throw new ConflictException(
+            'Règlement déjà en cours (débit partiel détecté).',
+          );
+        } else {
+          // 3) débit frais, DANS la tx de confirmation (clé wallet-pay:<id>).
+          await this.wallet.applyWithClient(
+            tx,
+            preview.customer.id,
+            { ...debitInput, amountCents: amountTtcCents },
+            'debit',
+          );
+        }
+
+        // 4) confirmation = mêmes droits que tout autre règlement (corps tx
+        //    identique), audit d'échec inclus.
+        const c = await this.confirmOrderInTx(tx, orderId, ctx);
+        const customer = await tx.customer.findUnique({
+          where: { id: preview.customer.id },
+          select: { walletBalanceCents: true },
+        });
+        return {
+          replayed: false,
+          balanceCents: customer?.walletBalanceCents ?? 0,
+          status: c.renewal ? OrderStatus.ACTIVE : OrderStatus.PAID,
+          conf: c,
+        };
+      });
+    } catch (e) {
+      await this.audit
+        .record({
+          action: 'payment.confirm_failed',
+          resourceType: 'order',
+          resourceId: orderId,
+          details: { source: ctx.source, error: String(e) },
+        })
+        .catch(() => {});
+      throw e;
+    }
+
+    // Effets post-commit : best-effort TOUJOURS (un échec ici ne retourne
+    // JAMAIS une erreur après commit — l'état committé est la vérité, aucun
+    // re-crédit).
+    if (out.conf && !out.conf.alreadyConfirmed) {
+      try {
+        await this.postConfirmEffects(out.conf, orderId, ctx);
+      } catch (e) {
+        this.log.warn(`wallet pay order=${orderId}: post effects failed: ${String(e)}`);
+      }
+    }
     return {
       orderId,
-      status: outcome.renewal ? OrderStatus.ACTIVE : OrderStatus.PAID,
-      alreadyConfirmed: false,
-      subscriptionAction: outcome.subscriptionAction,
+      status: out.status,
+      balanceCents: out.balanceCents,
+      amountTtcCents: preview.amountTtcCents,
+      replayed: out.replayed,
+      alreadyConfirmed: out.replayed || (out.conf?.alreadyConfirmed ?? true),
+      subscriptionAction: out.conf?.subscriptionAction ?? null,
     };
   }
 

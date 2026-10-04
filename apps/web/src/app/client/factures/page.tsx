@@ -11,6 +11,7 @@ import {
   listMyInvoices,
   INVOICE_STATUS_LABEL,
   INVOICE_STATUS_TONE,
+  payMyInvoiceWithWallet,
   type InvoiceDetail,
   type InvoiceListPage,
   type Me,
@@ -49,6 +50,8 @@ export default function ClientInvoicesPage() {
   const [data, setData] = useState<InvoiceListPage | null>(null);
   const [detail, setDetail] = useState<InvoiceDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
+  // Q-A (GO item 1) — règlement d'une facture UNPAID par solde (atomique).
+  const [paying, setPaying] = useState(false);
 
   const load = useCallback(
     async (t: string, p: number, st: string) => {
@@ -106,6 +109,34 @@ export default function ClientInvoicesPage() {
       }
     },
     [token, toast],
+  );
+
+  /**
+   * Q-A (item 1) — règlement par SOLDE : le serveur redirige vers la commande
+   * qui porte la facture (débit + encaissement en UNE transaction). Facture
+   * sans commande / déjà réglée → 409 serveur, message affiché tel quel.
+   */
+  const payByWallet = useCallback(
+    async (invId: string) => {
+      setPaying(true);
+      const r = await payMyInvoiceWithWallet(token, invId);
+      setPaying(false);
+      if (!r.ok) {
+        const msg = (r.data as { message?: string } | null)?.message;
+        toast.error(
+          msg && typeof msg === 'string' ? msg : 'Règlement refusé (solde insuffisant ?).',
+        );
+        return;
+      }
+      toast.ok(
+        (r.data as { replayed?: boolean } | null)?.replayed
+          ? 'Facture déjà réglée — aucun nouveau débit.'
+          : 'Facture réglée par solde.',
+      );
+      await load(token, 1, status);
+      if (detail && detail.id === invId) await openDetail(token, invId);
+    },
+    [token, toast, load, status, detail, openDetail],
   );
 
   useEffect(() => {
@@ -233,6 +264,16 @@ export default function ClientInvoicesPage() {
                         </td>
                         <td className="nowrap" style={{ textAlign: 'right' }}>
                           <span className="row" style={{ justifyContent: 'flex-end', gap: 6 }}>
+                            {/* Q-A (item 1) — encaissement direct par solde. */}
+                            {inv.status === 'UNPAID' && (
+                              <Button
+                                size="sm"
+                                disabled={paying}
+                                onClick={() => void payByWallet(inv.id)}
+                              >
+                                Régler
+                              </Button>
+                            )}
                             <Button size="sm" variant="secondary" onClick={() => void openDetail(token, inv.id)}>
                               Détail
                             </Button>
@@ -293,6 +334,16 @@ export default function ClientInvoicesPage() {
                 <Badge tone={INVOICE_STATUS_TONE[detail.status] ?? 'neutral'}>
                   {INVOICE_STATUS_LABEL[detail.status] ?? detail.status}
                 </Badge>
+                {/* Q-A (item 1) — règlement par solde depuis le détail. */}
+                {detail.status === 'UNPAID' && (
+                  <Button
+                    size="sm"
+                    disabled={paying}
+                    onClick={() => void payByWallet(detail.id)}
+                  >
+                    {paying ? 'Règlement…' : 'Régler par solde'}
+                  </Button>
+                )}
                 <Button size="sm" variant="secondary" onClick={() => void downloadPdf(detail)}>
                   Télécharger le PDF
                 </Button>

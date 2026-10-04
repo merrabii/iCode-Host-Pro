@@ -1,23 +1,32 @@
 import {
+  Body,
+  ConflictException,
   Controller,
   Get,
   NotFoundException,
   Param,
+  Patch,
+  Post,
   Query,
   Res,
   StreamableFile,
   UseGuards,
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
-import { Prisma } from '@prisma/client';
+import { BillingCycle, InvoiceStatus, OrderStatus, Prisma } from '@prisma/client';
 import type { Response } from 'express';
 import * as fs from 'node:fs';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import { JwtPayload } from '../auth/types';
+import { AuditService } from '../audit/audit.service';
 import { PrismaService } from '../prisma/prisma.service';
+import { WalletService } from '../wallet/wallet.service';
+import { CheckoutService } from './checkout.service';
+import { addBillingCycle } from './billing-cycle';
 import { InvoicePdfService } from './invoice-pdf.service';
 import { InvoiceListQueryDto, OrderListQueryDto } from './dto/store-lists.dto';
+import { RenewalToggleDto } from './dto/renewal-toggle.dto';
 
 /**
  * Socle commercial (GO P4 / lot B1 - visibilité) — vues « mes commandes » et
@@ -38,6 +47,9 @@ export class ClientStoreController {
   constructor(
     private readonly prisma: PrismaService,
     private readonly pdf: InvoicePdfService,
+    private readonly wallet: WalletService,
+    private readonly checkout: CheckoutService,
+    private readonly audit: AuditService,
   ) {}
 
   /** Propriétaire du dossier : compte lié (userId) OU client au même email. */
@@ -109,6 +121,24 @@ export class ClientStoreController {
     return order;
   }
 
+  /**
+   * Q-A (item 1) — règlement d'une commande par SOLDE : débit + confirmation
+   * ATOMIQUES (`CheckoutService.payOrderWithWallet`, une seule transaction).
+   * Le dossier invité non lié est d'abord rattaché au compte
+   * (`ensureOwnedCustomer`, conflit si le dossier appartient à un autre
+   * compte) ; le propriétaire STRICT (`customer.userId === sub`) est ensuite
+   * revérifié côté service — 404 sinon, jamais de fuite d'existence.
+   */
+  @Post('orders/:id/pay-with-wallet')
+  @ApiOperation({ summary: 'Régler ma commande avec mon solde portefeuille' })
+  async payMyOrderWithWallet(
+    @CurrentUser() user: JwtPayload,
+    @Param('id') id: string,
+  ) {
+    await this.wallet.ensureOwnedCustomer(user);
+    return this.checkout.payOrderWithWallet(id, user);
+  }
+
   /** Factures du client connecté, paginées, triées de la plus récente. */
   @Get('invoices')
   @ApiOperation({ summary: 'Mes factures (client, paginé)' })
@@ -171,6 +201,114 @@ export class ClientStoreController {
   }
 
   /**
+   * Q-A (item 1) — règlement d'une facture UNPAID par SOLDE : le règlement est
+   * commande-centrique et atomique, on redirige vers la commande qui porte la
+   * facture. Facture sans commande (ad hoc admin) → 409 honnête ; facture déjà
+   * réglée → 409 ; propriétaire strict revérifié côté service (404 sinon).
+   */
+  @Post('invoices/:id/pay-with-wallet')
+  @ApiOperation({ summary: 'Régler ma facture avec mon solde portefeuille' })
+  async payMyInvoiceWithWallet(
+    @CurrentUser() user: JwtPayload,
+    @Param('id') id: string,
+  ) {
+    const invoice = await this.prisma.invoice.findFirst({
+      where: { id, customer: this.ownedBy(user) },
+      select: { orderId: true, status: true },
+    });
+    if (!invoice) throw new NotFoundException('Facture introuvable.');
+    if (invoice.status !== InvoiceStatus.UNPAID) {
+      throw new ConflictException(`Facture ${invoice.status} : déjà réglée.`);
+    }
+    if (!invoice.orderId) {
+      throw new ConflictException('Facture sans commande : règlement par solde impossible.');
+    }
+    await this.wallet.ensureOwnedCustomer(user);
+    return this.checkout.payOrderWithWallet(invoice.orderId, user);
+  }
+
+  /**
+   * Q-A (item 4) — armement / RÉVOCATION du renouvellement automatique par le
+   * propriétaire strict de la commande. `enabled=true` enregistre le
+   * consentement daté (`renewalConsentAt`, si absent) et arme `autoRenew` +
+   * l'échéance ; `enabled=false` bascule `autoRenew=false` immédiatement (le
+   * consentement historique reste daté). CAS : les sweeps de création voient
+   * l'état courant — la révocation même concurrente à un sweep est sûre (le
+   * flip de création exige `autoRenew: true`).
+   */
+  @Patch('orders/:id/renewal')
+  @ApiOperation({ summary: 'Activer ou révoquer le renouvellement automatique' })
+  async setMyOrderRenewal(
+    @CurrentUser() user: JwtPayload,
+    @Param('id') id: string,
+    @Body() body: RenewalToggleDto,
+  ) {
+    const order = await this.prisma.order.findFirst({
+      where: { id, customer: this.ownedBy(user) },
+      select: {
+        id: true,
+        status: true,
+        billingCycle: true,
+        autoRenew: true,
+        renewalConsentAt: true,
+        nextBillingDate: true,
+      },
+    });
+    if (!order) throw new NotFoundException('Commande introuvable.');
+    if (order.billingCycle === BillingCycle.ONETIME) {
+      throw new ConflictException('Commande sans abonnement : aucun renouvellement à gérer.');
+    }
+
+    if (body.enabled) {
+      if (
+        order.status !== OrderStatus.PAID &&
+        order.status !== OrderStatus.PROVISIONING &&
+        order.status !== OrderStatus.ACTIVE
+      ) {
+        throw new ConflictException(
+          `Commande ${order.status} : renouvellement armable seulement après règlement.`,
+        );
+      }
+      const now = new Date();
+      const next =
+        order.nextBillingDate ?? addBillingCycle(now, order.billingCycle) ?? now;
+      await this.prisma.order.updateMany({
+        where: { id: order.id, autoRenew: false },
+        data: {
+          autoRenew: true,
+          renewalConsentAt: order.renewalConsentAt ?? now,
+          nextBillingDate: next,
+        },
+      });
+    } else {
+      await this.prisma.order.updateMany({
+        where: { id: order.id, autoRenew: true },
+        data: { autoRenew: false },
+      });
+    }
+
+    await this.audit
+      .record({
+        action: 'subscription.renewal_toggled',
+        resourceType: 'order',
+        resourceId: order.id,
+        details: { enabled: body.enabled },
+      })
+      .catch(() => {});
+
+    const fresh = await this.prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+      select: {
+        id: true,
+        autoRenew: true,
+        renewalConsentAt: true,
+        nextBillingDate: true,
+      },
+    });
+    return fresh;
+  }
+
+  /**
    * PDF de ma facture (D1) — même isolation que le détail (404 si le compte
    * n'en est pas propriétaire). Rendu figé à l'émission, jamais régénéré à
    * partir des paramètres courants.
@@ -210,6 +348,9 @@ const ORDER_LIST_SELECT = {
   paidAt: true,
   nextBillingDate: true,
   autoRenew: true,
+  // Q-A (item 4) — consentement daté exposé au client (jamais modifiable
+  // directement : armement/révocation via PATCH orders/:id/renewal).
+  renewalConsentAt: true,
   customerName: true,
   customerEmail: true,
   paymentMethodName: true,

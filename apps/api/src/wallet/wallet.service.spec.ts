@@ -104,11 +104,23 @@ describe('WalletService — C2 (crédit/débit atomiques, idempotence, anti-nég
 
   it('rejeu P2002 (même clé, même client) → replay neutre, pas de 2e écriture', async () => {
     lockRows = [{ walletBalanceCents: 1000 }];
-    prisma.walletTransaction.findUnique.mockResolvedValue({ customerId: 'cust1' });
+    // Q-A (item 2) : le rejeu n'est accepté que si l'IDENTITÉ complète est la
+    // même (sens, montant, devise, statut abouti, liens commande/facture).
+    prisma.walletTransaction.findUnique.mockResolvedValue({
+      customerId: 'cust1',
+      type: 'DEBIT',
+      amountCents: 300,
+      currency: 'USD',
+      status: 'SUCCEEDED',
+      orderId: null,
+      invoiceId: null,
+      reference: null,
+    });
     prisma.customer.findUnique.mockResolvedValue({ walletBalanceCents: 700 });
     tx.walletTransaction.create.mockImplementation(p2002);
     const res = await service.debit('cust1', { amountCents: 300, idempotencyKey: 'k2' });
     expect(res).toEqual({ balanceCents: 700, replayed: true });
+    expect(tx.walletTransaction.create).not.toHaveBeenCalled();
     expect(tx.customer.update).not.toHaveBeenCalled();
   });
 
@@ -118,6 +130,24 @@ describe('WalletService — C2 (crédit/débit atomiques, idempotence, anti-nég
     await expect(
       service.credit('cust1', { amountCents: 100, idempotencyKey: 'k-x' }),
     ).rejects.toBeInstanceOf(ConflictException);
+  });
+
+  it('Q-A : même clé mais identité DIFFÉRENTE (montant) → 409, aucune écriture', async () => {
+    prisma.walletTransaction.findUnique.mockResolvedValue({
+      customerId: 'cust1',
+      type: 'DEBIT',
+      amountCents: 999, // ≠ 300 demandé → ce n'est PAS un rejeu
+      currency: 'USD',
+      status: 'SUCCEEDED',
+      orderId: null,
+      invoiceId: null,
+      reference: null,
+    });
+    await expect(
+      service.debit('cust1', { amountCents: 300, idempotencyKey: 'k2' }),
+    ).rejects.toBeInstanceOf(ConflictException);
+    expect(tx.walletTransaction.create).not.toHaveBeenCalled();
+    expect(tx.customer.update).not.toHaveBeenCalled();
   });
 
   it('montants invalides (0, négatif, décimal) → 400, jamais écrit', async () => {

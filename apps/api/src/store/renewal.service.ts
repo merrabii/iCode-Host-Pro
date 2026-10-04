@@ -1,17 +1,23 @@
-import { ConflictException, Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
+import {
+  ConflictException,
+  Injectable,
+  Logger,
+  NotFoundException,
+  OnModuleDestroy,
+  OnModuleInit,
+} from '@nestjs/common';
 import {
   BillingCycle,
+  InvoiceLineKind,
   InvoiceStatus,
   OrderStatus,
   Prisma,
+  Role,
   SubscriptionStatus,
-  WalletTransactionType,
-  WalletTxStatus,
 } from '@prisma/client';
 import { AuditService } from '../audit/audit.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { MailSettingsService } from '../mail/mail-settings.service';
-import { WalletService } from '../wallet/wallet.service';
 import { CheckoutService } from './checkout.service';
 import { claimInvoiceSequence } from './invoice-sequence';
 import { clientAreaUrl } from './web-links';
@@ -35,16 +41,18 @@ function clampDays(value: unknown, fallback: number): number {
  *
  * Quatre passes idempotentes, dans cet ordre :
  *
- *  1. **Renouvellement** (`autoRenew` + `nextBillingDate` échue, commande de la
- *     famille payée, souscription ACTIVE du même produit) → NOUVELLE commande
- *     (`renewsOrderId` chaîné, la mère bascule `autoRenew=false` dans la MÊME
- *     transaction : UNE seule tentative à la fois, contrainte unique en secours)
- *     + NOUVELLE facture UNPAID (numéros partagés D1, mentions/échéance
- *     figées). Puis **paiement par solde** (`WalletService.debit`, clé
- *     `renewal:<orderId>`) → `confirmOrderPaid(source 'wallet')` : la commande
- *     renouvellement passe PAID → ACTIVE sans provisioning (service inchangé).
- *     Solde insuffisant → facture reste UNPAID (la période suivante n'est
- *     JAMAIS ouverte avant règlement).
+ *  1. **Renouvellement** (`autoRenew` + `nextBillingDate` échue +
+ *     `renewalConsentAt` enregistré = consentement explicite Q-A, commande de la
+ *     famille payée, souscription liée à la CHAÎNE et ACTIVE du même produit) →
+ *     NOUVELLE commande (`renewsOrderId` chaîné, la mère bascule
+ *     `autoRenew=false` dans la MÊME transaction : UNE seule tentative à la
+ *     fois, contrainte unique en secours) + NOUVELLE facture UNPAID (numéros
+ *     partagés D1, mentions/échéance figées, lignes RÉCURRENTES seulement).
+ *     Puis **paiement atomique** : `CheckoutService.payOrderWithWallet`
+ *     (débit + confirmation UNE SEULE transaction, clé `wallet-pay:<orderId>`,
+ *     sans crédit compensatoire) → commande renouvellement PAID → ACTIVE sans
+ *     provisioning (service inchangé). Solde insuffisant → facture reste UNPAID
+ *     (la période suivante n'est JAMAIS ouverte avant règlement).
  *  2. **Reprise/relance de paiement** : renouvellement PENDING sans prélevement
  *     → réessai (le client a pu recharger) ; prélevé mais non confirmé (crash
  *     entre le débit et la confirmation) → re-confirmation idempotente.
@@ -72,7 +80,6 @@ export class RenewalService implements OnModuleInit, OnModuleDestroy {
   constructor(
     private readonly prisma: PrismaService,
     private readonly audit: AuditService,
-    private readonly wallet: WalletService,
     private readonly checkout: CheckoutService,
     private readonly mail: MailSettingsService,
   ) {}
@@ -133,16 +140,21 @@ export class RenewalService implements OnModuleInit, OnModuleDestroy {
     stopped: number;
   }> {
     const now = new Date();
-    // Échu + cycle récurrent + famille payée (PAID/PROVISIONING/ACTIVE).
+    // Échu + cycle récurrent + CONSENTEMENT enregistré (Q-A : sans
+    // `renewalConsentAt`, AUCUN prélèvement automatique n'est planifié — les
+    // têtes héritées sans consentement sont simplement ignorées) + famille
+    // payée (PAID/PROVISIONING/ACTIVE).
     const heads = await this.prisma.order.findMany({
       where: {
         autoRenew: true,
+        renewalConsentAt: { not: null },
         nextBillingDate: { lte: now },
         billingCycle: { not: BillingCycle.ONETIME },
         status: { in: [OrderStatus.PAID, OrderStatus.PROVISIONING, OrderStatus.ACTIVE] },
       },
       select: {
         id: true,
+        renewsOrderId: true,
         customerId: true,
         customerName: true,
         customerEmail: true,
@@ -161,6 +173,7 @@ export class RenewalService implements OnModuleInit, OnModuleDestroy {
         optionsSnapshot: true,
         addonsSnapshot: true,
         nextBillingDate: true,
+        renewalConsentAt: true,
         customer: { select: { userId: true } },
       },
       take: 10,
@@ -173,7 +186,7 @@ export class RenewalService implements OnModuleInit, OnModuleDestroy {
     let stopped = 0;
     for (const head of heads) {
       try {
-        const gate = await this.gateSubscription(head.productId, head.customer.userId);
+        const gate = await this.gateSubscription(head, head.customer.userId);
         if (gate === 'stop' || gate === 'stop_product') {
           stopped += await this.stopChain(
             head.id,
@@ -192,16 +205,15 @@ export class RenewalService implements OnModuleInit, OnModuleDestroy {
           details: {
             motherOrderId: head.id,
             invoiceNumber: made.invoiceNumber,
-            amountTtcCents: head.amountTtcCents,
+            amountTtcCents: made.invoice.amountTtcCents,
             missedBillingDate: head.nextBillingDate,
             billingCycle: head.billingCycle,
           },
         });
         const outcome = await this.attemptPayment(
           made.renewal.id,
-          made.invoice.id,
           made.invoice.amountTtcCents,
-          head.customerId,
+          { userId: head.customer.userId, email: head.customerEmail },
           made.invoiceNumber,
         );
         if (outcome === 'paid') paid += 1;
@@ -222,24 +234,56 @@ export class RenewalService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * Garde d'éligibilité (lecture seule) :
-   * - `ok`   : souscription ACTIVE du MÊME produit → renouveler ;
-   * - `skip` : souscription PENDING/SUSPENDED → on n'arrête PAS la chaîne
+   * Garde d'éligibilité (lecture seule) — Q-A (item 4) : l'abonnement est
+   * résolu par la CHAÎNE de renouvellements (`renewsOrderId`, garde 50), et
+   * par l'abonnement porté par la facture de l'échéance quand il existe —
+   * JAMAIS « simplement le dernier abonnement actif » du compte :
+   * - `ok`   : abonnement lié à la chaîne, ACTIVE, même produit → renouveler ;
+   * - `skip` : lié mais PENDING/SUSPENDED → on n'arrête PAS la chaîne
    *            (l'admin peut réactiver ; le renouvellement reprendra) ;
-   * - `stop` : aucune souscription / CANCELLED / REJECTED / produit changé
-   *            (upgrade) → la chaîne s'arrête définitivement.
+   * - `stop` : lié CANCELLED/REJECTED, ou aucun abonnement lié ;
+   * - `stop_product` : abonnement lié d'un AUTRE produit (upgrade).
+   * Fallback documenté : SANS lien de chaîne (données avant traçabilité
+   * facture→abonnement), repli sur l'ancien comportement P8.
    */
   private async gateSubscription(
-    productId: string,
+    head: { id: string; renewsOrderId: string | null; productId: string },
     userId: string | null,
   ): Promise<'ok' | 'skip' | 'stop' | 'stop_product'> {
     if (!userId) return 'stop';
+    const chain: string[] = [head.id];
+    let cursor = head.renewsOrderId;
+    for (let guard = 0; cursor && guard < 50; guard++) {
+      chain.push(cursor);
+      const parent = await this.prisma.order.findUnique({
+        where: { id: cursor },
+        select: { renewsOrderId: true },
+      });
+      cursor = parent?.renewsOrderId ?? null;
+    }
+    const linked = await this.prisma.subscription.findFirst({
+      where: { userId, orderId: { in: chain } },
+      select: { productId: true, status: true },
+    });
+    if (linked) {
+      if (linked.status === SubscriptionStatus.ACTIVE) {
+        return linked.productId === head.productId ? 'ok' : 'stop_product';
+      }
+      if (
+        linked.status === SubscriptionStatus.SUSPENDED ||
+        linked.status === SubscriptionStatus.PENDING
+      ) {
+        return 'skip';
+      }
+      return 'stop'; // CANCELLED / REJECTED
+    }
+    // Fallback données pré-lien : ancien comportement P8 conservé.
     const active = await this.prisma.subscription.findFirst({
       where: { userId, status: SubscriptionStatus.ACTIVE },
       orderBy: { createdAt: 'desc' },
-      select: { id: true, productId: true },
+      select: { productId: true },
     });
-    if (active) return active.productId === productId ? 'ok' : 'stop_product';
+    if (active) return active.productId === head.productId ? 'ok' : 'stop_product';
     const latest = await this.prisma.subscription.findFirst({
       where: { userId },
       orderBy: { createdAt: 'desc' },
@@ -275,6 +319,7 @@ export class RenewalService implements OnModuleInit, OnModuleDestroy {
   private async createRenewalOrder(
     head: {
       id: string;
+      renewsOrderId: string | null;
       customerId: string;
       customerName: string;
       customerEmail: string;
@@ -293,6 +338,7 @@ export class RenewalService implements OnModuleInit, OnModuleDestroy {
       optionsSnapshot: Prisma.JsonValue;
       addonsSnapshot: Prisma.JsonValue;
       nextBillingDate: Date | null;
+      renewalConsentAt: Date | null;
     },
     now: Date,
   ): Promise<{
@@ -311,6 +357,44 @@ export class RenewalService implements OnModuleInit, OnModuleDestroy {
         where: { orderId: head.id },
         include: { lines: { orderBy: { sortOrder: 'asc' } } },
       });
+      // Q-A (item 4) — SEULEMENT les lignes RÉCURRENTES sont renouvelées :
+      // produit/option/addons. Les lignes une-fois (frais d'installation =
+      // ADJUSTMENT, crédits...) ne réapparaissent JAMAIS ; les totaux sont
+      // RECALCULÉS depuis ces lignes (jamais recopiés tels quels).
+      const recurringLines = (motherInv?.lines ?? []).filter(
+        (l) =>
+          l.kind === InvoiceLineKind.PRODUCT ||
+          l.kind === InvoiceLineKind.OPTION ||
+          l.kind === InvoiceLineKind.ADDON,
+      );
+      if (motherInv && recurringLines.length === 0) {
+        // Rien de récurrent à facturer : la tête vient d'être close (flip ci-
+        // dessus) — tracée dans l'historique, aucun renouvellement fabriqué.
+        await tx.orderStatusHistory.create({
+          data: {
+            orderId: head.id,
+            status: OrderStatus.PAID,
+            note: 'Renouvellement close : aucune ligne récurrente sur la facture mère.',
+            actorEmail: null,
+          },
+        });
+        return null;
+      }
+      const computed = motherInv
+        ? {
+            amountHtCents: recurringLines.reduce(
+              (s, l) => s + l.unitPriceHtCents * l.qty,
+              0,
+            ),
+            taxAmountCents: recurringLines.reduce((s, l) => s + l.taxAmountCents, 0),
+            amountTtcCents: recurringLines.reduce((s, l) => s + l.totalTtcCents, 0),
+          }
+        : {
+            amountHtCents: head.amountHtCents,
+            taxAmountCents: head.taxAmountCents,
+            amountTtcCents: head.amountTtcCents,
+          };
+
       const claim = await claimInvoiceSequence(tx);
       const billing = claim.billing;
       const dueDays = clampDays(billing?.invoiceDueDays, 14);
@@ -328,16 +412,19 @@ export class RenewalService implements OnModuleInit, OnModuleDestroy {
           packId: head.packId,
           status: OrderStatus.PENDING_PAYMENT,
           billingCycle: head.billingCycle as BillingCycle,
-          currency: claim.currency,
+          // Q-A (item 4) : devise de la TÊTE (jamais une devise « réclamée »)
+          // + consentement hérité de la tête (la chaîne reste traçable).
+          currency: head.currency,
           taxRatePercent: head.taxRatePercent,
-          amountHtCents: head.amountHtCents,
-          taxAmountCents: head.taxAmountCents,
-          amountTtcCents: head.amountTtcCents,
+          amountHtCents: computed.amountHtCents,
+          taxAmountCents: computed.taxAmountCents,
+          amountTtcCents: computed.amountTtcCents,
           paymentMethodId: head.paymentMethodId,
           paymentMethodName: head.paymentMethodName,
           optionsSnapshot: head.optionsSnapshot ?? Prisma.JsonNull,
           addonsSnapshot: head.addonsSnapshot ?? Prisma.JsonNull,
           renewsOrderId: head.id,
+          renewalConsentAt: head.renewalConsentAt,
         },
       });
 
@@ -347,11 +434,11 @@ export class RenewalService implements OnModuleInit, OnModuleDestroy {
           orderId: renewal.id,
           customerId: head.customerId,
           status: InvoiceStatus.UNPAID,
-          currency: claim.currency,
+          currency: head.currency,
           taxRatePercent: head.taxRatePercent,
-          amountHtCents: head.amountHtCents,
-          taxAmountCents: head.taxAmountCents,
-          amountTtcCents: head.amountTtcCents,
+          amountHtCents: computed.amountHtCents,
+          taxAmountCents: computed.taxAmountCents,
+          amountTtcCents: computed.amountTtcCents,
           issuedAt,
           dueDate,
           legalMentionsSnapshot: motherInv?.legalMentionsSnapshot ?? {},
@@ -362,7 +449,7 @@ export class RenewalService implements OnModuleInit, OnModuleDestroy {
           },
           lines: motherInv
             ? {
-                create: motherInv.lines.map((l, i) => ({
+                create: recurringLines.map((l, i) => ({
                   kind: l.kind,
                   label: l.label,
                   qty: l.qty,
@@ -393,83 +480,82 @@ export class RenewalService implements OnModuleInit, OnModuleDestroy {
   // ───────────────────── 2. Paiement / reprise ──────────────────────────────
 
   /**
-   * Débite le solde (clé idempotente `renewal:<orderId>`) puis confirme la
-   * commande. `amount <= 0` → confirmation `free` (aucun mouvement).
-   * Retourne `paid` (débit réussi + confirmé) ou `pending` (solde insuffisant
-   * ou prélevé non confirmé — relancé par la passe suivante).
+   * Q-A (item 1) — paiement ATOMIQUE d'un renouvellement : débit + confirmation
+   * dans UNE transaction (`CheckoutService.payOrderWithWallet`, clé
+   * `wallet-pay:<orderId>`), JAMAIS de crédit compensatoire (le rollback de la
+   * tx est le seul compensateur). `amount <= 0` → confirmation `free` (aucun
+   * mouvement). Retourne `paid` ou `pending` : solde insuffisant, devise non
+   * prise en charge, commande non trouvée ou non au propriétaire → relancé par
+   * la passe suivante (jamais de débit silencieux).
    */
   private async attemptPayment(
     orderId: string,
-    invoiceId: string | null,
     amountCents: number,
-    customerId: string,
-    invoiceNumber: string,
+    owner: { userId: string | null; email: string },
+    label: string,
   ): Promise<'paid' | 'pending'> {
     if (amountCents <= 0) {
       await this.checkout.confirmOrderPaid(orderId, { source: 'free' });
       return 'paid';
     }
+    if (!owner.userId) {
+      // Aucun compte lié au dossier : aucun prélèvement n'est JAMAIS possible.
+      this.log.warn(`renewal payment order=${orderId} pending: aucun compte lié (${label})`);
+      return 'pending';
+    }
     try {
-      await this.wallet.debit(customerId, {
-        amountCents,
-        idempotencyKey: `renewal:${orderId}`,
-        orderId,
-        invoiceId,
-        note: `Renouvellement automatique — facture ${invoiceNumber}`,
+      await this.checkout.payOrderWithWallet(orderId, {
+        sub: owner.userId,
+        email: owner.email,
+        role: Role.USER,
       });
+      return 'paid';
     } catch (e) {
-      if (e instanceof ConflictException) return 'pending'; // solde insuffisant
+      if (e instanceof ConflictException || e instanceof NotFoundException) {
+        this.log.warn(`renewal payment order=${orderId} pending (${label}): ${String(e)}`);
+        return 'pending';
+      }
       throw e;
     }
-    try {
-      await this.checkout.confirmOrderPaid(orderId, { source: 'wallet' });
-    } catch (e) {
-      // Compensation best-effort : la confirmation a échoué après le débit.
-      await this.wallet
-        .credit(customerId, {
-          amountCents,
-          idempotencyKey: `renewal-refund:${orderId}`,
-          orderId,
-          invoiceId,
-          note: 'Annulation du prélèvement de renouvellement (confirmation impossible).',
-        })
-        .catch(() => {});
-      throw e;
-    }
-    return 'paid';
   }
 
   /**
-   * Reprise : les renouvellements PENDING sont soit re-prélevés (le client a
-   * rechargé), soit re-confirmés si le prélevement existe déjà (crash entre le
-   * débit et la confirmation).
+   * Reprise : les renouvellements PENDING sont RE-VALIDÉS (garde d'éligibilité,
+   * Q-A : jamais de prélèvement sur une chaîne close/suspendue/produit changé
+   * depuis la création) puis re-prélevés/confirmés par le paiement atomique
+   * (`payOrderWithWallet`) — qui sait lui-même récupérer un débit legacy non
+   * compensé (confirmation SANS second débit) et refuser un double débit.
    */
   private async payPendingRenewals(): Promise<{ paid: number; pending: number }> {
     const pendingOrders = await this.prisma.order.findMany({
       where: { renewsOrderId: { not: null }, status: OrderStatus.PENDING_PAYMENT },
-      select: { id: true, customerId: true, amountTtcCents: true, invoice: { select: { id: true, number: true, amountTtcCents: true } } },
+      select: {
+        id: true,
+        renewsOrderId: true,
+        productId: true,
+        amountTtcCents: true,
+        customerEmail: true,
+        customer: { select: { userId: true } },
+        invoice: { select: { number: true } },
+      },
       take: 10,
     });
     let paid = 0;
     let pending = 0;
     for (const o of pendingOrders) {
       try {
-        const debit = await this.prisma.walletTransaction.findFirst({
-          where: { orderId: o.id, type: WalletTransactionType.DEBIT, status: WalletTxStatus.SUCCEEDED },
-          select: { id: true },
-        });
-        if (debit) {
-          await this.checkout.confirmOrderPaid(o.id, { source: 'wallet' });
-          paid += 1;
+        const gate = await this.gateSubscription(o, o.customer.userId);
+        if (gate !== 'ok') {
+          // Chaîne close / suspendue / produit changé depuis la création :
+          // AUCUN débit (la facture reste UNPAID, gérée par dunning/suspension).
+          pending += 1;
           continue;
         }
-        const invoice = o.invoice;
         const outcome = await this.attemptPayment(
           o.id,
-          invoice?.id ?? null,
           o.amountTtcCents,
-          o.customerId,
-          invoice?.number ?? '?',
+          { userId: o.customer.userId, email: o.customerEmail },
+          o.invoice?.number ?? 'reprise',
         );
         if (outcome === 'paid') paid += 1;
         else pending += 1;

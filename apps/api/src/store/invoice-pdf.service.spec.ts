@@ -46,6 +46,7 @@ describe('InvoicePdfService (D1)', () => {
       dunningRemindedAt: null,
       paidAt: null,
       walletTransactionId: null,
+      subscriptionId: null,
       pdfPath: null,
       creditNoteOfId: null,
       legalMentionsSnapshot: {

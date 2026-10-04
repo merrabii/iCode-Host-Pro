@@ -11,6 +11,8 @@ import {
   listMyOrders,
   ORDER_STATUS_LABEL,
   ORDER_STATUS_TONE,
+  payMyOrderWithWallet,
+  setMyOrderRenewal,
   type InvoiceDetail,
   type Me,
   type OrderDetail,
@@ -53,6 +55,9 @@ export default function ClientOrdersPage() {
   const [detail, setDetail] = useState<OrderDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [invoice, setInvoice] = useState<InvoiceDetail | null>(null);
+  // Q-A (GO item 1+4) — règlement par solde + armement/révocation renouvellement.
+  const [paying, setPaying] = useState(false);
+  const [renewing, setRenewing] = useState(false);
 
   const load = useCallback(
     async (t: string, p: number, st: string) => {
@@ -125,6 +130,69 @@ export default function ClientOrdersPage() {
     setPage(1);
     void load(token, 1, v);
   };
+
+  /**
+   * Q-A (item 1) — règlement par SOLDE : le serveur exécute débit + encaissement
+   * en UNE transaction (jamais de double débit). Échec (solde insuffisant,
+   * commande déjà réglée…) = message serveur, aucun état local modifié.
+   */
+  const payByWallet = useCallback(async () => {
+    if (!detail) return;
+    setPaying(true);
+    const r = await payMyOrderWithWallet(token, detail.id);
+    setPaying(false);
+    if (!r.ok) {
+      const msg = (r.data as { message?: string } | null)?.message;
+      toast.error(
+        msg && typeof msg === 'string' ? msg : 'Règlement refusé (solde insuffisant ?).',
+      );
+      return;
+    }
+    toast.ok(
+      (r.data as { replayed?: boolean } | null)?.replayed
+        ? 'Commande déjà réglée — aucun nouveau débit.'
+        : 'Commande réglée par solde.',
+    );
+    await openDetail(token, detail.id);
+    await load(token, page, status);
+  }, [detail, token, toast, openDetail, load, page, status]);
+
+  /**
+   * Q-A (item 4) — armement (consentement daté) / RÉVOCATION immédiate du
+   * renouvellement automatique, CAS côté serveur.
+   */
+  const toggleRenewal = useCallback(
+    async (enabled: boolean) => {
+      if (!detail) return;
+      setRenewing(true);
+      const r = await setMyOrderRenewal(token, detail.id, enabled);
+      setRenewing(false);
+      if (!r.ok) {
+        const msg = (r.data as { message?: string } | null)?.message;
+        toast.error(msg && typeof msg === 'string' ? msg : 'Modification impossible.');
+        return;
+      }
+      toast.ok(
+        enabled
+          ? 'Renouvellement automatique activé.'
+          : 'Renouvellement automatique révoqué.',
+      );
+      const fresh = r.data;
+      if (!fresh) return;
+      setDetail((d) =>
+        d
+          ? {
+              ...d,
+              autoRenew: fresh.autoRenew,
+              renewalConsentAt: fresh.renewalConsentAt,
+              nextBillingDate: fresh.nextBillingDate,
+            }
+          : d,
+      );
+      await load(token, page, status);
+    },
+    [detail, token, toast, load, page, status],
+  );
 
   const totalPages = data ? Math.max(1, Math.ceil(data.total / data.perPage)) : 1;
 
@@ -298,6 +366,19 @@ export default function ClientOrdersPage() {
                   {detail.paidAt ? ` — payée le ${new Date(detail.paidAt).toLocaleString()}` : ''}
                 </span>
               </div>
+
+              {/* Q-A (item 1) — réglage direct par solde sur commande en attente. */}
+              {detail.status === 'PENDING_PAYMENT' && (
+                <div className="row mb" style={{ gap: 10, flexWrap: 'wrap' }}>
+                  <Button size="sm" disabled={paying} onClick={() => void payByWallet()}>
+                    {paying ? 'Règlement…' : 'Régler par solde'}
+                  </Button>
+                  <span className="muted cell-sub">
+                    Débit et confirmation sont exécutés en une seule opération sur votre
+                    portefeuille.
+                  </span>
+                </div>
+              )}
               {(detail.statusHistory ?? []).length > 0 && (
                 <ol className="muted" style={{ margin: 0, paddingLeft: 18, fontSize: 13 }}>
                   {(detail.statusHistory ?? []).map((h) => (
@@ -335,13 +416,44 @@ export default function ClientOrdersPage() {
                   <span>
                     {detail.billingCycle === 'ONETIME' ? (
                       <span className="muted">—</span>
-                    ) : detail.autoRenew ? (
-                      <Badge tone="info">Activé</Badge>
                     ) : (
-                      <Badge tone="neutral">Arrêté</Badge>
+                      <span className="row" style={{ gap: 8, justifyContent: 'flex-end' }}>
+                        {detail.autoRenew ? (
+                          <Badge tone="info">Activé</Badge>
+                        ) : (
+                          <Badge tone="neutral">Arrêté</Badge>
+                        )}
+                        {/* Q-A (item 4) — armement possible seulement après
+                            règlement ; révocation à tout moment (CAS serveur). */}
+                        {detail.billingCycle !== 'ONETIME' &&
+                          detail.status !== 'PENDING_PAYMENT' &&
+                          detail.status !== 'CANCELLED' &&
+                          detail.status !== 'REFUNDED' && (
+                            <Button
+                              size="sm"
+                              variant={detail.autoRenew ? 'secondary' : 'primary'}
+                              disabled={renewing}
+                              onClick={() => void toggleRenewal(!detail.autoRenew)}
+                            >
+                              {renewing
+                                ? '…'
+                                : detail.autoRenew
+                                  ? 'Révoquer'
+                                  : 'Activer'}
+                            </Button>
+                          )}
+                      </span>
                     )}
                   </span>
                 </li>
+                {detail.renewalConsentAt && (
+                  <li className="row" style={{ justifyContent: 'space-between', padding: '6px 0' }}>
+                    <span className="muted">Consentement renouvellement</span>
+                    <span className="nowrap">
+                      accordé le {new Date(detail.renewalConsentAt).toLocaleDateString('fr-FR')}
+                    </span>
+                  </li>
+                )}
                 {detail.autoRenew && detail.nextBillingDate && (
                   <li className="row" style={{ justifyContent: 'space-between', padding: '6px 0' }}>
                     <span className="muted">Prochaine échéance</span>

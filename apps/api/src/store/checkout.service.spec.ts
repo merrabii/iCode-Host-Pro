@@ -51,6 +51,7 @@ describe('CheckoutService — idempotencyKey inclut le sous-domaine', () => {
       mockProvisioning as never,
       mockCloudflare as never,
       { resolveTracking: jest.fn(), operational: jest.fn().mockResolvedValue(false) } as never,
+      { applyWithClient: jest.fn() } as never,
     );
   });
 
@@ -138,6 +139,7 @@ describe('CheckoutService — resolveSubdomainAndRoot (Phase 4, choix racine)', 
       mockProvisioning as never,
       mockCloudflare as never,
       { resolveTracking: jest.fn(), operational: jest.fn().mockResolvedValue(false) } as never,
+      { applyWithClient: jest.fn() } as never,
     );
   });
 

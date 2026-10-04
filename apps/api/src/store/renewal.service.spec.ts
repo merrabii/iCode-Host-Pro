@@ -3,6 +3,7 @@ import { Test } from '@nestjs/testing';
 import {
   BillingCycle,
   InvoiceStatus,
+  Role,
   SubscriptionStatus,
 } from '@prisma/client';
 import { AuditService } from '../audit/audit.service';
@@ -17,19 +18,26 @@ import {
 } from './renewal.service';
 
 /**
- * P8 (lot D2) — matrice de décision du scheduler de renouvellement :
- *   - arrêt de chaîne (aucune souscription / produit changé) CAS idempotent ;
+ * P8 (lot D2) + Q-A (GO items 1/4) — matrice de décision du scheduler :
+ *   - arrêt de chaîne (aucune souscription liée / produit changé) CAS idempotent ;
  *   - suspension admin = on n'arrête JAMAIS la chaîne (résumable) ;
- *   - création + paiement par solde (clé `renewal:<orderId>`, source wallet) ;
- *   - solde insuffisant → facture reste impayée, aucun crédit fabriqué ;
- *   - reprise : débit déjà présent → re-confirmation SANS nouveau débit ;
+ *   - création + paiement ATOMIQUE (`checkout.payOrderWithWallet` = débit +
+ *     confirmation dans UNE tx, clé `wallet-pay:<orderId>`) ;
+ *   - solde insuffisant → facture reste impayée, AUCUN crédit compensatoire ;
+ *   - reprise : garde RE-VALIDÉE avant tout débit (jamais de prélèvement sur
+ *     une chaîne close/suspendue/produit changé depuis la création) ;
  *   - dunning : UNE relance (CAS `dunningRemindedAt`), suspension CAS
  *     ACTIVE→SUSPENDED, AUCUN appel infrastructure (§6-4) ;
  *   - anti-chevauchement local + coupe-timer d'isolement de test.
  */
 describe('RenewalService (D2 — échéances, renouvellement, dunning)', () => {
   let prisma: {
-    order: { findMany: jest.Mock; updateMany: jest.Mock; create: jest.Mock };
+    order: {
+      findMany: jest.Mock;
+      findUnique: jest.Mock;
+      updateMany: jest.Mock;
+      create: jest.Mock;
+    };
     subscription: { findFirst: jest.Mock; updateMany: jest.Mock };
     invoice: { findMany: jest.Mock; updateMany: jest.Mock; findUnique: jest.Mock; create: jest.Mock };
     walletTransaction: { findFirst: jest.Mock };
@@ -39,13 +47,17 @@ describe('RenewalService (D2 — échéances, renouvellement, dunning)', () => {
   };
   let audit: { record: jest.Mock };
   let wallet: { debit: jest.Mock; credit: jest.Mock };
-  let checkout: { confirmOrderPaid: jest.Mock };
+  let checkout: {
+    confirmOrderPaid: jest.Mock;
+    payOrderWithWallet: jest.Mock;
+  };
   let mail: { sendPlain: jest.Mock };
   let svc: RenewalService;
   let lastTx: ReturnType<typeof txStub> | null = null;
 
   const head = (over: Record<string, unknown> = {}) => ({
     id: 'mother-1',
+    renewsOrderId: null,
     customerId: 'cus-1',
     customerName: 'Alice',
     customerEmail: 'alice@test.local',
@@ -64,6 +76,7 @@ describe('RenewalService (D2 — échéances, renouvellement, dunning)', () => {
     optionsSnapshot: null,
     addonsSnapshot: null,
     nextBillingDate: new Date('2026-09-01T00:00:00.000Z'),
+    renewalConsentAt: new Date('2026-08-01T00:00:00.000Z'),
     customer: { userId: 'user-1' },
     ...over,
   });
@@ -98,7 +111,12 @@ describe('RenewalService (D2 — échéances, renouvellement, dunning)', () => {
 
   beforeEach(async () => {
     prisma = {
-      order: { findMany: jest.fn(async () => []), updateMany: jest.fn(async () => ({ count: 1 })), create: jest.fn() },
+      order: {
+        findMany: jest.fn(async () => []),
+        findUnique: jest.fn(async () => null), // remontée de chaîne renewsOrderId
+        updateMany: jest.fn(async () => ({ count: 1 })),
+        create: jest.fn(),
+      },
       subscription: { findFirst: jest.fn(async () => null), updateMany: jest.fn(async () => ({ count: 1 })) },
       invoice: { findMany: jest.fn(async () => []), updateMany: jest.fn(async () => ({ count: 1 })), findUnique: jest.fn(), create: jest.fn() },
       walletTransaction: { findFirst: jest.fn(async () => null) },
@@ -113,7 +131,17 @@ describe('RenewalService (D2 — échéances, renouvellement, dunning)', () => {
     lastTx = null;
     audit = { record: jest.fn(async () => undefined) };
     wallet = { debit: jest.fn(async () => ({ ok: true })), credit: jest.fn(async () => ({ ok: true })) };
-    checkout = { confirmOrderPaid: jest.fn(async () => ({ alreadyConfirmed: false })) };
+    checkout = {
+      confirmOrderPaid: jest.fn(async () => ({ alreadyConfirmed: false })),
+      payOrderWithWallet: jest.fn(async () => ({
+        orderId: 'x',
+        status: 'PAID',
+        balanceCents: 500,
+        amountTtcCents: 1200,
+        replayed: false,
+        alreadyConfirmed: false,
+      })),
+    };
     mail = { sendPlain: jest.fn(async () => undefined) };
 
     const moduleRef = await Test.createTestingModule({
@@ -131,10 +159,14 @@ describe('RenewalService (D2 — échéances, renouvellement, dunning)', () => {
 
   // ── 1. Renouvellement : création + paiement ────────────────────────────────
 
-  it('crée la commande de renouvellement, débite le solde et confirme (source wallet)', async () => {
+  it('crée la commande de renouvellement, paie ATOMIQUEMENT (débit+confirm en une tx)', async () => {
     prisma.order.findMany.mockResolvedValueOnce([head()]); // échéances
     prisma.order.findMany.mockResolvedValueOnce([]); // payPending
-    prisma.subscription.findFirst.mockResolvedValue({ id: 'sub-1', productId: 'prod-1' });
+    prisma.subscription.findFirst.mockResolvedValue({
+      id: 'sub-1',
+      productId: 'prod-1',
+      status: SubscriptionStatus.ACTIVE,
+    });
 
     const res = await svc.sweep();
 
@@ -145,13 +177,15 @@ describe('RenewalService (D2 — échéances, renouvellement, dunning)', () => {
       where: { id: 'mother-1', autoRenew: true },
       data: { autoRenew: false },
     });
-    expect(wallet.debit).toHaveBeenCalledWith('cus-1', expect.objectContaining({
-      amountCents: 1200,
-      idempotencyKey: `renewal:renewal-1`,
-      orderId: 'renewal-1',
-      invoiceId: 'inv-renewal-1',
-    }));
-    expect(checkout.confirmOrderPaid).toHaveBeenCalledWith('renewal-1', { source: 'wallet' });
+    // Q-A (item 1) : paiement ATOMIQUE — plus de débit séparé + confirmation.
+    expect(checkout.payOrderWithWallet).toHaveBeenCalledTimes(1);
+    expect(checkout.payOrderWithWallet).toHaveBeenCalledWith('renewal-1', {
+      sub: 'user-1',
+      email: 'alice@test.local',
+      role: Role.USER,
+    });
+    expect(wallet.debit).not.toHaveBeenCalled();
+    expect(checkout.confirmOrderPaid).not.toHaveBeenCalled();
     expect(audit.record).toHaveBeenCalledWith(expect.objectContaining({
       action: 'subscription.renewal_created',
       resourceId: 'renewal-1',
@@ -161,14 +195,19 @@ describe('RenewalService (D2 — échéances, renouvellement, dunning)', () => {
   it('solde insuffisant → renouvellement PENDING (aucune confirmation, aucun crédit fabriqué)', async () => {
     prisma.order.findMany.mockResolvedValueOnce([head()]);
     prisma.order.findMany.mockResolvedValueOnce([]);
-    prisma.subscription.findFirst.mockResolvedValue({ id: 'sub-1', productId: 'prod-1' });
-    wallet.debit.mockRejectedValueOnce(new ConflictException('Solde insuffisant.'));
+    prisma.subscription.findFirst.mockResolvedValue({
+      id: 'sub-1',
+      productId: 'prod-1',
+      status: SubscriptionStatus.ACTIVE,
+    });
+    checkout.payOrderWithWallet.mockRejectedValueOnce(new ConflictException('Solde insuffisant.'));
 
     const res = await svc.sweep();
 
     expect(res).toMatchObject({ created: 1, paid: 0, pending: 1 });
     expect(checkout.confirmOrderPaid).not.toHaveBeenCalled();
     expect(wallet.credit).not.toHaveBeenCalled();
+    expect(wallet.debit).not.toHaveBeenCalled();
   });
 
   // ── 1b. Gardes d'éligibilité ───────────────────────────────────────────────
@@ -193,7 +232,11 @@ describe('RenewalService (D2 — échéances, renouvellement, dunning)', () => {
 
   it('produit changé (upgrade) → arrêt avec raison product_changed', async () => {
     prisma.order.findMany.mockResolvedValueOnce([head()]);
-    prisma.subscription.findFirst.mockResolvedValue({ id: 'sub-1', productId: 'autre-produit' });
+    prisma.subscription.findFirst.mockResolvedValue({
+      id: 'sub-1',
+      productId: 'autre-produit',
+      status: SubscriptionStatus.ACTIVE,
+    });
 
     const res = await svc.sweep();
 
@@ -208,7 +251,8 @@ describe('RenewalService (D2 — échéances, renouvellement, dunning)', () => {
   it('souscription suspendue → on N\u2019arrête PAS la chaîne (résumable, aucun flip)', async () => {
     prisma.order.findMany.mockResolvedValueOnce([head()]);
     prisma.subscription.findFirst
-      .mockResolvedValueOnce(null) // pas d'ACTIVE
+      .mockResolvedValueOnce(null) // chaîne : aucun abonnement lié
+      .mockResolvedValueOnce(null) // fallback : pas d'ACTIVE
       .mockResolvedValueOnce({ status: SubscriptionStatus.SUSPENDED }); // dernière connue
 
     const res = await svc.sweep();
@@ -230,38 +274,78 @@ describe('RenewalService (D2 — échéances, renouvellement, dunning)', () => {
 
   // ── 2. Reprise de paiement ────────────────────────────────────────────────
 
-  it('renouvellement déjà prélevé non confirmé → re-confirmation SANS nouveau débit', async () => {
+  it('renouvellement PENDING → reprise ATOMIQUE (garde re-validée, aucun débit isolé)', async () => {
     prisma.order.findMany.mockResolvedValueOnce([]); // aucune échéance
     prisma.order.findMany.mockResolvedValueOnce([{
       id: 'renewal-1',
-      customerId: 'cus-1',
+      renewsOrderId: 'mother-1',
+      productId: 'prod-1',
       amountTtcCents: 1200,
-      invoice: { id: 'inv-1', number: '2026-0041', amountTtcCents: 1200 },
+      customerEmail: 'alice@test.local',
+      customer: { userId: 'user-1' },
+      invoice: { number: '2026-0041' },
     }]);
-    prisma.walletTransaction.findFirst.mockResolvedValueOnce({ id: 'wtx-1' });
+    prisma.subscription.findFirst.mockResolvedValue({
+      id: 'sub-1',
+      productId: 'prod-1',
+      status: SubscriptionStatus.ACTIVE,
+    });
 
     const res = await svc.sweep();
 
     expect(res).toMatchObject({ paid: 1, pending: 0 });
+    // Q-A : le « déjà prélevé → re-confirmé sans 2e débit » vit MAINTENANT
+    // dans payOrderWithWallet (net des débits non compensés, e2e PG).
+    expect(checkout.payOrderWithWallet).toHaveBeenCalledTimes(1);
     expect(wallet.debit).not.toHaveBeenCalled();
-    expect(checkout.confirmOrderPaid).toHaveBeenCalledWith('renewal-1', { source: 'wallet' });
+    expect(checkout.confirmOrderPaid).not.toHaveBeenCalled();
   });
 
   it('renouvellement impayé sans débit → nouvel essai de prélèvement (recharge tardive)', async () => {
     prisma.order.findMany.mockResolvedValueOnce([]);
     prisma.order.findMany.mockResolvedValueOnce([{
       id: 'renewal-1',
-      customerId: 'cus-1',
+      renewsOrderId: 'mother-1',
+      productId: 'prod-1',
       amountTtcCents: 1200,
-      invoice: { id: 'inv-1', number: '2026-0041', amountTtcCents: 1200 },
+      customerEmail: 'alice@test.local',
+      customer: { userId: 'user-1' },
+      invoice: { number: '2026-0041' },
     }]);
-    prisma.walletTransaction.findFirst.mockResolvedValueOnce(null);
-    wallet.debit.mockRejectedValueOnce(new ConflictException('Solde insuffisant.'));
+    prisma.subscription.findFirst.mockResolvedValue({
+      id: 'sub-1',
+      productId: 'prod-1',
+      status: SubscriptionStatus.ACTIVE,
+    });
+    checkout.payOrderWithWallet.mockRejectedValueOnce(new ConflictException('Solde insuffisant.'));
 
     const res = await svc.sweep();
 
     expect(res).toMatchObject({ paid: 0, pending: 1 });
-    expect(wallet.debit).toHaveBeenCalledTimes(1);
+    expect(checkout.payOrderWithWallet).toHaveBeenCalledTimes(1);
+    expect(checkout.confirmOrderPaid).not.toHaveBeenCalled();
+    expect(wallet.credit).not.toHaveBeenCalled();
+  });
+
+  it('Q-A : chaîne close depuis la création → AUCUN débit à la reprise (garde re-validée)', async () => {
+    prisma.order.findMany.mockResolvedValueOnce([]);
+    prisma.order.findMany.mockResolvedValueOnce([{
+      id: 'renewal-1',
+      renewsOrderId: 'mother-1',
+      productId: 'prod-1',
+      amountTtcCents: 1200,
+      customerEmail: 'alice@test.local',
+      customer: { userId: 'user-1' },
+      invoice: { number: '2026-0041' },
+    }]);
+    // Garde : plus d'abonnement lié (annulé entre-temps) → stop.
+    prisma.subscription.findFirst.mockResolvedValue(null);
+
+    const res = await svc.sweep();
+
+    expect(res).toMatchObject({ paid: 0, pending: 1 });
+    expect(checkout.payOrderWithWallet).not.toHaveBeenCalled();
+    expect(wallet.debit).not.toHaveBeenCalled();
     expect(checkout.confirmOrderPaid).not.toHaveBeenCalled();
   });
 

@@ -5,7 +5,7 @@ import Link from 'next/link';
 import { useSearchParams } from 'next/navigation';
 import { StoreShell } from '@/components/store-shell';
 import { IconAlert, IconCheck, IconChevronRight, IconInfo, IconRefresh } from '@/components/icons';
-import { getOrderStatus } from '@/lib/api';
+import { getOrderStatus, getSessionToken, payMyOrderWithWallet } from '@/lib/api';
 
 const ORDER_KEY = 'codiali.order.v1';
 
@@ -75,6 +75,9 @@ function SuccessInner() {
   const [check, setCheck] = useState<OrderStatusInfo | null>(null); // null = en cours ou échec
   const [checkError, setCheckError] = useState(false);
   const [attempt, setAttempt] = useState(0);
+  // Q-A (item 1) — règlement par solde depuis la confirmation.
+  const [paying, setPaying] = useState(false);
+  const [payError, setPayError] = useState<string | null>(null);
   // Garde anti-réponse périmée : seule la réponse de la DERNIÈRE référence
   // demandée (changement d'orderId en cours de vol) a le droit d'écrire l'état.
   const seqRef = useRef(0);
@@ -96,6 +99,35 @@ function SuccessInner() {
     if (!res) { setCheckError(true); return; }
     setCheck(res);
   }, [orderId]);
+
+  /**
+   * Q-A (item 1) — « Régler par solde » : débit + confirmation en UNE
+   * transaction côté serveur, puis re-vérification de l'état réel (jamais
+   * d'état affirmé côté client). Sans session → renvoi vers le détail de la
+   * commande dans l'espace client.
+   */
+  const payByWallet = useCallback(async () => {
+    setPayError(null);
+    setPaying(true);
+    try {
+      const t = await getSessionToken();
+      if (!t) {
+        window.location.href = `/client/commandes?id=${encodeURIComponent(orderId)}`;
+        return;
+      }
+      const r = await payMyOrderWithWallet(t, orderId);
+      if (!r.ok) {
+        const msg = (r.data as { message?: string } | null)?.message;
+        setPayError(
+          msg && typeof msg === 'string' ? msg : 'Règlement refusé (solde insuffisant ?).',
+        );
+        return;
+      }
+      await verify();
+    } finally {
+      setPaying(false);
+    }
+  }, [orderId, verify]);
 
   useEffect(() => {
     if (!orderId) return;
@@ -250,7 +282,24 @@ function SuccessInner() {
             </div>
           )}
 
+          {payError && (
+            <div className="alert error" role="alert" style={{ width: '100%' }}>
+              {payError}
+            </div>
+          )}
+
           <div className="store-success-actions">
+            {/* Q-A (item 1) — encaissement direct par solde sur commande en attente. */}
+            {st === 'PENDING_PAYMENT' && (
+              <button
+                type="button"
+                className="btn-primary"
+                disabled={paying}
+                onClick={() => void payByWallet()}
+              >
+                {paying ? 'Règlement…' : 'Régler par solde'}
+              </button>
+            )}
             <Link href="/client" className="btn-primary">Accéder à mon espace <IconChevronRight size={15} /></Link>
             <Link href="/client/commandes" className="btn-secondary">Voir mes commandes</Link>
             <Link href="/shop" className="btn-secondary">Retour à la boutique</Link>

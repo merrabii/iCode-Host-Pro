@@ -45,7 +45,8 @@ process.env.RENEWAL_SWEEP_ENABLED = 'false';
  *     suspension ACTIVE→SUSPENDED (audit, **statut seul : aucun appel infra,
  *     §6-4**) ; souscription suspendue = chaîne résumable (pas d'arrêt) ;
  *  D. Reprise de crash (débit committé, confirmation jamais exécutée) →
- *     sweep → re-confirmation SANS second débit (clé `renewal:<orderId>`) ;
+ *     sweep → re-confirmation SANS second débit (net des débits non
+ *     compensés, clé legacy `renewal:<orderId>` conservée comme données) ;
  *  E. Expiration 48 h : un renouvellement PENDING n'est JAMAIS annulé par le
  *     sweep de reprise (son impayé vit le dunning), contrairement à une
  *     commande standard du même âge ;
@@ -125,7 +126,9 @@ describe('Abonnements récurrents (e2e, P8)', () => {
   function checkout(email: string, name: string, productSlug: string, token?: string) {
     const req = request(app.getHttpServer())
       .post(`/${GlobalPrefix}/store/checkout`)
-      .send({ productSlug, name, email, paymentMethodId: virId });
+      // Q-A (item 4) : consentement EXPLICITE au renouvellement (case du
+      // checkout) — sans lui, aucun prélèvement automatique n'est planifié.
+      .send({ productSlug, name, email, paymentMethodId: virId, renewalConsent: true });
     if (token) req.set('Authorization', `Bearer ${token}`);
     return req;
   }
@@ -421,7 +424,8 @@ describe('Abonnements récurrents (e2e, P8)', () => {
     expect(debits).toHaveLength(1);
     expect(debits[0].amountCents).toBe(mother.amountTtcCents);
     expect(debits[0].status).toBe('SUCCEEDED');
-    expect(debits[0].idempotencyKey).toBe(`renewal:${renewal1Id}`);
+    // Q-A (item 1) : débit + confirmation sont ATOMIQUES (clé wallet-pay).
+    expect(debits[0].idempotencyKey).toBe(`wallet-pay:${renewal1Id}`);
     const aliceAfter = await prisma.customer.findUniqueOrThrow({ where: { id: aliceCustomerId } });
     expect(aliceAfter.walletBalanceCents).toBe(balanceBefore - mother.amountTtcCents);
 

@@ -306,6 +306,9 @@ export const storeCheckout = async (payload: {
   /** Point 6 : membre connecté → facturer sous les coordonnées du compte (true) ou
    *  sous d'autres coordonnées de facturation (false). Inutile pour l'invité. */
   useAccountDetails?: boolean;
+  /** Q-A (GO item 4) — consentement EXPLICITE au renouvellement automatique
+   *  (case de la page paiement) ; ignoré pour un cycle ONETIME. */
+  renewalConsent?: boolean;
 }): Promise<ApiResult> => {
   // Tunnel de commande UNIQUE (Bloc 2) : le checkout API reconnaît le client via
   // le header `Authorization: Bearer` (OptionalJwtAuthGuard). Sans token → invité.
@@ -434,6 +437,8 @@ export interface OrderListItem {
   paidAt?: string | null;
   nextBillingDate?: string | null;
   autoRenew?: boolean;
+  /** Q-A (GO item 4) — consentement EXPLICITE au renouvellement, daté au checkout. */
+  renewalConsentAt?: string | null;
   customerName?: string;
   customerEmail?: string;
   paymentMethodName?: string | null;
@@ -637,6 +642,40 @@ export const getMyInvoice = (t: string, id: string) =>
   apiJson(`/api/client/invoices/${encodeURIComponent(id)}`, t) as Promise<
     ApiResult<InvoiceDetail>
   >;
+
+// ═══ Q-A (GO item 1+2+4) — règlement par SOLDE + renouvellement ═════════════
+/** Résultat d'un règlement atomique par solde (débit + confirmation en 1 tx). */
+export interface WalletPayResult {
+  orderId: string;
+  status: string;
+  balanceCents: number;
+  amountTtcCents: number;
+  /** true = rejeu propre (aucun second effet). */
+  replayed: boolean;
+  alreadyConfirmed: boolean;
+  subscriptionAction?: string | null;
+}
+export const payMyOrderWithWallet = (t: string, id: string) =>
+  apiJson(`/api/client/orders/${encodeURIComponent(id)}/pay-with-wallet`, t, {
+    method: 'POST',
+  }) as Promise<ApiResult<WalletPayResult>>;
+export const payMyInvoiceWithWallet = (t: string, id: string) =>
+  apiJson(`/api/client/invoices/${encodeURIComponent(id)}/pay-with-wallet`, t, {
+    method: 'POST',
+  }) as Promise<ApiResult<WalletPayResult>>;
+
+/** État renouvellement après armement (consentement daté) ou révocation CAS. */
+export interface RenewalToggleResult {
+  id: string;
+  autoRenew: boolean;
+  renewalConsentAt: string | null;
+  nextBillingDate: string | null;
+}
+export const setMyOrderRenewal = (t: string, id: string, enabled: boolean) =>
+  apiJson(`/api/client/orders/${encodeURIComponent(id)}/renewal`, t, {
+    method: 'PATCH',
+    body: JSON.stringify({ enabled }),
+  }) as Promise<ApiResult<RenewalToggleResult>>;
 
 // Admin — listes globales paginées + agrégats KPI (commandes).
 export const listAdminOrders = (t: string, query: ListQuery = {}) =>

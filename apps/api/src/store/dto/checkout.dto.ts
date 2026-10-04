@@ -100,6 +100,15 @@ export class CheckoutDto {
   @IsOptional()
   @IsBoolean()
   useAccountDetails?: boolean;
+
+  @ApiPropertyOptional({
+    description:
+      'Consentement EXPLICITE au renouvellement automatique (produits récurrents) — Q-A (GO item 4). ' +
+      'Sans cette case cochée, aucun prélèvement automatique ne sera JAMAIS planifié.',
+  })
+  @IsOptional()
+  @IsBoolean()
+  renewalConsent?: boolean;
 }
 
 /** Représentation lisible (jamais les secrets) d’un moyen de paiement pour /cart/checkout. */

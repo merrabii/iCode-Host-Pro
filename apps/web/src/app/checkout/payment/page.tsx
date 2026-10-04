@@ -42,6 +42,9 @@ function CheckoutPaymentView() {
   const [methodId, setMethodId] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Q-A (GO item 4) — consentement EXPLICITE au renouvellement automatique :
+  // NON coché par défaut (aucun prélèvement sans action volontaire).
+  const [renewalConsent, setRenewalConsent] = useState(false);
 
   const contact = useMemo(() => buyerStorage.read(), []);
 
@@ -97,6 +100,7 @@ function CheckoutPaymentView() {
         subdomain,
         requestedDomainId,
         useAccountDetails: contact.useAccountDetails,
+        renewalConsent,
       });
       const data = res.data as unknown;
       if (!res.ok) {
@@ -219,6 +223,32 @@ function CheckoutPaymentView() {
                 <span>Ce tunnel n&apos;exige aucune carte bancaire : le paiement est géré par le moyen de paiement ci-dessus. L&apos;état de votre commande s&apos;affiche ensuite sur la page de confirmation.</span>
               </div>
             </div>
+
+            {/* Q-A (GO item 4) — renouvellement automatique : consentement
+                EXPLICITE (case NON cochée par défaut), révocable à tout moment
+                depuis « Mes commandes ». */}
+            {item.product.billingCycle !== 'ONETIME' && (
+              <label
+                className="store-contact-note"
+                style={{ cursor: 'pointer', alignItems: 'flex-start' }}
+              >
+                <input
+                  type="checkbox"
+                  checked={renewalConsent}
+                  onChange={(e) => setRenewalConsent(e.target.checked)}
+                  style={{ marginTop: 3 }}
+                />
+                <div>
+                  <b>Renouvellement automatique</b>
+                  <span>
+                    À chaque échéance ({billingCycleLabel(item.product.billingCycle)}), le montant
+                    de la période suivante est prélevé sur mon solde portefeuille. Sans cette case,
+                    aucun prélèvement automatique n&apos;est planifié. Révocable à tout moment
+                    depuis « Mes commandes ».
+                  </span>
+                </div>
+              </label>
+            )}
           </div>
 
           <button type="submit" className="btn-primary store-cta" disabled={loading || methods === null || methods.length === 0}>

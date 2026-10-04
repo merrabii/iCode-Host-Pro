@@ -729,6 +729,10 @@ model Subscription {
   // uniquement : aucun abonnement existant n'est transformé dans cette phase.
   hostingServices HostingService[]
 
+  // Q-A (GO item 4) — factures émises POUR CET abonnement (échéances renouvelées).
+  // Relation inverse portée par Invoice.subscriptionId.
+  invoices Invoice[]
+
   @@index([userId])
   @@index([status])
 }
@@ -1382,6 +1386,11 @@ model Order {
   addonsSnapshot    Json? // suppléments retenus (label + prix)
   nextBillingDate   DateTime? // prochaine échéance (cycle récurrent)
   autoRenew         Boolean           @default(false)
+  // Q-A (GO item 4) — consentement EXPLICITE au prélèvement automatique :
+  // enregistré au checkout (case dédiée) ou par opt-in client, JAMAIS forcé.
+  // `null` = aucun consentement → aucun prélèvement automatique, jamais.
+  // La révocation = `autoRenew=false` (le consentement historique reste daté).
+  renewalConsentAt  DateTime?
   renewsOrderId     String?           @unique // commande mère renouvelée
   createdAt         DateTime          @default(now())
   updatedAt         DateTime          @updatedAt
@@ -1454,6 +1463,11 @@ model Invoice {
   dunningRemindedAt         DateTime?
   paidAt                    DateTime?
   walletTransactionId       String?       @unique // trace du règlement
+  // Q-A (GO item 4) — chaque échéance est LIEE à son abonnement : la facture
+  // porte l'abonnement qu'elle facture (null sur les lignes anciennes →
+  // résolution par chaîne renewsOrderId). Jamais « dernier abonnement actif ».
+  subscriptionId            String?
+  subscription              Subscription? @relation(fields: [subscriptionId], references: [id], onDelete: SetNull)
   pdfPath                   String? // PDF généré (stocké, téléchargeable)
   creditNoteOfId            String?       @unique // avoir émis sur cette facture
   creditNoteOf              Invoice?      @relation("CreditNote", fields: [creditNoteOfId], references: [id], onDelete: SetNull)
@@ -1465,6 +1479,7 @@ model Invoice {
 
   @@index([customerId])
   @@index([status])
+  @@index([subscriptionId])
 }
 
 model InvoiceLine {

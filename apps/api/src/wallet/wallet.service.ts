@@ -15,6 +15,8 @@ import { JwtPayload } from '../auth/types';
 export interface ApplyWalletInput {
   amountCents: number;
   idempotencyKey: string;
+  /** Devise de l'opération (défaut USD) — partie de l'identité opérationnelle. */
+  currency?: string;
   note?: string | null;
   reference?: string | null;
   orderId?: string | null;
@@ -38,6 +40,18 @@ export interface ApplyResult {
 const PROOF_DIR = path.resolve(process.cwd(), 'public', 'wallet-proofs');
 const RECHARGE_MIN_CENTS = 100; // 1 USD
 const RECHARGE_MAX_CENTS = 10_000_000; // 100 000 USD
+
+/** Sous-ensemble de WalletTransaction servant à comparer l'identité opérationnelle. */
+type WalletTxIdentityRow = {
+  customerId: string;
+  type: WalletTransactionType;
+  amountCents: number;
+  currency: string;
+  status: WalletTxStatus;
+  orderId: string | null;
+  invoiceId: string | null;
+  reference: string | null;
+};
 const PROOF_EXT: Record<string, string> = {
   'image/png': '.png',
   'image/jpeg': '.jpg',
@@ -129,75 +143,170 @@ export class WalletService {
     return this.apply(customerId, input, 'debit');
   }
 
+  /**
+   * Q-A (item 2) — identité COMPLÈTE d'une opération de solde. Un rejeu n'est
+   * accepté que si TOUT correspond (client, sens, montant, devise, commande,
+   * facture, référence, statut abouti) ; sinon 409, JAMAIS d'effet silencieux
+   * sur une autre opération portant la même clé.
+   */
+  private operationIdentityMatches(
+    row: WalletTxIdentityRow,
+    customerId: string,
+    input: ApplyWalletInput,
+    direction: 'credit' | 'debit',
+  ): boolean {
+    return (
+      row.customerId === customerId &&
+      row.type ===
+        (direction === 'credit'
+          ? WalletTransactionType.CREDIT
+          : WalletTransactionType.DEBIT) &&
+      row.amountCents === input.amountCents &&
+      row.currency === (input.currency ?? 'USD') &&
+      row.status === WalletTxStatus.SUCCEEDED &&
+      (row.orderId ?? null) === (input.orderId ?? null) &&
+      (row.invoiceId ?? null) === (input.invoiceId ?? null) &&
+      (row.reference ?? null) === (input.reference ?? null)
+    );
+  }
+
+  /** Rejeu : retour neutre + solde actuel, aucun second effet de solde. */
+  private async replayResult(
+    client: Prisma.TransactionClient | PrismaService,
+    row: WalletTxIdentityRow,
+    customerId: string,
+    input: ApplyWalletInput,
+    direction: 'credit' | 'debit',
+  ): Promise<ApplyResult> {
+    if (!this.operationIdentityMatches(row, customerId, input, direction)) {
+      throw new ConflictException(
+        'Clé d’idempotence déjà utilisée pour une autre opération.',
+      );
+    }
+    const customer = await client.customer.findUnique({
+      where: { id: customerId },
+      select: { walletBalanceCents: true },
+    });
+    if (!customer) throw new NotFoundException('Dossier client introuvable.');
+    return { balanceCents: customer.walletBalanceCents, replayed: true };
+  }
+
+  /**
+   * Q-A (item 1+2) — moteur d'application du solde, exécuté DANS une
+   * transaction (appelante ou propre) :
+   *  1. LECTURE D'ABORD : opération déjà aboutie avec la même identité =
+   *     rejeu (retour neutre, y compris si le solde a baissé entre-temps) ;
+   *  2. sous verrou `FOR UPDATE` : garde solde (débit), insertion, incrément ;
+   *  3. un P2002 résiduel (deux tx insèrent la même clé) abort la tx → le
+   *     chemin appelant relit et décide : identité OK = rejeu, sinon 409.
+   */
+  private async applyInTx(
+    tx: Prisma.TransactionClient,
+    customerId: string,
+    input: ApplyWalletInput,
+    direction: 'credit' | 'debit',
+  ): Promise<ApplyResult> {
+    const dup = await tx.walletTransaction.findUnique({
+      where: { idempotencyKey: input.idempotencyKey },
+    });
+    if (dup) {
+      return this.replayResult(tx, dup, customerId, input, direction);
+    }
+    const rows = await tx.$queryRaw<{ walletBalanceCents: number }[]>`
+      SELECT "walletBalanceCents" FROM "Customer" WHERE id = ${customerId} FOR UPDATE`;
+    if (rows.length === 0) {
+      throw new NotFoundException('Dossier client introuvable.');
+    }
+    const current = Number(rows[0].walletBalanceCents);
+    if (direction === 'debit' && current < input.amountCents) {
+      throw new ConflictException('Solde insuffisant.');
+    }
+    await tx.walletTransaction.create({
+      data: {
+        customerId,
+        type:
+          direction === 'credit'
+            ? WalletTransactionType.CREDIT
+            : WalletTransactionType.DEBIT,
+        amountCents: input.amountCents,
+        currency: input.currency ?? 'USD',
+        status: WalletTxStatus.SUCCEEDED,
+        idempotencyKey: input.idempotencyKey,
+        reference: input.reference ?? null,
+        note: input.note ?? null,
+        orderId: input.orderId ?? null,
+        invoiceId: input.invoiceId ?? null,
+        paymentMethodId: input.paymentMethodId ?? null,
+        methodName: input.methodName ?? null,
+        processedAt: new Date(),
+      },
+    });
+    const updated = await tx.customer.update({
+      where: { id: customerId },
+      data:
+        direction === 'credit'
+          ? { walletBalanceCents: { increment: input.amountCents } }
+          : { walletBalanceCents: { decrement: input.amountCents } },
+    });
+    return { balanceCents: updated.walletBalanceCents, replayed: false };
+  }
+
+  /** Application standalone : tour de `$transaction` dédié. */
   private async apply(
     customerId: string,
     input: ApplyWalletInput,
     direction: 'credit' | 'debit',
   ): Promise<ApplyResult> {
+    // Lecture d'abord HORS tx : chemin chaud des rejeus (aucune tx ouverte).
+    const pre = await this.prisma.walletTransaction.findUnique({
+      where: { idempotencyKey: input.idempotencyKey },
+    });
+    if (pre) {
+      return this.replayResult(this.prisma, pre, customerId, input, direction);
+    }
     try {
-      const balanceCents = await this.prisma.$transaction(async (tx) => {
-        const rows = await tx.$queryRaw<{ walletBalanceCents: number }[]>`
-          SELECT "walletBalanceCents" FROM "Customer" WHERE id = ${customerId} FOR UPDATE`;
-        if (rows.length === 0) {
-          throw new NotFoundException('Dossier client introuvable.');
-        }
-        const current = Number(rows[0].walletBalanceCents);
-        if (direction === 'debit' && current < input.amountCents) {
-          throw new ConflictException('Solde insuffisant.');
-        }
-        await tx.walletTransaction.create({
-          data: {
-            customerId,
-            type:
-              direction === 'credit'
-                ? WalletTransactionType.CREDIT
-                : WalletTransactionType.DEBIT,
-            amountCents: input.amountCents,
-            status: WalletTxStatus.SUCCEEDED,
-            idempotencyKey: input.idempotencyKey,
-            reference: input.reference ?? null,
-            note: input.note ?? null,
-            orderId: input.orderId ?? null,
-            invoiceId: input.invoiceId ?? null,
-            paymentMethodId: input.paymentMethodId ?? null,
-            methodName: input.methodName ?? null,
-            processedAt: new Date(),
-          },
-        });
-        const updated = await tx.customer.update({
-          where: { id: customerId },
-          data:
-            direction === 'credit'
-              ? { walletBalanceCents: { increment: input.amountCents } }
-              : { walletBalanceCents: { decrement: input.amountCents } },
-        });
-        return updated.walletBalanceCents;
-      });
-      return { balanceCents, replayed: false };
+      return await this.prisma.$transaction((tx) =>
+        this.applyInTx(tx, customerId, input, direction),
+      );
     } catch (err) {
-      // Rejeu de la MÊME clé : la ligne existe → aucun second effet de solde.
       if (
         err instanceof Prisma.PrismaClientKnownRequestError &&
         err.code === 'P2002'
       ) {
         const existing = await this.prisma.walletTransaction.findUnique({
           where: { idempotencyKey: input.idempotencyKey },
-          select: { customerId: true },
         });
-        if (existing && existing.customerId === customerId) {
-          const customer = await this.prisma.customer.findUnique({
-            where: { id: customerId },
-            select: { walletBalanceCents: true },
-          });
-          return {
-            balanceCents: customer?.walletBalanceCents ?? 0,
-            replayed: true,
-          };
+        if (existing) {
+          return this.replayResult(
+            this.prisma,
+            existing,
+            customerId,
+            input,
+            direction,
+          );
         }
         throw new ConflictException('Clé d’idempotence déjà utilisée.');
       }
       throw err;
     }
+  }
+
+  /**
+   * Q-A (item 1) — même opération DANS la transaction d'un appelant
+   * (paiement portefeuille = débit + confirmation de commande atomiques).
+   * Lecture d'abord INSIDE la tx : un P2002 abort toute la tx appelante, on ne
+   * peut donc jamais y « rebondir » — le rejeu est détecté avant insertion
+   * (et l'appelant verrouille d'ordre la commande concernée, ce qui sérialise
+   * les courses sur la même commande).
+   */
+  async applyWithClient(
+    tx: Prisma.TransactionClient,
+    customerId: string,
+    input: ApplyWalletInput,
+    direction: 'credit' | 'debit',
+  ): Promise<ApplyResult> {
+    this.assertAmount(input.amountCents);
+    return this.applyInTx(tx, customerId, input, direction);
   }
 
   /** Justificatif (image/PDF ≤ 5 Mo) : disque `public/wallet-proofs/`. */
