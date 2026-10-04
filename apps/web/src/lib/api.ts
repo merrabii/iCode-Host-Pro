@@ -13,6 +13,9 @@ export interface Me {
   mfaEnabled?: boolean;
   oauthProvider?: string | null;
   oauthSubject?: string | null;
+  // GO Q3 : adresse demandée mais PAS encore vérifiée (le changement d'email
+  // n'est plus immédiat : un lien part vers la NOUVELLE adresse).
+  pendingEmail?: string | null;
 }
 
 export interface ManagerSummary {
@@ -2132,6 +2135,72 @@ export const updateProfile = (t: string, patch: { name?: string; email?: string 
   apiJson('/api/users/me', t, { method: 'PATCH', body: JSON.stringify(patch) });
 export const oauthUnlink = (t: string, provider: 'google' | 'github') =>
   apiJson('/api/auth/oauth/unlink', t, { method: 'POST', body: JSON.stringify({ provider }) });
+
+// ── GO Q3 : changement d'email VÉRIFIÉ + demande de clôture de compte ───────
+
+/**
+ * Consomme le jeton unique reçu sur la NOUVELLE adresse
+ * (/auth/verifier-email?token=…). Endpoint PUBLIC (comme le reset) : la
+ * possession du jeton prouve l'accès à la boîte cible. 409 = l'adresse a été
+ * prise entre-temps (contrainte d'unicité revérifiée en transaction).
+ */
+export async function confirmEmailChange(token: string): Promise<ApiResult> {
+  try {
+    const res = await fetch('/api/auth/confirm-email-change', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token }),
+    });
+    let data: unknown = null;
+    try {
+      data = await res.json();
+    } catch {
+      /* corps non-JSON */
+    }
+    return { ok: res.ok, status: res.status, data };
+  } catch {
+    return { ok: false, status: 0, data: null };
+  }
+}
+
+export type ClosureRequestStatus = 'PENDING' | 'CANCELLED' | 'COMPLETED';
+
+export interface ClosureRequest {
+  id: string;
+  userId: string;
+  reason: string | null;
+  status: ClosureRequestStatus;
+  createdAt: string;
+  updatedAt: string;
+  resolvedAt: string | null;
+  resolvedById: string | null;
+  resolutionNote: string | null;
+}
+
+/** Demande de clôture : DEMANDER n'est pas exécuter — aucune pièce
+ *  financière n'est jamais supprimée par ce parcours. */
+export const getClosureRequest = (t: string) =>
+  apiJson('/api/users/me/closure-request', t);
+export const requestClosure = (t: string, reason?: string) =>
+  apiJson('/api/users/me/closure-request', t, {
+    method: 'POST',
+    body: JSON.stringify(reason ? { reason } : {}),
+  });
+export const cancelClosureRequest = (t: string) =>
+  apiJson('/api/users/me/closure-request', t, { method: 'DELETE' });
+// Traitement admin (API seulement — l'UI admin est hors périmètre GO Q3).
+export const listClosureRequests = (t: string) =>
+  apiJson('/api/users/closure-requests', t);
+export const resolveClosureRequest = (
+  t: string,
+  id: string,
+  status: 'COMPLETED' | 'CANCELLED',
+  note?: string,
+) =>
+  apiJson(`/api/users/closure-requests/${id}`, t, {
+    method: 'PATCH',
+    body: JSON.stringify(note ? { status, note } : { status }),
+  });
 
 // ═══ Phase 10bis — Déploiement GitHub → Coolify ══════════════════════════════
 export interface GithubRepo {

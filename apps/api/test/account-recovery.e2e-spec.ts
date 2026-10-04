@@ -4,7 +4,7 @@ import * as cookieParser from 'cookie-parser';
 import * as bcrypt from 'bcryptjs';
 import request = require('supertest');
 import { createHash } from 'crypto';
-import { Role } from '@prisma/client';
+import { ClosureRequestStatus, Role } from '@prisma/client';
 import { AppModule } from './../src/app.module';
 import { PrismaService } from './../src/prisma/prisma.service';
 import { GlobalPrefix } from './../src/config/constants';
@@ -13,8 +13,9 @@ import { MailTransportFactory } from './../src/mail/mail-transport.factory';
 import { PanelTransport, PanelTransportFactory } from './../src/servers/panel-transport.factory';
 
 /**
- * P3 — Compte client (e2e, GO socle lot A1) : reset de mot de passe + édition
- * de profil sur la base dédiée du chantier.
+ * P3 — Compte client (e2e, GO socle lot A1 + GO Q3 item 3) : reset de mot de
+ * passe, édition de profil, changement d'email VÉRIFIÉ, sessions, propriété
+ * des dossiers et demande de clôture — base dédiée du chantier.
  *
  *  A. forgot-password : anti-énumération (réponse identique connu/inconnu,
  *     aucun mail ni jeton pour un compte inexistant), jeton sha256 seul au
@@ -22,15 +23,32 @@ import { PanelTransport, PanelTransportFactory } from './../src/servers/panel-tr
  *  B. reset-password : parcours complet (mail → lien → nouveau mdp), usage
  *     unique, 400 générique unique inconnu/utilisé/expiré, mdp trop court
  *     AVANT de brûler le jeton, sessions détruites (refresh cookie mort),
- *     ancien mdp refusé / nouveau accepté, audit sans secrets.
- *  C. PATCH /users/me : isolation stricte par JWT, trim, 409 email pris,
- *     401 anonyme, 400 corps vide, audit des champs.
- *  D. session d'impersonation = lecture seule sur PATCH /users/me (403).
+ *     ancien mdp refusé / nouveau accepté, audit sans secrets,
+ *     + CONSUMPTION CONCURRENTE : deux confirmations simultanées du même
+ *     jeton → UNE SEULE réussit (GO : opération conditionnelle atomique).
+ *  C. PATCH /users/me : nom appliqué immédiatement, email = PARCOURS DE
+ *     VÉRIFICATION (aucune écriture immédiate, mail vers la NOUVELLE adresse,
+ *     pendingEmail exposé), 409 email déjà pris par un compte, isolation JWT.
+ *  D. POST /auth/confirm-email-change : bascule atomique (usage unique CAS),
+ *     double-confirmation → 400, unicité revérifiée sous contrainte → 409,
+ *     ancien JWT toujours valable (stateless) mais claims périmés documentés.
+ *  E. impersonation = lecture seule sur PATCH /users/me (403).
+ *  F. sessions (GO) : double-refresh concurrent toléré + une seule rotation,
+ *     logout SUPPRIME la ligne (401 même dans la fenêtre de rejeu 10 s),
+ *     changePassword détruit toutes les sessions, isActive bloque le refresh,
+ *     access token stateless après logout (documenté).
+ *  G. propriété (GO) : deux comptes + dossier invité + ancien JWT + régression
+ *     ownedBy (un email ne vole pas le dossier lié à un autre compte),
+ *     ensureOwnedCustomer : identité DB (JWT périmé), rattachement concurrent
+ *     → un seul dossier.
+ *  H. clôture de compte (GO) : demande annulable/réactivable, AUCUNE
+ *     suppression automatique des pièces financières, RBAC admin, 409 après
+ *     traitement.
  *
  * Coutures (AUCUN réseau réel) : MailTransportFactory stubbé (emails capturés),
  * PanelTransportFactory stubbé. PrismaService RÉEL — base dédiée du chantier.
  */
-describe('Compte client — reset mdp + profil (e2e, P3 / lot A1)', () => {
+describe('Compte client — reset mdp, profil, email vérifié, sessions, dossiers, clôture (e2e, P3 / A1 / GO Q3)', () => {
   let app: INestApplication;
   let prisma: PrismaService;
   let limiter: SaRateLimiter;
@@ -48,11 +66,14 @@ describe('Compte client — reset mdp + profil (e2e, P3 / lot A1)', () => {
 
   let aliceId = '';
   let bobId = '';
+  let adminId = '';
   let aliceToken = '';
   let bobToken = '';
   let adminToken = '';
   let aliceResetToken = '';
   let aliceRefreshCookie = '';
+  let aliceVerifyToken = '';
+  let bobVerifyToken = '';
   let createdMailId: string | null = null;
   let priorMailSnapshot: {
     id: string;
@@ -69,6 +90,7 @@ describe('Compte client — reset mdp + profil (e2e, P3 / lot A1)', () => {
   } as unknown as PanelTransportFactory;
 
   const GENERIC_400 = 'Lien de réinitialisation invalide ou expiré.';
+  const GENERIC_EC_400 = 'Lien de vérification invalide ou expiré.';
 
   // ── Helpers ───────────────────────────────────────────────────────────────
   function forgot(email: string): request.Test {
@@ -108,6 +130,50 @@ describe('Compte client — reset mdp + profil (e2e, P3 / lot A1)', () => {
       .set('Cookie', cookie);
   }
 
+  function logout(cookie: string): request.Test {
+    return request(app.getHttpServer())
+      .post(`/${GlobalPrefix}/auth/logout`)
+      .set('Cookie', cookie);
+  }
+
+  function changePw(token: string, body: Record<string, string>): request.Test {
+    return request(app.getHttpServer())
+      .post(`/${GlobalPrefix}/auth/change-password`)
+      .set('Authorization', `Bearer ${token}`)
+      .send(body);
+  }
+
+  function confirmEmailChange(token: string): request.Test {
+    return request(app.getHttpServer())
+      .post(`/${GlobalPrefix}/auth/confirm-email-change`)
+      .send({ token });
+  }
+
+  function getWallet(token: string): request.Test {
+    return request(app.getHttpServer())
+      .get(`/${GlobalPrefix}/client/wallet`)
+      .set('Authorization', `Bearer ${token}`);
+  }
+
+  function listOrders(token: string): request.Test {
+    return request(app.getHttpServer())
+      .get(`/${GlobalPrefix}/client/orders`)
+      .set('Authorization', `Bearer ${token}`);
+  }
+
+  function patchUser(adminTok: string, id: string, body: Record<string, unknown>): request.Test {
+    return request(app.getHttpServer())
+      .patch(`/${GlobalPrefix}/users/${id}`)
+      .set('Authorization', `Bearer ${adminTok}`)
+      .send(body);
+  }
+
+  /** Première valeur `set-cookie` réduite à `name=value`. */
+  function cookieOf(res: request.Response): string {
+    const set = res.headers['set-cookie'] as unknown as string[] | undefined;
+    return String(set?.[0] ?? '').split(';')[0];
+  }
+
   /** Texte du premier email dont le sujet commence par `prefix`. */
   function mailText(prefix: string): string {
     const call = mailTransportStub.sendMail.mock.calls.find((c: unknown[]) =>
@@ -119,6 +185,12 @@ describe('Compte client — reset mdp + profil (e2e, P3 / lot A1)', () => {
   function extractResetToken(text: string): string {
     const m = /auth\/reset\?token=([A-Za-z0-9_-]+)/.exec(text);
     if (!m) throw new Error(`Aucun jeton de réinitialisation dans le mail: ${text}`);
+    return m[1];
+  }
+
+  function extractVerifyToken(text: string): string {
+    const m = /auth\/verifier-email\?token=([A-Za-z0-9_-]+)/.exec(text);
+    if (!m) throw new Error(`Aucun jeton de vérification email dans le mail: ${text}`);
     return m[1];
   }
 
@@ -153,6 +225,7 @@ describe('Compte client — reset mdp + profil (e2e, P3 / lot A1)', () => {
     });
     aliceId = alice.id;
     bobId = bob.id;
+    adminId = (await prisma.user.findUniqueOrThrow({ where: { email: adminEmail } })).id;
 
     aliceToken = (await login(aliceEmail, password).expect(201)).body.accessToken as string;
     bobToken = (await login(bobEmail, password).expect(201)).body.accessToken as string;
@@ -202,9 +275,40 @@ describe('Compte client — reset mdp + profil (e2e, P3 / lot A1)', () => {
     // Journal d'audit APPEND-ONLY laissé en place (même convention que P2 :
     // seuls les comptes/jetons/fixtures sont supprimés, cascade FK comprise).
     await prisma.passwordResetToken.deleteMany({ where: { userId: { in: [aliceId, bobId] } } }).catch(() => {});
-    await prisma.refreshToken.deleteMany({ where: { userId: { in: [aliceId, bobId] } } }).catch(() => {});
+    await prisma.refreshToken
+      .deleteMany({ where: { userId: { in: [aliceId, bobId] } } })
+      .catch(() => {});
+    // Fixtures GO Q3 : dossiers (→ cascades sur les commandes), puis produit.
+    // Tous les emails de fixtures finissent par _${stamp}@… (ou @guest…).
+    await prisma.customer
+      .deleteMany({
+        where: {
+          OR: [
+            { email: { endsWith: `_${stamp}@example.com` } },
+            { email: { endsWith: `_${stamp}@guest.example.com` } },
+            { userId: { in: [aliceId, bobId] } },
+          ],
+        },
+      })
+      .catch(() => {});
+    await prisma.product.deleteMany({ where: { name: `GO-ownership-${uid}` } }).catch(() => {});
     await prisma.user
-      .deleteMany({ where: { email: { in: [aliceEmail, aliceNewEmail, bobEmail, adminEmail] } } })
+      .deleteMany({
+        where: {
+          email: {
+            in: [
+              aliceEmail,
+              aliceNewEmail,
+              bobEmail,
+              adminEmail,
+              `charlie_${stamp}@example.com`,
+              `eve_old_${stamp}@example.com`,
+              `eve_new_${stamp}@example.com`,
+              `conc_${stamp}@example.com`,
+            ],
+          },
+        },
+      })
       .catch(() => {});
     if (createdMailId) {
       await prisma.mailSetting.delete({ where: { id: createdMailId } }).catch(() => {});
@@ -372,6 +476,32 @@ describe('Compte client — reset mdp + profil (e2e, P3 / lot A1)', () => {
       expect(expiredRes.body.message).toBe(GENERIC_400);
     });
 
+    it('GO Q3: two CONCURRENT consumptions of the same token → exactly ONE wins', async () => {
+      await forgot(aliceEmail).expect(201);
+      const token = extractResetToken(mailText('Réinitialisation'));
+      const before = await prisma.refreshToken.count({ where: { userId: aliceId, revokedAt: null } });
+      expect(before).toBeGreaterThan(0); // la session du login précédent est vivante
+
+      const [r1, r2] = await Promise.all([
+        reset(token, newPassword),
+        reset(token, newPassword),
+      ]);
+      // Une seule conditionnelle atomique peut obtenir count === 1.
+      expect([r1.status, r2.status].sort()).toEqual([201, 400]);
+
+      const row = await prisma.passwordResetToken.findUniqueOrThrow({
+        where: { tokenHash: sha256(token) },
+      });
+      expect(row.usedAt).not.toBeNull();
+      // Le gagnant a détruit toutes les sessions (le perdant n'a rien écrit).
+      expect(
+        await prisma.refreshToken.count({ where: { userId: aliceId, revokedAt: null } }),
+      ).toBe(0);
+      // Et le mot de passe final reste celui du gagnant (identique ici).
+      const user = await prisma.user.findUniqueOrThrow({ where: { id: aliceId } });
+      expect(await bcrypt.compare(newPassword, user.passwordHash)).toBe(true);
+    });
+
     it('audit: reset + reset_requested journaled, secrets never present', async () => {
       const requested = await prisma.auditLog.findFirst({
         where: { action: 'auth.password.reset_requested', actorId: aliceId },
@@ -392,38 +522,87 @@ describe('Compte client — reset mdp + profil (e2e, P3 / lot A1)', () => {
     });
   });
 
-  // ── C. PATCH /users/me ────────────────────────────────────────────────────
-  describe('C. PATCH /users/me (édition profil, isolation par JWT)', () => {
-    it('updates my own name + email (trimmed), never leaks secrets', async () => {
+  // ── C. PATCH /users/me — parcours de vérification d'email (GO Q3) ─────────
+  describe('C. PATCH /users/me (nom immédiat, email en attente de vérification)', () => {
+    it('name applied immediately, email NOT written — verification mail to the NEW address', async () => {
       const res = await patchMe(aliceToken, {
         name: '  Alice Renommée  ',
         email: aliceNewEmail,
       }).expect(200);
       expect(res.body.name).toBe('Alice Renommée');
-      expect(res.body.email).toBe(aliceNewEmail);
+      // Aucune écriture immédiate de l'email : il change À la confirmation.
+      expect(res.body.email).toBe(aliceEmail);
+      expect(res.body.pendingEmail).toBe(aliceNewEmail);
       expect(res.body).not.toHaveProperty('passwordHash');
       expect(res.body).not.toHaveProperty('mfaSecretEnc');
       expect(res.body).not.toHaveProperty('githubTokenEnc');
 
-      const me = await getMe(aliceToken).expect(200);
-      expect(me.body.name).toBe('Alice Renommée');
-      expect(me.body.email).toBe(aliceNewEmail);
+      // En base : inchangé, seule une demande (jeton sha256) existe.
+      const dbUser = await prisma.user.findUniqueOrThrow({ where: { id: aliceId } });
+      expect(dbUser.email).toBe(aliceEmail);
+      const pending = await prisma.emailChangeToken.findMany({
+        where: { userId: aliceId, usedAt: null },
+      });
+      expect(pending).toHaveLength(1);
+      expect(pending[0].tokenHash).toHaveLength(64);
+      expect(pending[0].newEmail).toBe(aliceNewEmail);
 
-      const audit = await prisma.auditLog.findFirst({
+      // Mail envoyé À LA NOUVELLE adresse, lien de vérification dedans.
+      expect(mailTransportStub.sendMail).toHaveBeenCalledTimes(1);
+      const text = mailText('Confirmez');
+      expect(text).toContain('/auth/verifier-email?token=');
+      aliceVerifyToken = extractVerifyToken(text);
+      expect(pending[0].tokenHash).toBe(sha256(aliceVerifyToken));
+
+      // getMe expose pendingEmail.
+      const me = await getMe(aliceToken).expect(200);
+      expect(me.body.email).toBe(aliceEmail);
+      expect(me.body.pendingEmail).toBe(aliceNewEmail);
+
+      // Audit : name immédiat + demande de changement séparées.
+      const profAudit = await prisma.auditLog.findFirst({
         where: { action: 'auth.profile.update', actorId: aliceId },
         orderBy: { createdAt: 'desc' },
       });
-      expect(audit).toBeTruthy();
-      expect((audit!.details as { fields?: string[] })?.fields).toEqual(['name', 'email']);
+      expect((profAudit!.details as { fields?: string[] })?.fields).toEqual(['name']);
+      const reqAudit = await prisma.auditLog.findFirst({
+        where: { action: 'auth.email.change_requested', actorId: aliceId },
+        orderBy: { createdAt: 'desc' },
+      });
+      expect((reqAudit!.details as { newEmail?: string })?.newEmail).toBe(aliceNewEmail);
+      expect(JSON.stringify(reqAudit)).not.toContain(aliceVerifyToken);
     });
 
-    it("another account cannot steal the new email (409) and Bob stays untouched", async () => {
-      await patchMe(bobToken, { email: aliceNewEmail }).expect(409);
+    it("an address held by ANOTHER account → 409 before any verification mail", async () => {
+      // aliceEmail appartient encore à alice : refus immédiat côté demande.
+      await patchMe(bobToken, { email: aliceEmail }).expect(409);
+      const bobDb = await prisma.user.findUniqueOrThrow({ where: { id: bobId } });
+      expect(bobDb.email).toBe(bobEmail);
+      expect(mailTransportStub.sendMail).not.toHaveBeenCalled();
+    });
 
-      const bob = await getMe(bobToken).expect(200);
-      expect(bob.body.email).toBe(bobEmail);
-      expect(bob.body.name).toBe('Bob P3');
-      expect(bob.body.id).toBe(bobId);
+    it('GO Q3: an address only PENDING for someone else is still claimable — the constraint decides at confirm', async () => {
+      // aliceNewEmail n'est encore le compte de PERSONNE (pas confirmé) :
+      // la demande de Bob est acceptée, la course se joue à la confirmation.
+      const res = await patchMe(bobToken, { email: aliceNewEmail }).expect(200);
+      expect(res.body.email).toBe(bobEmail); // pas d'écriture immédiate
+      expect(res.body.pendingEmail).toBe(aliceNewEmail);
+
+      expect(mailTransportStub.sendMail).toHaveBeenCalledTimes(1);
+      const call = mailTransportStub.sendMail.mock.calls[0][0] as { to?: string; text?: string };
+      // Enveloppe : le mail part BIEN vers la nouvelle adresse (le corps ne la
+      // contient pas — il ne parle que de l'adresse actuelle, anti-fuite).
+      expect(call.to).toBe(aliceNewEmail);
+      const text = String(call.text ?? '');
+      expect(text).toContain('/auth/verifier-email?token=');
+      bobVerifyToken = extractVerifyToken(text);
+      expect(bobVerifyToken).toBeTruthy();
+
+      const bobPending = await prisma.emailChangeToken.findMany({
+        where: { userId: bobId, usedAt: null },
+      });
+      expect(bobPending).toHaveLength(1);
+      expect(bobPending[0].newEmail).toBe(aliceNewEmail);
     });
 
     it('anonymous PATCH → 401; empty body → 400; bad email → 400', async () => {
@@ -438,14 +617,79 @@ describe('Compte client — reset mdp + profil (e2e, P3 / lot A1)', () => {
       await patchMe(aliceToken, { email: 'pas-un-email' }).expect(400);
     });
 
-    it('login works with the NEW email afterwards (same password)', async () => {
+    it('requesting the CURRENT email again → no-op (no mail, no pending)', async () => {
+      await patchMe(aliceToken, { email: aliceEmail }).expect(200);
+      expect(mailTransportStub.sendMail).not.toHaveBeenCalled();
+      const me = await getMe(aliceToken).expect(200);
+      expect(me.body.pendingEmail).toBe(aliceNewEmail); // seule demande en vie, inchangée
+    });
+  });
+
+  // ── D. POST /auth/confirm-email-change (GO Q3) ────────────────────────────
+  describe('D. POST /auth/confirm-email-change (bascule atomique)', () => {
+    it('valid token: email switched inside one transaction, pending cleared, audited', async () => {
+      await confirmEmailChange(aliceVerifyToken).expect(201);
+
+      const dbUser = await prisma.user.findUniqueOrThrow({ where: { id: aliceId } });
+      expect(dbUser.email).toBe(aliceNewEmail);
+      const row = await prisma.emailChangeToken.findUniqueOrThrow({
+        where: { tokenHash: sha256(aliceVerifyToken) },
+      });
+      expect(row.usedAt).not.toBeNull();
+
+      const me = await getMe(aliceToken).expect(200); // ancien JWT : stateless, OK
+      expect(me.body.email).toBe(aliceNewEmail);
+      expect(me.body.pendingEmail).toBeNull();
+
+      const audit = await prisma.auditLog.findFirst({
+        where: { action: 'auth.email.change_confirmed', actorId: aliceId },
+        orderBy: { createdAt: 'desc' },
+      });
+      expect(audit).toBeTruthy();
+      expect(JSON.stringify(audit)).not.toContain(aliceVerifyToken);
+    });
+
+    it('second confirmation of the same token → the generic 400 (single-use CAS)', async () => {
+      const res = await confirmEmailChange(aliceVerifyToken).expect(400);
+      expect(res.body.message).toBe(GENERIC_EC_400);
+      // L'email déjà basculé reste inchangé.
+      const dbUser = await prisma.user.findUniqueOrThrow({ where: { id: aliceId } });
+      expect(dbUser.email).toBe(aliceNewEmail);
+    });
+
+    it('GO Q3: the address was taken meanwhile → 409 under constraint, tx rolled back', async () => {
+      // aliceNewEmail appartient désormais à alice : la confirmation de Bob
+      // échoue sur P2002 dans la transaction, qui se remplit entièrement
+      // (le jeton de Bob n'est PAS consommé — rollback).
+      const res = await confirmEmailChange(bobVerifyToken).expect(409);
+      expect(String(res.body.message)).toContain('existe déjà');
+
+      const bobDb = await prisma.user.findUniqueOrThrow({ where: { id: bobId } });
+      expect(bobDb.email).toBe(bobEmail);
+      const bobRow = await prisma.emailChangeToken.findUniqueOrThrow({
+        where: { tokenHash: sha256(bobVerifyToken) },
+      });
+      expect(bobRow.usedAt).toBeNull(); // rollback complet
+      const audit = await prisma.auditLog.findFirst({
+        where: { action: 'auth.email.change_confirmed', actorId: bobId },
+      });
+      expect(audit).toBeNull();
+    });
+
+    it('unknown token → 400 (same generic message)', async () => {
+      const res = await confirmEmailChange(`jamais-emis-${uid}`).expect(400);
+      expect(res.body.message).toBe(GENERIC_EC_400);
+    });
+
+    it('login works with the NEW email, old email refused (same password)', async () => {
+      await login(aliceEmail, newPassword).expect(401);
       const res = await login(aliceNewEmail, newPassword).expect(201);
       expect(res.body.accessToken).toBeTruthy();
     });
   });
 
-  // ── D. impersonation = lecture seule ──────────────────────────────────────
-  describe("D. session d'impersonation sur PATCH /users/me", () => {
+  // ── E. impersonation = lecture seule ──────────────────────────────────────
+  describe("E. session d'impersonation sur PATCH /users/me", () => {
     it('admin "as client" can read (200) but not write (403)', async () => {
       adminToken = (await login(adminEmail, password).expect(201)).body.accessToken as string;
       const imp = await request(app.getHttpServer())
@@ -462,6 +706,379 @@ describe('Compte client — reset mdp + profil (e2e, P3 / lot A1)', () => {
       // Le profil n'a pas bougé.
       const me = await getMe(aliceToken).expect(200);
       expect(me.body.name).toBe('Alice Renommée');
+    });
+  });
+
+  // ── F. sessions (GO Q3) : rotation, logout, changePassword, isActive ──────
+  describe('F. sessions — rotation concurrente, logout, changePassword, isActive', () => {
+    const charlieEmail = `charlie_${stamp}@example.com`;
+    const charliePw = 'Charlie-Mdp-2026';
+    let charlieId = '';
+
+    beforeAll(async () => {
+      const hash = await bcrypt.hash(password, 10);
+      charlieId = (
+        await prisma.user.create({
+          data: { email: charlieEmail, name: 'Charlie P3', role: Role.USER, passwordHash: hash },
+        })
+      ).id;
+    });
+
+    afterAll(async () => {
+      await prisma.refreshToken.deleteMany({ where: { userId: charlieId } }).catch(() => {});
+      await prisma.user.delete({ where: { id: charlieId } }).catch(() => {});
+    });
+
+    it('double-refresh concurrent: rotation tolerated, the row is revoked exactly once', async () => {
+      const loginRes = await login(charlieEmail, password).expect(201);
+      const cookie = cookieOf(loginRes);
+      const access = loginRes.body.accessToken as string;
+      const rowA = await prisma.refreshToken.findFirstOrThrow({
+        where: { userId: charlieId, revokedAt: null },
+        orderBy: { createdAt: 'desc' },
+      });
+
+      // Deux renouvellements simultanés du MÊME cookie : aucun 500, aucun 401
+      // (fenêtre de rejeu 10 s) — la rotation CAS ne révoque qu'une fois.
+      const [a, b] = await Promise.all([refresh(cookie), refresh(cookie)]);
+      expect([a.status, b.status].sort()).toEqual([201, 201]);
+
+      const rowAfter = await prisma.refreshToken.findUniqueOrThrow({ where: { id: rowA.id } });
+      expect(rowAfter.revokedAt).not.toBeNull();
+      expect(
+        await prisma.refreshToken.count({ where: { userId: charlieId, revokedAt: null } }),
+      ).toBeGreaterThanOrEqual(1);
+      expect(access).toBeTruthy();
+    });
+
+    it('logout DELETES the row: refresh 401 even inside the 10 s reuse window', async () => {
+      const loginRes = await login(charlieEmail, password).expect(201);
+      const cookie = cookieOf(loginRes);
+      const access = loginRes.body.accessToken as string;
+      const rowBefore = await prisma.refreshToken.findFirstOrThrow({
+        where: { userId: charlieId, revokedAt: null },
+        orderBy: { createdAt: 'desc' },
+      });
+
+      await logout(cookie).expect(201);
+      // Supprimée, pas révoquée : la fenêtre de rejeu ne voit rien à ressusciter.
+      expect(await prisma.refreshToken.findUnique({ where: { id: rowBefore.id } })).toBeNull();
+      await refresh(cookie).expect(401); // immédiatement, bien avant 10 s
+
+      // Access token stateless (documenté) : encore valable ≤ jwtExpiresIn.
+      const me = await getMe(access).expect(200);
+      expect(me.body.id).toBe(charlieId);
+    });
+
+    it('changePassword destroys EVERY active session of the account', async () => {
+      const loginRes = await login(charlieEmail, password).expect(201);
+      const cookie = cookieOf(loginRes);
+
+      await changePw(loginRes.body.accessToken as string, {
+        currentPassword: password,
+        newPassword: charliePw,
+      }).expect(201);
+
+      await refresh(cookie).expect(401);
+      expect(
+        await prisma.refreshToken.count({ where: { userId: charlieId, revokedAt: null } }),
+      ).toBe(0);
+      await login(charlieEmail, password).expect(401);
+      await login(charlieEmail, charliePw).expect(201);
+
+      // Restauration du mot de passe d'origine pour la suite.
+      const newLogin = await login(charlieEmail, charliePw).expect(201);
+      await changePw(newLogin.body.accessToken as string, {
+        currentPassword: charliePw,
+        newPassword: password,
+      }).expect(201);
+    });
+
+    it('isActive=false blocks refresh (admin kill-switch), reactivation restores it', async () => {
+      const loginRes = await login(charlieEmail, password).expect(201);
+      const cookie = cookieOf(loginRes);
+
+      await patchUser(adminToken, charlieId, { isActive: false }).expect(200);
+      await refresh(cookie).expect(401); // la ligne est encore active, le compte ne l'est plus
+
+      await patchUser(adminToken, charlieId, { isActive: true }).expect(200);
+      await refresh(cookie).expect(201); // réactivé : la même session repart
+    });
+  });
+
+  // ── G. propriété des dossiers (GO Q3) ─────────────────────────────────────
+  describe('G. deux comptes, dossiers invités, ancien JWT, ownedBy/ensureOwnedCustomer', () => {
+    const eveOld = `eve_old_${stamp}@example.com`;
+    const eveNew = `eve_new_${stamp}@example.com`;
+    const concEmail = `conc_${stamp}@example.com`;
+    const guestAtOldAlice = `guestold_${stamp}@guest.example.com`;
+
+    it('ensureOwnedCustomer: stale JWT uses the CURRENT DB identity (no folder theft, no duplicate)', async () => {
+      const hash = await bcrypt.hash(password, 10);
+      const eve = await prisma.user.create({
+        data: { email: eveOld, name: 'Eve P3', role: Role.USER, passwordHash: hash },
+      });
+      const eveLogin = await login(eveOld, password).expect(201);
+      const eveJwt = eveLogin.body.accessToken as string; // claim = eveOld (périmé après suite)
+
+      // Changement d'email confirmé « entre-temps » : la DB passe à eveNew,
+      // le JWT émis plus tôt porte encore eveOld.
+      await prisma.user.update({ where: { id: eve.id }, data: { email: eveNew } });
+      // Un dossier invité existe déjà à la NOUVELLE adresse (rattachable).
+      await prisma.customer.create({
+        data: { email: eveNew, name: 'Invité Eve', userId: null },
+      });
+
+      const res = await getWallet(eveJwt).expect(200);
+      // L'identité DB l'emporte sur le claim périmé : dossier invité rattaché…
+      expect(res.body.customerEmail).toBe(eveNew);
+      const guest = await prisma.customer.findUniqueOrThrow({ where: { email: eveNew } });
+      expect(guest.userId).toBe(eve.id);
+      // …et AUCUN second dossier créé sous l'email périmé du JWT.
+      expect(await prisma.customer.findUnique({ where: { email: eveOld } })).toBeNull();
+
+      await prisma.user.delete({ where: { id: eve.id } }).catch(() => {});
+      await prisma.customer.deleteMany({ where: { email: eveNew } }).catch(() => {});
+    });
+
+    it('two CONCURRENT wallet fetches of a fresh account → exactly ONE folder', async () => {
+      const hash = await bcrypt.hash(password, 10);
+      const conc = await prisma.user.create({
+        data: { email: concEmail, name: 'Conc P3', role: Role.USER, passwordHash: hash },
+      });
+      const tok = (await login(concEmail, password).expect(201)).body.accessToken as string;
+
+      const [w1, w2] = await Promise.all([getWallet(tok), getWallet(tok)]);
+      expect(w1.status).toBe(200);
+      expect(w2.status).toBe(200);
+      expect(
+        await prisma.customer.count({ where: { userId: conc.id } }),
+      ).toBe(1); // jamais deux dossiers concurrents
+
+      await prisma.user.delete({ where: { id: conc.id } }).catch(() => {});
+      await prisma.customer.deleteMany({ where: { userId: conc.id } }).catch(() => {});
+    });
+
+    it('ownedBy: an email NEVER opens a folder linked to ANOTHER account (linked vs guest)', async () => {
+      const prod = await prisma.product.create({
+        data: { name: `GO-ownership-${uid}` },
+      });
+      // Dossier LIÉ à Bob mais portant l'ancien email d'Alice : seul Bob doit
+      // le voir (régression ownedBy — l'email seul n'ouvre jamais un dossier lié).
+      const linkedToBob = await prisma.customer.create({
+        data: { email: aliceEmail, name: 'Dossier Bob @ ancien Alice', userId: bobId },
+      });
+      // Dossier INVITÉ non rattaché à l'adresse de Bob : Bob le voit aussi
+      // (branche guest bornée à userId null).
+      const guest = await prisma.customer.create({
+        data: { email: bobEmail, name: 'Invité Bob', userId: null },
+      });
+      for (const [cust, label] of [
+        [linkedToBob, 'lié'],
+        [guest, 'invité'],
+      ] as const) {
+        await prisma.order.create({
+          data: {
+            customerId: cust.id,
+            customerName: label,
+            customerEmail: cust.email,
+            productId: prod.id,
+            productName: 'GO ownership',
+            amountHtCents: 1000,
+            taxAmountCents: 200,
+            amountTtcCents: 1200,
+          },
+        });
+      }
+
+      // Alice (ancien JWT, claim = aliceEmail) : 0 commande — son email ne
+      // lui donne PAS le dossier lié à Bob (avant fix : total = 1).
+      const aliceOldJwt = aliceToken; // jamais ré-émis depuis : claims périmés
+      const aliceOrders = await listOrders(aliceOldJwt).expect(200);
+      expect(aliceOrders.body.total).toBe(0);
+
+      // Nouveau JWT d'Alice (claim = nouvel email) : toujours 0 (son dossier
+      // n'a pas de commande).
+      const aliceFresh = (await login(aliceNewEmail, newPassword).expect(201)).body
+        .accessToken as string;
+      const aliceFreshOrders = await listOrders(aliceFresh).expect(200);
+      expect(aliceFreshOrders.body.total).toBe(0);
+
+      // Bob voit les DEUX : le sien (lié) + l'invité à son email.
+      const bobOrders = await listOrders(bobToken).expect(200);
+      expect(bobOrders.body.total).toBe(2);
+
+      // Nettoyage local de la section.
+      await prisma.customer.deleteMany({
+        where: { id: { in: [linkedToBob.id, guest.id] } },
+      });
+      await prisma.product.delete({ where: { id: prod.id } });
+    });
+
+    it('ensureOwnedCustomer on Alice: folder bound to her CURRENT account, guest at old email untouched', async () => {
+      // Dossier invité à l'ancien email d'Alice (userId null).
+      await prisma.customer.create({
+        data: { email: guestAtOldAlice, name: 'Invité ancien Alice', userId: null },
+      });
+
+      const res = await getWallet(aliceToken).expect(200);
+      expect(res.body.customerEmail).toBe(aliceNewEmail);
+      const db = await prisma.user.findUniqueOrThrow({ where: { id: aliceId } });
+      expect(db.email).toBe(aliceNewEmail);
+
+      // Le dossier invité de l'adresse périmée n'a pas été réutilisé : il lui
+      // fallait l'identité ACTUELLE (aliceNewEmail), pas le claim du JWT.
+      const aliceCustomers = await prisma.customer.findMany({ where: { userId: aliceId } });
+      expect(aliceCustomers).toHaveLength(1);
+      expect(aliceCustomers[0].email).toBe(aliceNewEmail);
+      const oldGuest = await prisma.customer.findUnique({
+        where: { email: guestAtOldAlice },
+      });
+      expect(oldGuest?.userId).toBeNull(); // jamais détourné sous claim périmé
+      await prisma.customer.deleteMany({ where: { email: guestAtOldAlice } });
+    });
+  });
+
+  // ── H. demande de clôture de compte (GO Q3) ───────────────────────────────
+  describe('H. demande de clôture de compte (aucune suppression financière)', () => {
+    it('open → PENDING (idempotent), GET exposes it, nothing financial touched', async () => {
+      const ordersBefore = await prisma.order.count();
+      const invoicesBefore = await prisma.invoice.count();
+      const txsBefore = await prisma.walletTransaction.count();
+
+      const nullRes = await request(app.getHttpServer())
+        .get(`/${GlobalPrefix}/users/me/closure-request`)
+        .set('Authorization', `Bearer ${aliceToken}`)
+        .expect(200);
+      // `null` sérialisé en corps vide (jamais `{}` ni `null` littéral).
+      expect(nullRes.text).toBe('');
+
+      const res = await request(app.getHttpServer())
+        .post(`/${GlobalPrefix}/users/me/closure-request`)
+        .set('Authorization', `Bearer ${aliceToken}`)
+        .send({ reason: '  je pars  ' })
+        .expect(201);
+      expect(res.body.status).toBe(ClosureRequestStatus.PENDING);
+      expect(res.body.reason).toBe('je pars');
+
+      // Idempotent : une seule demande en attente par compte.
+      const again = await request(app.getHttpServer())
+        .post(`/${GlobalPrefix}/users/me/closure-request`)
+        .set('Authorization', `Bearer ${aliceToken}`)
+        .send({ reason: 'autre' })
+        .expect(201);
+      expect(again.body.id).toBe(res.body.id);
+      expect(again.body.status).toBe(ClosureRequestStatus.PENDING);
+
+      const get = await request(app.getHttpServer())
+        .get(`/${GlobalPrefix}/users/me/closure-request`)
+        .set('Authorization', `Bearer ${aliceToken}`)
+        .expect(200);
+      expect(get.body.id).toBe(res.body.id);
+
+      // AUCUNE suppression automatique : les pièces financières restent.
+      expect(await prisma.order.count()).toBe(ordersBefore);
+      expect(await prisma.invoice.count()).toBe(invoicesBefore);
+      expect(await prisma.walletTransaction.count()).toBe(txsBefore);
+
+      const audit = await prisma.auditLog.findFirst({
+        where: { action: 'account.closure_requested', actorId: aliceId },
+        orderBy: { createdAt: 'desc' },
+      });
+      expect(audit).toBeTruthy();
+      expect((audit!.details as { reason?: string })?.reason).toBe('je pars');
+    });
+
+    it('cancel → CANCELLED, reopen → same row PENDING again', async () => {
+      const cancel = await request(app.getHttpServer())
+        .delete(`/${GlobalPrefix}/users/me/closure-request`)
+        .set('Authorization', `Bearer ${aliceToken}`)
+        .expect(200);
+      expect(cancel.body.status).toBe(ClosureRequestStatus.CANCELLED);
+
+      // Plus de demande en attente → 404 sur une nouvelle annulation.
+      await request(app.getHttpServer())
+        .delete(`/${GlobalPrefix}/users/me/closure-request`)
+        .set('Authorization', `Bearer ${aliceToken}`)
+        .expect(404);
+
+      const reopen = await request(app.getHttpServer())
+        .post(`/${GlobalPrefix}/users/me/closure-request`)
+        .set('Authorization', `Bearer ${aliceToken}`)
+        .send({ reason: 'réouverture' })
+        .expect(201);
+      expect(reopen.body.status).toBe(ClosureRequestStatus.PENDING);
+      expect(reopen.body.id).toBe(cancel.body.id); // même ligne, contrat @@unique
+    });
+
+    it('RBAC: regular client cannot list closure requests (403), admin can', async () => {
+      await request(app.getHttpServer())
+        .get(`/${GlobalPrefix}/users/closure-requests`)
+        .set('Authorization', `Bearer ${aliceToken}`)
+        .expect(403);
+
+      const list = await request(app.getHttpServer())
+        .get(`/${GlobalPrefix}/users/closure-requests`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .expect(200);
+      const row = (list.body as { userId: string }[]).find((r) => r.userId === aliceId);
+      expect(row).toBeTruthy();
+    });
+
+    it('admin resolves PENDING → COMPLETED; further resolve/reopen → 409; finances still intact', async () => {
+      const ordersBefore = await prisma.order.count();
+      const invoicesBefore = await prisma.invoice.count();
+      const txsBefore = await prisma.walletTransaction.count();
+
+      const pending = await request(app.getHttpServer())
+        .get(`/${GlobalPrefix}/users/me/closure-request`)
+        .set('Authorization', `Bearer ${aliceToken}`)
+        .expect(200);
+
+      const list = await request(app.getHttpServer())
+        .get(`/${GlobalPrefix}/users/closure-requests`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .expect(200);
+      const target = (list.body as { id: string }[]).find((r) => r.id === pending.body.id);
+      expect(target).toBeTruthy();
+
+      const done = await request(app.getHttpServer())
+        .patch(`/${GlobalPrefix}/users/closure-requests/${pending.body.id}`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ status: ClosureRequestStatus.COMPLETED, note: 'traité manuellement' })
+        .expect(200);
+      expect(done.body.status).toBe(ClosureRequestStatus.COMPLETED);
+      expect(done.body.resolvedById).toBeTruthy();
+
+      // Déjà traitée → 409 (ni double résolution, ni réouverture).
+      await request(app.getHttpServer())
+        .patch(`/${GlobalPrefix}/users/closure-requests/${pending.body.id}`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ status: ClosureRequestStatus.CANCELLED })
+        .expect(409);
+      await request(app.getHttpServer())
+        .post(`/${GlobalPrefix}/users/me/closure-request`)
+        .set('Authorization', `Bearer ${aliceToken}`)
+        .send({})
+        .expect(409);
+
+      // RBAC sur l'écriture admin.
+      await request(app.getHttpServer())
+        .patch(`/${GlobalPrefix}/users/closure-requests/${pending.body.id}`)
+        .set('Authorization', `Bearer ${aliceToken}`)
+        .send({ status: ClosureRequestStatus.CANCELLED })
+        .expect(403);
+
+      // Aucune pièce financière supprimée par le parcours complet.
+      expect(await prisma.order.count()).toBe(ordersBefore);
+      expect(await prisma.invoice.count()).toBe(invoicesBefore);
+      expect(await prisma.walletTransaction.count()).toBe(txsBefore);
+
+      const audit = await prisma.auditLog.findFirst({
+        where: { action: 'account.closure_resolved', actorId: adminId },
+        orderBy: { createdAt: 'desc' },
+      });
+      expect(audit).toBeTruthy();
     });
   });
 });

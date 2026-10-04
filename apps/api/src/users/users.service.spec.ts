@@ -1,5 +1,5 @@
 import { BadRequestException, ConflictException, ForbiddenException, NotFoundException } from '@nestjs/common';
-import { Role } from '@prisma/client';
+import { ClosureRequestStatus, Role } from '@prisma/client';
 import { UpdateUserDto } from './dto/update-user.dto';
 import { UsersService } from './users.service';
 
@@ -19,10 +19,27 @@ describe('UsersService', () => {
       findUnique: jest.fn(),
       create: jest.fn(),
     },
+    emailChangeToken: {
+      findFirst: jest.fn(),
+      deleteMany: jest.fn(),
+      create: jest.fn(),
+      updateMany: jest.fn(),
+      findUnique: jest.fn(),
+    },
+    accountClosureRequest: {
+      findUnique: jest.fn(),
+      findMany: jest.fn(),
+      create: jest.fn(),
+      update: jest.fn(),
+    },
   };
   const mockAudit = { record: jest.fn() };
   const mockDeployments = {
     getOrCreateClientProject: jest.fn(),
+  };
+  const mockAuth = {
+    requestEmailChange: jest.fn(),
+    confirmEmailChange: jest.fn(),
   };
 
   const admin = {
@@ -54,7 +71,12 @@ describe('UsersService', () => {
   const actorOther = { sub: 'o1', email: 'other@example.com' };
 
   beforeEach(() => {
-    service = new UsersService(mockPrisma as never, mockAudit as never, mockDeployments as never);
+    service = new UsersService(
+      mockPrisma as never,
+      mockAudit as never,
+      mockDeployments as never,
+      mockAuth as never,
+    );
     jest.clearAllMocks();
   });
 
@@ -266,7 +288,7 @@ describe('UsersService', () => {
     });
   });
 
-  // ── GO socle (lot A1): self-service profile edit (PATCH /users/me) ─────────
+  // ── GO socle (lot A1) + GO Q3: self-service profile edit (PATCH /users/me) ─
   describe('updateProfile (own account only)', () => {
     it('refuses an empty body before touching the database', async () => {
       await expect(service.updateProfile('u1', {})).rejects.toBeInstanceOf(BadRequestException);
@@ -280,22 +302,27 @@ describe('UsersService', () => {
       );
     });
 
-    it('updates name + email, strips secrets, audits the changed field names', async () => {
+    it('GO Q3: name applied immediately, email becomes a PENDING verification (no immediate write)', async () => {
       mockPrisma.user.findUnique
         .mockResolvedValueOnce(user) // load own account
         .mockResolvedValueOnce(null); // email conflict check: free
-      mockPrisma.user.update.mockResolvedValue({
-        ...user,
-        name: 'Ada L.',
-        email: 'ada@example.com',
-      });
+      mockPrisma.user.update.mockResolvedValue({ ...user, name: 'Ada L.' });
 
       const res = await service.updateProfile('u1', { name: '  Ada L.  ', email: 'ada@example.com' });
 
+      // Jamais d'écriture immédiate de User.email : seul le nom change.
       expect(mockPrisma.user.update).toHaveBeenCalledWith({
         where: { id: 'u1' },
-        data: { name: 'Ada L.', email: 'ada@example.com' },
+        data: { name: 'Ada L.' },
       });
+      expect(mockPrisma.user.update).not.toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ email: 'ada@example.com' }) }),
+      );
+      // La vérification part vers la NOUVELLE adresse.
+      expect(mockAuth.requestEmailChange).toHaveBeenCalledWith(
+        { id: 'u1', email: 'user@example.com' },
+        'ada@example.com',
+      );
       expect(res).not.toHaveProperty('passwordHash');
       expect(res).not.toHaveProperty('mfaSecretEnc');
       expect(res).not.toHaveProperty('githubTokenEnc');
@@ -303,18 +330,32 @@ describe('UsersService', () => {
         expect.objectContaining({
           action: 'auth.profile.update',
           actorId: 'u1',
-          details: { fields: ['name', 'email'] },
+          details: { fields: ['name'] },
         }),
       );
     });
 
-    it('email already used by ANOTHER account → ConflictException', async () => {
+    it('GO Q3: email-only change → pending flow, NO user.write, NO auth.profile.update', async () => {
+      mockPrisma.user.findUnique
+        .mockResolvedValueOnce(user)
+        .mockResolvedValueOnce(null);
+      mockAuth.requestEmailChange.mockResolvedValue({ pendingEmail: 'new@example.com', expiresAt: new Date() });
+
+      await service.updateProfile('u1', { email: 'new@example.com' });
+
+      expect(mockPrisma.user.update).not.toHaveBeenCalled();
+      expect(mockAuth.requestEmailChange).toHaveBeenCalledTimes(1);
+      expect(mockAudit.record).not.toHaveBeenCalled(); // l'audit est porté par requestEmailChange
+    });
+
+    it('email already used by ANOTHER account → ConflictException before any verification mail', async () => {
       mockPrisma.user.findUnique
         .mockResolvedValueOnce(user)
         .mockResolvedValueOnce({ id: 'other', email: 'taken@example.com' });
       await expect(
         service.updateProfile('u1', { email: 'taken@example.com' }),
       ).rejects.toBeInstanceOf(ConflictException);
+      expect(mockAuth.requestEmailChange).not.toHaveBeenCalled();
       expect(mockPrisma.user.update).not.toHaveBeenCalled();
     });
 
@@ -324,17 +365,137 @@ describe('UsersService', () => {
       const res = await service.updateProfile('u1', { name: '   ' });
       expect(mockPrisma.user.update).toHaveBeenCalledWith({
         where: { id: 'u1' },
-        data: { name: null, email: 'user@example.com' },
+        data: { name: null },
       });
       expect(res).not.toHaveProperty('passwordHash');
     });
 
-    it('no-op when values are already identical (no write, no audit)', async () => {
+    it('no-op when values are already identical (no write, no audit, no verification mail)', async () => {
       mockPrisma.user.findUnique.mockResolvedValueOnce(user);
       const res = await service.updateProfile('u1', { email: 'user@example.com', name: 'User' });
       expect(mockPrisma.user.update).not.toHaveBeenCalled();
       expect(mockAudit.record).not.toHaveBeenCalled();
+      expect(mockAuth.requestEmailChange).not.toHaveBeenCalled();
       expect(res).toEqual(expect.objectContaining({ id: 'u1' }));
+    });
+
+    it('getProfile exposes pendingEmail from the live verification request', async () => {
+      mockPrisma.user.findUnique.mockResolvedValue(user);
+      mockPrisma.emailChangeToken.findFirst.mockResolvedValue({ newEmail: 'pending@example.com' });
+      const res = await service.getProfile('u1');
+      expect(res.pendingEmail).toBe('pending@example.com');
+    });
+  });
+
+  // ── GO Q3: demande de clôture de compte (demander ≠ exécuter) ──────────────
+  describe('account closure request', () => {
+    const closureRow = {
+      id: 'cl1',
+      userId: 'u1',
+      reason: 'plus besoin',
+      status: ClosureRequestStatus.PENDING,
+      createdAt: new Date('2026-10-01'),
+      updatedAt: new Date('2026-10-01'),
+      resolvedAt: null,
+      resolvedById: null,
+      resolutionNote: null,
+    };
+
+    it('getClosureRequest returns null when there is none', async () => {
+      mockPrisma.accountClosureRequest.findUnique.mockResolvedValue(null);
+      await expect(service.getClosureRequest('u1')).resolves.toBeNull();
+    });
+
+    it('requestClosure creates a PENDING row + audits (no financial touch)', async () => {
+      mockPrisma.user.findUnique.mockResolvedValue(user);
+      mockPrisma.accountClosureRequest.findUnique.mockResolvedValue(null);
+      mockPrisma.accountClosureRequest.create.mockResolvedValue(closureRow);
+
+      const res = await service.requestClosure('u1', '  plus besoin ');
+      expect(res.status).toBe(ClosureRequestStatus.PENDING);
+      expect(mockPrisma.accountClosureRequest.create).toHaveBeenCalledWith({
+        data: { userId: 'u1', reason: 'plus besoin' },
+      });
+      expect(mockAudit.record).toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'account.closure_requested', resourceId: 'u1' }),
+      );
+      // Aucune écriture sur User ni sur des entités financières.
+      expect(mockPrisma.user.update).not.toHaveBeenCalled();
+    });
+
+    it('requestClosure is idempotent on an existing PENDING row', async () => {
+      mockPrisma.user.findUnique.mockResolvedValue(user);
+      mockPrisma.accountClosureRequest.findUnique.mockResolvedValue(closureRow);
+      const res = await service.requestClosure('u1', 'autre motif');
+      expect(res).toMatchObject({ id: 'cl1', status: ClosureRequestStatus.PENDING });
+      expect(mockPrisma.accountClosureRequest.create).not.toHaveBeenCalled();
+      expect(mockPrisma.accountClosureRequest.update).not.toHaveBeenCalled();
+      expect(mockAudit.record).not.toHaveBeenCalled();
+    });
+
+    it('requestClosure refuses when already COMPLETED (409)', async () => {
+      mockPrisma.user.findUnique.mockResolvedValue(user);
+      mockPrisma.accountClosureRequest.findUnique.mockResolvedValue({
+        ...closureRow,
+        status: ClosureRequestStatus.COMPLETED,
+      });
+      await expect(service.requestClosure('u1')).rejects.toBeInstanceOf(ConflictException);
+    });
+
+    it('cancelClosureRequest: 404 without a pending row, else CANCELLED + audit', async () => {
+      mockPrisma.user.findUnique.mockResolvedValue(user);
+      mockPrisma.accountClosureRequest.findUnique.mockResolvedValue(null);
+      await expect(service.cancelClosureRequest('u1')).rejects.toBeInstanceOf(NotFoundException);
+
+      mockPrisma.accountClosureRequest.findUnique.mockResolvedValue(closureRow);
+      mockPrisma.accountClosureRequest.update.mockResolvedValue({
+        ...closureRow,
+        status: ClosureRequestStatus.CANCELLED,
+        resolvedAt: new Date(),
+        resolvedById: 'u1',
+      });
+      const res = await service.cancelClosureRequest('u1');
+      expect(res.status).toBe(ClosureRequestStatus.CANCELLED);
+      expect(mockAudit.record).toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'account.closure_cancelled' }),
+      );
+    });
+
+    it('resolveClosureRequest (admin): 404 unknown, 409 already resolved, COMPLETED + audit', async () => {
+      mockPrisma.accountClosureRequest.findUnique.mockResolvedValue(null);
+      await expect(
+        service.resolveClosureRequest('nope', { status: ClosureRequestStatus.COMPLETED }, actorOther),
+      ).rejects.toBeInstanceOf(NotFoundException);
+
+      mockPrisma.accountClosureRequest.findUnique.mockResolvedValue({
+        ...closureRow,
+        status: ClosureRequestStatus.CANCELLED,
+        user: { id: 'u1', email: 'user@example.com', name: 'User' },
+      });
+      await expect(
+        service.resolveClosureRequest('cl1', { status: ClosureRequestStatus.COMPLETED }, actorOther),
+      ).rejects.toBeInstanceOf(ConflictException);
+
+      mockPrisma.accountClosureRequest.findUnique.mockResolvedValue({
+        ...closureRow,
+        user: { id: 'u1', email: 'user@example.com', name: 'User' },
+      });
+      mockPrisma.accountClosureRequest.update.mockResolvedValue({
+        ...closureRow,
+        status: ClosureRequestStatus.COMPLETED,
+        resolvedAt: new Date(),
+        resolvedById: 'o1',
+      });
+      const res = await service.resolveClosureRequest(
+        'cl1',
+        { status: ClosureRequestStatus.COMPLETED, note: 'traité' },
+        actorOther,
+      );
+      expect(res.status).toBe(ClosureRequestStatus.COMPLETED);
+      expect(mockAudit.record).toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'account.closure_resolved', actorId: 'o1' }),
+      );
+      expect(mockPrisma.user.update).not.toHaveBeenCalled();
     });
   });
 });

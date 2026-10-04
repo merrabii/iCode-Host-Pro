@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ConflictException,
   ForbiddenException,
   NotFoundException,
   UnauthorizedException,
@@ -12,6 +13,8 @@ jest.mock('bcryptjs', () => ({
   compare: jest.fn(async () => true),
   hash: jest.fn(async (s: string) => `hashed:${s}`),
 }));
+
+const bcryptMock = jest.requireMock('bcryptjs') as { compare: jest.Mock; hash: jest.Mock };
 
 describe('AuthService (impersonation + order-time registration, ADR-027)', () => {
   const mockPrisma = {
@@ -29,6 +32,13 @@ describe('AuthService (impersonation + order-time registration, ADR-027)', () =>
       create: jest.fn(),
       deleteMany: jest.fn(),
       update: jest.fn(),
+      updateMany: jest.fn(),
+    },
+    emailChangeToken: {
+      findUnique: jest.fn(),
+      create: jest.fn(),
+      deleteMany: jest.fn(),
+      updateMany: jest.fn(),
     },
     subscription: { create: jest.fn() },
     auditLog: { create: jest.fn() },
@@ -59,6 +69,9 @@ describe('AuthService (impersonation + order-time registration, ADR-027)', () =>
       mockMailSettings as never,
     );
     jest.clearAllMocks();
+    // clearAllMocks ne remet PAS les implémentations : on reprend la main sur
+    // $transaction (chaque bloc pose la sienne : fonction interactive vs tableau).
+    mockPrisma.$transaction.mockReset();
     mockConfig.get.mockReturnValue(undefined);
     mockSettings.isSelfRegistrationEnabled.mockResolvedValue(true);
     mockMailSettings.isEnabled.mockResolvedValue(true);
@@ -329,13 +342,42 @@ describe('AuthService (impersonation + order-time registration, ADR-027)', () =>
     });
   });
 
-  describe('resetPassword (single-use, generic 400, sessions revoked)', () => {
+  // ── GO Q3: reset atomique (CAS usage unique + expiration dans la tx) ───────
+  describe('resetPassword (atomic single-use CAS, generic 400, sessions destroyed)', () => {
     const rawToken = 'one-time-raw-token';
+    const tokenHash = createHash('sha256').update(rawToken).digest('hex');
     const record = {
       id: 'pr1',
       userId: 'u1',
+      tokenHash,
       usedAt: null as Date | null,
       expiresAt: new Date(Date.now() + 60_000),
+    };
+
+    /** Tx « heureuse » : CAS count 1, puis écritures. */
+    const happyTx = () => {
+      const tx = {
+        passwordResetToken: { updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
+        user: { update: jest.fn().mockResolvedValue({}) },
+        refreshToken: { deleteMany: jest.fn().mockResolvedValue({ count: 2 }) },
+      };
+      mockPrisma.$transaction.mockImplementation(async (cb: (t: typeof tx) => Promise<unknown>) =>
+        cb(tx),
+      );
+      return tx;
+    };
+
+    /** Tx « perdante » : le CAS retourne count 0 (déjà consommé / expiré en DB). */
+    const losingTx = () => {
+      const tx = {
+        passwordResetToken: { updateMany: jest.fn().mockResolvedValue({ count: 0 }) },
+        user: { update: jest.fn() },
+        refreshToken: { deleteMany: jest.fn() },
+      };
+      mockPrisma.$transaction.mockImplementation(async (cb: (t: typeof tx) => Promise<unknown>) =>
+        cb(tx),
+      );
+      return tx;
     };
 
     it('short password: 400 BEFORE burning the token', async () => {
@@ -345,26 +387,29 @@ describe('AuthService (impersonation + order-time registration, ADR-027)', () =>
       expect(mockPrisma.passwordResetToken.findUnique).not.toHaveBeenCalled();
     });
 
-    it('valid token: password updated, token consumed, ALL refresh tokens revoked, audited', async () => {
+    it('valid token: CAS consumption + password + session destruction in ONE tx, audited', async () => {
       mockPrisma.passwordResetToken.findUnique.mockResolvedValue(record);
       mockPrisma.user.findUnique.mockResolvedValue({ ...client, passwordHash: 'old' });
-      mockPrisma.passwordResetToken.update.mockResolvedValue({});
-      mockPrisma.user.update.mockResolvedValue({});
-      mockPrisma.refreshToken.updateMany.mockResolvedValue({ count: 2 });
-      // Override the register-test implementation left in place by clearAllMocks.
-      mockPrisma.$transaction.mockResolvedValue(undefined);
+      const tx = happyTx();
 
       await expect(service.resetPassword(rawToken, 'new-password-1')).resolves.toEqual({ ok: true });
 
-      expect(mockPrisma.passwordResetToken.update).toHaveBeenCalledWith(
-        expect.objectContaining({ data: { usedAt: expect.any(Date) } }),
-      );
-      expect(mockPrisma.user.update).toHaveBeenCalledWith(
-        expect.objectContaining({ data: { passwordHash: 'hashed:new-password-1' } }),
-      );
-      expect(mockPrisma.refreshToken.deleteMany).toHaveBeenCalledWith(
-        expect.objectContaining({ where: { userId: 'u1', revokedAt: null } }),
-      );
+      // CAS conditionnel : usage unique + expiration revérifiés DANS la tx.
+      expect(tx.passwordResetToken.updateMany).toHaveBeenCalledWith({
+        where: {
+          tokenHash,
+          usedAt: null,
+          expiresAt: { gt: expect.any(Date) },
+        },
+        data: { usedAt: expect.any(Date) },
+      });
+      expect(tx.user.update).toHaveBeenCalledWith({
+        where: { id: 'u1' },
+        data: { passwordHash: 'hashed:new-password-1' },
+      });
+      expect(tx.refreshToken.deleteMany).toHaveBeenCalledWith({
+        where: { userId: 'u1', revokedAt: null },
+      });
       expect(mockAudit.record).toHaveBeenCalledWith(
         expect.objectContaining({ action: 'auth.password.reset', actorId: 'u1' }),
       );
@@ -373,27 +418,372 @@ describe('AuthService (impersonation + order-time registration, ADR-027)', () =>
       expect(dump).not.toContain(rawToken);
     });
 
+    it('concurrent loser (CAS count 0): generic 400, NO password write, NO reset audit', async () => {
+      mockPrisma.passwordResetToken.findUnique.mockResolvedValue(record);
+      mockPrisma.user.findUnique.mockResolvedValue({ ...client, passwordHash: 'old' });
+      const tx = losingTx();
+
+      await expect(service.resetPassword(rawToken, 'new-password-1')).rejects.toBeInstanceOf(
+        BadRequestException,
+      );
+      expect(tx.user.update).not.toHaveBeenCalled();
+      expect(tx.refreshToken.deleteMany).not.toHaveBeenCalled();
+      const actions = mockAudit.record.mock.calls.map((c) => c[0]?.action);
+      expect(actions).not.toContain('auth.password.reset');
+    });
+
     it('unknown / used / expired all yield the SAME generic 400 (no oracle)', async () => {
       const generic = 'Lien de réinitialisation invalide ou expiré.';
       const outcomes: unknown[] = [];
 
+      // Inconnu : échec avant toute écriture (pre-read négatif).
       mockPrisma.passwordResetToken.findUnique.mockResolvedValueOnce(null);
       await service.resetPassword('bad', 'long-enough-1').catch((e) => outcomes.push(e.message));
 
+      // Déjà consommé : pre-read trouve la ligne, le CAS tranche (count 0) en tx.
       mockPrisma.passwordResetToken.findUnique.mockResolvedValueOnce({
         ...record,
         usedAt: new Date(),
       });
+      losingTx();
       await service.resetPassword(rawToken, 'long-enough-1').catch((e) => outcomes.push(e.message));
 
+      // Expiré : idem (le CAS exige expiresAt > now).
       mockPrisma.passwordResetToken.findUnique.mockResolvedValueOnce({
         ...record,
         expiresAt: new Date(Date.now() - 1000),
       });
+      losingTx();
       await service.resetPassword(rawToken, 'long-enough-1').catch((e) => outcomes.push(e.message));
 
       expect(outcomes).toEqual([generic, generic, generic]);
       expect(mockPrisma.user.update).not.toHaveBeenCalled();
+    });
+  });
+
+  // ── GO Q3: rotation CAS, fenêtre de rejeu, isActive, session déconnectée ───
+  describe('refresh (CAS rotation, reuse window, isActive, logout absence)', () => {
+    const rt = {
+      id: 'rt1',
+      userId: 'u1',
+      tokenHash: 'hash',
+      revokedAt: null as Date | null,
+      expiresAt: new Date(Date.now() + 60_000),
+    };
+
+    it('active row: CAS rotation + audit auth.refresh + new pair', async () => {
+      mockPrisma.refreshToken.findUnique.mockResolvedValue(rt);
+      mockPrisma.refreshToken.updateMany.mockResolvedValue({ count: 1 });
+      mockPrisma.user.findUnique.mockResolvedValue(client);
+      mockPrisma.refreshToken.create.mockResolvedValue({});
+
+      const res = await service.refresh('raw-refresh');
+      expect(res.accessToken).toBe('jwt.token');
+      // Seule une ligne ENCORE ACTIVE peut être révoquée (CAS).
+      expect(mockPrisma.refreshToken.updateMany).toHaveBeenCalledWith({
+        where: { id: 'rt1', revokedAt: null },
+        data: { revokedAt: expect.any(Date) },
+      });
+      expect(mockAudit.record).toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'auth.refresh', actorId: 'u1' }),
+      );
+    });
+
+    it('rotated <10 s ago (concurrent double-refresh) → reuse window: new pair, NO re-revoke', async () => {
+      mockPrisma.refreshToken.findUnique.mockResolvedValue({
+        ...rt,
+        revokedAt: new Date(Date.now() - 1_000),
+      });
+      mockPrisma.user.findUnique.mockResolvedValue(client);
+      mockPrisma.refreshToken.create.mockResolvedValue({});
+
+      const res = await service.refresh('raw-refresh');
+      expect(res.accessToken).toBe('jwt.token');
+      expect(mockPrisma.refreshToken.updateMany).not.toHaveBeenCalled();
+      expect(mockAudit.record).toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'auth.refresh.reuse' }),
+      );
+    });
+
+    it('rotated >10 s ago → 401 (stale reuse is not forgiven)', async () => {
+      mockPrisma.refreshToken.findUnique.mockResolvedValue({
+        ...rt,
+        revokedAt: new Date(Date.now() - 30_000),
+      });
+      await expect(service.refresh('raw-refresh')).rejects.toBeInstanceOf(UnauthorizedException);
+      expect(mockPrisma.refreshToken.updateMany).not.toHaveBeenCalled();
+      expect(mockAudit.record).not.toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'auth.refresh.reuse' }),
+      );
+    });
+
+    it('row ABSENT (destroyed by logout) → 401, never enters the reuse window', async () => {
+      mockPrisma.refreshToken.findUnique.mockResolvedValue(null);
+      await expect(service.refresh('raw-refresh')).rejects.toBeInstanceOf(UnauthorizedException);
+      expect(mockPrisma.refreshToken.updateMany).not.toHaveBeenCalled();
+      expect(mockPrisma.refreshToken.create).not.toHaveBeenCalled();
+    });
+
+    it('expired row → 401', async () => {
+      mockPrisma.refreshToken.findUnique.mockResolvedValue({
+        ...rt,
+        expiresAt: new Date(Date.now() - 1_000),
+      });
+      await expect(service.refresh('raw-refresh')).rejects.toBeInstanceOf(UnauthorizedException);
+      expect(mockPrisma.refreshToken.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('user deleted after rotation → 401', async () => {
+      mockPrisma.refreshToken.findUnique.mockResolvedValue(rt);
+      mockPrisma.refreshToken.updateMany.mockResolvedValue({ count: 1 });
+      mockPrisma.user.findUnique.mockResolvedValue(null);
+      await expect(service.refresh('raw-refresh')).rejects.toBeInstanceOf(UnauthorizedException);
+    });
+
+    it('disabled account → 401 even with a valid active row (admin kill-switch)', async () => {
+      mockPrisma.refreshToken.findUnique.mockResolvedValue(rt);
+      mockPrisma.refreshToken.updateMany.mockResolvedValue({ count: 1 });
+      mockPrisma.user.findUnique.mockResolvedValue({ ...client, isActive: false });
+      await expect(service.refresh('raw-refresh')).rejects.toBeInstanceOf(UnauthorizedException);
+      const actions = mockAudit.record.mock.calls.map((c) => c[0]?.action);
+      expect(actions).not.toContain('auth.refresh');
+    });
+
+    it('CAS lost (count 0, concurrent winner) → reuse path issues a pair + audit', async () => {
+      mockPrisma.refreshToken.findUnique.mockResolvedValue(rt);
+      mockPrisma.refreshToken.updateMany.mockResolvedValue({ count: 0 });
+      mockPrisma.user.findUnique.mockResolvedValue(client);
+      mockPrisma.refreshToken.create.mockResolvedValue({});
+
+      const res = await service.refresh('raw-refresh');
+      expect(res.accessToken).toBe('jwt.token');
+      expect(mockAudit.record).toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'auth.refresh.reuse' }),
+      );
+    });
+  });
+
+  // ── GO Q3: logout supprime la ligne (aucune ressuscitation) ────────────────
+  describe('logout (deletes the session row — no resurrection)', () => {
+    it('deletes the session row (not just revoking) + audits', async () => {
+      mockPrisma.refreshToken.findUnique.mockResolvedValue({ id: 'rt1', userId: 'u1' });
+      mockPrisma.refreshToken.deleteMany.mockResolvedValue({ count: 1 });
+      mockPrisma.user.findUnique.mockResolvedValue(client);
+
+      await service.logout('raw-refresh');
+      expect(mockPrisma.refreshToken.deleteMany).toHaveBeenCalledWith({
+        where: { tokenHash: createHash('sha256').update('raw-refresh').digest('hex') },
+      });
+      expect(mockPrisma.refreshToken.updateMany).not.toHaveBeenCalled();
+      expect(mockAudit.record).toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'auth.logout', actorId: 'u1' }),
+      );
+    });
+
+    it('unknown token: idempotent no-op, no audit', async () => {
+      mockPrisma.refreshToken.findUnique.mockResolvedValue(null);
+      mockPrisma.refreshToken.deleteMany.mockResolvedValue({ count: 0 });
+      await expect(service.logout('raw-refresh')).resolves.toBeUndefined();
+      expect(mockPrisma.refreshToken.deleteMany).toHaveBeenCalled();
+      expect(mockAudit.record).not.toHaveBeenCalled();
+    });
+  });
+
+  // ── GO Q3: changement de mot de passe détruit toutes les sessions ──────────
+  describe('changePassword (kills ALL active sessions)', () => {
+    it('wrong current password → 401, no write', async () => {
+      mockPrisma.user.findUnique.mockResolvedValue(client);
+      bcryptMock.compare.mockResolvedValueOnce(false);
+      await expect(service.changePassword('u1', 'bad', 'new-password-1')).rejects.toBeInstanceOf(
+        UnauthorizedException,
+      );
+      expect(mockPrisma.user.update).not.toHaveBeenCalled();
+    });
+
+    it('short new password → 400 before any write', async () => {
+      mockPrisma.user.findUnique.mockResolvedValue(client);
+      await expect(service.changePassword('u1', 'current', 'short')).rejects.toBeInstanceOf(
+        BadRequestException,
+      );
+      expect(mockPrisma.user.update).not.toHaveBeenCalled();
+    });
+
+    it('success: password updated AND every active session destroyed in one tx, audited', async () => {
+      mockPrisma.user.findUnique.mockResolvedValue({ ...client, passwordHash: 'old' });
+      mockPrisma.$transaction.mockResolvedValue(undefined);
+
+      await expect(service.changePassword('u1', 'current', 'new-password-1')).resolves.toEqual({
+        ok: true,
+      });
+      expect(mockPrisma.user.update).toHaveBeenCalledWith({
+        where: { id: 'u1' },
+        data: { passwordHash: 'hashed:new-password-1' },
+      });
+      expect(mockPrisma.refreshToken.deleteMany).toHaveBeenCalledWith({
+        where: { userId: 'u1', revokedAt: null },
+      });
+      expect(mockAudit.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'auth.password.change',
+          details: { sessionsRevoked: true },
+        }),
+      );
+    });
+  });
+
+  // ── GO Q3: changement d'email (demande + confirmation atomique) ────────────
+  describe('requestEmailChange (verification mail to the NEW address)', () => {
+    it('supersedes pending tokens, stores sha256, mails the NEW address, audits', async () => {
+      mockPrisma.emailChangeToken.deleteMany.mockResolvedValue({ count: 1 });
+      mockPrisma.emailChangeToken.create.mockImplementation(
+        async (args: { data: Record<string, unknown> }) => ({ id: 'ec1', ...args.data }),
+      );
+
+      const res = await service.requestEmailChange(
+        { id: 'u1', email: 'old@example.com' },
+        'new@example.com',
+      );
+      expect(res.pendingEmail).toBe('new@example.com');
+      expect(mockPrisma.emailChangeToken.deleteMany).toHaveBeenCalledWith({
+        where: { userId: 'u1', usedAt: null },
+      });
+      const created = mockPrisma.emailChangeToken.create.mock.calls[0][0].data as {
+        tokenHash: string;
+        newEmail: string;
+        expiresAt: Date;
+      };
+      expect(created.tokenHash).toHaveLength(64); // sha256 hex
+      expect(created.newEmail).toBe('new@example.com');
+      expect(created.expiresAt.getTime()).toBeGreaterThan(Date.now());
+
+      const msg = mockMailSettings.sendPlain.mock.calls[0][0];
+      expect(msg.to).toBe('new@example.com'); // recipient is the NEW address
+      const raw = /token=([A-Za-z0-9_-]+)/.exec(msg.text)?.[1];
+      expect(raw).toBeTruthy();
+      expect(created.tokenHash).toBe(createHash('sha256').update(raw!).digest('hex'));
+      expect(mockAudit.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'auth.email.change_requested',
+          details: expect.objectContaining({ newEmail: 'new@example.com' }),
+        }),
+      );
+    });
+
+    it('mail failure: response unchanged, emailSent:false in audit', async () => {
+      mockPrisma.emailChangeToken.create.mockImplementation(
+        async (args: { data: Record<string, unknown> }) => ({ id: 'ec1', ...args.data }),
+      );
+      mockMailSettings.sendPlain.mockRejectedValueOnce(new Error('smtp down'));
+      await expect(
+        service.requestEmailChange({ id: 'u1', email: 'old@example.com' }, 'new@example.com'),
+      ).resolves.toMatchObject({ pendingEmail: 'new@example.com' });
+      expect(mockAudit.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          details: expect.objectContaining({ emailSent: false }),
+        }),
+      );
+    });
+
+    it('never journals the raw token', async () => {
+      mockPrisma.emailChangeToken.create.mockImplementation(
+        async (args: { data: Record<string, unknown> }) => ({ id: 'ec1', ...args.data }),
+      );
+      await service.requestEmailChange(
+        { id: 'u1', email: 'old@example.com' },
+        'new@example.com',
+      );
+      const msg = mockMailSettings.sendPlain.mock.calls[0][0];
+      const raw = /token=([A-Za-z0-9_-]+)/.exec(msg.text)?.[1];
+      const dump = JSON.stringify(mockAudit.record.mock.calls);
+      expect(dump).not.toContain(raw!);
+      expect(dump).not.toContain(msg.text);
+    });
+  });
+
+  describe('confirmEmailChange (atomic single-use CAS)', () => {
+    const ecRecord = {
+      id: 'ec1',
+      userId: 'u1',
+      tokenHash: createHash('sha256').update('raw-email-token').digest('hex'),
+      newEmail: 'new@example.com',
+      usedAt: null as Date | null,
+      expiresAt: new Date(Date.now() + 60_000),
+    };
+
+    it('unknown token → 400, no transaction', async () => {
+      mockPrisma.emailChangeToken.findUnique.mockResolvedValue(null);
+      await expect(service.confirmEmailChange('bad')).rejects.toBeInstanceOf(BadRequestException);
+      expect(mockPrisma.$transaction).not.toHaveBeenCalled();
+    });
+
+    it('CAS count 0 (already used / expired) → generic 400, email untouched', async () => {
+      mockPrisma.emailChangeToken.findUnique.mockResolvedValue(ecRecord);
+      const tx = {
+        emailChangeToken: { updateMany: jest.fn().mockResolvedValue({ count: 0 }) },
+        user: { update: jest.fn() },
+      };
+      mockPrisma.$transaction.mockImplementation(async (cb: (t: typeof tx) => Promise<unknown>) =>
+        cb(tx),
+      );
+
+      await expect(service.confirmEmailChange('raw-email-token')).rejects.toBeInstanceOf(
+        BadRequestException,
+      );
+      expect(tx.user.update).not.toHaveBeenCalled();
+      const actions = mockAudit.record.mock.calls.map((c) => c[0]?.action);
+      expect(actions).not.toContain('auth.email.change_confirmed');
+    });
+
+    it('valid: consumes the token AND switches the email inside ONE tx, audited', async () => {
+      mockPrisma.emailChangeToken.findUnique.mockResolvedValue(ecRecord);
+      const tx = {
+        emailChangeToken: { updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
+        user: { update: jest.fn().mockResolvedValue({ email: 'new@example.com' }) },
+      };
+      mockPrisma.$transaction.mockImplementation(async (cb: (t: typeof tx) => Promise<unknown>) =>
+        cb(tx),
+      );
+
+      await expect(service.confirmEmailChange('raw-email-token')).resolves.toEqual({
+        ok: true,
+        email: 'new@example.com',
+      });
+      expect(tx.emailChangeToken.updateMany).toHaveBeenCalledWith({
+        where: {
+          tokenHash: ecRecord.tokenHash,
+          usedAt: null,
+          expiresAt: { gt: expect.any(Date) },
+        },
+        data: { usedAt: expect.any(Date) },
+      });
+      expect(tx.user.update).toHaveBeenCalledWith({
+        where: { id: 'u1' },
+        data: { email: 'new@example.com' },
+      });
+      expect(mockAudit.record).toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'auth.email.change_confirmed', actorId: 'u1' }),
+      );
+    });
+
+    it('address taken between request and confirm → ConflictException, tx rolled back', async () => {
+      mockPrisma.emailChangeToken.findUnique.mockResolvedValue(ecRecord);
+      const tx = {
+        emailChangeToken: { updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
+        user: {
+          update: jest.fn().mockRejectedValue(
+            Object.assign(new Error('Unique constraint failed'), { code: 'P2002' }),
+          ),
+        },
+      };
+      mockPrisma.$transaction.mockImplementation(async (cb: (t: typeof tx) => Promise<unknown>) =>
+        cb(tx),
+      );
+
+      await expect(service.confirmEmailChange('raw-email-token')).rejects.toBeInstanceOf(
+        ConflictException,
+      );
+      const actions = mockAudit.record.mock.calls.map((c) => c[0]?.action);
+      expect(actions).not.toContain('auth.email.change_confirmed');
     });
   });
 });

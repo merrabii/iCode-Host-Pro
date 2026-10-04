@@ -1,4 +1,4 @@
-import { BadRequestException, ConflictException, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, NotFoundException, UnauthorizedException } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { WalletService } from './wallet.service';
 
@@ -373,25 +373,33 @@ describe('WalletService — C3a (recharge virement : PENDING puis validation uni
   });
 });
 
-describe('WalletService — contrôle propriétaire (ensureOwnedCustomer)', () => {
+describe('WalletService — contrôle propriétaire (ensureOwnedCustomer, GO Q3)', () => {
   let service: WalletService;
   let prisma: {
-    customer: { findUnique: jest.Mock; update: jest.Mock; create: jest.Mock };
+    customer: {
+      findUnique: jest.Mock;
+      update: jest.Mock;
+      updateMany: jest.Mock;
+      create: jest.Mock;
+    };
     user: { findUnique: jest.Mock };
     $transaction: jest.Mock;
   };
   const user = { sub: 'u1', email: 'alice@example.com', role: 'USER' } as never;
+  // Identité actuelle lue en DB par le service (jamais le seul claim du JWT).
+  const identity = { email: 'alice@example.com', isActive: true, name: 'Alice' };
 
   beforeEach(() => {
     prisma = {
-      customer: { findUnique: jest.fn(), update: jest.fn(), create: jest.fn() },
+      customer: { findUnique: jest.fn(), update: jest.fn(), updateMany: jest.fn(), create: jest.fn() },
       user: { findUnique: jest.fn() },
       $transaction: jest.fn(),
     };
     service = new WalletService(prisma as never);
   });
 
-  it('dossier lié au compte → utilisé tel quel', async () => {
+  it('dossier lié au compte → utilisé tel quel (identité revérifiée en DB)', async () => {
+    prisma.user.findUnique.mockResolvedValue(identity);
     prisma.customer.findUnique.mockResolvedValueOnce({
       id: 'c1',
       email: 'alice@example.com',
@@ -402,35 +410,38 @@ describe('WalletService — contrôle propriétaire (ensureOwnedCustomer)', () =
     expect(prisma.customer.create).not.toHaveBeenCalled();
   });
 
-  it('dossier invité au même email → lié au compte (repli P4)', async () => {
+  it('dossier invité au même email → rattachement CAS (updateMany userId:null)', async () => {
     prisma.customer.findUnique
-      .mockResolvedValueOnce(null)
-      .mockResolvedValueOnce({ id: 'c2', email: 'alice@example.com', userId: null });
-    prisma.customer.update.mockResolvedValue({
-      id: 'c2',
-      email: 'alice@example.com',
-      walletBalanceCents: 0,
-    });
+      .mockResolvedValueOnce(null) // pas encore lié (userId)
+      .mockResolvedValueOnce({ id: 'c2', email: 'alice@example.com', userId: null, walletBalanceCents: 0 });
+    prisma.user.findUnique.mockResolvedValue(identity);
+    prisma.customer.updateMany.mockResolvedValue({ count: 1 });
+
     const out = await service.ensureOwnedCustomer(user);
     expect(out.id).toBe('c2');
-    expect(prisma.customer.update).toHaveBeenCalledWith(
-      expect.objectContaining({ data: { userId: 'u1' } }),
-    );
+    // CAS : seul un dossier TOUJOURS non rattaché peut être pris.
+    expect(prisma.customer.updateMany).toHaveBeenCalledWith({
+      where: { id: 'c2', userId: null },
+      data: { userId: 'u1' },
+    });
+    expect(prisma.customer.update).not.toHaveBeenCalled();
   });
 
   it('dossier d’un AUTRE compte → conflit (jamais de vol de solde)', async () => {
     prisma.customer.findUnique
       .mockResolvedValueOnce(null)
       .mockResolvedValueOnce({ id: 'c3', email: 'alice@example.com', userId: 'u2' });
+    prisma.user.findUnique.mockResolvedValue(identity);
     await expect(service.ensureOwnedCustomer(user)).rejects.toBeInstanceOf(
       ConflictException,
     );
+    expect(prisma.customer.updateMany).not.toHaveBeenCalled();
     expect(prisma.customer.create).not.toHaveBeenCalled();
   });
 
-  it('aucun dossier → création lié au compte', async () => {
+  it('aucun dossier → création lié au compte (email de la DB, pas du JWT)', async () => {
     prisma.customer.findUnique.mockResolvedValueOnce(null).mockResolvedValueOnce(null);
-    prisma.user.findUnique.mockResolvedValue({ name: 'Alice' });
+    prisma.user.findUnique.mockResolvedValue(identity);
     prisma.customer.create.mockResolvedValue({
       id: 'c4',
       email: 'alice@example.com',
@@ -438,10 +449,67 @@ describe('WalletService — contrôle propriétaire (ensureOwnedCustomer)', () =
     });
     const out = await service.ensureOwnedCustomer(user);
     expect(out.id).toBe('c4');
+    expect(prisma.customer.findUnique).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ where: { email: 'alice@example.com' } }),
+    );
     expect(prisma.customer.create).toHaveBeenCalledWith(
       expect.objectContaining({
-        data: expect.objectContaining({ userId: 'u1', name: 'Alice' }),
+        data: expect.objectContaining({ userId: 'u1', name: 'Alice', email: 'alice@example.com' }),
       }),
     );
+  });
+
+  it('JWT périmé : l’email de la DB fait foi pour retrouver le dossier invité', async () => {
+    const staleJwt = { sub: 'u1', email: 'ancien@exemple.com', role: 'USER' } as never;
+    prisma.customer.findUnique
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({ id: 'c5', email: 'alice@example.com', userId: null, walletBalanceCents: 0 });
+    prisma.user.findUnique.mockResolvedValue(identity); // email actuel ≠ claim JWT
+    prisma.customer.updateMany.mockResolvedValue({ count: 1 });
+
+    await service.ensureOwnedCustomer(staleJwt);
+    expect(prisma.customer.findUnique).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ where: { email: 'alice@example.com' } }),
+    );
+    expect(prisma.customer.updateMany).toHaveBeenCalledWith({
+      where: { id: 'c5', userId: null },
+      data: { userId: 'u1' },
+    });
+  });
+
+  it('compte désactivé → 401, identité refusée AVANT tout accès au dossier', async () => {
+    prisma.user.findUnique.mockResolvedValue({ ...identity, isActive: false });
+    await expect(service.ensureOwnedCustomer(user)).rejects.toBeInstanceOf(
+      UnauthorizedException,
+    );
+    expect(prisma.customer.findUnique).not.toHaveBeenCalled();
+    expect(prisma.customer.create).not.toHaveBeenCalled();
+  });
+
+  it('CAS perdu (rattachement pris entre-temps) → relecture, pas d’erreur', async () => {
+    prisma.customer.findUnique
+      .mockResolvedValueOnce(null) // tour 1 : pas encore lié
+      .mockResolvedValueOnce({ id: 'c6', email: 'alice@example.com', userId: null, walletBalanceCents: 0 })
+      .mockResolvedValueOnce({ id: 'c6', email: 'alice@example.com', userId: 'u1', walletBalanceCents: 0 }); // tour 2
+    prisma.user.findUnique.mockResolvedValue(identity);
+    prisma.customer.updateMany.mockResolvedValue({ count: 0 }); // perdu
+
+    const out = await service.ensureOwnedCustomer(user);
+    expect(out.id).toBe('c6');
+    expect(prisma.customer.create).not.toHaveBeenCalled();
+  });
+
+  it('course à la création (P2002) → nouvelle tentative, pas de 500', async () => {
+    prisma.customer.findUnique.mockResolvedValueOnce(null).mockResolvedValueOnce(null);
+    prisma.user.findUnique.mockResolvedValue(identity);
+    prisma.customer.create
+      .mockRejectedValueOnce(Object.assign(new Error('unique'), { code: 'P2002' }))
+      .mockResolvedValue({ id: 'c7', email: 'alice@example.com', walletBalanceCents: 0 });
+
+    const out = await service.ensureOwnedCustomer(user);
+    expect(out.id).toBe('c7');
+    expect(prisma.customer.create).toHaveBeenCalledTimes(2);
   });
 });

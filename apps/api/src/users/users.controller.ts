@@ -1,16 +1,21 @@
-import { Body, Controller, Get, Param, Patch, Post, UseGuards } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, Patch, Post, Req, UnauthorizedException, UseGuards } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { Role } from '@prisma/client';
+import { Request } from 'express';
 import { AuthService } from '../auth/auth.service';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import { Roles } from '../auth/decorators/roles.decorator';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
 import { MfaService } from '../auth/mfa/mfa.service';
+import { RATE, SaRateLimiter, rateKey } from '../auth/rate-limiter';
 import { JwtPayload } from '../auth/types';
+import { RequestClosureDto, ResolveClosureDto } from './dto/closure.dto';
 import { UpdateUserDto } from './dto/update-user.dto';
 import { UpdateProfileDto } from './dto/update-profile.dto';
 import { UsersService } from './users.service';
+
+type Iprq = Request & { ip?: string };
 
 @ApiTags('users')
 @ApiBearerAuth()
@@ -21,20 +26,52 @@ export class UsersController {
     private readonly users: UsersService,
     private readonly auth: AuthService,
     private readonly mfa: MfaService,
+    private readonly limiter: SaRateLimiter,
   ) {}
 
   @Get('me')
-  @ApiOperation({ summary: 'Current user profile' })
+  @ApiOperation({ summary: 'Current user profile (includes pendingEmail)' })
   getMe(@CurrentUser() user: JwtPayload) {
     return this.users.getProfile(user.sub);
   }
 
   // GO socle (lot A1): self-service profile edit. Declared BEFORE @Patch(':id')
   // so "me" never matches the id route; userId comes from the JWT only.
+  // GO Q3: rate-limited (email-change requests trigger outbound verification
+  // mails) — email is a PENDING flow, never an immediate write.
   @Patch('me')
-  @ApiOperation({ summary: 'Update my own profile (name / email)' })
-  updateMe(@Body() dto: UpdateProfileDto, @CurrentUser() user: JwtPayload) {
+  @ApiOperation({ summary: 'Update my own profile (name; email => verification pending)' })
+  updateMe(@Body() dto: UpdateProfileDto, @CurrentUser() user: JwtPayload, @Req() req: Iprq) {
+    const rl = this.limiter.consume(
+      rateKey(req.ip, 'update-profile'),
+      RATE.emailChange.limit,
+      RATE.emailChange.windowMs,
+    );
+    if (!rl.allowed) {
+      throw new UnauthorizedException(
+        `Trop de tentatives. Réessayez dans ${Math.ceil(rl.retryAfterMs / 1000)} s.`,
+      );
+    }
     return this.users.updateProfile(user.sub, dto);
+  }
+
+  // ── GO Q3 : demande de clôture de compte (demander ≠ exécuter) ────────────
+  @Get('me/closure-request')
+  @ApiOperation({ summary: 'My pending account-closure request (null if none)' })
+  getClosureRequest(@CurrentUser() user: JwtPayload) {
+    return this.users.getClosureRequest(user.sub);
+  }
+
+  @Post('me/closure-request')
+  @ApiOperation({ summary: 'Open (or reopen) my account-closure request' })
+  requestClosure(@Body() dto: RequestClosureDto, @CurrentUser() user: JwtPayload) {
+    return this.users.requestClosure(user.sub, dto.reason);
+  }
+
+  @Delete('me/closure-request')
+  @ApiOperation({ summary: 'Cancel my pending account-closure request' })
+  cancelClosureRequest(@CurrentUser() user: JwtPayload) {
+    return this.users.cancelClosureRequest(user.sub);
   }
 
   // Phase 3 (admin management): listing users and mutating role/active state are
@@ -46,6 +83,28 @@ export class UsersController {
   findAll() {
     return this.users.findAll();
   }
+
+  // ── GO Q3 : traitement admin des demandes de clôture (ADMIN, avant :id) ───
+  @Get('closure-requests')
+  @UseGuards(RolesGuard)
+  @Roles(Role.ADMIN)
+  @ApiOperation({ summary: 'List account-closure requests (ADMIN)' })
+  listClosureRequests() {
+    return this.users.listClosureRequests();
+  }
+
+  @Patch('closure-requests/:id')
+  @UseGuards(RolesGuard)
+  @Roles(Role.ADMIN)
+  @ApiOperation({ summary: 'Resolve an account-closure request (ADMIN) — no data deletion' })
+  resolveClosureRequest(
+    @Param('id') id: string,
+    @Body() dto: ResolveClosureDto,
+    @CurrentUser() actor: JwtPayload,
+  ) {
+    return this.users.resolveClosureRequest(id, dto, actor);
+  }
+
 
   @Patch(':id')
   @UseGuards(RolesGuard)

@@ -20,6 +20,7 @@ import { AcceptInviteDto } from './dto/accept-invite.dto';
 import { ChangePasswordDto } from './dto/change-password.dto';
 import { ForgotPasswordDto } from './dto/forgot-password.dto';
 import { ResetPasswordDto } from './dto/reset-password.dto';
+import { ConfirmEmailChangeDto } from './dto/confirm-email-change.dto';
 import { CurrentUser } from './decorators/current-user.decorator';
 import { AllowImpersonationMutation } from './decorators/allow-impersonation.decorator';
 import { JwtAuthGuard } from './guards/jwt-auth.guard';
@@ -165,6 +166,25 @@ export class AuthController {
       );
     }
     return this.auth.resetPassword(dto.token, dto.password, req.ip);
+  }
+
+  // ── GO Q3 : confirmation du changement d'email (jeton envoyé à la NOUVELLE
+  // adresse) — endpoint public comme le reset : la possession du jeton prouve
+  // l'accès à la boîte cible, aucune session n'est requise.
+  @Post('confirm-email-change')
+  @ApiOperation({ summary: 'Consume a one-time email-change token (link sent to the NEW address)' })
+  async confirmEmailChange(@Body() dto: ConfirmEmailChangeDto, @Req() req: CookieRequest) {
+    const rl = this.limiter.consume(
+      rateKey(req.ip, 'confirm-email-change'),
+      RATE.emailChangeConfirm.limit,
+      RATE.emailChangeConfirm.windowMs,
+    );
+    if (!rl.allowed) {
+      throw new UnauthorizedException(
+        `Trop de tentatives. Réessayez dans ${Math.ceil(rl.retryAfterMs / 1000)} s.`,
+      );
+    }
+    return this.auth.confirmEmailChange(dto.token);
   }
 
   @Post('refresh')

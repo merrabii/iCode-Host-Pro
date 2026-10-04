@@ -1,10 +1,11 @@
 import { BadRequestException, ConflictException, ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
-import { Role, User } from '@prisma/client';
+import { ClosureRequestStatus, Role, User } from '@prisma/client';
 import { AuditService } from '../audit/audit.service';
 import { UpdateUserDto } from './dto/update-user.dto';
 import { UpdateProfileDto } from './dto/update-profile.dto';
 import { DeploymentsService } from '../deployments/deployments.service';
+import { AuthService } from '../auth/auth.service';
 
 // Public shape NEVER carries passwordHash nor the at-rest secrets (MFA TOTP
 // secret, GitHub token). mfaEnabled/oauthProvider are the safe public signals.
@@ -12,6 +13,23 @@ import { DeploymentsService } from '../deployments/deployments.service';
 export type PublicUser = Omit<User, 'passwordHash' | 'mfaSecretEnc' | 'githubTokenEnc'> & {
   clientProject?: { id: string; name: string; projectUuid: string } | null;
 };
+
+/** Vue profil (mes comptes) : PublicUser + adresse en attente de vérification
+ *  (GO Q3 : le changement d'email n'est plus immédiat). */
+export type ProfileView = PublicUser & { pendingEmail: string | null };
+
+/** GO Q3 — demande de clôture (jamais d'exécution automatique). */
+export interface ClosureRequestView {
+  id: string;
+  userId: string;
+  reason: string | null;
+  status: ClosureRequestStatus;
+  createdAt: Date;
+  updatedAt: Date;
+  resolvedAt: Date | null;
+  resolvedById: string | null;
+  resolutionNote: string | null;
+}
 
 /** The authenticated actor performing an admin action (JwtPayload shaped). */
 export interface Actor {
@@ -25,24 +43,29 @@ export class UsersService {
     private readonly prisma: PrismaService,
     private readonly audit: AuditService,
     private readonly deployments: DeploymentsService,
+    private readonly auth: AuthService,
   ) {}
 
-  async getProfile(userId: string): Promise<PublicUser> {
+  async getProfile(userId: string): Promise<ProfileView> {
     const user = await this.prisma.user.findUnique({ where: { id: userId } });
     if (!user) {
       throw new NotFoundException('User not found');
     }
-    return this.toPublic(user);
+    return this.toProfileView(user);
   }
 
   /**
-   * GO socle (lot A1): self-service edit of the caller's OWN profile
-   * (PATCH /users/me — the userId comes from the JWT, never from the body, so
-   * one account can only ever touch itself). Name: blank clears it. Email:
-   * exact-match uniqueness like register/invitation (409 on another account).
-   * Journals auth.profile.update with the changed field names only.
+   * GO socle (lot A1) + GO Q3 : self-service edit of the caller's OWN profile
+   * (PATCH /users/me — the userId comes from the JWT, never from the body).
+   * Name: applied IMMEDIATELY (blank clears it). Email: **NO immediate write** —
+   * a verification link is sent to the NEW address (`AuthService.requestEmailChange`,
+   * rate-limited, single active token, hashed at rest); User.email only changes
+   * on `POST /auth/confirm-email-change`. Pre-check 409 on a taken address is
+   * only UX — the uniqueness that counts is enforced under constraint during
+   * the confirmation transaction. Journals auth.profile.update (name) and
+   * auth.email.change_requested (email) separately.
    */
-  async updateProfile(userId: string, dto: UpdateProfileDto): Promise<PublicUser> {
+  async updateProfile(userId: string, dto: UpdateProfileDto): Promise<ProfileView> {
     if (dto.name === undefined && dto.email === undefined) {
       throw new BadRequestException('Aucun champ à mettre à jour.');
     }
@@ -51,36 +74,66 @@ export class UsersService {
       throw new NotFoundException('User not found');
     }
 
+    // ── Email : parcours de vérification (GO Q3), jamais d'écriture directe ──
+    if (dto.email !== undefined) {
+      const nextEmail = dto.email.trim();
+      if (nextEmail !== user.email) {
+        const taken = await this.prisma.user.findUnique({ where: { email: nextEmail } });
+        if (taken && taken.id !== userId) {
+          throw new ConflictException('Un compte existe déjà avec cet email.');
+        }
+        await this.auth.requestEmailChange({ id: user.id, email: user.email }, nextEmail);
+      }
+    }
+
+    // ── Nom : application immédiate ──────────────────────────────────────────
     const nextName =
       dto.name === undefined ? user.name : dto.name.trim() === '' ? null : dto.name.trim();
-    const nextEmail = dto.email === undefined ? user.email : dto.email.trim();
-
-    const changed: string[] = [];
-    if (nextName !== user.name) changed.push('name');
-    if (nextEmail !== user.email) {
-      const taken = await this.prisma.user.findUnique({ where: { email: nextEmail } });
-      if (taken && taken.id !== userId) {
-        throw new ConflictException('Un compte existe déjà avec cet email.');
-      }
-      changed.push('email');
+    let updated = user;
+    if (nextName !== user.name) {
+      updated = await this.prisma.user.update({
+        where: { id: userId },
+        data: { name: nextName },
+      });
+      await this.audit.record({
+        actorId: user.id,
+        actorEmail: user.email,
+        action: 'auth.profile.update',
+        resourceType: 'user',
+        resourceId: user.id,
+        details: { fields: ['name'] },
+      });
     }
-    if (changed.length === 0) {
-      return this.toPublic(user); // nothing to write (idempotent no-op)
-    }
+    return this.toProfileView(updated);
+  }
 
-    const updated = await this.prisma.user.update({
-      where: { id: userId },
-      data: { name: nextName, email: nextEmail },
+  /** Dernière demande de changement d'email EN ATTENTE du compte (null sinon). */
+  private async pendingEmailOf(userId: string): Promise<string | null> {
+    const row = await this.prisma.emailChangeToken.findFirst({
+      where: { userId, usedAt: null, expiresAt: { gt: new Date() } },
+      orderBy: { createdAt: 'desc' },
+      select: { newEmail: true },
     });
-    await this.audit.record({
-      actorId: user.id,
-      actorEmail: user.email,
-      action: 'auth.profile.update',
-      resourceType: 'user',
-      resourceId: user.id,
-      details: { fields: changed },
+    return row?.newEmail ?? null;
+  }
+
+  private async toProfileView(user: User): Promise<ProfileView> {
+    return { ...(await this.toPublicAsync(user)), pendingEmail: await this.pendingEmailOf(user.id) };
+  }
+
+  /** Compat : la vue profil attend la shape complète (clientProjects chargés). */
+  private async toPublicAsync(user: User): Promise<PublicUser> {
+    const full = await this.prisma.user.findUnique({
+      where: { id: user.id },
+      include: {
+        clientProjects: {
+          include: { module: true },
+          where: { module: { kind: 'PER_CLIENT_PROJECT' } },
+          take: 1,
+        },
+      },
     });
-    return this.toPublic(updated);
+    return this.toPublic(full ?? user);
   }
 
   /** Admin: list every account (public shape, no passwordHash). */
@@ -251,5 +304,136 @@ export class UsersService {
     });
 
     return { id: result.id, name: `${module.perClientPrefix}-${userId}`, projectUuid: result.projectUuid };
+  }
+
+  // ─── GO Q3 : demande de clôture de compte ────────────────────────────────
+  // AUCUNE exécution automatique : on enregistre/annule/tranche une DEMANDE.
+  // Les pièces financières (Invoice, WalletTransaction, Order…) ne sont JAMAIS
+  // touchées par ce parcours — garantie couverte par le test e2e dédié.
+
+  private toClosureView(row: {
+    id: string; userId: string; reason: string | null; status: ClosureRequestStatus;
+    createdAt: Date; updatedAt: Date; resolvedAt: Date | null;
+    resolvedById: string | null; resolutionNote: string | null;
+  }): ClosureRequestView {
+    const { id, userId, reason, status, createdAt, updatedAt, resolvedAt, resolvedById, resolutionNote } = row;
+    return { id, userId, reason, status, createdAt, updatedAt, resolvedAt, resolvedById, resolutionNote };
+  }
+
+  /** Consultation du compte connecté (null = aucune demande). */
+  async getClosureRequest(userId: string): Promise<ClosureRequestView | null> {
+    const row = await this.prisma.accountClosureRequest.findUnique({ where: { userId } });
+    return row ? this.toClosureView(row) : null;
+  }
+
+  /**
+   * Ouvre (ou réactive) la demande de clôture du compte appelant.
+   * Idempotent sur PENDING ; une demande COMPLÉTÉE ne se rouvre pas (409) ;
+   * une demande CANCELLED est réactivée (mise à jour de la même ligne, la
+   * contrainte @@unique(userId) garde une seule demande par compte.
+   */
+  async requestClosure(userId: string, reason?: string): Promise<ClosureRequestView> {
+    const user = await this.prisma.user.findUnique({ where: { id: userId } });
+    if (!user) {
+      throw new NotFoundException('User not found');
+    }
+    const existing = await this.prisma.accountClosureRequest.findUnique({ where: { userId } });
+    if (existing?.status === ClosureRequestStatus.PENDING) {
+      return this.toClosureView(existing); // déjà en attente → idempotent
+    }
+    if (existing?.status === ClosureRequestStatus.COMPLETED) {
+      throw new ConflictException('Compte déjà clôturé — contactez le support.');
+    }
+    const cleanReason = reason?.trim() ? reason.trim() : null;
+    const row = existing
+      ? await this.prisma.accountClosureRequest.update({
+          where: { id: existing.id },
+          data: { status: ClosureRequestStatus.PENDING, reason: cleanReason, resolvedAt: null, resolvedById: null, resolutionNote: null },
+        })
+      : await this.prisma.accountClosureRequest.create({
+          data: { userId, reason: cleanReason },
+        });
+    await this.audit.record({
+      actorId: user.id,
+      actorEmail: user.email,
+      action: 'account.closure_requested',
+      resourceType: 'user',
+      resourceId: userId,
+      details: { reason: cleanReason, reopened: Boolean(existing) },
+    });
+    return this.toClosureView(row);
+  }
+
+  /** Annulation par le compte lui-même (seulement tant que PENDING). */
+  async cancelClosureRequest(userId: string): Promise<ClosureRequestView> {
+    const user = await this.prisma.user.findUnique({ where: { id: userId } });
+    const row = await this.prisma.accountClosureRequest.findUnique({ where: { userId } });
+    if (!user || !row || row.status !== ClosureRequestStatus.PENDING) {
+      throw new NotFoundException('Aucune demande de clôture en attente.');
+    }
+    const updated = await this.prisma.accountClosureRequest.update({
+      where: { id: row.id },
+      data: { status: ClosureRequestStatus.CANCELLED, resolvedAt: new Date(), resolvedById: userId },
+    });
+    await this.audit.record({
+      actorId: user.id,
+      actorEmail: user.email,
+      action: 'account.closure_cancelled',
+      resourceType: 'user',
+      resourceId: userId,
+      details: { requestId: row.id },
+    });
+    return this.toClosureView(updated);
+  }
+
+  /** Admin : liste des demandes (plus récentes d'abord). */
+  async listClosureRequests(): Promise<
+    Array<ClosureRequestView & { user: { id: string; email: string; name: string | null } }>
+  > {
+    const rows = await this.prisma.accountClosureRequest.findMany({
+      orderBy: { createdAt: 'desc' },
+      include: { user: { select: { id: true, email: true, name: true } } },
+    });
+    return rows.map(({ user, ...row }) => ({ ...this.toClosureView(row), user }));
+  }
+
+  /**
+   * Admin : tranche une demande PENDING (COMPLETED ou CANCELLED). Le
+   * traitement reste manuel (désactivation/anonymisation hors de ce modèle) —
+   * l'opération n'écrit QUE sur la demande + audit.
+   */
+  async resolveClosureRequest(
+    id: string,
+    dto: { status: ClosureRequestStatus; note?: string | null },
+    actor: Actor,
+  ): Promise<ClosureRequestView & { user: { id: string; email: string; name: string | null } }> {
+    const row = await this.prisma.accountClosureRequest.findUnique({
+      where: { id },
+      include: { user: { select: { id: true, email: true, name: true } } },
+    });
+    if (!row) {
+      throw new NotFoundException('Demande de clôture introuvable.');
+    }
+    if (row.status !== ClosureRequestStatus.PENDING) {
+      throw new ConflictException('Cette demande a déjà été traitée.');
+    }
+    const updated = await this.prisma.accountClosureRequest.update({
+      where: { id },
+      data: {
+        status: dto.status,
+        resolvedAt: new Date(),
+        resolvedById: actor.sub,
+        resolutionNote: dto.note?.trim() || null,
+      },
+    });
+    await this.audit.record({
+      actorId: actor.sub,
+      actorEmail: actor.email,
+      action: 'account.closure_resolved',
+      resourceType: 'user',
+      resourceId: row.userId,
+      details: { requestId: id, to: dto.status, note: dto.note ?? null },
+    });
+    return { ...this.toClosureView(updated), user: row.user };
   }
 }

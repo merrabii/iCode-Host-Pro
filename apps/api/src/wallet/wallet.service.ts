@@ -3,6 +3,7 @@ import {
   ConflictException,
   Injectable,
   NotFoundException,
+  UnauthorizedException,
 } from '@nestjs/common';
 import { Prisma, WalletTransactionType, WalletTxStatus } from '@prisma/client';
 import * as fs from 'node:fs';
@@ -86,49 +87,81 @@ export class WalletService {
   }
 
   /**
-   * Dossier du membre connecté : lié au compte (userId) ; sinon dossier au
-   * même email (dossier invité → lié au compte au premier accès) ; sinon
-   * création. Un dossier déjà lié à un AUTRE compte = conflit (jamais de vol).
+   * Dossier du membre connecté (GO Q3) :
+   *  - rattaché au compte (`userId`) → retour immédiat ;
+   *  - dossier INVITÉ (`userId: null`) au même email **de la DB** → rattachement
+   *    **CAS atomique** (`userId: null` requis) : deux requêtes concurrentes du
+   *    même compte ne peuvent pas écraser l'une l'autre, et un dossier repris
+   *    entre-temps par un tiers n'est jamais détourné ;
+   *  - absent → création (P2002 sur `email` → nouvelle tentative : course perdue
+   *    sur la création, pas d'erreur 500) ;
+   *  - dossier lié à un AUTRE compte → conflit (jamais de vol).
+   *
+   * Identité actuelle : l'identité est relue **en base** (email du compte +
+   * `isActive`) — le claim email d'un JWT peut être périmé (changement d'email
+   * confirmé entre-temps) et un compte désactivé ne rattache/crée plus rien.
    */
   async ensureOwnedCustomer(
     user: JwtPayload,
   ): Promise<{ id: string; email: string; walletBalanceCents: number }> {
-    const byUser = await this.prisma.customer.findUnique({
-      where: { userId: user.sub },
-      select: { id: true, email: true, walletBalanceCents: true },
-    });
-    if (byUser) return byUser;
-
-    const byEmail = await this.prisma.customer.findUnique({
-      where: { email: user.email },
-      select: { id: true, email: true, userId: true, walletBalanceCents: true },
-    });
-    if (byEmail) {
-      if (byEmail.userId && byEmail.userId !== user.sub) {
-        throw new ConflictException(
-          'Dossier client rattaché à un autre compte.',
-        );
-      }
-      const linked = await this.prisma.customer.update({
-        where: { id: byEmail.id },
-        data: { userId: user.sub },
-        select: { id: true, email: true, walletBalanceCents: true },
-      });
-      return linked;
-    }
-
+    // Identité actuelle vérifiée TOUJOURS en DB AVANT tout accès (jamais le
+    // seul JWT) : email courant + isActive, même si le dossier est déjà lié —
+    // un compte désactivé ne lit ni ne rattache plus rien.
     const me = await this.prisma.user.findUnique({
       where: { id: user.sub },
-      select: { name: true },
+      select: { email: true, isActive: true, name: true },
     });
-    return this.prisma.customer.create({
-      data: {
-        email: user.email,
-        name: me?.name?.trim() || user.email,
-        userId: user.sub,
-      },
-      select: { id: true, email: true, walletBalanceCents: true },
-    });
+    if (!me || !me.isActive) {
+      throw new UnauthorizedException('Compte désactivé ou introuvable.');
+    }
+    const dbEmail = me.email;
+
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const byUser = await this.prisma.customer.findUnique({
+        where: { userId: user.sub },
+        select: { id: true, email: true, walletBalanceCents: true },
+      });
+      if (byUser) return byUser;
+
+      const byEmail = await this.prisma.customer.findUnique({
+        where: { email: dbEmail },
+        select: { id: true, email: true, userId: true, walletBalanceCents: true },
+      });
+      if (byEmail) {
+        if (byEmail.userId === user.sub) return byEmail;
+        if (byEmail.userId) {
+          throw new ConflictException('Dossier client rattaché à un autre compte.');
+        }
+        // CAS de rattachement : seul un dossier TOUJOURS non rattaché est pris.
+        const cas = await this.prisma.customer.updateMany({
+          where: { id: byEmail.id, userId: null },
+          data: { userId: user.sub },
+        });
+        if (cas.count === 1) {
+          return {
+            id: byEmail.id,
+            email: byEmail.email,
+            walletBalanceCents: byEmail.walletBalanceCents,
+          };
+        }
+        continue; // course perdue → 2ᵉ tour (relecture complète)
+      }
+
+      try {
+        return await this.prisma.customer.create({
+          data: {
+            email: dbEmail,
+            name: me.name?.trim() || dbEmail,
+            userId: user.sub,
+          },
+          select: { id: true, email: true, walletBalanceCents: true },
+        });
+      } catch (e) {
+        if ((e as { code?: string }).code === 'P2002') continue; // création parallèle
+        throw e;
+      }
+    }
+    throw new ConflictException('Dossier client rattaché à un autre compte.');
   }
 
   /** Crédit immédiat (idempotent) : verrou + insertion + incrément, un seul tour. */

@@ -54,6 +54,10 @@ export const RATE = {
   // GO socle (lot A1): reset password — the confirm bucket caps token guessing.
   passwordReset: { limit: 5, windowMs: 60_000 },
   passwordResetConfirm: { limit: 10, windowMs: 60_000 },
+  // GO Q3 : changement d'email — requête (email de vérification) + confirmation
+  // (devine le jeton depuis la boîte cible).
+  emailChange: { limit: 5, windowMs: 60_000 },
+  emailChangeConfirm: { limit: 10, windowMs: 60_000 },
 } as const;
 
 /** Build a stable bucket key from a client IP + a logical route name. */

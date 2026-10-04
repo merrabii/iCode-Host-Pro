@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ConflictException,
   ForbiddenException,
   Injectable,
   NotFoundException,
@@ -367,50 +368,87 @@ export class AuthService {
   }
 
   // ───────────────────────── Tokens ─────────────────────────────────────────
+  /**
+   * Rotation du refresh token.
+   *
+   * Comportement documenté (GO Q3) :
+   *  - **CAS de rotation** : l'ancienne ligne n'est révoquée QUE si elle est
+   *    encore active (`revokedAt: null`) — deux renouvellements concurrents
+   *    ne peuvent pas « double-révoquer » ; le perdant (count 0) suit la
+   *    même fenêtre de rejeu qu'une réutilisation de rotation.
+   *  - **Fenêtre de rejeu 10 s** (réutilisation LÉGITIME de rotation :
+   *    2 onglets / appel en double) : audit `auth.refresh.reuse`. Une ligne
+   *    ABSENTE (session détruite par logout/reset) n'entre JAMAIS dans cette
+   *    fenêtre → 401, aucune ressurrection.
+   *  - **Compte désactivé** (`isActive=false`) : refus (le logout admin coupe
+   *    donc aussi le renouvellement, pas seulement le login).
+   *
+   * Access tokens = **stateless JWT** (signature + exp, aucun contrôle serveur,
+   * voir JwtAuthGuard) : déconnexion/désactivation ne révoque PAS un bearer
+   * déjà émis, il expire de lui-même (durée `jwtExpiresIn`, défaut 15 min).
+   * Seul le refresh est un point de révocation serveur.
+   */
   async refresh(refreshToken: string): Promise<AuthTokens> {
     const record = await this.prisma.refreshToken.findUnique({
       where: { tokenHash: this.hashToken(refreshToken) },
     });
+    if (!record) {
+      throw new UnauthorizedException('Invalid refresh token');
+    }
+    const user = await this.prisma.user.findUnique({
+      where: { id: record.userId },
+    });
+    if (!user) {
+      throw new UnauthorizedException('User not found');
+    }
     // Rotation race (2 onglets / calls concurrentes) : quand un token vient d'être
     // roté (révoqué il y a ≤ REUSE_WINDOW_MS), on le considère comme une réutilisation
     // LÉGITIME concurrente et on émet un nouveau jeu pour le même utilisateur, au lieu
     // de déconnecter le client « pour rien ». Une vraie réutilisation malveillante
     // (token volé) est elle aussi marquée `revokedAt` — la fenêtre courte (10 s) la rend
     // négligeable et l'audit `auth.refresh.reuse` trace l'événement.
-    if (record && record.revokedAt !== null) {
+    if (record.revokedAt !== null) {
       const ageMs = Date.now() - record.revokedAt.getTime();
-      if (ageMs <= 10_000) {
-        const user = await this.prisma.user.findUnique({
-          where: { id: record.userId },
+      if (ageMs <= 10_000 && user.isActive) {
+        await this.audit.record({
+          actorId: user.id,
+          actorEmail: user.email,
+          action: 'auth.refresh.reuse',
+          resourceType: 'user',
+          resourceId: user.id,
+          details: { reason: 'rotation-concurrente' },
         });
-        if (user) {
-          await this.audit.record({
-            actorId: user.id,
-            actorEmail: user.email,
-            action: 'auth.refresh.reuse',
-            resourceType: 'user',
-            resourceId: user.id,
-            details: { reason: 'rotation-concurrente' },
-          });
-          return this.issueTokens(user);
-        }
+        return this.issueTokens(user);
       }
       throw new UnauthorizedException('Invalid refresh token');
     }
-    if (!record || record.expiresAt < new Date()) {
+    if (record.expiresAt < new Date()) {
       throw new UnauthorizedException('Invalid refresh token');
     }
+    // Compte désactivé entre-temps : refus AVANT toute rotation — la ligne de
+    // session reste intacte et reprend seule après réactivation (kill-switch
+    // admin sans détruire les sessions).
+    if (!user.isActive) {
+      throw new UnauthorizedException('Account disabled');
+    }
 
-    await this.prisma.refreshToken.update({
-      where: { id: record.id },
+    // CAS de rotation : seule une ligne ENCORE ACTIVE peut être révoquée.
+    const cas = await this.prisma.refreshToken.updateMany({
+      where: { id: record.id, revokedAt: null },
       data: { revokedAt: new Date() },
     });
-
-    const user = await this.prisma.user.findUnique({
-      where: { id: record.userId },
-    });
-    if (!user) {
-      throw new UnauthorizedException('User not found');
+    if (cas.count !== 1) {
+      // Course perdue : un autre renouvellement a pris la rotation avant nous —
+      // même traitement que la fenêtre de rejeu (audit + nouveau jeu).
+      await this.audit.record({
+        actorId: user.id,
+        actorEmail: user.email,
+        action: 'auth.refresh.reuse',
+        resourceType: 'user',
+        resourceId: user.id,
+        details: { reason: 'rotation-concurrente' },
+      });
+      return this.issueTokens(user);
     }
     await this.audit.record({
       actorId: user.id,
@@ -422,15 +460,19 @@ export class AuthService {
     return this.issueTokens(user);
   }
 
+  /**
+   * Déconnexion = **suppression** de la ligne de session (pas simple
+   * révocation) : la ligne absente fait échouer tout refresh concurrent — y
+   * compris la fenêtre de rejeu de rotation, qui ne voit QUE des lignes
+   * révoquées-rotation, jamais une session déconnectée (GO Q3 : révocation
+   * vérifiable, pas de ressurrection après logout). Idempotent.
+   */
   async logout(refreshToken: string): Promise<void> {
     const hash = this.hashToken(refreshToken);
     const record = await this.prisma.refreshToken.findUnique({
       where: { tokenHash: hash },
     });
-    await this.prisma.refreshToken.updateMany({
-      where: { tokenHash: hash, revokedAt: null },
-      data: { revokedAt: new Date() },
-    });
+    await this.prisma.refreshToken.deleteMany({ where: { tokenHash: hash } });
     if (record?.userId) {
       const user = await this.prisma.user.findUnique({ where: { id: record.userId } });
       await this.audit.record({
@@ -443,7 +485,12 @@ export class AuthService {
     }
   }
 
-  /** Self-service password change (re-verifies the current password). */
+  /**
+   * Self-service password change (re-verifies the current password).
+   * GO Q3 : toute réussite **détruit toutes les sessions actives** (même
+   * contrat que le reset) — un changement de mot de passe ne laisse aucune
+   * session existante survivre. La session courante doit se reconnecter.
+   */
   async changePassword(
     userId: string,
     currentPassword: string,
@@ -458,16 +505,24 @@ export class AuthService {
       throw new BadRequestException('Le nouveau mot de passe doit faire au moins 8 caractères.');
     }
     const passwordHash = await bcrypt.hash(newPassword, 10);
-    await this.prisma.user.update({
-      where: { id: userId },
-      data: { passwordHash },
-    });
+    await this.prisma.$transaction([
+      this.prisma.user.update({
+        where: { id: userId },
+        data: { passwordHash },
+      }),
+      // Suppression (pas seulement révocation) : identique au reset — la
+      // fenêtre de rejeu 10 s de refresh() ne ressuscite pas une ligne absente.
+      this.prisma.refreshToken.deleteMany({
+        where: { userId, revokedAt: null },
+      }),
+    ]);
     await this.audit.record({
       actorId: user.id,
       actorEmail: user.email,
       action: 'auth.password.change',
       resourceType: 'user',
       resourceId: user.id,
+      details: { sessionsRevoked: true },
     });
     return { ok: true };
   }
@@ -558,22 +613,30 @@ export class AuthService {
   /**
    * Consume the one-time reset token. Unknown / already-used / expired all
    * yield the SAME generic 400 (no oracle for token guessing). The password
-   * length is checked BEFORE burning the token, then password update + token
-   * consumption + DESTRUCTION of every active refresh token happen in one
-   * transaction: all sessions die immediately. Deletion, not revocation —
-   * refresh() re-issues a token revoked <10 s ago (rotation race window), which
-   * must NOT resurrect a session killed by a password reset. Journals
-   * auth.password.reset — never the raw token nor the password.
+   * length is checked BEFORE any database write (bcrypt first), then — GO Q3 —
+   * **expiration AND single-use are re-verified INSIDE the transaction** by a
+   * conditional update (`usedAt: null` + `expiresAt > now` + `tokenHash`): two
+   * CONCURRENT consumptions of the same token can only have `count === 1`
+   * once, the loser rolls back with the generic 400 (single-use enforced by
+   * PostgreSQL, not by a pre-read). Password update + DESTRUCTION of every
+   * active refresh token happen in the same transaction. Deletion, not
+   * revocation — refresh() re-issues a token revoked <10 s ago (rotation race
+   * window), which must NOT resurrect a session killed by a password reset,
+   * and a deleted row can never enter that window. Journals auth.password.reset
+   * — never the raw token nor the password.
    */
   async resetPassword(token: string, newPassword: string, ip?: string): Promise<{ ok: true }> {
     if (newPassword.length < 8) {
       throw new BadRequestException('Le nouveau mot de passe doit faire au moins 8 caractères.');
     }
     const invalid = 'Lien de réinitialisation invalide ou expiré.';
+    const tokenHash = this.hashToken(token);
+    // Lecture préalable UNIQUEMENT pour le message générique — aucune décision
+    // de validité ici : expiration et usage unique sont tranchés dans la tx.
     const record = await this.prisma.passwordResetToken.findUnique({
-      where: { tokenHash: this.hashToken(token) },
+      where: { tokenHash },
     });
-    if (!record || record.usedAt !== null || record.expiresAt < new Date()) {
+    if (!record) {
       throw new BadRequestException(invalid);
     }
     const user = await this.prisma.user.findUnique({ where: { id: record.userId } });
@@ -581,17 +644,25 @@ export class AuthService {
       throw new BadRequestException(invalid);
     }
 
-    const passwordHash = await bcrypt.hash(newPassword, 10);
-    await this.prisma.$transaction([
-      this.prisma.passwordResetToken.update({
-        where: { id: record.id },
+    const passwordHash = await bcrypt.hash(newPassword, 10); // hors tx (bcrypt ~100 ms)
+    const consumed = await this.prisma.$transaction(async (tx) => {
+      // CAS conditionnel : expiration + usage unique VÉRIFIÉS dans la
+      // transaction. Deux appels concurrents sur le même jeton : un seul
+      // obtient count === 1 ; l'autre ne modifie rien.
+      const cas = await tx.passwordResetToken.updateMany({
+        where: { tokenHash, usedAt: null, expiresAt: { gt: new Date() } },
         data: { usedAt: new Date() },
-      }),
-      this.prisma.user.update({ where: { id: user.id }, data: { passwordHash } }),
-      this.prisma.refreshToken.deleteMany({
+      });
+      if (cas.count !== 1) return false;
+      await tx.user.update({ where: { id: user.id }, data: { passwordHash } });
+      await tx.refreshToken.deleteMany({
         where: { userId: user.id, revokedAt: null },
-      }),
-    ]);
+      });
+      return true;
+    });
+    if (!consumed) {
+      throw new BadRequestException(invalid);
+    }
     await this.audit.record({
       actorId: user.id,
       actorEmail: user.email,
@@ -601,6 +672,135 @@ export class AuthService {
       details: { ip: ip ?? null },
     });
     return { ok: true };
+  }
+
+  // ─────── Email change (GO Q3) : vérification de la NOUVELLE adresse ────────
+
+  /** Email-change TTL in minutes: default 30, clamped 5..1440 (same policy as reset). */
+  private emailChangeTtlMinutes(): number {
+    const raw = this.config.get<number>('emailChangeExpiresInMinutes') ?? 30;
+    return Math.min(Math.max(raw, 5), 1440);
+  }
+
+  /**
+   * Démarre le changement d'email : AUCUNE écriture immédiate sur User.email.
+   * Pose un jeton unique (sha256 au repos, usage unique, TTL) envoyé À LA
+   * NOUVELLE adresse — seul le détenteur de la boîte cible peut confirmer.
+   * Les liens précédents du compte sont supprimés (un seul actif). L'unicité
+   * de la cible est re-vérifiée à la confirmation sous contrainte (P2002).
+   * Best-effort mail (réponse identique si SMTP tombe, trace à l'audit).
+   */
+  async requestEmailChange(
+    user: { id: string; email: string },
+    newEmail: string,
+  ): Promise<{ pendingEmail: string; expiresAt: Date }> {
+    const ttlMinutes = this.emailChangeTtlMinutes();
+    const token = randomBytes(32).toString('base64url');
+    await this.prisma.emailChangeToken.deleteMany({
+      where: { userId: user.id, usedAt: null },
+    });
+    const row = await this.prisma.emailChangeToken.create({
+      data: {
+        tokenHash: this.hashToken(token),
+        userId: user.id,
+        newEmail,
+        expiresAt: new Date(Date.now() + ttlMinutes * 60_000),
+      },
+    });
+
+    let emailSent = false;
+    try {
+      if (await this.mailSettings.isEnabled()) {
+        const base = (
+          this.config.get<string>('publicBaseUrl') ?? 'http://localhost:3000'
+        ).replace(/\/+$/, '');
+        const link = `${base}/auth/verifier-email?token=${encodeURIComponent(token)}`;
+        await this.mailSettings.sendPlain({
+          to: newEmail,
+          subject: 'Confirmez votre nouvelle adresse email - Code Diali',
+          text: [
+            'Bonjour,',
+            '',
+            `Une demande de changement d'email a été faite pour votre compte Code Diali (actuellement : ${user.email}).`,
+            '',
+            'Pour confirmer cette NOUVELLE adresse, ouvrez ce lien :',
+            link,
+            '',
+            `Ce lien est utilisable une seule fois et expire dans ${ttlMinutes} minutes.`,
+            "Si vous n'êtes pas à l'origine de cette demande, ignorez cet email : votre adresse actuelle reste inchangée.",
+          ].join('\n'),
+        });
+        emailSent = true;
+      }
+    } catch {
+      emailSent = false; // best-effort : la réponse ne change jamais
+    }
+
+    await this.audit.record({
+      actorId: user.id,
+      actorEmail: user.email,
+      action: 'auth.email.change_requested',
+      resourceType: 'user',
+      resourceId: user.id,
+      details: { newEmail, emailSent, ttlMinutes },
+    });
+    return { pendingEmail: newEmail, expiresAt: row.expiresAt };
+  }
+
+  /**
+   * Consomme le jeton de vérification : **usage unique + expiration revérifiés
+   * dans la transaction** (CAS conditionnel, même contrat que le reset — deux
+   * confirmations concurrentes = UNE SEULE réussit) puis bascule User.email
+   * dans la MÊME transaction sous contrainte d'unicité (P2002 → 409, tx
+   * annulée : le jeton n'est pas consommé pour autant, la cible reste prise).
+   * Journals auth.email.change_confirmed — jamais le jeton brut.
+   */
+  async confirmEmailChange(token: string): Promise<{ ok: true; email: string }> {
+    const invalid = 'Lien de vérification invalide ou expiré.';
+    const tokenHash = this.hashToken(token);
+    const record = await this.prisma.emailChangeToken.findUnique({ where: { tokenHash } });
+    if (!record) {
+      throw new BadRequestException(invalid);
+    }
+
+    let updated: { email: string } | null = null;
+    try {
+      updated = await this.prisma.$transaction(async (tx) => {
+        const cas = await tx.emailChangeToken.updateMany({
+          where: { tokenHash, usedAt: null, expiresAt: { gt: new Date() } },
+          data: { usedAt: new Date() },
+        });
+        if (cas.count !== 1) return null;
+        // Unicité revérifiée SOUS contrainte : un email pris entre la demande
+        // et la confirmation lève P2002 → rollback de toute la transaction.
+        const user = await tx.user.update({
+          where: { id: record.userId },
+          data: { email: record.newEmail },
+        });
+        return { email: user.email };
+      });
+    } catch (e) {
+      if (
+        e instanceof Error &&
+        (e as { code?: string }).code === 'P2002'
+      ) {
+        throw new ConflictException('Un compte existe déjà avec cet email.');
+      }
+      throw e;
+    }
+    if (!updated) {
+      throw new BadRequestException(invalid);
+    }
+
+    await this.audit.record({
+      actorId: record.userId,
+      actorEmail: updated.email,
+      action: 'auth.email.change_confirmed',
+      resourceType: 'user',
+      resourceId: record.userId,
+      details: { newEmail: updated.email },
+    });
+    return { ok: true, email: updated.email };
   }
 
   /** Enroll-token TTL (seconds), default 900s, clamped 300..3600. */
@@ -613,8 +813,19 @@ export class AuthService {
     return createHash('sha256').update(token).digest('hex');
   }
 
-  /** Issue a token pair. With an `imp` marker, NO refresh row is created and
-   *  refreshToken is returned empty (the controller must not set a cookie). */
+  /**
+   * Issue a token pair. With an `imp` marker, NO refresh row is created and
+   * refreshToken is returned empty (the controller must not set a cookie).
+   *
+   * **Access token = stateless JWT (documenté GO Q3)** : payload
+   * `sub/email/role` figé à l'émission, vérifié par signature + `exp` UNIQUEMENT
+   * (aucun appel base dans JwtAuthGuard) ; conséquences :
+   *  - déconnexion (logout) et désactivation admin ne révoquent PAS un bearer
+   *    déjà émis — il expire tout seul après `jwtExpiresIn` (défaut 15 min) ;
+   *  - l'claim `email` peut être périmé (changement d'email confirmé entre-temps)
+   *    — toute propriété de ressource doit se fier à `sub` (jamais à l'email) ;
+   *  - seul le refresh token (ligne en base) est un point de révocation serveur.
+   */
   async issueTokens(user: User): Promise<AuthTokens> {
     const payload: JwtPayload = {
       sub: user.id,

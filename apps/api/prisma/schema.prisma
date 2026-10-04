@@ -35,6 +35,8 @@ model User {
 
   refreshTokens       RefreshToken[]
   passwordResetTokens PasswordResetToken[] // one-time reset links (GO socle, lot A1)
+  emailChangeTokens   EmailChangeToken[] // GO Q3 : vérification de la nouvelle adresse
+  closureRequest      AccountClosureRequest? // GO Q3 : demande de clôture (une par compte)
   auditLogs           AuditLog[] // audit entries this user performed (Phase 4)
   subscriptions Subscription[] // client-owned subscriptions (Phase 5)
   issuedInvites Invitation[] // invitations this admin issued (Phase 5)
@@ -204,6 +206,52 @@ model PasswordResetToken {
   createdAt DateTime  @default(now())
 
   @@index([userId])
+}
+
+// ── GO Q3 (item 3) : vérification de la NOUVELLE adresse avant changement ─────
+// Le changement d'email n'est plus immédiat : PATCH /users/me pose une demande,
+// le jeton (sha256 au repos, usage unique, TTL court) est envoyé À LA NOUVELLE
+// adresse ; User.email bascule seulement à la confirmation atomique. Une
+// confirmation concurrente ne réussit qu'une fois (CAS usedAt dans la tx) ;
+// l'unicité est revérifiée sous contrainte (P2002 → 409) dans la transaction.
+model EmailChangeToken {
+  id        String    @id @default(cuid())
+  tokenHash String    @unique // sha256 of the raw verification token
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  newEmail  String
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+}
+
+// ── GO Q3 (item 3) : demande de clôture de compte ─────────────────────────────
+// Demande (et non exécution) : AUCUNE suppression automatique — les pièces
+// financières (factures, mouvements de portefeuille, commandes) sont
+// volontairement hors périmètre de ce modèle et restent intactes. Le
+// traitement (désactivation/anonymisation) reste une opération manuelle
+// documentée, tracée par resolvedAt/resolvedById.
+enum ClosureRequestStatus {
+  PENDING
+  CANCELLED
+  COMPLETED
+}
+
+model AccountClosureRequest {
+  id             String                @id @default(cuid())
+  userId         String                @unique // une seule demande active par compte
+  user           User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  reason         String?
+  status         ClosureRequestStatus  @default(PENDING)
+  createdAt      DateTime              @default(now())
+  updatedAt      DateTime              @updatedAt
+  resolvedAt     DateTime?
+  resolvedById   String?
+  resolutionNote String?
+
+  @@index([status])
 }
 
 // ── Phase 2 — core domain (ADR-017): platform-global reference entities ──────

@@ -8,15 +8,19 @@ import { TotpQr } from '@/components/totp-qr';
 import { useToast } from '@/components/toast';
 import { useAnySession } from '@/lib/session';
 import {
+  cancelClosureRequest,
   changePassword,
   decodeJwt,
+  getClosureRequest,
   getSupportCodeStatus,
   getPublicAuthConfig,
   mfaConfirm,
   mfaDisable,
   mfaSetup,
   oauthUnlink,
+  requestClosure,
   updateProfile,
+  type ClosureRequest,
   type PublicAuthConfig,
 } from '@/lib/api';
 
@@ -43,6 +47,10 @@ export default function ProfilPage() {
   const [editEmail, setEditEmail] = useState('');
   // Support code status
   const [hasCode, setHasCode] = useState(false);
+  // GO Q3 — demande de clôture de compte (demandée ≠ exécutée)
+  const [closure, setClosure] = useState<ClosureRequest | null>(null);
+  const [closureReason, setClosureReason] = useState('');
+  const [closureBusy, setClosureBusy] = useState(false);
 
   // Query feedback after an OAuth link round-trip (?linked=google&?conflict=…).
   useEffect(() => {
@@ -80,6 +88,9 @@ export default function ProfilPage() {
         const d = res.data as { active: boolean };
         setHasCode(!!d.active);
       }
+      // GO Q3 — état de MA demande de clôture (null = aucune demande).
+      const cr = await getClosureRequest(token);
+      setClosure(cr.ok ? ((cr.data as { request: ClosureRequest | null })?.request ?? null) : null);
     })();
   }, [token]);
 
@@ -157,6 +168,8 @@ export default function ProfilPage() {
 
   // GO socle (A1) — édition de MES coordonnées : PATCH strictement limité au
   // compte du jeton côté serveur (aucun id dans la requête).
+  // GO Q3 : l'email n'est PAS modifié immédiatement — une demande de
+  // vérification part vers la nouvelle adresse (pendingEmail).
   async function saveProfile() {
     if (!editEmail.trim()) {
       toast.error('L’email est requis.');
@@ -170,9 +183,40 @@ export default function ProfilPage() {
       toast.error((res.data as { message?: string })?.message ?? 'Profil non modifié.');
       return;
     }
-    toast.ok('Profil mis à jour.');
+    const pending = (res.data as { pendingEmail?: string | null } | null)?.pendingEmail;
+    if (pending && pending.toLowerCase() !== (me?.email ?? '').toLowerCase()) {
+      toast.ok(`Vérification envoyée à ${pending} : cliquez le lien reçu pour activer l’adresse.`);
+    } else {
+      toast.ok('Profil mis à jour.');
+    }
     // Recharge pour resynchroniser l'en-tête d'identité + la session.
     window.location.reload();
+  }
+
+  // GO Q3 — demande / annulation de clôture : l'exécution reste une décision
+  // humaine (admin) et n'efface AUCUNE pièce financière.
+  async function sendClosure(action: 'request' | 'cancel') {
+    setClosureBusy(true);
+    try {
+      const res =
+        action === 'request'
+          ? await requestClosure(token, closureReason.trim() || undefined)
+          : await cancelClosureRequest(token);
+      if (!res.ok) {
+        toast.error((res.data as { message?: string })?.message ?? 'Opération impossible.');
+        return;
+      }
+      const d = res.data as { request?: ClosureRequest | null } | null;
+      setClosure(d?.request ?? null);
+      setClosureReason('');
+      toast.ok(
+        action === 'request'
+          ? 'Demande de clôture enregistrée. Un administrateur la traitera ; aucune donnée n’est supprimée automatiquement.'
+          : 'Demande de clôture annulée.',
+      );
+    } finally {
+      setClosureBusy(false);
+    }
   }
 
   async function unlink(provider: 'google' | 'github') {
@@ -246,6 +290,13 @@ export default function ProfilPage() {
               </div>
             </div>
             <div className="panel-body stack">
+              {me.pendingEmail && me.pendingEmail.toLowerCase() !== me.email.toLowerCase() && (
+                <div className="alert warn" role="status" style={{ fontSize: 13.5, marginBottom: 0 }}>
+                  Nouvelle adresse en attente de vérification : <b>{me.pendingEmail}</b>.
+                  Ouvrez le lien reçu sur cette adresse pour l’activer — l’adresse actuelle
+                  reste valable jusqu’à la confirmation.
+                </div>
+              )}
               <Field label="Nom">
                 <Input
                   value={editName}
@@ -267,6 +318,7 @@ export default function ProfilPage() {
               </Field>
               <div className="muted" style={{ fontSize: 12.5 }}>
                 L’email sert aussi de login : un email déjà pris par un autre compte est refusé.
+                Un changement d’email exige la vérification de la nouvelle adresse (lien reçu par email).
               </div>
               <Button onClick={saveProfile} disabled={!canEdit || !editEmail.trim()}>
                 Enregistrer les coordonnées
@@ -381,6 +433,67 @@ export default function ProfilPage() {
                 <Input type="password" minLength={8} value={newPw} onChange={(e) => setNewPw(e.target.value)} disabled={!canEdit} />
               </Field>
               <Button onClick={savePassword} disabled={!canEdit}>Changer le mot de passe</Button>
+            </div>
+          </div>
+
+          {/* GO Q3 — clôture de compte : demander ≠ exécuter, aucune pièce
+              financière n'est supprimée automatiquement. */}
+          <div className="panel">
+            <div className="panel-head">
+              <div className="flex-1">
+                <div className="panel-title">Clôture du compte</div>
+                <div className="panel-sub">
+                  Demande soumise à validation administrative — factures, commandes et
+                  pièces financières sont conservées.
+                </div>
+              </div>
+            </div>
+            <div className="panel-body stack">
+              {!closure || closure.status === 'CANCELLED' ? (
+                <>
+                  <div className="muted" style={{ fontSize: 12.5 }}>
+                    {closure?.status === 'CANCELLED'
+                      ? 'Votre précédente demande a été annulée. Vous pouvez en soumettre une nouvelle.'
+                      : 'Aucune demande en cours. La clôture est traitée par un administrateur : vos pièces financières restent conservées pour obligations légales.'}
+                  </div>
+                  <Field label="Motif (facultatif)">
+                    <Input
+                      value={closureReason}
+                      maxLength={500}
+                      placeholder="Raison de votre départ…"
+                      onChange={(e) => setClosureReason(e.target.value)}
+                      disabled={!canEdit || closureBusy}
+                    />
+                  </Field>
+                  <Button
+                    variant="danger"
+                    onClick={() => sendClosure('request')}
+                    disabled={!canEdit || closureBusy}
+                  >
+                    Demander la clôture de mon compte
+                  </Button>
+                </>
+              ) : closure.status === 'PENDING' ? (
+                <div className="stack">
+                  <div className="alert warn" role="status" style={{ fontSize: 13.5, marginBottom: 0 }}>
+                    Demande enregistrée le {new Date(closure.createdAt).toLocaleDateString('fr-FR')}
+                    {closure.reason ? ` — motif : ${closure.reason}` : ''}. Elle reste sans effet
+                    tant qu’un administrateur ne l’a pas traitée.
+                  </div>
+                  <Button
+                    variant="secondary"
+                    onClick={() => sendClosure('cancel')}
+                    disabled={!canEdit || closureBusy}
+                  >
+                    Annuler ma demande
+                  </Button>
+                </div>
+              ) : (
+                <div className="alert info" role="status" style={{ fontSize: 13.5, marginBottom: 0 }}>
+                  Clôture traitée le{' '}
+                  {closure.resolvedAt ? new Date(closure.resolvedAt).toLocaleDateString('fr-FR') : '—'}.
+                </div>
+              )}
             </div>
           </div>
         </div>

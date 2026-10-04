@@ -52,9 +52,19 @@ export class ClientStoreController {
     private readonly audit: AuditService,
   ) {}
 
-  /** Propriétaire du dossier : compte lié (userId) OU client au même email. */
+  /**
+   * Propriétaire du dossier (GO Q3) — le JWT seul décide, l'email n'est
+   * qu'un rattachement de secours ET BORNÉ : soit le compte lié (`userId`),
+   * soit un dossier INVITÉ non rattaché (`userId: null`) au même email.
+   * Un email (même aligné sur la DB) ne donne JAMAIS accès à un dossier
+   * déjà lié à un autre compte : la branche email porte `userId: null`,
+   * donc les dossiers d'un tiers sont invisibles — pas de vol de dossier,
+   * ni même avec un claim email périmé après changement d'email.
+   */
   private ownedBy(user: JwtPayload): Prisma.CustomerWhereInput {
-    return { OR: [{ userId: user.sub }, { email: user.email }] };
+    return {
+      OR: [{ userId: user.sub }, { AND: [{ email: user.email }, { userId: null }] }],
+    };
   }
 
   private clamp(query: { page?: number; perPage?: number }) {
