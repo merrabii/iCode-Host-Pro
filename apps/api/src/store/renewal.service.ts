@@ -20,6 +20,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { MailSettingsService } from '../mail/mail-settings.service';
 import { CheckoutService } from './checkout.service';
 import { claimInvoiceSequence } from './invoice-sequence';
+import { SuspensionEffectsService, applyHostingStatusInTx } from './suspension-effects.service';
 import { clientAreaUrl } from './web-links';
 
 /** Env : période du scheduler de renouvellement (ms). `0`/absente → 60000. */
@@ -60,12 +61,19 @@ function clampDays(value: unknown, fallback: number): number {
  *     relance (marqueur `Invoice.dunningRemindedAt`, colonne P8) = audit +
  *     email best-effort.
  *  4. **Suspension à échéance** : facture UNPAID au-delà de
- *     `dueDate + dunningGraceDays` → souscription ACTIVE → SUSPENDED (CAS).
+ *     `dueDate + dunningGraceDays` → **SOUSCRIPTION DE CETTE FACTURE**
+ *     (résolution stricte facture → abonnement, jamais « le dernier abonnement
+ *     actif du client ») ACTIVE → SUSPENDED (CAS **sous verrou** `FOR UPDATE`
+ *     facture puis abonnement, impayé ET états revérifiés avant toute
+ *     transition), services hébergement de CET abonnement ACTIVE → SUSPENDED
+ *     dans la MÊME transaction (probe schéma préalable).
  *
- * **Effet infra : AUCUN (§6-4, décision owner)** — la suspension bloque le
- * renouvellement et l'accès commercial, elle n'arrête jamais d'app ni n'appelle
- * de provider (interdit ici, non tranché). Toute réactivation est manuelle
- * (whitelist admin existante).
+ * **Effet provider (Q5, GO item 5)** : après commit, **arrêt réversible** des
+ * applications concernées via `SuspensionEffectsService` (transport simulé en
+ * test, C4 sous flag, aucune suppression). L'email client ne revendique **jamais**
+ * « l'accès suspendu » quand seul le statut a changé : il décrit l'état
+ * réellement constaté (arrêt confirmé / bloqué / échec visible). Toute
+ * réactivation est contrôlée (whitelist admin) et rejoue la relance des apps.
  *
  * Timer simple (`setInterval`, sans dépendance), anti-chevauchement local,
  * désactivable par `RENEWAL_SWEEP_ENABLED=false` ; `sweep()` est PUBLIC et
@@ -82,6 +90,7 @@ export class RenewalService implements OnModuleInit, OnModuleDestroy {
     private readonly audit: AuditService,
     private readonly checkout: CheckoutService,
     private readonly mail: MailSettingsService,
+    private readonly effects: SuspensionEffectsService,
   ) {}
 
   onModuleInit(): void {
@@ -628,6 +637,23 @@ export class RenewalService implements OnModuleInit, OnModuleDestroy {
 
   // ───────────────────── 4. Suspension à échéance ───────────────────────────
 
+  /**
+   * Q5 (GO item 5) — suspension des impayés :
+   *  - **portée** : une facture impayée n'affecte QUE l'abonnement auquel elle
+   *    se rapporte (`Invoice.subscriptionId` → abonnement de sa commande →
+   *    chaîne `renewsOrderId`) — JAMAIS « le dernier abonnement actif du
+   *    client » (un second abonnement du même client reste intact) ;
+   *  - **verrou** : facture `FOR UPDATE` puis abonnement `FOR UPDATE`, impayé
+   *    ET états revérifiés dans la transaction avant toute transition (la
+   *    course paiement/suspension est sérialisée : un règlement committé est
+   *    vu sous verrou → aucune suspension) ;
+   *  - **services** : les HostingService de CET abonnement passent
+   *    ACTIVE → SUSPENDED dans la MÊME transaction (probe schéma préalable) ;
+   *  - **effets provider post-commit** : arrêt réversible des apps via
+   *    `SuspensionEffectsService` (aucune suppression), résumé honnête dans
+   *    l'email (aucune revendication d'« accès suspendu » sur un simple
+   *    changement de statut).
+   */
   private async suspendOverdue(): Promise<number> {
     const settings = await this.prisma.billingSetting.findFirst({ orderBy: { createdAt: 'asc' } });
     const graceDays = clampDays(settings?.dunningGraceDays, 14);
@@ -639,55 +665,200 @@ export class RenewalService implements OnModuleInit, OnModuleDestroy {
         id: true,
         number: true,
         dueDate: true,
+        amountTtcCents: true,
+        currency: true,
+        subscriptionId: true,
+        orderId: true,
         customer: { select: { userId: true, email: true, name: true } },
       },
       take: 25,
     });
     let suspended = 0;
     for (const inv of overdue) {
-      const userId = inv.customer.userId;
-      if (!userId) continue;
-      const sub = await this.prisma.subscription.findFirst({
-        where: { userId, status: SubscriptionStatus.ACTIVE },
-        orderBy: { createdAt: 'desc' },
-        select: { id: true },
-      });
-      if (!sub) continue; // déjà suspendu/annulé → idempotent
-      const cas = await this.prisma.subscription.updateMany({
-        where: { id: sub.id, status: SubscriptionStatus.ACTIVE },
-        data: { status: SubscriptionStatus.SUSPENDED },
-      });
-      if (cas.count !== 1) continue;
-      suspended += 1;
-      await this.audit.record({
+      const outcome = await this.suspendOneOverdue(inv, cutoff, graceDays);
+      if (outcome) suspended += 1;
+    }
+    return suspended;
+  }
+
+  /** Une facture : verrou + relecture + transition + effets (post-commit). */
+  private async suspendOneOverdue(
+    inv: {
+      id: string;
+      number: string;
+      dueDate: Date | null;
+      amountTtcCents: number;
+      currency: string;
+      subscriptionId: string | null;
+      orderId: string | null;
+      customer: { userId: string | null; email: string; name: string | null };
+    },
+    cutoff: Date,
+    graceDays: number,
+  ): Promise<boolean> {
+    const committed = await this.suspendOneInTx(inv, cutoff);
+    if (!committed) return false;
+
+    await this.audit
+      .record({
         action: 'subscription.auto_suspend',
         resourceType: 'subscription',
-        resourceId: sub.id,
+        resourceId: committed.subId,
         details: {
           reason: 'invoice_overdue',
           invoiceId: inv.id,
           invoiceNumber: inv.number,
           dueDate: inv.dueDate,
           graceDays,
+          scope: 'invoice_subscription',
         },
+      })
+      .catch((e) => this.log.warn(`suspend audit sub=${committed.subId} failed: ${String(e)}`));
+
+    // Effets provider post-commit (jamais dans la TX) : arrêt réversible,
+    // aucune suppression ; échecs/blocages tracés et comptabilisés.
+    const effects = await this.effects
+      .suspendApps({
+        subscriptionId: committed.subId,
+        holder: 'system:renewal-sweep',
+        orderId: committed.orderId,
+      })
+      .catch((e): SuspensionEffectsSummaryLike => {
+        this.log.warn(`suspend effects sub=${committed.subId} failed: ${String(e)}`);
+        return { apps: 0, done: 0, blocked: 0, failed: 0 };
       });
-      await this.mail
-        .sendPlain({
-          to: inv.customer.email,
-          subject: `Abonnement suspendu — facture ${inv.number} impayée`,
-          text: [
-            `Bonjour ${inv.customer.name || ''},`.trim(),
-            '',
-            `Votre facture ${inv.number} n'a pas été réglée dans le délai de grâce`,
-            `(${graceDays} jours après échéance). Votre abonnement est suspendu :`,
-            'le renouvellement est bloqué et l’accès est suspendu.',
-            '',
-            'Réglez depuis votre espace client puis contactez le support pour réactiver.',
-            clientAreaUrl(),
-          ].join('\n'),
-        })
-        .catch((e) => this.log.warn(`suspend mail invoice=${inv.id} failed: ${String(e)}`));
-    }
-    return suspended;
+
+    await this.mail
+      .sendPlain({
+        to: inv.customer.email,
+        subject: `Abonnement suspendu — facture ${inv.number} impayée`,
+        text: [
+          `Bonjour ${inv.customer.name || ''},`.trim(),
+          '',
+          `Votre facture ${inv.number} d'un montant de ${(
+            inv.amountTtcCents / 100
+          ).toFixed(2)} ${inv.currency} n'a pas été réglée dans le délai de grâce`,
+          `(${graceDays} jours après échéance).`,
+          '',
+          'Votre abonnement est suspendu : le renouvellement automatique est bloqué.',
+          effects.done > 0
+            ? `${effects.done} application(s) hébergée(s) ont été arrêtée(s) de façon réversible : aucune donnée ni ressource n'a été supprimée.`
+            : 'Aucune donnée ni ressource n’a été supprimée.',
+          effects.blocked > 0 || effects.failed > 0
+            ? `Arrêt d'applications non constaté sur ${effects.blocked + effects.failed} application(s) (bloqué ou en échec) : contactez le support.`
+            : '',
+          '',
+          'Réglez depuis votre espace client : la réactivation est contrôlée après régularisation,',
+          'sans double facturation.',
+          clientAreaUrl(),
+        ]
+          .filter(Boolean)
+          .join('\n'),
+      })
+      .catch((e) => this.log.warn(`suspend mail invoice=${inv.id} failed: ${String(e)}`));
+    return true;
   }
+
+  /** Transaction de suspension : verrous + revérification + CAS + services. */
+  private async suspendOneInTx(
+    inv: { id: string; subscriptionId: string | null; orderId: string | null },
+    cutoff: Date,
+  ): Promise<{ subId: string; orderId: string | null } | null> {
+    try {
+      return await this.prisma.$transaction(async (tx) => {
+        // 1. Verrou facture — l'état est revérifié SOUS VERROU.
+        const rows = await tx.$queryRaw<
+          Array<{
+            id: string;
+            status: string;
+            dueDate: Date | null;
+            subscriptionId: string | null;
+            orderId: string | null;
+          }>
+        >`
+          SELECT "id", "status", "dueDate", "subscriptionId", "orderId"
+          FROM "Invoice" WHERE "id" = ${inv.id} FOR UPDATE`;
+        const row = rows[0];
+        if (!row) return null;
+        if (row.status !== InvoiceStatus.UNPAID) return null; // réglée sous verrou
+        if (!row.dueDate || row.dueDate >= cutoff) return null; // plus échue sous verrou
+
+        // 2. Portée stricte : l'abonnement AUQUEL la facture se rapporte.
+        const subId = await this.resolveSubscriptionIdInTx(tx, row);
+        if (!subId) return null; // facture sans lien → AUCUNE autre souscription touchée
+
+        // 3. Verrou abonnement + état revérifié.
+        const subs = await tx.$queryRaw<Array<{ id: string; status: string; orderId: string | null }>>`
+          SELECT "id", "status", "orderId" FROM "Subscription"
+          WHERE "id" = ${subId} FOR UPDATE`;
+        const sub = subs[0];
+        if (!sub || sub.status !== SubscriptionStatus.ACTIVE) return null;
+
+        // 4. CAS ACTIVE → SUSPENDED (deux sweeps concurrents → un seul gagne).
+        const cas = await tx.subscription.updateMany({
+          where: { id: subId, status: SubscriptionStatus.ACTIVE },
+          data: { status: SubscriptionStatus.SUSPENDED },
+        });
+        if (cas.count !== 1) return null;
+
+        // 5. Services hébergement de CET abonnement, MÊME transaction
+        //    (probe schéma : base pré-C1 sans table → skip, jamais d'erreur).
+        await applyHostingStatusInTx(
+          tx,
+          subId,
+          'ACTIVE',
+          'SUSPENDED',
+        );
+
+        return { subId, orderId: row.orderId ?? sub.orderId };
+      });
+    } catch (e) {
+      this.log.warn(`suspend invoice=${inv.id} failed: ${String(e)}`);
+      return null;
+    }
+  }
+
+  /** Résolution stricte facture → abonnement (Q5). Jamais « dernier actif ». */
+  private async resolveSubscriptionIdInTx(
+    tx: Prisma.TransactionClient,
+    row: { subscriptionId: string | null; orderId: string | null },
+  ): Promise<string | null> {
+    if (row.subscriptionId) {
+      const s = await tx.subscription.findFirst({
+        where: { id: row.subscriptionId },
+        select: { id: true },
+      });
+      return s?.id ?? null;
+    }
+    if (!row.orderId) return null;
+    const byOrder = await tx.subscription.findFirst({
+      where: { orderId: row.orderId },
+      select: { id: true },
+    });
+    if (byOrder) return byOrder.id;
+    // Chaîne de renouvellement : remonte renewsOrderId vers l'abonnement d'origine.
+    let cursor = row.orderId;
+    for (let i = 0; i < 25; i += 1) {
+      const parent = await tx.order.findUnique({
+        where: { id: cursor },
+        select: { renewsOrderId: true },
+      });
+      if (!parent?.renewsOrderId) return null;
+      const chained = await tx.subscription.findFirst({
+        where: { orderId: parent.renewsOrderId },
+        select: { id: true },
+      });
+      if (chained) return chained.id;
+      cursor = parent.renewsOrderId;
+    }
+    return null;
+  }
+}
+
+/** Résumé d'effets utilisé pour le mail honnête (structure de secours). */
+interface SuspensionEffectsSummaryLike {
+  apps: number;
+  done: number;
+  blocked: number;
+  failed: number;
 }

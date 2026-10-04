@@ -18,6 +18,11 @@ import { Actor } from '../users/users.service';
 import { UpgradeSubscriptionDto } from './dto/upgrade-subscription.dto';
 import { UpdateSubscriptionDto } from './dto/update-subscription.dto';
 import { ProvisioningService } from '../store/provisioning.service';
+import {
+  SuspensionEffectsService,
+  SuspensionEffectsSummary,
+  applyHostingStatusInTx,
+} from '../store/suspension-effects.service';
 
 // Phase 5 (ADR-021): client workspace. One module, one shared service, two
 // controllers — /client/* (any authenticated, ownership enforced here) and
@@ -61,6 +66,7 @@ export class SubscriptionsService {
     private readonly prisma: PrismaService,
     private readonly audit: AuditService,
     private readonly provisioning: ProvisioningService,
+    private readonly effects: SuspensionEffectsService,
   ) {}
 
   // ───────────────────────── Client-scoped ─────────────────────────────────
@@ -348,38 +354,146 @@ export class SubscriptionsService {
     });
   }
 
-  /** ADMIN: apply a whitelisted subscription status transition. */
+  /**
+   * ADMIN: apply a whitelisted subscription status transition.
+   *
+   * Q5 (GO item 5) — transition SOUS VERROU : la ligne est verrouillée
+   * `FOR UPDATE`, la transition est RECALCULÉE sur l'état lu sous verrou (deux
+   * actions concurrentes → une seule gagne, jamais de transition sautée) ;
+   * les services hébergement de CETTE souscription basculent dans la MÊME
+   * transaction (ACTIVE ↔ SUSPENDED, probe schéma) ; les effets provider
+   * (arrêt/relance des apps — réversibles, AUCUNE suppression) sont exécutés
+   * post-commit et RETOURNÉS dans `effects` : blocages/échecs sont visibles
+   * (audits `suspension.app_*`) et RÉJOUABLES en relançant l'action.
+   *
+   * Réactivation (SUSPENDED → ACTIVE) = « réactivation contrôlée » (GO) :
+   * aucun encaissement ni écriture de facture — sans double facturation.
+   */
   async updateSubscription(
     id: string,
     dto: UpdateSubscriptionDto,
     actor: Actor,
-  ): Promise<Subscription> {
-    const sub = await this.prisma.subscription.findUnique({ where: { id } });
-    if (!sub) {
+  ): Promise<Subscription & { effects?: SuspensionEffectsSummary }> {
+    const existing = await this.prisma.subscription.findUnique({ where: { id } });
+    if (!existing) {
       throw new NotFoundException('Souscription introuvable.');
     }
-    if (dto.status === sub.status) {
-      return sub; // idempotent
+    if (dto.status === existing.status) {
+      return existing; // idempotent
     }
-    const transition = SUBSCRIPTION_TRANSITIONS[`${sub.status}->${dto.status}`];
-    if (!transition) {
-      throw new BadRequestException(
-        `Transition ${sub.status} → ${dto.status} non autorisée.`,
-      );
-    }
-    const updated = await this.prisma.subscription.update({
-      where: { id },
-      data: { status: transition.to },
+
+    const committed = await this.prisma.$transaction(async (tx) => {
+      const rows = await tx.$queryRaw<
+        Array<{ id: string; status: SubscriptionStatus; orderId: string | null }>
+      >`SELECT "id", "status", "orderId" FROM "Subscription" WHERE "id" = ${id} FOR UPDATE`;
+      const cur = rows[0];
+      if (!cur) {
+        throw new NotFoundException('Souscription introuvable.');
+      }
+      if (cur.status === dto.status) {
+        return { raced: true as const, from: cur.status, to: cur.status, orderId: cur.orderId };
+      }
+      // Transition RECALCULÉE sous verrou (jamais l'état lu avant verrou).
+      const transition = SUBSCRIPTION_TRANSITIONS[`${cur.status}->${dto.status}`];
+      if (!transition) {
+        throw new BadRequestException(
+          `Transition ${cur.status} → ${dto.status} non autorisée.`,
+        );
+      }
+      const cas = await tx.subscription.updateMany({
+        where: { id, status: cur.status },
+        data: { status: transition.to },
+      });
+      if (cas.count !== 1) {
+        return null; // perdu la course — l'état committé est relu ci-dessous
+      }
+      // Services hébergement du SEUL abonnement concerné, MÊME transaction.
+      // Seules les VRAIES paires (SUSPENDRE / RÉACTIVER) basculent les
+      // services : PENDING→ACTIVE (approbation) ne touche aucune app.
+      if (cur.status === SubscriptionStatus.ACTIVE && transition.to === SubscriptionStatus.SUSPENDED) {
+        await applyHostingStatusInTx(tx, id, 'ACTIVE', 'SUSPENDED');
+      } else if (
+        cur.status === SubscriptionStatus.SUSPENDED &&
+        transition.to === SubscriptionStatus.ACTIVE
+      ) {
+        await applyHostingStatusInTx(tx, id, 'SUSPENDED', 'ACTIVE');
+      }
+      return {
+        raced: false as const,
+        from: cur.status,
+        to: transition.to,
+        action: transition.action,
+        orderId: cur.orderId,
+      };
     });
+
+    if (!committed) {
+      // Course perdue : on relit — si l'action est déjà appliquée, idempotent.
+      const fresh = await this.prisma.subscription.findUnique({ where: { id } });
+      if (fresh && fresh.status === dto.status) return fresh;
+      throw new ConflictException('Transition concurrente — réessayez.');
+    }
+    if (committed.raced) {
+      const fresh = await this.prisma.subscription.findUnique({ where: { id } });
+      if (fresh) return fresh;
+      throw new NotFoundException('Souscription introuvable.');
+    }
+
+    const updated = await this.prisma.subscription.findUniqueOrThrow({ where: { id } });
+
+    // Effets provider POST-COMMIT (jamais dans la TX) — jamais de suppression.
+    // Même paire que les services : seul un VRAI suspendre/réactiver déclenche
+    // un appel provider (l'approbation PENDING→ACTIVE n'arrête/relance rien).
+    let effects: SuspensionEffectsSummary | undefined;
+    try {
+      if (
+        committed.from === SubscriptionStatus.ACTIVE &&
+        committed.to === SubscriptionStatus.SUSPENDED
+      ) {
+        effects = await this.effects.suspendApps({
+          subscriptionId: id,
+          holder: actor.sub,
+          orderId: committed.orderId,
+        });
+      } else if (
+        committed.from === SubscriptionStatus.SUSPENDED &&
+        committed.to === SubscriptionStatus.ACTIVE
+      ) {
+        effects = await this.effects.resumeApps({
+          subscriptionId: id,
+          holder: actor.sub,
+          orderId: committed.orderId,
+        });
+      }
+    } catch (e) {
+      // L'état committé est la vérité : l'échec d'effet reste visible (audit).
+      await this.audit
+        .record({
+          actorId: actor.sub,
+          actorEmail: actor.email,
+          action: 'suspension.effects_failed',
+          resourceType: 'subscription',
+          resourceId: id,
+          details: { to: committed.to, error: String(e) },
+        })
+        .catch(() => undefined);
+    }
+
+    const details: Prisma.InputJsonObject = {
+      from: committed.from,
+      to: committed.to,
+      productId: existing.productId,
+      ...(effects ? { effects: { ...effects } } : {}),
+    };
     await this.audit.record({
       actorId: actor.sub,
       actorEmail: actor.email,
-      action: transition.action,
+      action: committed.action,
       resourceType: 'subscription',
       resourceId: id,
-      details: { from: sub.status, to: transition.to, productId: sub.productId },
+      details,
     });
-    return updated;
+    return effects ? { ...updated, effects } : updated;
   }
 
   /**

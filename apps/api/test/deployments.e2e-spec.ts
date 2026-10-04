@@ -88,6 +88,8 @@ describe('Deployments GitHub → Coolify (e2e, Phase 10bis)', () => {
       setAppDomain: jest.fn().mockResolvedValue(undefined),
       deleteApplication: fakeDeleteApplication,
       deploymentStatus: fakeDeploymentStatus,
+      stopApplication: jest.fn().mockResolvedValue(undefined),
+      startApplication: jest.fn().mockResolvedValue(undefined),
     }),
   } as unknown as PanelTransportFactory;
 

@@ -25,6 +25,7 @@ import { ReconcileRunnerService } from './reconcile.runner.service';
 import { ReconcileService } from './reconcile.service';
 import { ReconcileSettingAdminController } from './reconcile-setting.admin.controller';
 import { ReconcileSettingsService } from './reconcile-settings.service';
+import { SuspensionEffectsService } from './suspension-effects.service';
 import { CoolifyEvidenceConnector } from './evidence-connectors/coolify-evidence.connector';
 import { StoreProvisioningAdminController } from './store-provisioning.admin.controller';
 import { StoreSubdomainController } from './store-subdomain.controller';
@@ -84,6 +85,7 @@ import { RenewalService } from './renewal.service';
     ReconcileService,
     ReconcileRunnerService,
     RenewalService,
+    SuspensionEffectsService,
   ],
   exports: [
     ProvisioningService,
@@ -92,6 +94,7 @@ import { RenewalService } from './renewal.service';
     ReconcileSettingsService,
     DeploymentEvidenceService,
     ReconcileService,
+    SuspensionEffectsService,
   ],
 })
 export class StoreModule {}

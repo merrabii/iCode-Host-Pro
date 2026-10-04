@@ -12,6 +12,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { WalletService } from '../wallet/wallet.service';
 import { CheckoutService } from './checkout.service';
 import { addBillingCycle } from './billing-cycle';
+import { SuspensionEffectsService } from './suspension-effects.service';
 import {
   RENEWAL_SWEEP_ENABLED_ENV,
   RenewalService,
@@ -26,8 +27,12 @@ import {
  *   - solde insuffisant → facture reste impayée, AUCUN crédit compensatoire ;
  *   - reprise : garde RE-VALIDÉE avant tout débit (jamais de prélèvement sur
  *     une chaîne close/suspendue/produit changé depuis la création) ;
- *   - dunning : UNE relance (CAS `dunningRemindedAt`), suspension CAS
- *     ACTIVE→SUSPENDED, AUCUN appel infrastructure (§6-4) ;
+ *   - dunning : UNE relance (CAS `dunningRemindedAt`) ;
+ *   - suspension Q5 (GO item 5) : portée stricte facture → SON abonnement,
+ *     verrous `FOR UPDATE` facture puis abonnement (course paiement/suspension
+ *     sérialisée), services hébergement dans la MÊME tx, effets provider
+ *     post-commit via SuspensionEffectsService (arrêt réversible, aucune
+ *     suppression), email SANS revendication d'« accès suspendu » ;
  *   - anti-chevauchement local + coupe-timer d'isolement de test.
  */
 describe('RenewalService (D2 — échéances, renouvellement, dunning)', () => {
@@ -52,6 +57,7 @@ describe('RenewalService (D2 — échéances, renouvellement, dunning)', () => {
     payOrderWithWallet: jest.Mock;
   };
   let mail: { sendPlain: jest.Mock };
+  let effects: { suspendApps: jest.Mock; resumeApps: jest.Mock };
   let svc: RenewalService;
   let lastTx: ReturnType<typeof txStub> | null = null;
 
@@ -143,6 +149,10 @@ describe('RenewalService (D2 — échéances, renouvellement, dunning)', () => {
       })),
     };
     mail = { sendPlain: jest.fn(async () => undefined) };
+    effects = {
+      suspendApps: jest.fn(async () => ({ apps: 0, done: 0, blocked: 0, failed: 0 })),
+      resumeApps: jest.fn(async () => ({ apps: 0, done: 0, blocked: 0, failed: 0 })),
+    };
 
     const moduleRef = await Test.createTestingModule({
       providers: [
@@ -151,6 +161,7 @@ describe('RenewalService (D2 — échéances, renouvellement, dunning)', () => {
         { provide: WalletService, useValue: wallet },
         { provide: CheckoutService, useValue: checkout },
         { provide: MailSettingsService, useValue: mail },
+        { provide: SuspensionEffectsService, useValue: effects },
         RenewalService,
       ],
     }).compile();
@@ -383,57 +394,230 @@ describe('RenewalService (D2 — échéances, renouvellement, dunning)', () => {
     expect(mail.sendPlain).toHaveBeenCalledTimes(1);
   });
 
-  // ── 4. Suspension à échéance (statut SEUL, jamais d\u2019infrastructure) ────
+  // ── 4. Suspension à échéance Q5 (portée stricte, verrous, effets) ────────
 
-  it('impayé au-delà du délai de grâce → souscription ACTIVE → SUSPENDED (CAS), aucun appel infra', async () => {
-    const overdue = {
-      id: 'inv-overdue',
-      number: '2026-0042',
-      dueDate: new Date('2026-01-01T00:00:00.000Z'),
-      customer: { userId: 'user-1', email: 'alice@test.local', name: 'Alice' },
+  /** Facture impayée liée à SON abonnement (les 3 champs de résolution Q5). */
+  const overdueInvoice = (over: Record<string, unknown> = {}) => ({
+    id: 'inv-overdue',
+    number: '2026-0042',
+    dueDate: new Date('2026-01-01T00:00:00.000Z'),
+    amountTtcCents: 1200,
+    currency: 'USD',
+    subscriptionId: 'sub-1',
+    orderId: 'ord-1',
+    customer: { userId: 'user-1', email: 'alice@test.local', name: 'Alice' },
+    ...over,
+  });
+
+  /** Les 4 passes de sweep : échéances, payPending, dunning, suspension. */
+  const stubSweepPasses = (overdue: unknown[]) => {
+    prisma.order.findMany.mockResolvedValueOnce([]); // échéances
+    prisma.order.findMany.mockResolvedValueOnce([]); // payPending
+    prisma.invoice.findMany.mockResolvedValueOnce([]); // dunning
+    prisma.invoice.findMany.mockResolvedValueOnce(overdue); // suspension
+  };
+
+  /** TX de suspension Q5 : verrou Invoice → résolution → verrou Subscription
+   *  → sonde HostingService → CAS. L'ordre des `$queryRaw` suit l'appel réel. */
+  const suspendTx = (opts: {
+    invoiceRow?: Record<string, unknown> | null;
+    subRow?: Record<string, unknown> | null;
+    subResolve?: { id: string } | null;
+    probe?: boolean;
+    casCount?: number;
+  } = {}) => {
+    const tx = {
+      $queryRaw: jest
+        .fn()
+        .mockResolvedValueOnce([opts.invoiceRow ?? null]) // verrou Invoice
+        .mockResolvedValueOnce([opts.subRow ?? null]) // verrou Subscription
+        .mockResolvedValue([{ exists: opts.probe ?? false }]), // sonde HostingService
+      subscription: {
+        findFirst: jest.fn(async () => opts.subResolve ?? null),
+        updateMany: jest.fn(async () => ({ count: opts.casCount ?? 1 })),
+      },
+      hostingService: { updateMany: jest.fn(async () => ({ count: 1 })) },
+      order: { findUnique: jest.fn(async () => null) },
     };
-    prisma.order.findMany.mockResolvedValueOnce([]);
-    prisma.order.findMany.mockResolvedValueOnce([]);
-    prisma.invoice.findMany.mockResolvedValueOnce([]); // dunning : rien
-    prisma.invoice.findMany.mockResolvedValueOnce([overdue]); // suspension
-    prisma.subscription.findFirst.mockResolvedValueOnce({ id: 'sub-1' });
+    prisma.$transaction.mockImplementationOnce(
+      async (cb: (t: typeof tx) => Promise<unknown>) => cb(tx),
+    );
+    return tx;
+  };
+
+  it('impayé au-delà du grâce → SON abonnement suspendu (verrous + CAS), services + effets réversibles', async () => {
+    stubSweepPasses([overdueInvoice()]);
+    const tx = suspendTx({
+      invoiceRow: {
+        id: 'inv-overdue',
+        status: 'UNPAID',
+        dueDate: new Date('2026-01-01T00:00:00.000Z'),
+        subscriptionId: 'sub-1',
+        orderId: 'ord-1',
+      },
+      subRow: { id: 'sub-1', status: 'ACTIVE', orderId: 'ord-1' },
+      subResolve: { id: 'sub-1' },
+      probe: true,
+    });
 
     const res = await svc.sweep();
 
     expect(res.suspended).toBe(1);
-    expect(prisma.subscription.updateMany).toHaveBeenCalledWith({
+    expect(tx.subscription.updateMany).toHaveBeenCalledWith({
       where: { id: 'sub-1', status: SubscriptionStatus.ACTIVE },
       data: { status: SubscriptionStatus.SUSPENDED },
     });
-    expect(audit.record).toHaveBeenCalledWith(expect.objectContaining({
-      action: 'subscription.auto_suspend',
-      resourceId: 'sub-1',
-      details: expect.objectContaining({ reason: 'invoice_overdue' }),
-    }));
+    // Services hébergement du SEUL abonnement concerné, MÊME transaction.
+    expect(tx.hostingService.updateMany).toHaveBeenCalledWith({
+      where: { subscriptionId: 'sub-1', status: 'ACTIVE' },
+      data: { status: 'SUSPENDED' },
+    });
+    // Effets provider post-commit via SuspensionEffectsService (aucune suppression).
+    expect(effects.suspendApps).toHaveBeenCalledWith({
+      subscriptionId: 'sub-1',
+      holder: 'system:renewal-sweep',
+      orderId: 'ord-1',
+    });
+    expect(audit.record).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: 'subscription.auto_suspend',
+        resourceId: 'sub-1',
+        details: expect.objectContaining({
+          reason: 'invoice_overdue',
+          scope: 'invoice_subscription',
+        }),
+      }),
+    );
     expect(mail.sendPlain).toHaveBeenCalledTimes(1);
-    // §6-4 : aucun chemin d'écriture provisioning/panel n'est injecté ni appelé.
+    const text = mail.sendPlain.mock.calls[0][0].text as string;
+    expect(text).toContain('Votre abonnement est suspendu');
+    expect(text).not.toMatch(/acc[eè]s est suspendu/);
+    // Aucun accès direct provisioning/panel sur le service : tout passe par
+    // SuspensionEffectsService (mocké ci-dessus).
     expect((svc as unknown as Record<string, unknown>).provisioning).toBeUndefined();
     expect((svc as unknown as Record<string, unknown>).panel).toBeUndefined();
   });
 
-  it('souscription déjà suspendue → idempotent (aucun double audit)', async () => {
-    const overdue = {
-      id: 'inv-overdue',
-      number: '2026-0042',
-      dueDate: new Date('2026-01-01T00:00:00.000Z'),
-      customer: { userId: 'user-1', email: 'alice@test.local', name: 'Alice' },
-    };
-    prisma.order.findMany.mockResolvedValueOnce([]);
-    prisma.order.findMany.mockResolvedValueOnce([]);
-    prisma.invoice.findMany.mockResolvedValueOnce([]);
-    prisma.invoice.findMany.mockResolvedValueOnce([overdue]);
-    prisma.subscription.findFirst.mockResolvedValueOnce(null); // plus d'ACTIVE
+  it('Q5 : facture réglée sous verrou (course paiement/suspension) → AUCUNE suspension', async () => {
+    stubSweepPasses([overdueInvoice()]);
+    const tx = suspendTx({
+      invoiceRow: {
+        id: 'inv-overdue',
+        status: 'PAID', // le paiement a committé avant notre verrou
+        dueDate: new Date('2026-01-01T00:00:00.000Z'),
+        subscriptionId: 'sub-1',
+        orderId: 'ord-1',
+      },
+    });
 
     const res = await svc.sweep();
 
     expect(res.suspended).toBe(0);
-    expect(prisma.subscription.updateMany).not.toHaveBeenCalled();
+    expect(tx.subscription.updateMany).not.toHaveBeenCalled();
+    expect(effects.suspendApps).not.toHaveBeenCalled();
+    expect(audit.record).not.toHaveBeenCalledWith(
+      expect.objectContaining({ action: 'subscription.auto_suspend' }),
+    );
     expect(mail.sendPlain).not.toHaveBeenCalled();
+  });
+
+  it('Q5 : facture SANS lien d\u2019abonnement → AUCUNE autre souscription du client touch\u00e9e (port\u00e9e stricte)', async () => {
+    // L'ancien défaut suspendait « le dernier ACTIVE du client » : le
+    // r\u00e9gression doit prouver qu'aucune souscription n'est m\u00eame lue.
+    stubSweepPasses([overdueInvoice({ subscriptionId: null, orderId: null })]);
+    const tx = suspendTx({
+      invoiceRow: {
+        id: 'inv-overdue',
+        status: 'UNPAID',
+        dueDate: new Date('2026-01-01T00:00:00.000Z'),
+        subscriptionId: null,
+        orderId: null,
+      },
+    });
+
+    const res = await svc.sweep();
+
+    expect(res.suspended).toBe(0);
+    expect(tx.subscription.findFirst).not.toHaveBeenCalled();
+    expect(tx.subscription.updateMany).not.toHaveBeenCalled();
+    expect(prisma.subscription.findFirst).not.toHaveBeenCalled();
+    expect(effects.suspendApps).not.toHaveBeenCalled();
+    expect(audit.record).not.toHaveBeenCalledWith(
+      expect.objectContaining({ action: 'subscription.auto_suspend' }),
+    );
+    expect(mail.sendPlain).not.toHaveBeenCalled();
+  });
+
+  it('souscription d\u00e9j\u00e0 suspendue \u2192 idempotent (aucun double audit, aucun effet)', async () => {
+    stubSweepPasses([overdueInvoice()]);
+    const tx = suspendTx({
+      invoiceRow: {
+        id: 'inv-overdue',
+        status: 'UNPAID',
+        dueDate: new Date('2026-01-01T00:00:00.000Z'),
+        subscriptionId: 'sub-1',
+        orderId: 'ord-1',
+      },
+      subRow: { id: 'sub-1', status: 'SUSPENDED', orderId: 'ord-1' },
+      subResolve: { id: 'sub-1' },
+    });
+
+    const res = await svc.sweep();
+
+    expect(res.suspended).toBe(0);
+    expect(tx.subscription.updateMany).not.toHaveBeenCalled();
+    expect(effects.suspendApps).not.toHaveBeenCalled();
+    expect(mail.sendPlain).not.toHaveBeenCalled();
+    expect(audit.record).not.toHaveBeenCalledWith(
+      expect.objectContaining({ action: 'subscription.auto_suspend' }),
+    );
+  });
+
+  it('Q5 : arr\u00eats bloqu\u00e9s/\u00e9chou\u00e9s \u2192 email honn\u00eate (jamais « acc\u00e8s suspendu »)', async () => {
+    stubSweepPasses([overdueInvoice()]);
+    suspendTx({
+      invoiceRow: {
+        id: 'inv-overdue',
+        status: 'UNPAID',
+        dueDate: new Date('2026-01-01T00:00:00.000Z'),
+        subscriptionId: 'sub-1',
+        orderId: 'ord-1',
+      },
+      subRow: { id: 'sub-1', status: 'ACTIVE', orderId: 'ord-1' },
+      subResolve: { id: 'sub-1' },
+    });
+    effects.suspendApps.mockResolvedValueOnce({ apps: 2, done: 0, blocked: 1, failed: 1 });
+
+    const res = await svc.sweep();
+
+    expect(res.suspended).toBe(1);
+    const text = mail.sendPlain.mock.calls[0][0].text as string;
+    expect(text).toMatch(/bloqu\u00e9 ou en \u00e9chec/);
+    expect(text).not.toMatch(/acc[eè]s est suspendu/);
+  });
+
+  it('Q5 : \u00e9chec des effets provider \u2192 suspension maintenue, sweep non cass\u00e9', async () => {
+    stubSweepPasses([overdueInvoice()]);
+    suspendTx({
+      invoiceRow: {
+        id: 'inv-overdue',
+        status: 'UNPAID',
+        dueDate: new Date('2026-01-01T00:00:00.000Z'),
+        subscriptionId: 'sub-1',
+        orderId: 'ord-1',
+      },
+      subRow: { id: 'sub-1', status: 'ACTIVE', orderId: 'ord-1' },
+      subResolve: { id: 'sub-1' },
+    });
+    effects.suspendApps.mockRejectedValueOnce(new Error('panel down'));
+
+    const res = await svc.sweep();
+
+    expect(res.suspended).toBe(1);
+    expect(audit.record).toHaveBeenCalledWith(
+      expect.objectContaining({ action: 'subscription.auto_suspend' }),
+    );
+    expect(mail.sendPlain).toHaveBeenCalledTimes(1);
   });
 
   // ── 5. Ordonnanceur ───────────────────────────────────────────────────────

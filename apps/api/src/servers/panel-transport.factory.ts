@@ -182,6 +182,16 @@ export abstract class PanelTransport {
    *  l'échec réseau n'empêche pas la suppression locale. */
   abstract deleteApplication(target: PanelTarget, uuid: string): Promise<void>;
 
+  // Q5 (GO item 5) — suspension/réactivation RÉVERSIBLES d'une application :
+  // arrêt/relance du conteneur via le panneau, JAMAIS de suppression de
+  // ressources ni de données. COOLIFY uniquement ; un panneau sans cette
+  // capacité lève une erreur EXPLICITE (blocage visible, jamais de faux succès).
+  /** Arrêt réversible de l'application (GO : « arrêt réversible des
+   *  applications concernées »). Aucune suppression. */
+  abstract stopApplication(target: PanelTarget, uuid: string): Promise<void>;
+  /** Relance de l'application suspendue (GO : « réactivation contrôlée »). */
+  abstract startApplication(target: PanelTarget, uuid: string): Promise<void>;
+
   // Phase 13 — projets Coolify (COOLIFY uniquement).
   abstract listProjects(target: PanelTarget): Promise<CoolifyProject[]>;
   /** Liste les serveurs Coolify (uuid + nom). Utilisée pour AUTO-DÉTECTER le
@@ -760,6 +770,55 @@ class NodePanelTransport extends PanelTransport {
     if (status !== 200 && status !== 204) {
       throw new Error(
         `Coolify API : suppression de l'application refusée (HTTP ${status})${body ? ` — ${body.slice(0, 200)}` : ''}`,
+      );
+    }
+  }
+
+  /**
+   * Q5 (GO item 5) — arrêt RÉVERSIBLE d'une application Coolify
+   * (`POST /applications/:uuid/stop`). Aucune suppression : seules les données
+   * et la ressource sont conservées, la relance (`startApplication`) est
+   * possible. Panneau non Coolify (Hestia…) → erreur EXPLICITE portée par
+   * `assertCoolify` (capacité provider manquante = blocage visible).
+   */
+  async stopApplication(target: PanelTarget, uuid: string): Promise<void> {
+    this.assertCoolify(target);
+    const base = target.baseUrl.replace(/\/+$/, '');
+    const { status, body } = await httpJson(
+      'POST',
+      `${base}/applications/${encodeURIComponent(uuid)}/stop`,
+      { Authorization: `Bearer ${target.token}` },
+      target.strictTls,
+      this.timeoutMs,
+      JSON.stringify({ uuid }),
+    );
+    if (status !== 200 && status !== 201 && status !== 204) {
+      throw new Error(
+        `Coolify API : arrêt de l'application refusé (HTTP ${status})${body ? ` — ${body.slice(0, 200)}` : ''}`,
+      );
+    }
+  }
+
+  /**
+   * Q5 (GO item 5) — relance d'une application Coolify suspendue
+   * (`POST /applications/:uuid/start`). Mêmes contrats que `stopApplication`
+   * (réversible, aucun appel réseau de suppression, capacité manquante = erreur
+   * explicite).
+   */
+  async startApplication(target: PanelTarget, uuid: string): Promise<void> {
+    this.assertCoolify(target);
+    const base = target.baseUrl.replace(/\/+$/, '');
+    const { status, body } = await httpJson(
+      'POST',
+      `${base}/applications/${encodeURIComponent(uuid)}/start`,
+      { Authorization: `Bearer ${target.token}` },
+      target.strictTls,
+      this.timeoutMs,
+      JSON.stringify({ uuid }),
+    );
+    if (status !== 200 && status !== 201 && status !== 204) {
+      throw new Error(
+        `Coolify API : relance de l'application refusée (HTTP ${status})${body ? ` — ${body.slice(0, 200)}` : ''}`,
       );
     }
   }

@@ -48,6 +48,8 @@ describe('Server panel verify (e2e, Phase 9)', () => {
       setAppDomain: jest.fn(),
       deleteApplication: jest.fn(),
       deploymentStatus: jest.fn(),
+      stopApplication: jest.fn().mockResolvedValue(undefined),
+      startApplication: jest.fn().mockResolvedValue(undefined),
     }),
   } as unknown as PanelTransportFactory;
 
