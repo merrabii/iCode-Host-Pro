@@ -2,7 +2,7 @@
 
 **Date :** 2026-10-04 · **Branche :** `feat/socle-commercial` (worktree `C:\Users\mourad.errabii\Documents\iCode-Host-Recette`)
 **Base :** `icode_host_pro_socle` (docker `icode-postgres`) — 52 migrations · **Base recette UI :** `icode_host_pro_recette` (52 migrations depuis P10)
-**Commits (10) :** `86c9f61` (A0) → `17f1bf2` (P2) → `792dab8` (P3) → `4b931e1` (P4) → `9d96a83` (P5) → `d5fdae1` (P6) → `62d68fb` (P7) → `d8b55e4` (P8) → `763ae38` (P9) → `d989dbe` (P10, clôture/docs) — **aucun push, aucun merge** (`main` = `3245694` intact).
+**Commits :** `86c9f61` (A0) → `17f1bf2` (P2) → `792dab8` (P3) → `4b931e1` (P4) → `9d96a83` (P5) → `d5fdae1` (P6) → `62d68fb` (P7) → `d8b55e4` (P8) → `763ae38` (P9) → `d989dbe` (P10, clôture/docs) → correctifs de fin de session (liste exacte : `git log main..HEAD`) — **aucun push, aucun merge** (`main` = `3245694` intact).
 **Diff complet :** `main...HEAD` = **93 fichiers, +15 848 / −355** (patch : `recette/diff-socle-commercial.patch`).
 **Portée :** socle commercial de bout en bout (sécurité/paiement → comptes → visibilité → tarifs → factures → portefeuille → recharges → abonnements → exploitation/CI), cadres GO P0→P10 respectés.
 
