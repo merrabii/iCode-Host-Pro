@@ -1671,3 +1671,16 @@ model C4ReadinessProof {
   evidence      Json
   observedAt    DateTime @default(now())
 }
+
+// ── Q6 (GO item 6) — verrou de passe MULTI-PROCESSUS des sweeps ────────────
+// Le booléen `running` local n'est qu'une passe rapide ; l'exclusion réelle
+// entre processus (plusieurs instances API/worker) est une row CAS en base
+// (lease à expiration : un porteur libère la passe au plus tard après le TTL).
+// Les invariants métier restent garantis par les CAS par ligne (expiration,
+// dunning, suspension, création de renouvellement, clé wallet), jamais par ce
+// booléen. Additive, sans relation — compatibilité des bases pré-socle.
+model SweepLease {
+  name      String   @id
+  holder    String
+  expiresAt DateTime
+}

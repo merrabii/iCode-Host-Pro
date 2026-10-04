@@ -5,8 +5,9 @@
 #  - aucune seed n'est nécessaire : chaque spec crée ses fixtures ;
 #  - MailTransportFactory / PanelTransportFactory sont stubbés dans les specs
 #    (aucun SMTP ni panneau réel) ;
-#  - les timers (sweep commande + renouvellement) sont désactivés ci-dessous :
-#    les specs pilotent les sweeps à la main ;
+#  - les timers (sweep commande + renouvellement) sont OFF par défaut (Q6,
+#    activation explicite =true) ; les `false` ci-dessous restent posés à titre
+#    défensif et explicite — les specs pilotent les sweeps à la main ;
 #  - PAYMENT_SIMULATOR_ENABLED n'est PAS défini : les specs le pilotent elles-
 #    mêmes (activation/refus) ;
 #  - `next build` n'est PAS exécuté (voir mémoire de chantier) : la validation

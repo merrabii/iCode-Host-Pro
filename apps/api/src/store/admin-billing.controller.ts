@@ -281,9 +281,11 @@ export class AdminBillingController {
 
   /**
    * P8 (lot D2) — déclenche un passage du scheduler de renouvellement /
-   * dunning / suspension (idempotent, anti-chevauchement local). En prod le
-   * timer (`RENEWAL_SWEEP_ENABLED`, défaut actif) enchaîne ces passages ; cette
-   * route permet l'horloge accélérée des recettes et la relance manuelle.
+   * dunning / suspension (idempotent ; mêmes gardes que le timer : prérequis
+   * de schéma + lease multi-processus `SweepLease`, Q6). En prod le timer
+   * (**OFF par défaut** — activation explicite `RENEWAL_SWEEP_ENABLED=true`)
+   * enchaîne ces passages ; cette route permet l'horloge accélérée des
+   * recettes et la relance manuelle.
    */
   @Post('renewal/sweep')
   @ApiOperation({ summary: 'Déclenche un passage renouvellement/dunning (P8)' })

@@ -13,13 +13,15 @@ import { WalletService } from '../wallet/wallet.service';
 import { CheckoutService } from './checkout.service';
 import { addBillingCycle } from './billing-cycle';
 import { SuspensionEffectsService } from './suspension-effects.service';
+import { RENEWAL_SCHEMA } from './sweep-guards';
 import {
   RENEWAL_SWEEP_ENABLED_ENV,
+  RENEWAL_SWEEP_MS_ENV,
   RenewalService,
 } from './renewal.service';
 
 /**
- * P8 (lot D2) + Q-A (GO items 1/4) — matrice de décision du scheduler :
+ * P8 (lot D2) + Q-A (GO items 1/4) + Q5/Q6 — matrice de décision du scheduler :
  *   - arrêt de chaîne (aucune souscription liée / produit changé) CAS idempotent ;
  *   - suspension admin = on n'arrête JAMAIS la chaîne (résumable) ;
  *   - création + paiement ATOMIQUE (`checkout.payOrderWithWallet` = débit +
@@ -33,7 +35,10 @@ import {
  *     sérialisée), services hébergement dans la MÊME tx, effets provider
  *     post-commit via SuspensionEffectsService (arrêt réversible, aucune
  *     suppression), email SANS revendication d'« accès suspendu » ;
- *   - anti-chevauchement local + coupe-timer d'isolement de test.
+ *   - Q6 (GO item 6) : timer OFF par défaut (activation explicite `=true`),
+ *     prérequis de schéma avant toute mutation, exclusion multi-processus par
+ *     lease `SweepLease` en base (le booléen `running` local n'est qu'une
+ *     passe rapide) + coupe-timer d'isolement de test.
  */
 describe('RenewalService (D2 — échéances, renouvellement, dunning)', () => {
   let prisma: {
@@ -48,7 +53,9 @@ describe('RenewalService (D2 — échéances, renouvellement, dunning)', () => {
     walletTransaction: { findFirst: jest.Mock };
     billingSetting: { findFirst: jest.Mock };
     orderStatusHistory: { create: jest.Mock };
+    sweepLease: { updateMany: jest.Mock; findUnique: jest.Mock; create: jest.Mock };
     $transaction: jest.Mock;
+    $queryRaw: jest.Mock;
   };
   let audit: { record: jest.Mock };
   let wallet: { debit: jest.Mock; credit: jest.Mock };
@@ -116,6 +123,7 @@ describe('RenewalService (D2 — échéances, renouvellement, dunning)', () => {
   });
 
   beforeEach(async () => {
+    delete process.env[RENEWAL_SWEEP_ENABLED_ENV]; // héréditarité d'un worker
     prisma = {
       order: {
         findMany: jest.fn(async () => []),
@@ -128,10 +136,28 @@ describe('RenewalService (D2 — échéances, renouvellement, dunning)', () => {
       walletTransaction: { findFirst: jest.fn(async () => null) },
       billingSetting: { findFirst: jest.fn(async () => settings()) },
       orderStatusHistory: { create: jest.fn() },
+      // Q6 : lease de passe multi-processus (par défaut = pas de row → création → token).
+      sweepLease: {
+        updateMany: jest.fn(async () => ({ count: 0 })),
+        findUnique: jest.fn(async () => null),
+        create: jest.fn(async () => ({})),
+      },
       $transaction: jest.fn(async (cb: (tx: unknown) => Promise<unknown>) => {
         const tx = txStub();
         lastTx = tx;
         return cb(tx);
+      }),
+      // Q6 : probe `information_schema` des prérequis (les autres requêtes
+      // raw du domaine passent par les TX mockées ci-dessous).
+      $queryRaw: jest.fn(async (strings: TemplateStringsArray, ...values: unknown[]) => {
+        const sql = strings.join(' ');
+        if (sql.includes('information_schema.columns')) {
+          const table = String(values[0]);
+          const req = RENEWAL_SCHEMA.find((r) => r.table === table);
+          if (!req) return [];
+          return (req.columns ?? ['id']).map((c) => ({ column_name: c }));
+        }
+        return [{ next: 42 }];
       }),
     };
     lastTx = null;
@@ -639,7 +665,26 @@ describe('RenewalService (D2 — échéances, renouvellement, dunning)', () => {
     await first;
   });
 
-  it('RENEWAL_SWEEP_ENABLED=false \u2192 aucun timer au démarrage', () => {
+  // ── Q6 (GO item 6) : activation explicite + prérequis + lease ─────────────
+
+  it('Q6 : configuration ABSENTE → aucun timer au démarrage (aucune mutation auto)', () => {
+    delete process.env[RENEWAL_SWEEP_ENABLED_ENV];
+    const spy = jest.spyOn(global, 'setInterval');
+    try {
+      svc.onModuleInit();
+      expect(spy).not.toHaveBeenCalled();
+      expect((svc as unknown as { timer: unknown }).timer).toBeNull();
+      // Aucune lecture/écriture immédiate au boot : zéro expiration, zéro
+      // débit, zéro suspension, zéro provisionnement.
+      expect(prisma.order.findMany).not.toHaveBeenCalled();
+      expect(prisma.invoice.findMany).not.toHaveBeenCalled();
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('RENEWAL_SWEEP_ENABLED=false → aucun timer au démarrage', () => {
     process.env[RENEWAL_SWEEP_ENABLED_ENV] = 'false';
     const spy = jest.spyOn(global, 'setInterval');
     try {
@@ -650,6 +695,102 @@ describe('RenewalService (D2 — échéances, renouvellement, dunning)', () => {
       spy.mockRestore();
       delete process.env[RENEWAL_SWEEP_ENABLED_ENV];
     }
+  });
+
+  it('Q6 : activation explicite =true → timer planifié à l’intervalle, arrêt propre', () => {
+    process.env[RENEWAL_SWEEP_ENABLED_ENV] = 'true';
+    process.env[RENEWAL_SWEEP_MS_ENV] = '123456';
+    const spy = jest.spyOn(global, 'setInterval');
+    try {
+      svc.onModuleInit();
+      expect(spy).toHaveBeenCalledWith(expect.any(Function), 123456);
+      expect((svc as unknown as { timer: unknown }).timer).not.toBeNull();
+    } finally {
+      svc.onModuleDestroy();
+      spy.mockRestore();
+      delete process.env[RENEWAL_SWEEP_ENABLED_ENV];
+      delete process.env[RENEWAL_SWEEP_MS_ENV];
+    }
+    expect((svc as unknown as { timer: unknown }).timer).toBeNull();
+  });
+
+  it('Q6 : prérequis de schéma absents → AUCUNE mutation (zéro passe, zéro lease)', async () => {
+    // La probe `information_schema` ne voit pas les colonnes exigées.
+    prisma.$queryRaw.mockImplementation(async (strings: TemplateStringsArray) => {
+      if (strings.join(' ').includes('information_schema.columns')) return [];
+      return [{ next: 42 }];
+    });
+
+    const res = await svc.sweep();
+
+    expect(res).toEqual({ created: 0, paid: 0, pending: 0, reminded: 0, suspended: 0, stopped: 0 });
+    expect(prisma.order.findMany).not.toHaveBeenCalled();
+    expect(prisma.invoice.findMany).not.toHaveBeenCalled();
+    expect(prisma.billingSetting.findFirst).not.toHaveBeenCalled();
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+    expect(prisma.sweepLease.updateMany).not.toHaveBeenCalled(); // même le lease n'est pas écrit
+    expect(prisma.sweepLease.create).not.toHaveBeenCalled();
+  });
+
+  it('Q6 : lease tenu par un AUTRE processus → passage refusé (aucune passe)', async () => {
+    prisma.sweepLease.updateMany.mockResolvedValueOnce({ count: 0 }); // steal : row vivante
+    prisma.sweepLease.findUnique.mockResolvedValueOnce({
+      name: 'renewal',
+      holder: 'process- autre',
+      expiresAt: new Date(Date.now() + 60_000),
+    });
+
+    const res = await svc.sweep();
+
+    expect(res).toEqual({ created: 0, paid: 0, pending: 0, reminded: 0, suspended: 0, stopped: 0 });
+    expect(prisma.order.findMany).not.toHaveBeenCalled();
+    expect(prisma.invoice.findMany).not.toHaveBeenCalled();
+    // Le perdant ne libère PAS le lease d'un autre porteur.
+    expect(prisma.sweepLease.updateMany).toHaveBeenCalledTimes(1);
+  });
+
+  it('Q6 : lease non acquérable (base indisponible / course de création) → aucun passage', async () => {
+    // Course de création : steal 0, pas de row, la création échoue (P2002).
+    prisma.sweepLease.create.mockRejectedValueOnce(new Error('duplicate key'));
+
+    const res = await svc.sweep();
+
+    expect(res).toEqual({ created: 0, paid: 0, pending: 0, reminded: 0, suspended: 0, stopped: 0 });
+    expect(prisma.order.findMany).not.toHaveBeenCalled();
+    expect(prisma.sweepLease.updateMany).toHaveBeenCalledTimes(1); // steal seulement, pas de release
+  });
+
+  it('Q6 : lease acquis puis LIBÉRÉ en fin de passage (finally)', async () => {
+    stubSweepPasses([]);
+
+    await svc.sweep();
+
+    // Release : row conditionnée par le jeton du porteur, expiration à l'époque.
+    expect(prisma.sweepLease.updateMany).toHaveBeenCalledWith({
+      where: { name: 'renewal', holder: expect.any(String) },
+      data: { expiresAt: new Date(0) },
+    });
+  });
+
+  it('Q6 : échec d’une passe → lease LIBÉRÉ et running réinitialisé (finally)', async () => {
+    prisma.order.findMany.mockRejectedValueOnce(new Error('db down'));
+
+    await expect(svc.sweep()).rejects.toThrow('db down');
+
+    expect(prisma.sweepLease.updateMany).toHaveBeenCalledWith({
+      where: { name: 'renewal', holder: expect.any(String) },
+      data: { expiresAt: new Date(0) },
+    });
+    // Le verrou local est relâché : le sweep suivant repasse les gardes.
+    stubSweepPasses([]);
+    await expect(svc.sweep()).resolves.toEqual({
+      created: 0,
+      paid: 0,
+      pending: 0,
+      reminded: 0,
+      suspended: 0,
+      stopped: 0,
+    });
   });
 });
 

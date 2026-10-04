@@ -21,12 +21,21 @@ import { MailSettingsService } from '../mail/mail-settings.service';
 import { CheckoutService } from './checkout.service';
 import { claimInvoiceSequence } from './invoice-sequence';
 import { SuspensionEffectsService, applyHostingStatusInTx } from './suspension-effects.service';
+import {
+  RENEWAL_SCHEMA,
+  acquireSweepLease,
+  releaseSweepLease,
+  sweepSchemaPrereqsOk,
+} from './sweep-guards';
 import { clientAreaUrl } from './web-links';
 
 /** Env : période du scheduler de renouvellement (ms). `0`/absente → 60000. */
 export const RENEWAL_SWEEP_MS_ENV = 'RENEWAL_SWEEP_MS';
-/** Env : `RENEWAL_SWEEP_ENABLED=false` coupe le timer (tests isolés). */
+/** Env : ACTIVATION EXPLICITE du timer (Q6, GO item 6). Absent ≠ 'true' → aucun timer. */
 export const RENEWAL_SWEEP_ENABLED_ENV = 'RENEWAL_SWEEP_ENABLED';
+
+/** Nom de la row `SweepLease` de ce sweep (exclusion multi-processus). */
+export const RENEWAL_SWEEP_LEASE = 'renewal';
 
 /** Jours bornés (0..3650) — valeur non numérique → repli par défaut. */
 function clampDays(value: unknown, fallback: number): number {
@@ -75,9 +84,14 @@ function clampDays(value: unknown, fallback: number): number {
  * réellement constaté (arrêt confirmé / bloqué / échec visible). Toute
  * réactivation est contrôlée (whitelist admin) et rejoue la relance des apps.
  *
- * Timer simple (`setInterval`, sans dépendance), anti-chevauchement local,
- * désactivable par `RENEWAL_SWEEP_ENABLED=false` ; `sweep()` est PUBLIC et
- * testable directement (horloge accélérée = échéance rétrogradée en base).
+ * Timer simple (`setInterval`, sans dépendance) **OFF par défaut (Q6, GO
+ * item 6)** : il ne démarre QUE sur activation explicite
+ * (`RENEWAL_SWEEP_ENABLED=true`). L'exclusion multi-processus repose sur le
+ * lease en base `SweepLease` (le booléen `running` local n'est qu'une passe
+ * rapide ; les invariants métier, eux, sont garantis par les CAS par ligne de
+ * chaque passe) et les prérequis de schéma sont probeés avant toute mutation.
+ * `sweep()` reste PUBLIC et testable directement (horloge accélérée =
+ * échéance rétrogradée en base), y compris via l'endpoint admin.
  */
 @Injectable()
 export class RenewalService implements OnModuleInit, OnModuleDestroy {
@@ -94,7 +108,10 @@ export class RenewalService implements OnModuleInit, OnModuleDestroy {
   ) {}
 
   onModuleInit(): void {
-    if (process.env[RENEWAL_SWEEP_ENABLED_ENV] === 'false') return;
+    // Q6 (GO item 6) : ACTIVATION EXPLICITE — sans `=true` exact, AUCUN timer
+    // (aucun renouvellement, aucun débit, aucun dunning, aucune suspension
+    // automatique au démarrage).
+    if (process.env[RENEWAL_SWEEP_ENABLED_ENV] !== 'true') return;
     const raw = process.env[RENEWAL_SWEEP_MS_ENV];
     const ms = raw === undefined ? 60_000 : Number(raw);
     if (!Number.isFinite(ms) || ms <= 0) return;
@@ -109,7 +126,14 @@ export class RenewalService implements OnModuleInit, OnModuleDestroy {
     this.timer = null;
   }
 
-  /** Un passage complet. Idempotent, anti-chevauchement local. */
+  /**
+   * Un passage complet. Idempotent.
+   * Ordre des gardes (Q6) : booléen local (passe rapide) → **prérequis de
+   * schéma avant toute mutation** → **lease multi-processus** (`SweepLease`)
+   * → passes. Chaque mutation individuelle reste en CAS/verrou par ligne
+   * (autoRenew, dunningRemindedAt, verrous `FOR UPDATE`, clé wallet) : les
+   * invariants tiennent même si deux processus se chevauchent autour du lease.
+   */
   async sweep(): Promise<{
     created: number;
     paid: number;
@@ -118,8 +142,18 @@ export class RenewalService implements OnModuleInit, OnModuleDestroy {
     suspended: number;
     stopped: number;
   }> {
-    if (this.running) {
-      return { created: 0, paid: 0, pending: 0, reminded: 0, suspended: 0, stopped: 0 };
+    const zero = { created: 0, paid: 0, pending: 0, reminded: 0, suspended: 0, stopped: 0 };
+    if (this.running) return zero;
+    // 1. Prérequis de schéma AVANT toute mutation (base pré-socle → skip).
+    if (!(await sweepSchemaPrereqsOk(this.prisma, RENEWAL_SCHEMA))) {
+      this.log.warn('renewal sweep: prérequis de schéma absents — passage ignoré');
+      return zero;
+    }
+    // 2. Exclusion réelle entre processus (lease à expiration en base).
+    const lease = await acquireSweepLease(this.prisma, RENEWAL_SWEEP_LEASE);
+    if (!lease) {
+      this.log.warn('renewal sweep: passe déjà en cours (autre processus) — passage ignoré');
+      return zero;
     }
     this.running = true;
     try {
@@ -137,6 +171,7 @@ export class RenewalService implements OnModuleInit, OnModuleDestroy {
       };
     } finally {
       this.running = false;
+      await releaseSweepLease(this.prisma, RENEWAL_SWEEP_LEASE, lease);
     }
   }
 

@@ -3,11 +3,22 @@ import { InvoiceStatus, OrderStatus } from '@prisma/client';
 import { AuditService } from '../audit/audit.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { ProvisioningService } from './provisioning.service';
+import {
+  ORDER_LIFECYCLE_SCHEMA,
+  acquireSweepLease,
+  releaseSweepLease,
+  sweepSchemaPrereqsOk,
+} from './sweep-guards';
 
-/** Env : période du sweep de reprise (ms). `0`/absente→60000 ; désactivable. */
+/** Env : période du sweep de reprise (ms). `0`/absente→60000. */
 export const ORDER_SWEEP_MS_ENV = 'ORDER_SWEEP_MS';
+/** Env : ACTIVATION EXPLICITE du timer (Q6, GO item 6). Absent ≠ 'true' → aucun timer. */
+export const ORDER_SWEEP_ENABLED_ENV = 'ORDER_SWEEP_ENABLED';
 /** Env : durée de grâce des commandes en attente de règlement (heures). */
 export const PENDING_PAYMENT_TTL_HOURS_ENV = 'PENDING_PAYMENT_TTL_HOURS';
+
+/** Nom de la row `SweepLease` de ce sweep (exclusion multi-processus). */
+export const ORDER_SWEEP_LEASE = 'order-lifecycle';
 
 /** Commande PAID « confirmée mais non lancée » depuis ce délai → relance. */
 export const RELAUNCH_AFTER_MS = 2 * 60_000;
@@ -28,9 +39,12 @@ export const RELAUNCH_AFTER_MS = 2 * 60_000;
  *     double exécution (`ProvisioningService.provisionOrder` est idempotent :
  *     `PROVISIONING`/`ACTIVE` → no-op).
  *
- * Timer simple (`setInterval`, sans dépendance), anti-chevauchement local,
- * désactivable par `ORDER_SWEEP_ENABLED=false` (tests isolés). Le sweep est
- * PUBLIC et testable directement (`sweep()`).
+ * Timer simple (`setInterval`, sans dépendance) **OFF par défaut (Q6, GO
+ * item 6)** : il ne démarre QUE sur activation explicite
+ * (`ORDER_SWEEP_ENABLED=true`). L'exclusion multi-processus repose sur le
+ * lease en base `SweepLease` (le booléen `running` local n'est qu'une passe
+ * rapide) et les prérequis de schéma sont probeés avant toute mutation ;
+ * `sweep()` reste PUBLIC et testable directement.
  */
 @Injectable()
 export class OrderLifecycleService implements OnModuleInit, OnModuleDestroy {
@@ -45,7 +59,10 @@ export class OrderLifecycleService implements OnModuleInit, OnModuleDestroy {
   ) {}
 
   onModuleInit(): void {
-    if (process.env.ORDER_SWEEP_ENABLED === 'false') return;
+    // Q6 (GO item 6) : ACTIVATION EXPLICITE — sans `=true` exact, AUCUN timer
+    // (aucune expiration, aucun débit, aucune suspension, aucune provision
+    // automatique au démarrage).
+    if (process.env[ORDER_SWEEP_ENABLED_ENV] !== 'true') return;
     const raw = process.env[ORDER_SWEEP_MS_ENV];
     const ms = raw === undefined ? 60_000 : Number(raw);
     if (!Number.isFinite(ms) || ms <= 0) return;
@@ -61,9 +78,26 @@ export class OrderLifecycleService implements OnModuleInit, OnModuleDestroy {
     this.timer = null;
   }
 
-  /** Un passage de reprise. Idempotent, anti-chevauchement local. */
+  /**
+   * Un passage de reprise. Idempotent.
+   * Ordre des gardes (Q6) : booléen local (passe rapide) → **prérequis de
+   * schéma avant toute mutation** → **lease multi-processus** (`SweepLease`)
+   * → passes. Chaque mutation individuelle reste en CAS par ligne : les
+   * invariants tiennent même si deux processus se chevauchent autour du lease.
+   */
   async sweep(): Promise<{ expired: number; relaunched: number }> {
     if (this.running) return { expired: 0, relaunched: 0 };
+    // 1. Prérequis de schéma AVANT toute mutation (base pré-socle → skip).
+    if (!(await sweepSchemaPrereqsOk(this.prisma, ORDER_LIFECYCLE_SCHEMA))) {
+      this.log.warn('sweep: prérequis de schéma absents — passage ignoré');
+      return { expired: 0, relaunched: 0 };
+    }
+    // 2. Exclusion réelle entre processus (lease à expiration en base).
+    const lease = await acquireSweepLease(this.prisma, ORDER_SWEEP_LEASE);
+    if (!lease) {
+      this.log.warn('sweep: passe déjà en cours (autre processus) — passage ignoré');
+      return { expired: 0, relaunched: 0 };
+    }
     this.running = true;
     try {
       const expired = await this.expireStalePending();
@@ -71,6 +105,7 @@ export class OrderLifecycleService implements OnModuleInit, OnModuleDestroy {
       return { expired, relaunched };
     } finally {
       this.running = false;
+      await releaseSweepLease(this.prisma, ORDER_SWEEP_LEASE, lease);
     }
   }
 
@@ -96,12 +131,15 @@ export class OrderLifecycleService implements OnModuleInit, OnModuleDestroy {
     let expired = 0;
     for (const o of stale) {
       try {
-        await this.prisma.$transaction(async (tx) => {
+        // La transaction retourne un booléen : CAS gagné UNIQUEMENT (Q6 :
+        // sous concurrence multi-processus, le perdant n'AUDITE PAS une
+        // transition qu'il n'a pas faite et ne gonfle pas son compteur).
+        const done = await this.prisma.$transaction(async (tx) => {
           const cas = await tx.order.updateMany({
             where: { id: o.id, status: OrderStatus.PENDING_PAYMENT },
             data: { status: OrderStatus.CANCELLED },
           });
-          if (cas.count !== 1) return;
+          if (cas.count !== 1) return false;
           await tx.invoice.updateMany({
             where: { orderId: o.id, status: InvoiceStatus.UNPAID },
             data: { status: InvoiceStatus.CANCELLED },
@@ -114,7 +152,9 @@ export class OrderLifecycleService implements OnModuleInit, OnModuleDestroy {
               actorEmail: null,
             },
           });
+          return true;
         });
+        if (!done) continue;
         await this.audit.record({
           action: 'order.expired',
           resourceType: 'order',
@@ -129,7 +169,12 @@ export class OrderLifecycleService implements OnModuleInit, OnModuleDestroy {
     return expired;
   }
 
-  /** PAID restée immobile > 2 min → relance du provisioning (idempotent). */
+  /**
+   * PAID restée immobile > 2 min → relance du provisioning (idempotent).
+   * L'audit `order.relaunch_provisioning` trace la TENTATIVE (sous concurrence
+   * multi-processus deux tentatives peuvent être tracées — les transitions
+   * d'état, elles, restent protégées par les CAS/claims de `provisionOrder`).
+   */
   private async relaunchStuckPaid(): Promise<number> {
     const cutoff = new Date(Date.now() - RELAUNCH_AFTER_MS);
     const stuck = await this.prisma.order.findMany({
