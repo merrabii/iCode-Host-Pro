@@ -172,6 +172,7 @@ describe('Règlement par solde portefeuille (e2e, Q-A)', () => {
     await request(app.getHttpServer())
       .post(`/${GlobalPrefix}/store/admin/wallet/recharges/${created.body.id}/validate`)
       .set('Authorization', `Bearer ${adminToken}`)
+      .send({ bankRef: `BANK-Q8-FUND-${created.body.id}` })
       .expect(201);
   }
 

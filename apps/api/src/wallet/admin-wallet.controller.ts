@@ -22,7 +22,11 @@ import { JwtPayload } from '../auth/types';
 import { AuditService } from '../audit/audit.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { WalletService } from './wallet.service';
-import { AdminRechargeQueryDto, RejectRechargeDto } from './dto/wallet.dto';
+import {
+  AdminRechargeQueryDto,
+  RejectRechargeDto,
+  ValidateRechargeDto,
+} from './dto/wallet.dto';
 
 const RECHARGE_SELECT = {
   id: true,
@@ -31,6 +35,7 @@ const RECHARGE_SELECT = {
   currency: true,
   status: true,
   reference: true,
+  bankRef: true,
   methodName: true,
   proofFileName: true,
   note: true,
@@ -131,23 +136,33 @@ export class AdminWalletController {
 
   @Post('recharges/:id/validate')
   @ApiOperation({
-    summary: 'Valider une recharge → crédit unique (ADMIN, C3a)',
+    summary:
+      'Valider une recharge → crédit unique (ADMIN, C3a/Q8 : référence de rapprochement bancaire requise)',
   })
   async validate(
     @Param('id') id: string,
+    @Body() dto: ValidateRechargeDto,
     @CurrentUser() actor: JwtPayload,
   ) {
-    const result = await this.wallet.validateRecharge(id, {
-      sub: actor.sub,
-      email: actor.email,
-    });
+    const result = await this.wallet.validateRecharge(
+      id,
+      { sub: actor.sub, email: actor.email },
+      dto.bankRef,
+    );
     await this.audit.record({
       actorId: actor.sub,
       actorEmail: actor.email,
       action: 'wallet.recharge.validate',
       resourceType: 'walletTransaction',
       resourceId: id,
-      details: { balanceCents: result.balanceCents },
+      details: {
+        balanceCents: result.balanceCents,
+        // GO Q8 — rapprochement bancaire : encaissement constaté (référence,
+        // montant, devise) + acteur déjà porté sur la ligne.
+        bankRef: result.bankRef,
+        amountCents: result.amountCents,
+        currency: result.currency,
+      },
     });
     return { ok: true, ...result };
   }

@@ -1,4 +1,4 @@
-import { Type } from 'class-transformer';
+import { Transform, Type } from 'class-transformer';
 import { WalletTxStatus } from '@prisma/client';
 import {
   IsIn,
@@ -8,6 +8,7 @@ import {
   Max,
   MaxLength,
   Min,
+  MinLength,
 } from 'class-validator';
 
 /**
@@ -33,6 +34,20 @@ export class RejectRechargeDto {
   @IsString()
   @MaxLength(280)
   reason?: string;
+}
+
+/**
+ * GO Q8 — validation admin : référence de rapprochement bancaire OBLIGATOIRE
+ * (unicité DB = un encaissement ne finance qu'un crédit). Le montant, la
+ * devise et l'acteur sont déjà figés sur la ligne ; ce DTO n'ajoute que la
+ * preuve du rapprochement.
+ */
+export class ValidateRechargeDto {
+  @Transform(({ value }) => (typeof value === 'string' ? value.trim() : value))
+  @IsString()
+  @MinLength(3)
+  @MaxLength(64)
+  bankRef!: string;
 }
 
 /** Pagination stricte (convention P4 : page=0 → 400, perPage borné à 200). */

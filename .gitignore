@@ -44,3 +44,10 @@ Thumbs.db
 
 # --- artefacts locaux de debug (ne pas versionner) ---
 .tools/
+
+# --- stockage privé GO Q8 : justificatifs & factures JAMAIS versionnés, ---
+# --- JAMAIS dans un répertoire public (les anciens emplacements restent     ---
+# --- ignorés pour les artefacts locaux produits avant la migration Q8) ---
+apps/api/storage/
+apps/api/public/wallet-proofs/
+apps/api/public/invoices/

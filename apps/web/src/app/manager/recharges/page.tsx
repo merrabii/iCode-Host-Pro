@@ -94,22 +94,36 @@ export default function ManagerRechargesPage() {
   };
 
   const validate = async (row: RechargeItem) => {
+    // GO Q8 — la validation exige la référence de rapprochement bancaire de
+    // l'encaissement RÉELLEMENT constaté (unicité serveur : un virement ne
+    // peut créditer qu'une recharge).
+    const bankRef = window.prompt(
+      `Référence de rapprochement bancaire constatée pour ${row.reference} (${row.customer.email}, ${(row.amountCents / 100).toFixed(2)} ${row.currency}) :`,
+    );
+    if (bankRef === null) return;
+    const ref = bankRef.trim();
+    if (ref.length < 3 || ref.length > 64) {
+      toast.error('Référence de rapprochement bancaire requise (3 à 64 caractères).');
+      return;
+    }
     if (
       !window.confirm(
-        `Créditer ${row.customer.email} de ${(row.amountCents / 100).toFixed(2)} ${row.currency} (réf. ${row.reference}) ?`,
+        `Créditer ${row.customer.email} de ${(row.amountCents / 100).toFixed(2)} ${row.currency} (réf. ${row.reference}, encaissement ${ref}) ?`,
       )
     ) {
       return;
     }
     setBusyId(row.id);
-    const r = await validateAdminRecharge(token, row.id);
+    const r = await validateAdminRecharge(token, row.id, ref);
     setBusyId(null);
     if (!r.ok) {
       toast.error(apiError(r, 'Validation impossible.'));
       await load(token, page, status, q);
       return;
     }
-    toast.ok(`Recharge créditée — nouveau solde ${r.data ? (r.data.balanceCents / 100).toFixed(2) : ''} ${row.currency}.`);
+    toast.ok(
+      `Recharge créditée (encaissement ${ref}) — nouveau solde ${r.data ? (r.data.balanceCents / 100).toFixed(2) : ''} ${row.currency}.`,
+    );
     await load(token, page, status, q);
   };
 
@@ -266,6 +280,11 @@ export default function ManagerRechargesPage() {
                         {row.adminActorEmail && row.status !== 'PENDING' && (
                           <div className="muted" style={{ fontSize: 12 }}>
                             par {row.adminActorEmail}
+                          </div>
+                        )}
+                        {row.bankRef && (
+                          <div className="muted mono" style={{ fontSize: 12 }}>
+                            encaissement {row.bankRef}
                           </div>
                         )}
                       </td>

@@ -31,7 +31,11 @@ process.env.ORDER_SWEEP_ENABLED = 'false';
  *  D. rejet : 0 crédit (solde inchangé), motif conservé, re-rejet → 409 ;
  *  E. concurrence PG réelle : 5 débits parallèles (2 OK / 3 refus, jamais
  *     négatif) + rejeu idempotent d'un crédit (1 seul crédit) ;
- *  F. RBAC + audit.
+ *  F. RBAC + audit ;
+ *  G. Q8 : contenu RÉEL des justificatifs (magic bytes, pas le MIME déclaré),
+ *     bankRef de rapprochement obligatoire et UNIQUE (un encaissement = un
+ *     crédit), justificatif stocké HORS répertoire public, téléchargements
+ *     vérifiés avec et sans autorisation.
  *
  * Aucun réseau réel : MailTransportFactory + PanelTransportFactory stubbés,
  * PrismaService RÉEL sur la base dédiée du chantier (icode_host_pro_socle).
@@ -90,6 +94,11 @@ describe('Portefeuille & recharge virement (e2e, P6)', () => {
   }
 
   const PDF = { buffer: Buffer.from('%PDF-1.4 recette P6'), filename: 'virement.pdf' };
+  // Vrai PNG (1×1) — les tests Q8 vérifient la SIGNATURE, pas le nom de fichier.
+  const PNG_1PX = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+    'base64',
+  );
 
   async function balanceOf(email: string): Promise<number> {
     const c = await prisma.customer.findUnique({ where: { email } });
@@ -150,7 +159,7 @@ describe('Portefeuille & recharge virement (e2e, P6)', () => {
     }).catch(() => {});
     await prisma.customer.deleteMany({ where: { email: { in: [aliceEmail, bobEmail] } } }).catch(() => {});
     await prisma.user.deleteMany({ where: { email: { in: [aliceEmail, bobEmail, adminEmail] } } }).catch(() => {});
-    const dir = path.resolve(process.cwd(), 'public', 'wallet-proofs');
+    const dir = path.resolve(process.cwd(), 'storage', 'wallet-proofs');
     for (const f of proofPaths) {
       try {
         fs.unlinkSync(path.join(dir, path.basename(f)));
@@ -266,8 +275,20 @@ describe('Portefeuille & recharge virement (e2e, P6)', () => {
       expect(row.reference).toBe(res.body.reference);
       proofPaths.push(row.proofPath!);
 
-      const abs = path.resolve(process.cwd(), 'public', 'wallet-proofs');
+      const abs = path.resolve(process.cwd(), 'storage', 'wallet-proofs');
       expect(fs.existsSync(path.join(abs, path.basename(row.proofPath!)))).toBe(true);
+      // Q8 — le justificatif n'est JAMAIS dans un répertoire public.
+      expect(
+        fs.existsSync(
+          path.join(
+            path.resolve(process.cwd(), 'public', 'wallet-proofs'),
+            path.basename(row.proofPath!),
+          ),
+        ),
+      ).toBe(false);
+      await request(app.getHttpServer())
+        .get(`/wallet-proofs/${path.basename(row.proofPath!)}`)
+        .expect(404); // aucun statique servi
 
       // AUCUN crédit avant validation.
       expect(await balanceOf(aliceEmail)).toBe(0);
@@ -305,12 +326,16 @@ describe('Portefeuille & recharge virement (e2e, P6)', () => {
 
   // ── C — validation admin : crédit exactement une fois ──────────────────────
   describe('C — validation admin (crédit unique)', () => {
-    it('C1 — validate → solde crédité 1 fois + audit acteur', async () => {
+    it('C1 — validate (bankRef obligatoire) → solde crédité 1 fois + rapprochement + audit', async () => {
       const res = await request(app.getHttpServer())
         .post(`/${GlobalPrefix}/store/admin/wallet/recharges/${aliceRecharge1}/validate`)
         .set('Authorization', `Bearer ${adminToken}`)
+        .send({ bankRef: `BANK-C1-${stamp}` })
         .expect(201);
       expect(res.body.balanceCents).toBe(2500);
+      expect(res.body.bankRef).toBe(`BANK-C1-${stamp}`);
+      expect(res.body.amountCents).toBe(2500);
+      expect(res.body.currency).toBe('USD');
       expect(await balanceOf(aliceEmail)).toBe(2500);
 
       const row = await prisma.walletTransaction.findUniqueOrThrow({
@@ -318,22 +343,33 @@ describe('Portefeuille & recharge virement (e2e, P6)', () => {
       });
       expect(row.status).toBe(WalletTxStatus.SUCCEEDED);
       expect(row.adminActorEmail).toBe(adminEmail);
+      expect(row.bankRef).toBe(`BANK-C1-${stamp}`); // fonds constatés (Q8)
+      expect(row.processedAt).not.toBeNull();
 
       const audit = await prisma.auditLog.findFirst({
         where: { action: 'wallet.recharge.validate', resourceId: aliceRecharge1 },
       });
       expect(audit?.actorEmail).toBe(adminEmail);
+      // Q8 — l'audit conserve référence, montant et devise de l'encaissement.
+      const details = audit?.details as Record<string, unknown> | undefined;
+      expect(details?.bankRef).toBe(`BANK-C1-${stamp}`);
+      expect(details?.amountCents).toBe(2500);
+      expect(details?.currency).toBe('USD');
     });
 
     it('C2 — revalidation → 409, solde TOUJOURS 2500 (crédit unique)', async () => {
       await request(app.getHttpServer())
         .post(`/${GlobalPrefix}/store/admin/wallet/recharges/${aliceRecharge1}/validate`)
         .set('Authorization', `Bearer ${adminToken}`)
+        .send({ bankRef: `BANK-C2-${stamp}` })
         .expect(409);
       expect(await balanceOf(aliceEmail)).toBe(2500);
     });
 
-    it('C3 — justificatif : admin 200 (application/pdf), client 403, inconnu 404', async () => {
+    it('C3 — justificatif : anonyme 401, admin 200 (application/pdf), client 403, inconnu 404', async () => {
+      await request(app.getHttpServer())
+        .get(`/${GlobalPrefix}/store/admin/wallet/recharges/${aliceRecharge1}/proof`)
+        .expect(401);
       const proof = await request(app.getHttpServer())
         .get(`/${GlobalPrefix}/store/admin/wallet/recharges/${aliceRecharge1}/proof`)
         .set('Authorization', `Bearer ${adminToken}`)
@@ -406,6 +442,7 @@ describe('Portefeuille & recharge virement (e2e, P6)', () => {
       await request(app.getHttpServer())
         .post(`/${GlobalPrefix}/store/admin/wallet/recharges/p6-nope-${stamp}/validate`)
         .set('Authorization', `Bearer ${adminToken}`)
+        .send({ bankRef: `BANK-D2-${stamp}` })
         .expect(404);
       await request(app.getHttpServer())
         .post(`/${GlobalPrefix}/store/admin/wallet/recharges/p6-nope-${stamp}/reject`)
@@ -432,6 +469,7 @@ describe('Portefeuille & recharge virement (e2e, P6)', () => {
       await request(app.getHttpServer())
         .post(`/${GlobalPrefix}/store/admin/wallet/recharges/${bobRecharge1}/validate`)
         .set('Authorization', `Bearer ${adminToken}`)
+        .send({ bankRef: `BANK-E1-${stamp}` })
         .expect(201);
       expect(await balanceOf(bobEmail)).toBe(1000);
 
@@ -481,6 +519,109 @@ describe('Portefeuille & recharge virement (e2e, P6)', () => {
         where: { customerId: customer.id, idempotencyKey: key },
       });
       expect(rows).toBe(1);
+    });
+  });
+
+  // ── G — Q8 : contenu réel des preuves + encaissement bancaire unique ──────
+  describe('G — Q8 : justificatifs réels & encaissement unique', () => {
+    it('G1 — validate sans bankRef (absent ou < 3 car.) → 400, AUCUN crédit', async () => {
+      const created = await uploadRecharge(aliceToken, { amountCents: '500' }, PDF).expect(201);
+      rechargeIds.push(created.body.id);
+      const createdRow = await prisma.walletTransaction.findUniqueOrThrow({
+        where: { id: created.body.id },
+      });
+      proofPaths.push(createdRow.proofPath!);
+      const before = await balanceOf(aliceEmail);
+
+      await request(app.getHttpServer())
+        .post(`/${GlobalPrefix}/store/admin/wallet/recharges/${created.body.id}/validate`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .expect(400); // corps absent
+      await request(app.getHttpServer())
+        .post(`/${GlobalPrefix}/store/admin/wallet/recharges/${created.body.id}/validate`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ bankRef: 'ab' })
+        .expect(400); // trop court
+
+      const row = await prisma.walletTransaction.findUniqueOrThrow({
+        where: { id: created.body.id },
+      });
+      expect(row.status).toBe(WalletTxStatus.PENDING); // toujours juste un dépôt
+      expect(row.bankRef).toBeNull();
+      expect(await balanceOf(aliceEmail)).toBe(before);
+    });
+
+    it('G2 — contenu RÉEL du justificatif : signatures fausses → 400, rien stocké', async () => {
+      const countBefore = await prisma.walletTransaction.count({
+        where: { customer: { email: aliceEmail } },
+      });
+      // GIF bidon déclaré image/png (le nom de fichier ne fait pas foi).
+      await uploadRecharge(
+        aliceToken,
+        { amountCents: '300' },
+        { buffer: Buffer.from('GIF89a-bidon-'), filename: 'faux.png' },
+      ).expect(400);
+      // Contenu PNG mais déclaré image/jpeg.
+      await uploadRecharge(
+        aliceToken,
+        { amountCents: '300' },
+        { buffer: PNG_1PX, filename: 'faux.jpg' },
+      ).expect(400);
+      expect(
+        await prisma.walletTransaction.count({
+          where: { customer: { email: aliceEmail } },
+        }),
+      ).toBe(countBefore);
+    });
+
+    it('G3 — même encaissement bancaire → UN seul crédit (409 clair, ligne suivante intacte)', async () => {
+      const r1 = await uploadRecharge(aliceToken, { amountCents: '700' }, PDF).expect(201);
+      const r2 = await uploadRecharge(aliceToken, { amountCents: '800' }, PDF).expect(201);
+      rechargeIds.push(r1.body.id, r2.body.id);
+      for (const id of [r1.body.id, r2.body.id]) {
+        const row = await prisma.walletTransaction.findUniqueOrThrow({ where: { id } });
+        proofPaths.push(row.proofPath!);
+      }
+      const before = await balanceOf(aliceEmail);
+      const shared = `BANK-SHARED-${stamp}`;
+
+      await request(app.getHttpServer())
+        .post(`/${GlobalPrefix}/store/admin/wallet/recharges/${r1.body.id}/validate`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ bankRef: shared })
+        .expect(201);
+      expect(await balanceOf(aliceEmail)).toBe(before + 700);
+
+      const dup = await request(app.getHttpServer())
+        .post(`/${GlobalPrefix}/store/admin/wallet/recharges/${r2.body.id}/validate`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ bankRef: shared })
+        .expect(409);
+      expect((dup.body as { message: string }).message).toContain('déjà utilisé');
+      // Aucun second crédit — la transaction a été avortée par l'unicité PG.
+      expect(await balanceOf(aliceEmail)).toBe(before + 700);
+      const row2 = await prisma.walletTransaction.findUniqueOrThrow({
+        where: { id: r2.body.id },
+      });
+      expect(row2.status).toBe(WalletTxStatus.PENDING);
+      expect(row2.bankRef).toBeNull();
+
+      // L'admin voit le rapprochement bancaire sur la recharge créditée.
+      const detail = await request(app.getHttpServer())
+        .get(`/${GlobalPrefix}/store/admin/wallet/recharges/${r1.body.id}`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .expect(200);
+      expect((detail.body as { bankRef: string }).bankRef).toBe(shared);
+      // Le client, lui, ne voit JAMAIS la référence interne de rapprochement.
+      const history = await request(app.getHttpServer())
+        .get(`/${GlobalPrefix}/client/wallet/transactions`)
+        .set('Authorization', `Bearer ${aliceToken}`)
+        .expect(200);
+      const mine = (history.body.items as Record<string, unknown>[]).find(
+        (t) => t.id === r1.body.id,
+      );
+      expect(mine).toBeTruthy();
+      expect(mine!.bankRef).toBeUndefined();
     });
   });
 });

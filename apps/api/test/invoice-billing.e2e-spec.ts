@@ -304,12 +304,14 @@ describe('Facturation & PDF de facture (e2e, P7)', () => {
       await prisma.mailSetting.delete({ where: { id: createdMailId } }).catch(() => {});
     }
     mark('fixtures');
-    // PDF générés.
+    // PDF générés (storage/ Q8 + ancien emplacement public/ nettoyé aussi).
     for (const id of [aliceInvoiceId, ...(await invoiceIdsOfOrders(orderIds))]) {
-      try {
-        fs.unlinkSync(path.resolve(process.cwd(), 'public', 'invoices', `${id}.pdf`));
-      } catch {
-        /* déjà absent */
+      for (const dir of ['storage', 'public']) {
+        try {
+          fs.unlinkSync(path.resolve(process.cwd(), dir, 'invoices', `${id}.pdf`));
+        } catch {
+          /* déjà absent */
+        }
       }
     }
     mark('pdfs');
@@ -448,14 +450,27 @@ describe('Facturation & PDF de facture (e2e, P7)', () => {
       expect(text).not.toContain(norm('MENTION MODIFIEE POST EMISSION'));
       expect(text).not.toContain(norm('Nouvelle Raison SARL'));
 
-      // pdfPath renseigné après la 1re demande + fichier disque.
+      // pdfPath renseigné après la 1re demande + fichier disque (Q8 : storage/).
       const after = await prisma.invoice.findUniqueOrThrow({ where: { id: aliceInvoiceId } });
-      expect(after.pdfPath).toBe(`invoices/${aliceInvoiceId}.pdf`);
-      const abs = path.resolve(process.cwd(), 'public', 'invoices', `${aliceInvoiceId}.pdf`);
+      expect(after.pdfPath).toBe(`storage/invoices/${aliceInvoiceId}.pdf`);
+      expect(after.pdfRenderedStatus).toBe('UNPAID');
+      const abs = path.resolve(process.cwd(), 'storage', 'invoices', `${aliceInvoiceId}.pdf`);
       expect(fs.existsSync(abs)).toBe(true);
+      // Q8 — JAMAIS de PDF servable depuis un répertoire public.
+      expect(
+        fs.existsSync(path.resolve(process.cwd(), 'public', 'invoices', `${aliceInvoiceId}.pdf`)),
+      ).toBe(false);
+      await request(app.getHttpServer()).get(`/invoices/${aliceInvoiceId}.pdf`).expect(404);
+      await request(app.getHttpServer())
+        .get(`/${GlobalPrefix}/invoices/${aliceInvoiceId}.pdf`)
+        .expect(404);
     });
 
-    it('B2 — admin 200 (flux + détail hasPdf), client détail hasPdf, 404 inconnu', async () => {
+    it('B2 — admin 200 (flux + détail hasPdf), client détail hasPdf, 404 inconnu, RBAC', async () => {
+      // Q8 — téléchargements VÉRIFIÉS avec et sans autorisation.
+      await getPdf(`/store/admin/invoices/${aliceInvoiceId}/pdf`).expect(401); // anonyme
+      await getPdf(`/store/admin/invoices/${aliceInvoiceId}/pdf`, aliceToken).expect(403); // client
+
       const adminPdf = await getPdf(
         `/store/admin/invoices/${aliceInvoiceId}/pdf`,
         adminToken,
@@ -477,7 +492,7 @@ describe('Facturation & PDF de facture (e2e, P7)', () => {
     });
 
     it('B3 — régénération après suppression disque : même octets, toujours figé', async () => {
-      const abs = path.resolve(process.cwd(), 'public', 'invoices', `${aliceInvoiceId}.pdf`);
+      const abs = path.resolve(process.cwd(), 'storage', 'invoices', `${aliceInvoiceId}.pdf`);
       fs.unlinkSync(abs);
       await prisma.invoice.update({
         where: { id: aliceInvoiceId },
@@ -503,6 +518,35 @@ describe('Facturation & PDF de facture (e2e, P7)', () => {
       const b = await getPdf(`/client/invoices/${aliceInvoiceId}/pdf`, aliceToken).expect(200);
       expect((a.body as Buffer).equals(b.body as Buffer)).toBe(true);
       expect((a.body as Buffer).equals(alicePdf1!)).toBe(true);
+    });
+  });
+
+  // ── Q8 — politique explicite du statut de paiement sur le PDF ─────────────
+  describe('C2 (Q8) — statut de paiement re-stampé, émission toujours figée', () => {
+    it('C2.1 — passage UNPAID → PAID : prochain PDF affiche « Réglée », montants/mentions intacts', async () => {
+      await prisma.invoice.update({
+        where: { id: aliceInvoiceId },
+        data: { status: InvoiceStatus.PAID, paidAt: new Date('2026-10-05T10:00:00.000Z') },
+      });
+
+      const res = await getPdf(`/client/invoices/${aliceInvoiceId}/pdf`, aliceToken).expect(200);
+      const buf = res.body as Buffer;
+      const text = norm(pdfText(buf));
+      expect(text).toContain(norm('Reglee')); // statut ACTUEL
+      expect(text).toContain(norm(aliceInvoiceNumber)); // émission figée
+      expect(text).toContain(norm('MENTION ORIGINALE P7')); // snapshot figé
+      expect(text).toContain(norm('100.00 USD')); // montants figés
+      expect(text).not.toContain(norm('En attente de reglement')); // plus l'ancien statut
+
+      const after = await prisma.invoice.findUniqueOrThrow({ where: { id: aliceInvoiceId } });
+      expect(after.pdfRenderedStatus).toBe('PAID');
+      expect(after.pdfPath).toBe(`storage/invoices/${aliceInvoiceId}.pdf`);
+      const abs = path.resolve(process.cwd(), 'storage', 'invoices', `${aliceInvoiceId}.pdf`);
+      expect(fs.existsSync(abs)).toBe(true);
+
+      // Re-demande dans le même statut → octet-identique.
+      const again = await getPdf(`/client/invoices/${aliceInvoiceId}/pdf`, aliceToken).expect(200);
+      expect((again.body as Buffer).equals(buf)).toBe(true);
     });
   });
 

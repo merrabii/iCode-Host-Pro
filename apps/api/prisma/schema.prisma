@@ -1355,6 +1355,10 @@ model WalletTransaction {
   paymentMethod   PaymentMethod?      @relation(fields: [paymentMethodId], references: [id], onDelete: SetNull)
   methodName      String? // snapshot du moyen de paiement
   reference       String?             @unique // ref. de virement / transfert
+  // GO Q8 — référence de rapprochement bancaire saisie par l'ADMIN au moment
+  // de la constatation des fonds (validate). Unicité = un même encaissement ne
+  // peut financer qu'UN crédit (null tant que le dépôt n'est pas constaté).
+  bankRef         String?             @unique
   idempotencyKey  String              @unique
   orderId         String?
   invoiceId       String?
@@ -1516,7 +1520,11 @@ model Invoice {
   // résolution par chaîne renewsOrderId). Jamais « dernier abonnement actif ».
   subscriptionId            String?
   subscription              Subscription? @relation(fields: [subscriptionId], references: [id], onDelete: SetNull)
-  pdfPath                   String? // PDF généré (stocké, téléchargeable)
+  pdfPath                   String? // PDF généré (STOCKÉ HORS répertoire public, téléchargeable)
+  // GO Q8 — politique explicite du statut de paiement sur le PDF : le fichier
+  // courant est rendu avec le statut ACTUEL de la facture ; il est re-généré
+  // dès que `status` change (les données d'émission, elles, restent figées).
+  pdfRenderedStatus         String?
   creditNoteOfId            String?       @unique // avoir émis sur cette facture
   creditNoteOf              Invoice?      @relation("CreditNote", fields: [creditNoteOfId], references: [id], onDelete: SetNull)
   legalMentionsSnapshot     Json? // mentions légales au moment de l'émission

@@ -1,5 +1,7 @@
 import { BadRequestException, ConflictException, NotFoundException, UnauthorizedException } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import { WalletService } from './wallet.service';
 
 // GO P6 (lot C2) — invariants du service wallet testés SANS réseau/PG réel :
@@ -288,13 +290,21 @@ describe('WalletService — C3a (recharge virement : PENDING puis validation uni
       customerId: 'cust1',
       type: 'CREDIT',
       amountCents: 2500,
+      currency: 'USD',
     });
-    const res = await service.validateRecharge('rc1', admin);
+    const res = await service.validateRecharge('rc1', admin, 'BANK-RAP-001');
     expect(res.balanceCents).toBe(3400);
+    expect(res.bankRef).toBe('BANK-RAP-001');
+    expect(res.amountCents).toBe(2500);
+    expect(res.currency).toBe('USD');
     expect(tx.walletTransaction.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
         where: { id: 'rc1', status: 'PENDING' },
-        data: expect.objectContaining({ status: 'SUCCEEDED', adminActorEmail: admin.email }),
+        data: expect.objectContaining({
+          status: 'SUCCEEDED',
+          adminActorEmail: admin.email,
+          bankRef: 'BANK-RAP-001',
+        }),
       }),
     );
     expect(tx.customer.update).toHaveBeenCalledWith(
@@ -312,26 +322,26 @@ describe('WalletService — C3a (recharge virement : PENDING puis validation uni
       amountCents: 2500,
     });
     tx.walletTransaction.updateMany.mockResolvedValue({ count: 0 });
-    await expect(service.validateRecharge('rc1', admin)).rejects.toBeInstanceOf(
-      ConflictException,
-    );
+    await expect(
+      service.validateRecharge('rc1', admin, 'BANK-RAP-001'),
+    ).rejects.toBeInstanceOf(ConflictException);
     expect(tx.customer.update).not.toHaveBeenCalled();
   });
 
   it('validateRecharge : recharge introuvable → 404 ; type inattendu → 409', async () => {
     tx.walletTransaction.findUnique.mockResolvedValue(null);
-    await expect(service.validateRecharge('nope', admin)).rejects.toBeInstanceOf(
-      NotFoundException,
-    );
+    await expect(
+      service.validateRecharge('nope', admin, 'BANK-RAP-001'),
+    ).rejects.toBeInstanceOf(NotFoundException);
     tx.walletTransaction.findUnique.mockResolvedValue({
       id: 'rc2',
       customerId: 'cust1',
       type: 'DEBIT',
       amountCents: 10,
     });
-    await expect(service.validateRecharge('rc2', admin)).rejects.toBeInstanceOf(
-      ConflictException,
-    );
+    await expect(
+      service.validateRecharge('rc2', admin, 'BANK-RAP-001'),
+    ).rejects.toBeInstanceOf(ConflictException);
     expect(tx.customer.update).not.toHaveBeenCalled();
   });
 
@@ -511,5 +521,135 @@ describe('WalletService — contrôle propriétaire (ensureOwnedCustomer, GO Q3)
     const out = await service.ensureOwnedCustomer(user);
     expect(out.id).toBe('c7');
     expect(prisma.customer.create).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('WalletService — Q8 (preuves réelles & encaissement unique)', () => {
+  let service: WalletService;
+  let tx: {
+    $queryRaw: jest.Mock;
+    walletTransaction: { findUnique: jest.Mock; updateMany: jest.Mock };
+    customer: { update: jest.Mock };
+  };
+  let prisma: {
+    $transaction: jest.Mock;
+    walletTransaction: { findUnique: jest.Mock; updateMany: jest.Mock };
+  };
+
+  const admin = { sub: 'adm1', email: 'admin@example.com' };
+
+  const p2002BankRef = (): never => {
+    throw new Prisma.PrismaClientKnownRequestError('Unique constraint', {
+      code: 'P2002',
+      clientVersion: 'test',
+      meta: { target: ['bankRef'] },
+    });
+  };
+
+  beforeEach(() => {
+    tx = {
+      $queryRaw: jest.fn(() => [{ walletBalanceCents: 100 }]),
+      walletTransaction: {
+        findUnique: jest.fn(() => ({
+          id: 'rc1',
+          customerId: 'cust1',
+          type: 'CREDIT',
+          amountCents: 2500,
+          currency: 'USD',
+        })),
+        updateMany: jest.fn(() => ({ count: 1 })),
+      },
+      customer: { update: jest.fn(() => ({ walletBalanceCents: 3400 })) },
+    };
+    prisma = {
+      $transaction: jest.fn(async (fn: unknown) =>
+        typeof fn === 'function' ? (fn as (t: typeof tx) => unknown)(tx) : null,
+      ),
+      walletTransaction: {
+        findUnique: jest.fn(),
+        updateMany: jest.fn(),
+      },
+    };
+    service = new WalletService(prisma as never);
+  });
+
+  it('validateRecharge : bankRef obligatoire (3..64, trim) — 400 sans écriture', async () => {
+    for (const bad of ['', '  ', 'ab', undefined as unknown as string]) {
+      await expect(service.validateRecharge('rc1', admin, bad)).rejects.toBeInstanceOf(
+        BadRequestException,
+      );
+    }
+    expect(tx.walletTransaction.updateMany).not.toHaveBeenCalled();
+    expect(tx.customer.update).not.toHaveBeenCalled();
+  });
+
+  it('validateRecharge : même encaissement bancaire déjà constaté (P2002 bankRef) → 409 clair, 0 crédit', async () => {
+    tx.walletTransaction.updateMany.mockImplementation(p2002BankRef);
+    await expect(
+      service.validateRecharge('rc1', admin, '  VIR-2026-77  '),
+    ).rejects.toMatchObject({ status: 409, message: expect.stringContaining('VIR-2026-77') });
+    // La transaction est avorcée par l'unicité PG : aucun incrément résiduel.
+    expect(tx.customer.update).not.toHaveBeenCalled();
+  });
+
+  // ── Contenu RÉEL des justificatifs (magic bytes, pas le MIME déclaré) ─────
+  const PNG_1PX = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+    'base64',
+  );
+  const JPEG_BYTES = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.from('JFIF-marker')]);
+  const WEBP_BYTES = Buffer.concat([
+    Buffer.from('RIFF'),
+    Buffer.from([0x24, 0x00, 0x00, 0x00]),
+    Buffer.from('WEBPVP8 '),
+  ]);
+  const PDF_BYTES = Buffer.from('%PDF-1.4 contenu de justificatif');
+
+  it('persistProof : signatures valides acceptées — fichier écrit dans storage/ (jamais public/)', () => {
+    const cases: [Buffer, string, string][] = [
+      [PNG_1PX, 'image/png', '.png'],
+      [JPEG_BYTES, 'image/jpeg', '.jpg'],
+      [WEBP_BYTES, 'image/webp', '.webp'],
+      [PDF_BYTES, 'application/pdf', '.pdf'],
+    ];
+    const written: string[] = [];
+    try {
+      for (const [buf, mime, ext] of cases) {
+        const out = service.persistProof({
+          originalname: `f${ext}`,
+          mimetype: mime,
+          buffer: buf,
+        });
+        written.push(out.path);
+        expect(out.mime).toBe(mime);
+        expect(out.fileName.endsWith(ext)).toBe(true);
+        const abs = path.resolve(process.cwd(), 'storage', 'wallet-proofs', out.fileName);
+        expect(fs.existsSync(abs)).toBe(true);
+        expect(fs.existsSync(path.resolve(process.cwd(), 'public', 'wallet-proofs', out.fileName))).toBe(
+          false,
+        );
+      }
+    } finally {
+      for (const p of written) service.removeProof(p);
+    }
+  });
+
+  it('persistProof : MIME déclaré mensonger → 400 (le contenu fait foi)', () => {
+    const dir = path.resolve(process.cwd(), 'storage', 'wallet-proofs');
+    const count = () => (fs.existsSync(dir) ? fs.readdirSync(dir).length : 0);
+    const before = count();
+    // Contenu PNG déclaré « image/jpeg ».
+    expect(() =>
+      service.persistProof({ originalname: 'p.jpg', mimetype: 'image/jpeg', buffer: PNG_1PX }),
+    ).toThrow(BadRequestException);
+    // Signature totalement inconnue déclarée image/png.
+    expect(() =>
+      service.persistProof({ originalname: 'p.png', mimetype: 'image/png', buffer: Buffer.from('GIF89a-ou-bidon') }),
+    ).toThrow(BadRequestException);
+    // Buffer absent.
+    expect(() =>
+      service.persistProof({ originalname: 'p.png', mimetype: 'image/png' }),
+    ).toThrow(BadRequestException);
+    expect(count()).toBe(before); // aucun fichier écrit sur refus
   });
 });

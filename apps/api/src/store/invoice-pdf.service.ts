@@ -41,17 +41,28 @@ const STATUS_LABEL: Record<string, string> = {
  * - **PDF stable** : `compress:false` (flux lisible, preuve texte), dates
  *   d'info (`CreationDate`/`ModificationDate`) figées sur `issuedAt` →
  *   deux rendus de la même facture sont **octet-identiques**.
- * - **Stockage** : `public/invoices/<invoiceId>.pdf`, chemin relatif écrit dans
- *   `Invoice.pdfPath` (généré à la première demande, régénérable à l'identique
- *   si le fichier disque disparaît).
- * - Aucune écriture de montant : seul `pdfPath` peut être renseigné.
+ * - **Stockage** (GO Q8) : `storage/invoices/<invoiceId>.pdf` — HORS de tout
+ *   répertoire public ; chemin relatif écrit dans `Invoice.pdfPath` (généré à
+ *   la première demande, régénérable à l'identique si le fichier disque
+ *   disparaît).
+ * - **Statut de politique explicite (GO Q8)** : le PDF affiche TOUJOURS le
+ *   statut ACTUEL de la facture — `pdfRenderedStatus` mémorise le statut rendu
+ *   dans le fichier courant, qui est re-généré dès que `status` change. Les
+ *   données d'émission (montants, dates, mentions, numéro) restent figées :
+ *   deux rendus dans un MÊME statut sont octet-identiques.
+ * - **Documents longs (GO Q8)** : la table des lignes bascule sur une nouvelle
+ *   page (en-tête de tableau rappelé) avant de déborder ; les totaux ont une
+ *   place garantie.
+ * - Aucune écriture de montant : seuls `pdfPath`/`pdfRenderedStatus` peuvent
+ *   être renseignés.
  */
 @Injectable()
 export class InvoicePdfService {
   constructor(private readonly prisma: PrismaService) {}
 
+  // GO Q8 — jamais de répertoire public (le dossier n'est servi par rien).
   private get dir(): string {
-    return path.resolve(process.cwd(), 'public', 'invoices');
+    return path.resolve(process.cwd(), 'storage', 'invoices');
   }
 
   /** Génère (si besoin) et retourne le fichier PDF de la facture. */
@@ -69,17 +80,24 @@ export class InvoicePdfService {
 
     const safeId = path.basename(invoice.id);
     const abs = path.join(this.dir, `${safeId}.pdf`);
-    if (!fs.existsSync(abs)) {
+    // Re-génération si le fichier manque OU si le statut de paiement a changé
+    // depuis le rendu courant (politique « statut toujours actuel »).
+    const stale = !fs.existsSync(abs) || invoice.pdfRenderedStatus !== invoice.status;
+    if (stale) {
       const buf = await this.render(invoice);
       fs.mkdirSync(this.dir, { recursive: true });
       fs.writeFileSync(abs, buf);
     }
 
-    const rel = `invoices/${safeId}.pdf`;
-    if (invoice.pdfPath !== rel) {
-      // Seule écriture autorisée : le chemin du fichier (jamais un montant).
+    const rel = `storage/invoices/${safeId}.pdf`;
+    if (invoice.pdfPath !== rel || invoice.pdfRenderedStatus !== invoice.status) {
+      // Seules écritures autorisées : chemin du fichier + statut rendu
+      // (jamais un montant).
       await this.prisma.invoice
-        .update({ where: { id: invoice.id }, data: { pdfPath: rel } })
+        .update({
+          where: { id: invoice.id },
+          data: { pdfPath: rel, pdfRenderedStatus: invoice.status },
+        })
         .catch(() => {});
     }
     return { absPath: abs, fileName: `facture-${invoice.number}.pdf` };
@@ -171,7 +189,7 @@ export class InvoicePdfService {
         by += 13;
       }
 
-      // ── Table des lignes ───────────────────────────────────────────────────
+      // ── Table des lignes (GO Q8 : documents longs = pagination) ───────────
       let ty = Math.max(by, y + meta.length * 14) + 24;
       const cols = {
         label: { x: M, w: 245 },
@@ -180,17 +198,29 @@ export class InvoicePdfService {
         tax: { x: M + 365, w: 55 },
         total: { x: M + 420, w: 75 },
       };
-      doc.rect(M, ty, W, 18).fill('#f2f2f2');
-      doc.font('Helvetica-Bold').fontSize(8).fillColor('#555555');
-      doc.text('DESIGNATION', cols.label.x + 6, ty + 5, { width: cols.label.w - 12 });
-      doc.text('QTE', cols.qty.x, ty + 5, { width: cols.qty.w - 6, align: 'right' });
-      doc.text('P.U. HT', cols.unit.x, ty + 5, { width: cols.unit.w - 6, align: 'right' });
-      doc.text('TVA', cols.tax.x, ty + 5, { width: cols.tax.w - 6, align: 'right' });
-      doc.text('TOTAL TTC', cols.total.x, ty + 5, { width: cols.total.w - 6, align: 'right' });
-      ty += 22;
+      const bottom = () => doc.page.height - M;
+      const drawTableHeader = () => {
+        doc.rect(M, ty, W, 18).fill('#f2f2f2');
+        doc.font('Helvetica-Bold').fontSize(8).fillColor('#555555');
+        doc.text('DESIGNATION', cols.label.x + 6, ty + 5, { width: cols.label.w - 12 });
+        doc.text('QTE', cols.qty.x, ty + 5, { width: cols.qty.w - 6, align: 'right' });
+        doc.text('P.U. HT', cols.unit.x, ty + 5, { width: cols.unit.w - 6, align: 'right' });
+        doc.text('TVA', cols.tax.x, ty + 5, { width: cols.tax.w - 6, align: 'right' });
+        doc.text('TOTAL TTC', cols.total.x, ty + 5, { width: cols.total.w - 6, align: 'right' });
+        ty += 22;
+      };
+      drawTableHeader();
 
       doc.font('Helvetica').fontSize(9).fillColor('#111111');
       for (const l of invoice.lines) {
+        // Document LONG : nouvelle page + en-tête de tableau rappelé — une
+        // ligne n'est JAMAIS dessinée hors de la zone imprimable.
+        if (ty + 16 > bottom()) {
+          doc.addPage();
+          ty = M;
+          drawTableHeader();
+          doc.font('Helvetica').fontSize(9).fillColor('#111111');
+        }
         doc.text(l.label, cols.label.x + 6, ty, {
           width: cols.label.w - 12,
           height: 14,
@@ -214,6 +244,11 @@ export class InvoicePdfService {
         });
         ty += 16;
       }
+      // Totaux : place garantie (jamais coupés en fin de page).
+      if (ty + 12 + 3 * 16 + 8 > bottom()) {
+        doc.addPage();
+        ty = M;
+      }
       doc.moveTo(M, ty).lineTo(M + W, ty).strokeColor('#dddddd').lineWidth(0.5).stroke();
       ty += 12;
 
@@ -236,7 +271,20 @@ export class InvoicePdfService {
       });
 
       // ── Mentions figées à l'émission ───────────────────────────────────────
+      const footerCompany = [
+        snap.companyName,
+        snap.companyAddress,
+        snap.companyTaxId,
+        snap.companyEmail,
+      ].filter(Boolean);
       let fy = ty + totals.length * 16 + 26;
+      // GO Q8 — bloc de mentions entier : bascule de page si nécessaire.
+      const mentionLines =
+        1 + (footerCompany.length ? 1 : 0) + (snap.mentions ?? []).length;
+      if (fy + mentionLines * 13 > bottom()) {
+        doc.addPage();
+        fy = M;
+      }
       doc
         .font('Helvetica')
         .fontSize(8)
@@ -248,12 +296,6 @@ export class InvoicePdfService {
           { width: W },
         );
       fy += 13;
-      const footerCompany = [
-        snap.companyName,
-        snap.companyAddress,
-        snap.companyTaxId,
-        snap.companyEmail,
-      ].filter(Boolean);
       if (footerCompany.length) {
         doc.text(footerCompany.join(' · '), M, fy, { width: W });
         fy += 12;

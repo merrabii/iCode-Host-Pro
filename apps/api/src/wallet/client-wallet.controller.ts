@@ -3,6 +3,7 @@ import {
   Body,
   Controller,
   Get,
+  Logger,
   Post,
   Query,
   UploadedFile,
@@ -52,6 +53,8 @@ const TX_SELECT = {
 @UseGuards(JwtAuthGuard)
 @Controller('client/wallet')
 export class ClientWalletController {
+  private readonly logger = new Logger(ClientWalletController.name);
+
   constructor(
     private readonly wallet: WalletService,
     private readonly prisma: PrismaService,
@@ -126,14 +129,25 @@ export class ClientWalletController {
     }
     const customer = await this.wallet.ensureOwnedCustomer(user);
     let proof: { fileName: string; path: string; mime: string } | null = null;
+    let created: Awaited<ReturnType<WalletService['createRecharge']>>;
     try {
       proof = this.wallet.persistProof(file);
-      const created = await this.wallet.createRecharge(customer.id, {
+      created = await this.wallet.createRecharge(customer.id, {
         amountCents: dto.amountCents,
         note: dto.note ?? null,
         proof,
       });
-      await this.audit.record({
+    } catch (err) {
+      // ÉCHEC DE CRÉATION : aucune ligne ne référence le fichier → nettoyable.
+      if (proof) this.wallet.removeProof(proof.path);
+      throw err;
+    }
+    // GO Q8 — la recharge ET son justificatif sont DÉSORMAIS RÉFÉRENCÉS en
+    // base : si l'audit échoue ensuite, on ne SUPPRIME JAMAIS la preuve (elle
+    // reste sur disque et sur la ligne) — l'échec est seulement journalisé,
+    // le dépôt ayant réellement eu lieu.
+    await this.audit
+      .record({
         actorId: user.sub,
         actorEmail: user.email,
         action: 'wallet.recharge.create',
@@ -143,11 +157,12 @@ export class ClientWalletController {
           amountCents: created.amountCents,
           reference: created.reference,
         },
-      });
-      return created;
-    } catch (err) {
-      if (proof) this.wallet.removeProof(proof.path);
-      throw err;
-    }
+      })
+      .catch((err: unknown) =>
+        this.logger.warn(
+          `Audit wallet.recharge.create impossible (${created.id}) : ${String(err)}`,
+        ),
+      );
+    return created;
   }
 }

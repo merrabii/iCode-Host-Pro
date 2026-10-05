@@ -48,6 +48,7 @@ describe('InvoicePdfService (D1)', () => {
       walletTransactionId: null,
       subscriptionId: null,
       pdfPath: null,
+      pdfRenderedStatus: null,
       creditNoteOfId: null,
       legalMentionsSnapshot: {
         companyName: 'Code Diali SARL',
@@ -141,34 +142,108 @@ describe('InvoicePdfService (D1)', () => {
     expect(pdfText(b)).toContain('MODIFIEES');
   });
 
-  it('ensurePdf : écrit le fichier disque + renseigne pdfPath (une seule écriture)', async () => {
+  it('ensurePdf : écrit le fichier dans storage/ (HORS public) + pdfPath/pdfRenderedStatus (une seule écriture)', async () => {
     const id = `inv-spec-file-${Date.now().toString(36)}`;
-    const abs = path.resolve(process.cwd(), 'public', 'invoices', `${id}.pdf`);
+    const abs = path.resolve(process.cwd(), 'storage', 'invoices', `${id}.pdf`);
     findUnique.mockResolvedValue(makeInvoice(id));
     try {
       const first = await service.ensurePdf(id);
       expect(first.absPath).toBe(abs);
       expect(first.fileName).toBe('facture-2026-0042.pdf');
       expect(fs.existsSync(abs)).toBe(true);
+      // GO Q8 — jamais de PDF dans un répertoire public.
+      expect(
+        fs.existsSync(path.resolve(process.cwd(), 'public', 'invoices', `${id}.pdf`)),
+      ).toBe(false);
       expect(fs.readFileSync(abs).subarray(0, 8).toString('ascii')).toMatch(
         /^%PDF-1\.[34]$/,
       );
       expect(update).toHaveBeenCalledTimes(1);
       expect(update.mock.calls[0][0]).toEqual({
         where: { id },
-        data: { pdfPath: `invoices/${id}.pdf` },
+        data: { pdfPath: `storage/invoices/${id}.pdf`, pdfRenderedStatus: 'UNPAID' },
       });
 
-      // Fichier déjà présent + pdfPath déjà renseigné → aucune écriture.
+      // Fichier déjà présent + chemin + statut rendu alignés → aucune écriture.
       findUnique.mockResolvedValue({
         ...makeInvoice(id),
-        pdfPath: `invoices/${id}.pdf`,
+        pdfPath: `storage/invoices/${id}.pdf`,
+        pdfRenderedStatus: 'UNPAID',
       });
       await service.ensurePdf(id);
+      expect(update).toHaveBeenCalledTimes(1);
+
+      // Régénération après suppression disque → OCTETS identiques (déterminisme).
+      const bytes = fs.readFileSync(abs);
+      fs.unlinkSync(abs);
+      await service.ensurePdf(id);
+      expect(fs.readFileSync(abs).equals(bytes)).toBe(true);
       expect(update).toHaveBeenCalledTimes(1);
     } finally {
       if (fs.existsSync(abs)) fs.unlinkSync(abs);
     }
+  });
+
+  it('ensurePdf : changement de statut → re-génération avec le statut ACTUEL (politique Q8)', async () => {
+    const id = `inv-spec-status-${Date.now().toString(36)}`;
+    const abs = path.resolve(process.cwd(), 'storage', 'invoices', `${id}.pdf`);
+    findUnique.mockResolvedValue(makeInvoice(id));
+    try {
+      await service.ensurePdf(id); // rendu UNPAID
+      const unpaid = fs.readFileSync(abs);
+      expect(norm(pdfText(unpaid))).toContain(norm('En attente de reglement'));
+
+      // Facture payée entre-temps : le fichier courant porte encore UNPAID.
+      findUnique.mockResolvedValue({
+        ...makeInvoice(id),
+        status: InvoiceStatus.PAID,
+        paidAt: new Date('2026-10-05T09:00:00.000Z'),
+        pdfPath: `storage/invoices/${id}.pdf`,
+        pdfRenderedStatus: 'UNPAID',
+      });
+      await service.ensurePdf(id);
+      const paid = fs.readFileSync(abs);
+      expect(paid.equals(unpaid)).toBe(false); // le statut a changé → re-rendu
+      expect(norm(pdfText(paid))).toContain(norm('Reglee'));
+      expect(norm(pdfText(paid))).toContain(norm('2026-0042')); // données d'émission figées
+      expect(update).toHaveBeenLastCalledWith({
+        where: { id },
+        data: { pdfPath: `storage/invoices/${id}.pdf`, pdfRenderedStatus: 'PAID' },
+      });
+
+      // Re-demande dans le MÊME statut → octet-identique.
+      await service.ensurePdf(id);
+      expect(fs.readFileSync(abs).equals(paid)).toBe(true);
+    } finally {
+      if (fs.existsSync(abs)) fs.unlinkSync(abs);
+    }
+  });
+
+  it('document LONG (250 lignes) : pagination multi-pages, contenu complet, déterministe', async () => {
+    const inv = makeInvoice('inv-spec-long');
+    inv.lines = Array.from({ length: 250 }, (_, i) => ({
+      id: `l${i}`,
+      invoiceId: inv.id,
+      kind: InvoiceLineKind.PRODUCT,
+      label: `Ligne ${i + 1} design`,
+      qty: 1,
+      unitPriceHtCents: 100,
+      taxRatePercent: new Prisma.Decimal(20),
+      taxAmountCents: 20,
+      totalTtcCents: 120,
+      sortOrder: i,
+    }));
+    const a = await service.render(inv);
+    const b = await service.render(inv);
+    expect(a.equals(b)).toBe(true); // rendu déterministe
+    expect(a.subarray(0, 5).toString('ascii')).toBe('%PDF-');
+    const pages = (a.toString('latin1').match(/\/Type\s*\/Page\b(?!s)/g) ?? []).length;
+    expect(pages).toBeGreaterThanOrEqual(2); // bascule de page effective
+    const text = norm(pdfText(a));
+    expect(text).toContain(norm('Ligne 1 design')); // première ligne
+    expect(text).toContain(norm('Ligne 250 design')); // dernière ligne (jamais perdue)
+    expect(text).toContain(norm('DESIGNATION')); // en-tête de tableau rappelé
+    expect(text).toContain(norm('120.00 USD')); // totaux présents
   });
 
   it('ensurePdf : facture inconnue → 404', async () => {

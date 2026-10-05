@@ -38,7 +38,12 @@ export interface ApplyResult {
   replayed: boolean;
 }
 
-const PROOF_DIR = path.resolve(process.cwd(), 'public', 'wallet-proofs');
+// GO Q8 — justificatifs stockés HORS de tout répertoire public (jamais servis
+// par le web). `storage/` est ignoré par git ; l'ancien emplacement
+// `public/wallet-proofs/` ne sert qu'en LECTURE de repli pour les lignes
+// créées avant cette migration (aucune nouvelle écriture n'y est faite).
+const PROOF_DIR = path.resolve(process.cwd(), 'storage', 'wallet-proofs');
+const LEGACY_PROOF_DIR = path.resolve(process.cwd(), 'public', 'wallet-proofs');
 const RECHARGE_MIN_CENTS = 100; // 1 USD
 const RECHARGE_MAX_CENTS = 10_000_000; // 100 000 USD
 
@@ -59,6 +64,26 @@ const PROOF_EXT: Record<string, string> = {
   'image/webp': '.webp',
   'application/pdf': '.pdf',
 };
+
+// GO Q8 — contenu RÉEL du justificatif : c'est la signature binaire (magic
+// bytes) qui fait foi, jamais le MIME déclaré par le client.
+const PROOF_MAGIC: { mime: string; sniff: (b: Buffer) => boolean }[] = [
+  {
+    mime: 'image/png',
+    sniff: (b) =>
+      b.length >= 8 &&
+      b.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])),
+  },
+  { mime: 'image/jpeg', sniff: (b) => b.length >= 3 && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff },
+  {
+    mime: 'image/webp',
+    sniff: (b) =>
+      b.length >= 12 &&
+      b.toString('latin1', 0, 4) === 'RIFF' &&
+      b.toString('latin1', 8, 12) === 'WEBP',
+  },
+  { mime: 'application/pdf', sniff: (b) => b.length >= 5 && b.toString('latin1', 0, 5) === '%PDF-' },
+];
 
 /**
  * GO P6 (lot C2 - portefeuille) — SERVICE UNIQUE du solde.
@@ -342,7 +367,11 @@ export class WalletService {
     return this.applyInTx(tx, customerId, input, direction);
   }
 
-  /** Justificatif (image/PDF ≤ 5 Mo) : disque `public/wallet-proofs/`. */
+  /**
+   * Justificatif (image/PDF ≤ 5 Mo) : disque `storage/wallet-proofs/` —
+   * GO Q8 : HORS répertoire public. Le TYPE retenu est celui DÉTECTÉ dans le
+   * contenu (magic bytes) ; un MIME déclaré incohérent est refusé (400).
+   */
   persistProof(file: {
     originalname: string;
     mimetype: string;
@@ -351,29 +380,44 @@ export class WalletService {
     if (!file.buffer) {
       throw new BadRequestException('Justificatif illisible.');
     }
-    const ext = PROOF_EXT[file.mimetype];
-    if (!ext) {
+    const detected = PROOF_MAGIC.find((m) => m.sniff(file.buffer!));
+    if (!detected) {
       throw new BadRequestException(
-        'Type de justificatif refusé (PNG, JPEG, WebP ou PDF).',
+        'Contenu du justificatif non reconnu (signature PNG, JPEG, WebP ou PDF attendue).',
       );
     }
+    if (detected.mime !== file.mimetype) {
+      throw new BadRequestException(
+        `Contenu du justificatif incohérent avec le type déclaré (${file.mimetype} déclaré, ${detected.mime} détecté).`,
+      );
+    }
+    const ext = PROOF_EXT[detected.mime];
     const fileName = `proof-${randomBytes(8).toString('hex')}${ext}`;
     fs.mkdirSync(PROOF_DIR, { recursive: true });
     fs.writeFileSync(path.join(PROOF_DIR, fileName), file.buffer);
-    return { fileName, path: fileName, mime: file.mimetype };
+    return { fileName, path: fileName, mime: detected.mime };
   }
 
   removeProof(proofPath: string | null | undefined): void {
     if (!proofPath) return;
-    try {
-      fs.unlinkSync(path.join(PROOF_DIR, path.basename(proofPath)));
-    } catch {
-      // Fichier déjà absent : rien à nettoyer.
+    for (const dir of [PROOF_DIR, LEGACY_PROOF_DIR]) {
+      const abs = path.join(dir, path.basename(proofPath));
+      if (fs.existsSync(abs)) {
+        try {
+          fs.unlinkSync(abs);
+        } catch {
+          // Fichier déjà absent : rien à nettoyer.
+        }
+        return;
+      }
     }
   }
 
   proofAbsolutePath(proofPath: string): string {
-    return path.join(PROOF_DIR, path.basename(proofPath));
+    const abs = path.join(PROOF_DIR, path.basename(proofPath));
+    if (fs.existsSync(abs)) return abs;
+    // Repli LECTURE seule pour les justificatifs déposés avant Q8.
+    return path.join(LEGACY_PROOF_DIR, path.basename(proofPath));
   }
 
   /**
@@ -445,47 +489,89 @@ export class WalletService {
   }
 
   /**
-   * Validation admin d'une recharge : CAS `PENDING → SUCCEEDED` sous verrou +
-   * incrément du solde dans LE MÊME tour de `$transaction` — crédité exactement
-   * une fois (revalidation = 409, solde inchangé).
+   * Validation admin d'une recharge (GO Q8) : CAS `PENDING → SUCCEEDED` sous
+   * verrou + incrément du solde dans LE MÊME tour de `$transaction` — crédité
+   * exactement une fois (revalidation = 409, solde inchangé).
+   *
+   * `bankRef` = référence de rapprochement bancaire de l'ENCAISSEMENT réellement
+   * constaté (obligatoire, 3..64 car.) : elle est conservée sur la ligne avec le
+   * montant, la devise et l'acteur. Son unicité PostgreSQL garantit qu'un même
+   * encaissement ne finance JAMAIS deux crédits (P2002 → 409, la transaction
+   * est avortée : ni crédit partiel, ni ligne modifiée).
+   *
+   * Distinction explicite : `PENDING` = justificatif DÉPOSÉ (aucun fonds) ;
+   * `SUCCEEDED` + `bankRef` + `processedAt` + acteur = fonds CONSTATÉS.
    */
   async validateRecharge(
     rechargeId: string,
     admin: { sub: string; email: string },
-  ): Promise<{ balanceCents: number }> {
-    const balanceCents = await this.prisma.$transaction(async (tx) => {
-      const row = await tx.walletTransaction.findUnique({
-        where: { id: rechargeId },
-        select: { id: true, customerId: true, type: true, amountCents: true },
+    bankRef: string,
+  ): Promise<{ balanceCents: number; bankRef: string; amountCents: number; currency: string }> {
+    const ref = bankRef?.trim() ?? '';
+    if (ref.length < 3 || ref.length > 64) {
+      throw new BadRequestException(
+        'Référence de rapprochement bancaire requise (3 à 64 caractères).',
+      );
+    }
+    let credited: { balanceCents: number; amountCents: number; currency: string } | null = null;
+    try {
+      credited = await this.prisma.$transaction(async (tx) => {
+        const row = await tx.walletTransaction.findUnique({
+          where: { id: rechargeId },
+          select: { id: true, customerId: true, type: true, amountCents: true, currency: true },
+        });
+        if (!row) throw new NotFoundException('Recharge introuvable.');
+        if (row.type !== WalletTransactionType.CREDIT) {
+          throw new ConflictException('Type de mouvement inattendu.');
+        }
+        const rows = await tx.$queryRaw<{ walletBalanceCents: number }[]>`
+          SELECT "walletBalanceCents" FROM "Customer" WHERE id = ${row.customerId} FOR UPDATE`;
+        if (rows.length === 0) {
+          throw new NotFoundException('Dossier client introuvable.');
+        }
+        const cas = await tx.walletTransaction.updateMany({
+          where: { id: rechargeId, status: WalletTxStatus.PENDING },
+          data: {
+            status: WalletTxStatus.SUCCEEDED,
+            processedAt: new Date(),
+            adminActorId: admin.sub,
+            adminActorEmail: admin.email,
+            bankRef: ref,
+          },
+        });
+        if (cas.count !== 1) {
+          throw new ConflictException('Recharge déjà traitée.');
+        }
+        const updated = await tx.customer.update({
+          where: { id: row.customerId },
+          data: { walletBalanceCents: { increment: row.amountCents } },
+        });
+        return {
+          balanceCents: updated.walletBalanceCents,
+          amountCents: row.amountCents,
+          currency: row.currency,
+        };
       });
-      if (!row) throw new NotFoundException('Recharge introuvable.');
-      if (row.type !== WalletTransactionType.CREDIT) {
-        throw new ConflictException('Type de mouvement inattendu.');
+      return {
+        balanceCents: credited.balanceCents,
+        bankRef: ref,
+        amountCents: credited.amountCents,
+        currency: credited.currency,
+      };
+    } catch (err) {
+      if (
+        err instanceof Prisma.PrismaClientKnownRequestError &&
+        err.code === 'P2002' &&
+        String((err.meta as { target?: unknown } | undefined)?.target ?? '').includes('bankRef')
+      ) {
+        // Même encaissement déjà constaté sur une autre recharge : 409 clair,
+        // AUCUN crédit (la transaction a été annulée par l'unicité PG).
+        throw new ConflictException(
+          `Encaissement bancaire déjà utilisé (référence « ${ref} ») : un virement ne peut créditer qu’une recharge.`,
+        );
       }
-      const rows = await tx.$queryRaw<{ walletBalanceCents: number }[]>`
-        SELECT "walletBalanceCents" FROM "Customer" WHERE id = ${row.customerId} FOR UPDATE`;
-      if (rows.length === 0) {
-        throw new NotFoundException('Dossier client introuvable.');
-      }
-      const cas = await tx.walletTransaction.updateMany({
-        where: { id: rechargeId, status: WalletTxStatus.PENDING },
-        data: {
-          status: WalletTxStatus.SUCCEEDED,
-          processedAt: new Date(),
-          adminActorId: admin.sub,
-          adminActorEmail: admin.email,
-        },
-      });
-      if (cas.count !== 1) {
-        throw new ConflictException('Recharge déjà traitée.');
-      }
-      const updated = await tx.customer.update({
-        where: { id: row.customerId },
-        data: { walletBalanceCents: { increment: row.amountCents } },
-      });
-      return updated.walletBalanceCents;
-    });
-    return { balanceCents };
+      throw err;
+    }
   }
 
   /** Rejet admin : CAS `PENDING → CANCELED`, 0 crédit (preuve conservée). */

@@ -159,6 +159,7 @@ describe('Abonnements récurrents (e2e, P8)', () => {
     await request(app.getHttpServer())
       .post(`/${GlobalPrefix}/store/admin/wallet/recharges/${created.body.id}/validate`)
       .set('Authorization', `Bearer ${adminToken}`)
+      .send({ bankRef: `BANK-Q8-FUND-${created.body.id}` })
       .expect(201);
   }
 

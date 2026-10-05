@@ -2587,6 +2587,8 @@ export interface RechargeItem {
   currency: string;
   status: WalletTxStatus;
   reference: string;
+  /** GO Q8 — rapprochement bancaire saisi à la validation (admin). */
+  bankRef: string | null;
   methodName: string | null;
   proofFileName: string | null;
   note: string | null;
@@ -2661,12 +2663,12 @@ export const listAdminRecharges = (
     t,
   ) as Promise<ApiResult<RechargePage>>;
 };
-export const validateAdminRecharge = (t: string, id: string) =>
+export const validateAdminRecharge = (t: string, id: string, bankRef: string) =>
   apiJson(
     `/api/store/admin/wallet/recharges/${encodeURIComponent(id)}/validate`,
     t,
-    { method: 'POST' },
-  ) as Promise<ApiResult<{ ok: boolean; balanceCents: number; replayed?: boolean }>>;
+    { method: 'POST', body: JSON.stringify({ bankRef }) },
+  ) as Promise<ApiResult<{ ok: boolean; balanceCents: number; bankRef: string }>>;
 export const rejectAdminRecharge = (t: string, id: string, reason?: string) =>
   apiJson(
     `/api/store/admin/wallet/recharges/${encodeURIComponent(id)}/reject`,
