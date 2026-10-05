@@ -329,9 +329,19 @@ export class RefundService {
             creditNoteInvoiceId = noteId;
           }
 
-          // 7) Statuts sur cumul COMPLET uniquement.
+          // 7) Statuts sur cumul RÉUSSI uniquement (GO P4) : une intention
+          //    externe PENDING (non confirmée prestataire) ne constitue pas
+          //    un remboursement — elle réserve seulement le plafond (étape 3).
+          //    Le remboursement courant (wallet) bascule SUCCEEDED dans CETTE
+          //    transaction : son montant compte comme réussi.
           const total = used + input.amountCents;
-          const fullyRefunded = total === order.amountTtcCents;
+          const succeededAgg = await tx.refund.aggregate({
+            where: { orderId, status: RefundStatus.SUCCEEDED },
+            _sum: { amountCents: true },
+          });
+          const succeededTotal =
+            (succeededAgg._sum.amountCents ?? 0) + input.amountCents;
+          const fullyRefunded = succeededTotal === order.amountTtcCents;
           if (origin && fullyRefunded) {
             const target = creditNoteInvoiceId
               ? InvoiceStatus.CREDITED // réglé par avoir
@@ -375,6 +385,7 @@ export class RefundService {
               kind: input.kind,
               creditNoteInvoiceId,
               usedAfter: total,
+              succeededAfter: succeededTotal,
               captured: order.amountTtcCents,
               fullyRefunded,
               orderStatusChanged,

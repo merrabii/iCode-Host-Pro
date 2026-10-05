@@ -304,6 +304,97 @@ describe('RefundService (GO Q9 — remboursements et avoirs)', () => {
     });
   });
 
+  // ── E2. GO P4 : « fullyRefunded » = cumul des RÉUSSIS seulement ────────
+  describe('createRefund — cumul réussi vs engagé (P4)', () => {
+    it('intention externe PENDING ne bascule ni commande ni facture', async () => {
+      const { service, tx, wallet, audit } = makeService();
+      tx.$queryRaw.mockResolvedValue(paidOrderRow()); // encaissé 1500
+      tx.refund.findUnique.mockResolvedValue(null);
+      // 1er appel (plafond) : engagé = PENDING 500 + SUCCEEDED 0 = 500
+      // 2e appel (statuts) : RÉUSSIS seuls = 0 (l'externe reste PENDING)
+      tx.refund.aggregate
+        .mockResolvedValueOnce({ _sum: { amountCents: 500 } })
+        .mockResolvedValueOnce({ _sum: { amountCents: 0 } });
+      tx.invoice.findUnique.mockResolvedValue(originInvoice());
+      tx.refund.create.mockResolvedValue({ id: 'rf-p4' });
+      tx.walletTransaction.findUnique.mockResolvedValue({ id: 'wt-p4' });
+      tx.refund.update.mockImplementation(
+        async ({ data }: { data: Record<string, unknown> }) => ({
+          id: 'rf-p4',
+          ...data,
+        }),
+      );
+
+      const view = await service.createRefund(
+        'ord-1',
+        {
+          amountCents: 1000, // wallet réussi → cumul réussi 1000 < 1500
+          kind: RefundKind.WALLET_CREDIT,
+          reason: 'Moitié remboursée, moitié en attente prestataire',
+        },
+        'refund-key-p4-0001',
+        actor,
+      );
+
+      // le wallet est crédité (effet interne réel)…
+      expect(wallet.applyWithClient).toHaveBeenCalledTimes(1);
+      expect(view.status).toBe(RefundStatus.SUCCEEDED);
+      // …mais la commande reste PAID et la facture reste PAID : seul un
+      // cumul des RÉUSSIS égal à l'encaissé autorise la bascule.
+      expect(tx.order.updateMany).not.toHaveBeenCalled();
+      expect(tx.invoice.updateMany).not.toHaveBeenCalled();
+      const succ = audit.record.mock.calls.find(
+        (c) => c[0]?.action === 'refund.succeeded',
+      );
+      expect(succ?.[0].details).toMatchObject({
+        usedAfter: 1500, // engagé : 500 PENDING + 1000 wallet (plafond)
+        succeededAfter: 1000, // réussi : wallet seul
+        captured: 1500,
+        fullyRefunded: false,
+      });
+    });
+
+    it('cumul RÉUSSI exact = encaissé → bascule commande et facture', async () => {
+      const { service, tx } = makeService();
+      tx.$queryRaw.mockResolvedValue(paidOrderRow()); // encaissé 1500
+      tx.refund.findUnique.mockResolvedValue(null);
+      // plafond : 500 déjà engagés ; réussi : 500 déjà réellement remboursés
+      tx.refund.aggregate
+        .mockResolvedValueOnce({ _sum: { amountCents: 500 } })
+        .mockResolvedValueOnce({ _sum: { amountCents: 500 } });
+      tx.invoice.findUnique.mockResolvedValue(originInvoice());
+      tx.refund.create.mockResolvedValue({ id: 'rf-p4b' });
+      tx.walletTransaction.findUnique.mockResolvedValue({ id: 'wt-p4b' });
+      tx.order.updateMany.mockResolvedValue({ count: 1 });
+      tx.invoice.updateMany.mockResolvedValue({ count: 1 });
+      tx.refund.update.mockImplementation(
+        async ({ data }: { data: Record<string, unknown> }) => ({
+          id: 'rf-p4b',
+          ...data,
+        }),
+      );
+
+      await service.createRefund(
+        'ord-1',
+        { amountCents: 1000, kind: RefundKind.WALLET_CREDIT },
+        'refund-key-p4-0002',
+        actor,
+      );
+
+      expect(tx.invoice.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 'inv-1', status: 'PAID' },
+        }),
+      );
+      expect(tx.order.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 'ord-1', status: OrderStatus.PAID },
+          data: { status: OrderStatus.REFUNDED },
+        }),
+      );
+    });
+  });
+
   // ── F. rejeu : même clé = AUCUN second effet ───────────────────────────
   describe('createRefund — rejeu idempotent (F)', () => {
     it('même clé + même intention : rejeu sans wallet ni écriture', async () => {
