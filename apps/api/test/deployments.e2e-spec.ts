@@ -360,7 +360,11 @@ describe('Deployments GitHub → Coolify (e2e, Phase 10bis)', () => {
   });
 
   afterAll(async () => {
-    await setDeployEnabled(false);
+    // Restaure le DÉFAUT documenté (deployEnabled default-ON, Phase 17A.1) :
+    // laisser `false` persister en base partagée empoisonnerait toutes les
+    // suites suivantes (403 « déploiements GitHub → Coolify désactivés » au
+    // lieu du message métier attendu). Aucun test de la suite n'exige false.
+    await setDeployEnabled(true);
     // Teardown déterministe des fixtures DNS de CETTE suite : ids exacts
     // collectés à la création (aprèsEach + captures explicites), jamais un
     // filtre large. Aucun appel Cloudflare (transport factice + Prisma seul).

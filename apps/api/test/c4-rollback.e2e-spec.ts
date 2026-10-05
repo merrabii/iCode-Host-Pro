@@ -495,7 +495,11 @@ describe('C4 rollback intégration PostgreSQL réel — createProject / createGi
   });
 
   afterAll(async () => {
-    await setDeployEnabled(false);
+    // Restaure le DÉFAUT documenté (deployEnabled default-ON, Phase 17A.1) :
+    // laisser `false` persister en base partagée empoisonnerait les suites
+    // suivantes (403 « déploiements désactivés » au lieu du message métier).
+    // Aucun test de la suite n'exige false.
+    await setDeployEnabled(true);
     // Nettoyage LIMITÉ aux fixtures créées par CETTE suite (aucune purge
     // globale des tables C4) : ids dérivés des users/services suivis ci-dessus.
     const caseUsers: { id: string }[] = await prisma.user

@@ -345,7 +345,11 @@ describe('Deployments 17B.4F-C2 — garde HOSTING_C2_ENABLED (e2e)', () => {
   });
 
   afterAll(async () => {
-    await setDeployEnabled(false);
+    // Restaure le DÉFAUT documenté (deployEnabled default-ON, Phase 17A.1) :
+    // laisser `false` persister en base partagée empoisonnerait toutes les
+    // suites suivantes (403 « déploiements GitHub → Coolify désactivés » au
+    // lieu du message métier attendu). Aucun test de la suite n'exige false.
+    await setDeployEnabled(true);
     await snapshotSuiteClientSubdomains();
     if (trackedCsIds.size > 0) {
       await prisma.clientSubdomain
