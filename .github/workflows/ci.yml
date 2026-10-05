@@ -91,20 +91,29 @@ jobs:
         # c4-rollback) s'exécutent dans l'étape dédiée ci-dessous : elles
         # exigent chacune SA base dédiée (garde current_database()) — impossible
         # de les mixter avec la base CI principale. Leurs bases sont refabriquées
-        # à l'étape « bases dédiées » (Q10 : 58 migrations puis retrait des
-        # tables C1/C3/C4 pour l'état pré-migratoire).
+        # à l'étape « bases dédiées » (migrate complet, 60 migrations, puis
+        # retrait des tables C1/C3/C4 pour l'état pré-migratoire).
         run: >-
           pnpm -C apps/api exec jest --config ./test/jest-e2e.json --runInBand
           --testPathIgnorePatterns c3-premig c4-premig c4-release c4-rollback
 
       - name: Bases dédiées des suites legacy 17B (refabrique Q10)
         # Recette reproductible (identique à la refabrique locale Q10) :
-        #   1. 3 bases neuves migrées à 58/58 (colonnes du socle présentes) ;
-        #   2. c3premig : DROP des tables C1/C3 (+ C4) = état « pré-migrations »
-        #      historique (43/47) sur base à jour ;
-        #   3. c4premig : la migration C4 est déjà journalisée (record présent
-        #      depuis l'ancienne base) → les tables C4 restent absentes ;
-        #   4. c4test : base COMPLÈTE (C4 présent) = c4-release/c4-rollback.
+        #   1. 3 bases NEUVES (le service Postgres est jeté à chaque job :
+        #      la préparation ne dépend d'aucune base locale préparée) ;
+        #   2. migrate deploy complet (schéma courant) sur chacune ;
+        #   3. c3premig : DROP C1/C3/C4 = état « pré-migrations » historique
+        #      — ordre des dépendances : enfants AVANT parents
+        #      (OrderProvisioningTracking → Order ; HostingServiceAllocation
+        #      → HostingService en ON DELETE RESTRICT ⇒ allocation déposée
+        #      avant le service, dont les FK résiduelles de ClientProject et
+        #      Deployment tombent en CASCADE) ; tables C4 sans FK (ordre libre) ;
+        #   4. c4premig : DROP des 5 tables C4 SEULEMENT (aucune FK vers/depuis
+        #      ces tables — ordre indifférent) ; le reste du schéma (dont
+        #      HostingService) reste intact : état « pré-migration C4 » ;
+        #   5. c4test : base COMPLÈTE (C4 présent) = c4-release/c4-rollback.
+        # Aucun DROP DATABASE ici : les bases/preuves historiques ne sont
+        # jamais effacées.
         env:
           PGPASSWORD: icode
         run: |
@@ -126,6 +135,75 @@ jobs:
           DROP TABLE IF EXISTS "C4StopRequest";
           DROP TABLE IF EXISTS "C4ReleaseEvidence";
           DROP TABLE IF EXISTS "C4ReadinessProof";
+          SQL
+          psql "postgresql://icode:icode@localhost:5432/icode_host_pro_c4premig" -v ON_ERROR_STOP=1 <<'SQL'
+          DROP TABLE IF EXISTS "C4ProviderAttempt";
+          DROP TABLE IF EXISTS "C4Takeover";
+          DROP TABLE IF EXISTS "C4StopRequest";
+          DROP TABLE IF EXISTS "C4ReleaseEvidence";
+          DROP TABLE IF EXISTS "C4ReadinessProof";
+          SQL
+
+      - name: Préconditions effectives des bases legacy avant suites
+        # Fail-closed : chaque base doit présenter EXACTEMENT l'état attendu
+        # par sa suite (miroir des gardes current_database()/to_regclass des
+        # specs) AVANT tout lancement — une préparation incomplète ou une
+        # base héritée d'un run précédent casse ici, pas au milieu des tests.
+        env:
+          PGPASSWORD: icode
+        run: |
+          set -euo pipefail
+          psql "postgresql://icode:icode@localhost:5432/icode_host_pro_c3premig" -v ON_ERROR_STOP=1 <<'SQL'
+          DO $$
+          BEGIN
+            IF current_database() <> 'icode_host_pro_c3premig' THEN
+              RAISE EXCEPTION 'c3premig: identité % inattendue', current_database();
+            END IF;
+            IF to_regclass('public."OrderProvisioningTracking"') IS NOT NULL
+               OR to_regclass('public."HostingServiceAllocation"') IS NOT NULL
+               OR to_regclass('public."HostingService"') IS NOT NULL
+               OR to_regclass('public."C4ProviderAttempt"') IS NOT NULL THEN
+              RAISE EXCEPTION 'c3premig: DROP pré-migratoire incomplet (table C1/C3/C4 encore présente)';
+            END IF;
+            IF to_regclass('public."Order"') IS NULL OR to_regclass('public."Product"') IS NULL THEN
+              RAISE EXCEPTION 'c3premig: socle métier absent (préparation invalide)';
+            END IF;
+          END $$;
+          SQL
+          psql "postgresql://icode:icode@localhost:5432/icode_host_pro_c4premig" -v ON_ERROR_STOP=1 <<'SQL'
+          DO $$
+          BEGIN
+            IF current_database() <> 'icode_host_pro_c4premig' THEN
+              RAISE EXCEPTION 'c4premig: identité % inattendue', current_database();
+            END IF;
+            IF to_regclass('public."C4ProviderAttempt"') IS NOT NULL
+               OR to_regclass('public."C4Takeover"') IS NOT NULL
+               OR to_regclass('public."C4StopRequest"') IS NOT NULL
+               OR to_regclass('public."C4ReleaseEvidence"') IS NOT NULL
+               OR to_regclass('public."C4ReadinessProof"') IS NOT NULL THEN
+              RAISE EXCEPTION 'c4premig: tables C4 encore présentes (DROP C4 manquant dans la préparation)';
+            END IF;
+            IF to_regclass('public."HostingService"') IS NULL
+               OR to_regclass('public."HostingServiceAllocation"') IS NULL
+               OR to_regclass('public."Order"') IS NULL THEN
+              RAISE EXCEPTION 'c4premig: schéma non-C4 à tort retiré (préparation trop agressive)';
+            END IF;
+          END $$;
+          SQL
+          psql "postgresql://icode:icode@localhost:5432/icode_host_pro_c4test" -v ON_ERROR_STOP=1 <<'SQL'
+          DO $$
+          BEGIN
+            IF current_database() <> 'icode_host_pro_c4test' THEN
+              RAISE EXCEPTION 'c4test: identité % inattendue', current_database();
+            END IF;
+            IF to_regclass('public."C4ProviderAttempt"') IS NULL
+               OR to_regclass('public."C4Takeover"') IS NULL
+               OR to_regclass('public."C4StopRequest"') IS NULL
+               OR to_regclass('public."C4ReleaseEvidence"') IS NULL
+               OR to_regclass('public."C4ReadinessProof"') IS NULL THEN
+              RAISE EXCEPTION 'c4test: tables C4 absentes (base incomplète pour c4-release/c4-rollback)';
+            END IF;
+          END $$;
           SQL
 
       - name: Tests e2e legacy 17B (4 suites, bases dédiées)
