@@ -2,8 +2,8 @@
 
 **Date :** 2026-10-05 · **Branche :** `feat/socle-commercial` (worktree `C:\Users\mourad.errabii\Documents\iCode-Host-Recette`)
 **Base de tests :** `icode_host_pro_socle` (docker `icode-postgres`, 60 migrations) · **Base recette UI :** `icode_host_pro_recette` (60 migrations) · **Bases legacy :** `icode_host_pro_c3premig`, `icode_host_pro_c4premig`, `icode_host_pro_c4test`
-**Commits :** `git log main..HEAD` = **41 commits** (`86c9f61`→`323e793`, dont cachet Q11 `b4b6bad` + corrections Q12 `d949f65`→`323e793` (P1→P7) ; code testé = `323e793`) — **aucun push, aucun merge** (`main`/`origin/main` = `3245694` intact).
-**Diff complet :** `git diff 3245694 323e793` = **134 fichiers, +30 775 / −486** (patch : `recette/diff-socle-commercial.patch`, 1 627 040 octets, couvre **41 commits** ; le cachet docs Q12 final reprend le patch jusqu’au commit docs — chiffres et SHA-256 scellés par le cachet, auto-référence non composable sans récursion).
+**Commits :** `git log main..HEAD` = **43 commits** (`86c9f61`→cachet docs final Q12 ; code testé = `323e793`, docs Q12 = `562fc39`) — **aucun push, aucun merge** (`main`/`origin/main` = `3245694` intact).
+**Diff complet :** `git diff 3245694 562fc39` = **134 fichiers, +30 792 / −486** (patch : `recette/diff-socle-commercial.patch`, 1 632 679 octets, couvre **42 commits** — le seul commit hors patch est le cachet docs Q12 qui rapporte son SHA, auto-référence non composable sans récursion).
 **Environnement de preuve (toutes capacités ci-dessous, sauf mention contraire) :** local uniquement — docker `icode-postgres`, API Nest sur 3011 (PORT 3001 interdit), web Next sur 3002, proxy nav 3999, compte `admin-recette@icode.test` / `client-a-recette@icode.test`. Aucun appel réseau sortant vers un panneau/paiement réel (transports simulés).
 
 ---
@@ -90,8 +90,8 @@ Chaque point = une revue du patch `3245694`→HEAD ; **zéro assertion affaiblie
 
 - **Migrations ajoutées : 12 additives** (aucune ancienne modifiée ; total **48 → 60**) : `20261002000000_add_payment_confirmation`, `20261002100000_add_password_reset`, `20261003000000_add_invoice_billing_terms`, `20261003000001_add_invoice_dunning`, `20261004045500_q_a_renewal_consent_invoice_subscription`, `20261004045643_q_a_index_invoice_subscription`, `20261004104124_q6_sweep_lease`, `20261004114140_q3_email_change_closure`, `20261005000001_q8_wallet_bankref_invoice_pdfstatus`, `20261005000002_q9_refunds_credit_notes`, `20261006000000_q12_refresh_session_family`, `20261006000001_q12_p5_credit_note_pieces`.
 - **Dépendances ajoutées (2)** : `pdfkit` + `@types/pdfkit` (PDF facture) — `pnpm-lock.yaml` à jour.
-- **Commits : 41** (au code `323e793`) — liste exacte : `git log --oneline main..HEAD` (feature = `076a5ab`, `3fbbf62`, `2f3948c`, `8bd07d3`, `c498fda`, `ada8bed`, `73a6061`, `3eb0852` ; corrections Q12 = `d949f65` (P1), `5f06913` (P2), `4d56377` (P3), `e6ddb86` (P4), `41cd0b9` (P5), `8f44824` (P6), `323e793` (P7) ; tests/docs = commits `test(*)`, `docs(*)` ; le reste = P0→P10).
-- **Fichiers : 134 modifiés (+30 775 / −486)** — détails : `git diff --stat 3245694 323e793`. Nouveaux services notables : `RenewalService`, `InvoicePdfService`, `WalletService`, `RefundService`, `SuspensionEffectsService`, `sweep-guards`, module `pricing-acceptance` (preuve d’acceptation checkout) ; pages `/client/{commandes,factures,portefeuille}`, `/manager/{commandes,factures,facturation,taxe,recharges,moyens-paiement,subscriptions}`.
+- **Commits : 43** (code = 41 jusqu’à `323e793` + docs Q12 `562fc39` + cachet final) — liste exacte : `git log --oneline main..HEAD` (feature = `076a5ab`, `3fbbf62`, `2f3948c`, `8bd07d3`, `c498fda`, `ada8bed`, `73a6061`, `3eb0852` ; corrections Q12 = `d949f65` (P1), `5f06913` (P2), `4d56377` (P3), `e6ddb86` (P4), `41cd0b9` (P5), `8f44824` (P6), `323e793` (P7) ; tests/docs = commits `test(*)`, `docs(*)` ; le reste = P0→P10).
+- **Fichiers : 134 modifiés (+30 792 / −486)** — détails : `git diff --stat 3245694 562fc39`. Nouveaux services notables : `RenewalService`, `InvoicePdfService`, `WalletService`, `RefundService`, `SuspensionEffectsService`, `sweep-guards`, module `pricing-acceptance` (preuve d’acceptation checkout) ; pages `/client/{commandes,factures,portefeuille}`, `/manager/{commandes,factures,facturation,taxe,recharges,moyens-paiement,subscriptions}`.
 - **CI** : `.github/workflows/ci.yml` — typecheck×2, unit, e2e principal, **étape next build (heap 6144)**, **étapes bases dédiées + 3 suites legacy**, **préparations legacy P6** (DROP 5 tables C4 sur `c4premig` + étape « Préconditions effectives des bases legacy »).
 
 ---
@@ -100,10 +100,10 @@ Chaque point = une revue du patch `3245694`→HEAD ; **zéro assertion affaiblie
 
 1. **Rapport (ce fichier)** : `docs/RAPPORT-SOCLE-COMMERCIAL.md`.
 2. **HTML de suivi actualisé** : `docs/suivi-projet.html` (v9, ouverture locale + navigation vérifiées).
-3. **Patch complet depuis `3245694`** : `recette/diff-socle-commercial.patch` — **couvre `3245694`→`323e793` (41 commits)** : 134 fichiers, +30 775/−486, 1 627 040 octets, nouveaux fichiers inclus, généré par `git diff 3245694 323e793 --binary --full-index --output=…` (écriture par Git lui-même = **aucune redirection d'encodage**) ; le **cachet docs Q12 final** régénère le patch jusqu’au commit docs (chiffres et SHA-256 exacts scellés par le cachet, hors cachet lui-même).
+3. **Patch complet depuis `3245694`** : `recette/diff-socle-commercial.patch` — **couvre `3245694`→`562fc39` (42 commits)** : 134 fichiers, +30 792/−486, 1 632 679 octets, nouveaux fichiers inclus, généré par `git diff 3245694 562fc39 --binary --full-index --output=…` (écriture par Git lui-même = **aucune redirection d'encodage**) — seul le cachet docs Q12 reste hors patch.
 4. **Vérification de fidélité (corruption d'export vs corruption source)** :
-   - *Export* : deux exports successifs → **SHA-256 identiques** `161E49C433556B3D845F0253101D64BC4B87F8FE972CC9CC1EDF3E5FCF36B4A7` (export déterministe, non corrompu ; re-vérifié sur le patch final au cachet).
-   - *Source* : `git apply --check --reverse` du patch contre l’arbre `323e793` → **exit 0** (le patch est exactement reproductible des blobs Git ; tout écart blob/arbre aurait fait échouer le reverse-apply).
+   - *Export* : deux exports successifs → **SHA-256 identiques** `9074BB3848405303947EDD844F9F32B1AEDF1A8087270AAE83E467E581F9EDC6` (export déterministe, non corrompu).
+   - *Source* : `git apply --check --reverse` du patch contre l’arbre `562fc39` → **exit 0** (le patch est exactement reproductible des blobs Git ; tout écart blob/arbre aurait fait échouer le reverse-apply).
 5. **Guide court de recette manuelle** : `recette/GUIDE-RECETTE-P10.md` (mise à jour Q10/Q11/Q12).
 6. **Commit/états** : `git status` propre ; `main`/`origin/main` = `3245694` intact.
 
