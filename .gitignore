@@ -51,3 +51,5 @@ Thumbs.db
 apps/api/storage/
 apps/api/public/wallet-proofs/
 apps/api/public/invoices/
+# même stockage quand l'API tourne depuis la racine (recette up-p10 : cwd = racine)
+/storage/
