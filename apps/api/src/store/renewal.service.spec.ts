@@ -287,10 +287,12 @@ describe('RenewalService (D2 — échéances, renouvellement, dunning)', () => {
 
   it('souscription suspendue → on N\u2019arrête PAS la chaîne (résumable, aucun flip)', async () => {
     prisma.order.findMany.mockResolvedValueOnce([head()]);
-    prisma.subscription.findFirst
-      .mockResolvedValueOnce(null) // chaîne : aucun abonnement lié
-      .mockResolvedValueOnce(null) // fallback : pas d'ACTIVE
-      .mockResolvedValueOnce({ status: SubscriptionStatus.SUSPENDED }); // dernière connue
+    // Liée à la chaîne mais suspendue → skip (GO Q12-P2 : plus de fallback,
+    // le rattachement se lit UNIQUEMENT dans la chaîne).
+    prisma.subscription.findFirst.mockResolvedValueOnce({
+      productId: 'prod-1',
+      status: SubscriptionStatus.SUSPENDED,
+    });
 
     const res = await svc.sweep();
 
@@ -318,6 +320,7 @@ describe('RenewalService (D2 — échéances, renouvellement, dunning)', () => {
       renewsOrderId: 'mother-1',
       productId: 'prod-1',
       amountTtcCents: 1200,
+      autoRenew: true, // consentement de la chaîne porté par la fille (Q12-P2)
       customerEmail: 'alice@test.local',
       customer: { userId: 'user-1' },
       invoice: { number: '2026-0041' },
@@ -345,6 +348,7 @@ describe('RenewalService (D2 — échéances, renouvellement, dunning)', () => {
       renewsOrderId: 'mother-1',
       productId: 'prod-1',
       amountTtcCents: 1200,
+      autoRenew: true,
       customerEmail: 'alice@test.local',
       customer: { userId: 'user-1' },
       invoice: { number: '2026-0041' },
@@ -371,6 +375,7 @@ describe('RenewalService (D2 — échéances, renouvellement, dunning)', () => {
       renewsOrderId: 'mother-1',
       productId: 'prod-1',
       amountTtcCents: 1200,
+      autoRenew: true,
       customerEmail: 'alice@test.local',
       customer: { userId: 'user-1' },
       invoice: { number: '2026-0041' },
@@ -384,6 +389,94 @@ describe('RenewalService (D2 — échéances, renouvellement, dunning)', () => {
     expect(checkout.payOrderWithWallet).not.toHaveBeenCalled();
     expect(wallet.debit).not.toHaveBeenCalled();
     expect(checkout.confirmOrderPaid).not.toHaveBeenCalled();
+  });
+
+  it('Q12-P2 : solde insuffisant → impayé → RÉVOCATION (cascade) → recharge → reprise SANS débit', async () => {
+    // Passe 1 : création + solde insuffisant → facture UNPAID, aucun crédit.
+    prisma.order.findMany.mockResolvedValueOnce([head()]).mockResolvedValueOnce([]);
+    prisma.subscription.findFirst.mockResolvedValue({
+      id: 'sub-1',
+      productId: 'prod-1',
+      status: SubscriptionStatus.ACTIVE,
+    });
+    checkout.payOrderWithWallet.mockRejectedValueOnce(new ConflictException('Solde insuffisant.'));
+    const first = await svc.sweep();
+    expect(first).toMatchObject({ created: 1, paid: 0, pending: 1 });
+    expect(wallet.credit).not.toHaveBeenCalled();
+
+    // La révocation (contrôleur, cascade vers la fille) a basculé autoRenew.
+    prisma.order.findMany.mockResolvedValueOnce([]); // aucune échéance
+    prisma.order.findMany.mockResolvedValueOnce([{
+      id: 'renewal-1',
+      renewsOrderId: 'mother-1',
+      productId: 'prod-1',
+      amountTtcCents: 1200,
+      autoRenew: false, // RÉVOQUÉ
+      customerEmail: 'alice@test.local',
+      customer: { userId: 'user-1' },
+      invoice: { number: '2026-0041' },
+    }]);
+    // Le client recharge (solde suffisant) : le sweep ne doit RIEN prélever.
+    const second = await svc.sweep();
+    expect(second).toMatchObject({ paid: 0, pending: 1 });
+    expect(checkout.payOrderWithWallet).toHaveBeenCalledTimes(1); // passe 1 seulement
+    expect(checkout.confirmOrderPaid).not.toHaveBeenCalled();
+    expect(wallet.debit).not.toHaveBeenCalled();
+  });
+
+  it('Q12-P2 : course révocation/débit — révocation committée entre la lecture et le CAS → AUCUN débit', async () => {
+    prisma.order.findMany
+      .mockResolvedValueOnce([]) // aucune échéance
+      .mockResolvedValueOnce([{
+        id: 'renewal-1',
+        renewsOrderId: 'mother-1',
+        productId: 'prod-1',
+        amountTtcCents: 1200,
+        autoRenew: true, // lu AVANT que la révocation ne commite
+        customerEmail: 'alice@test.local',
+        customer: { userId: 'user-1' },
+        invoice: { number: '2026-0041' },
+      }]);
+    prisma.subscription.findFirst.mockResolvedValue({
+      id: 'sub-1',
+      productId: 'prod-1',
+      status: SubscriptionStatus.ACTIVE,
+    });
+    // CAS de consentement juste avant le débit : la révocation a committé
+    // entre la lecture de la passe et ce CAS → count 0.
+    prisma.order.updateMany.mockResolvedValueOnce({ count: 0 });
+
+    const res = await svc.sweep();
+
+    expect(res).toMatchObject({ paid: 0, pending: 1 });
+    expect(checkout.payOrderWithWallet).not.toHaveBeenCalled();
+    expect(checkout.confirmOrderPaid).not.toHaveBeenCalled();
+    expect(wallet.debit).not.toHaveBeenCalled();
+  });
+
+  it('Q12-P2 : deux chaînes d’un même client — chaque garde ne juge QUE sa chaîne (fallback supprimé)', async () => {
+    prisma.order.findMany
+      .mockResolvedValueOnce([
+        head(),
+        head({ id: 'mother-2', productId: 'prod-2' }),
+      ])
+      .mockResolvedValueOnce([]);
+    prisma.subscription.findFirst
+      .mockResolvedValueOnce({ id: 'sub-1', productId: 'prod-1', status: SubscriptionStatus.ACTIVE })
+      .mockResolvedValueOnce({ id: 'sub-2', productId: 'prod-2', status: SubscriptionStatus.SUSPENDED });
+
+    const res = await svc.sweep();
+
+    expect(res).toMatchObject({ created: 1, paid: 1, stopped: 0 });
+    // Chaque appel de garde porte orderId DANS sa propre chaîne — jamais un
+    // lookup « dernier abonnement actif du compte ».
+    expect(prisma.subscription.findFirst).toHaveBeenCalledTimes(2);
+    expect(prisma.subscription.findFirst.mock.calls[0][0].where.orderId).toEqual({
+      in: ['mother-1'],
+    });
+    expect(prisma.subscription.findFirst.mock.calls[1][0].where.orderId).toEqual({
+      in: ['mother-2'],
+    });
   });
 
   // ── 3. Dunning : relance unique ───────────────────────────────────────────

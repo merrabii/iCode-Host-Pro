@@ -242,9 +242,13 @@ export class ClientStoreController {
    * propriétaire strict de la commande. `enabled=true` enregistre le
    * consentement daté (`renewalConsentAt`, si absent) et arme `autoRenew` +
    * l'échéance ; `enabled=false` bascule `autoRenew=false` immédiatement (le
-   * consentement historique reste daté). CAS : les sweeps de création voient
-   * l'état courant — la révocation même concurrente à un sweep est sûre (le
-   * flip de création exige `autoRenew: true`).
+   * consentement historique reste daté) **ET CASCADE vers toute la descendance
+   * de la chaîne** (GO Q12-P2) : la fille de renouvellement porte le
+   * consentement copié dans SON `autoRenew`, et la mère est déjà passée à
+   * false à la création — sans cascade, la révocation serait silencieuse et la
+   * reprise débiterait malgré tout. CAS : les sweeps de création voient l'état
+   * courant — la révocation même concurrente à un sweep est sûre (le flip de
+   * création exige `autoRenew: true`, la reprise un CAS sur la fille).
    */
   @Patch('orders/:id/renewal')
   @ApiOperation({ summary: 'Activer ou révoquer le renouvellement automatique' })
@@ -269,6 +273,7 @@ export class ClientStoreController {
       throw new ConflictException('Commande sans abonnement : aucun renouvellement à gérer.');
     }
 
+    let revokedDescendants = 0;
     if (body.enabled) {
       if (
         order.status !== OrderStatus.PAID &&
@@ -291,10 +296,36 @@ export class ClientStoreController {
         },
       });
     } else {
+      // Cible : CAS idempotent (révocation même déjà faite = no-op sûr).
       await this.prisma.order.updateMany({
         where: { id: order.id, autoRenew: true },
         data: { autoRenew: false },
       });
+      // Cascade vers les FILLES de renouvellement (descendance `renewsOrderId`) :
+      // c'est LEUR `autoRenew` (consentement de la chaîne) que la reprise
+      // vérifie par CAS avant tout débit — la mère est souvent déjà à false.
+      const closed = new Set<string>();
+      let frontier: string[] = [order.id];
+      for (let depth = 0; depth < 50 && frontier.length > 0; depth++) {
+        const children = await this.prisma.order.findMany({
+          where: { renewsOrderId: { in: frontier } },
+          select: { id: true },
+        });
+        frontier = [];
+        for (const child of children) {
+          if (!closed.has(child.id)) {
+            closed.add(child.id);
+            frontier.push(child.id);
+          }
+        }
+      }
+      if (closed.size > 0) {
+        const cascade = await this.prisma.order.updateMany({
+          where: { id: { in: [...closed] }, autoRenew: true },
+          data: { autoRenew: false },
+        });
+        revokedDescendants = cascade.count;
+      }
     }
 
     await this.audit
@@ -302,7 +333,10 @@ export class ClientStoreController {
         action: 'subscription.renewal_toggled',
         resourceType: 'order',
         resourceId: order.id,
-        details: { enabled: body.enabled },
+        details: {
+          enabled: body.enabled,
+          ...(body.enabled ? {} : { revokedDescendants }),
+        },
       })
       .catch(() => {});
 

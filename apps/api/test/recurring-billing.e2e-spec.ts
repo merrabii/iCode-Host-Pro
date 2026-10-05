@@ -513,6 +513,62 @@ describe('Abonnements récurrents (e2e, P8)', () => {
     ).toBe(0);
   });
 
+  it('C1 — Q12-P2 : révocation sur la MÈRE (cascade vers la fille) → recharge → sweep SANS débit', async () => {
+    // La fille porte le consentement copié : avant la révocation, elle est
+    // bien armée (autoRenew=true) — c'est cette signature que la reprise CAS.
+    const daughterBefore = await prisma.order.findUniqueOrThrow({
+      where: { id: bobRenewalId },
+    });
+    expect(daughterBefore.autoRenew).toBe(true);
+
+    // Bob révoque sur LA COMMANDE QU'IL VOIT (la mère, déjà autoRenew=false
+    // depuis la création) : sans cascade, ce serait un no-op silencieux.
+    const off = await request(app.getHttpServer())
+      .patch(`/${GlobalPrefix}/client/orders/${bobMotherId}/renewal`)
+      .set('Authorization', `Bearer ${bobToken}`)
+      .send({ enabled: false })
+      .expect(200);
+    expect(off.body.autoRenew).toBe(false);
+
+    // Cascade : la fille est basculée — plus aucun prélèvement possible.
+    const daughterAfter = await prisma.order.findUniqueOrThrow({
+      where: { id: bobRenewalId },
+    });
+    expect(daughterAfter.autoRenew).toBe(false);
+    expect(
+      await prisma.auditLog.findFirst({
+        where: { action: 'subscription.renewal_toggled', resourceId: bobMotherId },
+      }),
+    ).not.toBeNull();
+
+    // Bob recharge (vrai parcours : preuve + validation admin).
+    await fundWallet(bobToken, 100_000);
+    const balanceAfterFund = (
+      await prisma.customer.findUniqueOrThrow({ where: { userId: bobUserId } })
+    ).walletBalanceCents;
+    expect(balanceAfterFund).toBeGreaterThanOrEqual(100_000);
+
+    // Sweep : la reprise voit la révocation → SANS débit, facture toujours
+    // UNPAID (dunning garde son droit), solde intact.
+    const r = await sweep().expect(201);
+    expect(r.body.paid).toBe(0);
+    expect(
+      await prisma.walletTransaction.count({ where: { orderId: bobRenewalId } }),
+    ).toBe(0);
+    const stillPending = await prisma.order.findUniqueOrThrow({
+      where: { id: bobRenewalId },
+    });
+    expect(stillPending.status).toBe(OrderStatus.PENDING_PAYMENT);
+    const inv = await prisma.invoice.findUniqueOrThrow({
+      where: { orderId: bobRenewalId },
+    });
+    expect(inv.status).toBe(InvoiceStatus.UNPAID);
+    const balanceAfterSweep = (
+      await prisma.customer.findUniqueOrThrow({ where: { userId: bobUserId } })
+    ).walletBalanceCents;
+    expect(balanceAfterSweep).toBe(balanceAfterFund); // AUCUN débit malgré la recharge
+  });
+
   it('C2 — rappel d\u2019impayé UNE seule fois (marqueur + audit), suspension au-delà du grâce, statut SEUL', async () => {
     const settings = await prisma.billingSetting.findFirstOrThrow({ orderBy: { createdAt: 'asc' } });
     const invBefore = await prisma.invoice.findUniqueOrThrow({ where: { orderId: bobRenewalId } });

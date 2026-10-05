@@ -851,14 +851,20 @@ export class CheckoutService {
         // Q-A (item 4) : le renouvellement automatique n'est ARMÉ que si le
         // consentement explicite est enregistré (`renewalConsentAt`) — sans
         // consentement, AUCUN prélèvement automatique n'est jamais planifié.
+        // GO Q12-P2 : pour une commande de RENOUVELLEMENT, l'armement suit
+        // `autoRenew` COURANT (consentement de la chaîne) — un règlement
+        // manuel après révocation ne réarme JAMAIS la chaîne ; une commande
+        // fraîche (case du checkout) s'arme sur la seule présence du
+        // consentement daté.
         const recurring = order.billingCycle !== BillingCycle.ONETIME;
+        const armNow = recurring && !!order.renewalConsentAt && (isRenewal ? order.autoRenew : true);
         const cas = await tx.order.updateMany({
           where: { id: orderId, status: OrderStatus.PENDING_PAYMENT },
           data: {
             status: OrderStatus.PAID,
             paidAt: now,
             ...(recurring
-              ? order.renewalConsentAt
+              ? armNow
                 ? {
                     autoRenew: true,
                     nextBillingDate: addBillingCycle(now, order.billingCycle),

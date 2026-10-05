@@ -64,8 +64,11 @@ function clampDays(value: unknown, fallback: number): number {
  *     provisioning (service inchangé). Solde insuffisant → facture reste UNPAID
  *     (la période suivante n'est JAMAIS ouverte avant règlement).
  *  2. **Reprise/relance de paiement** : renouvellement PENDING sans prélevement
- *     → réessai (le client a pu recharger) ; prélevé mais non confirmé (crash
- *     entre le débit et la confirmation) → re-confirmation idempotente.
+ *     → réessai (le client a pu recharge) MAIS seulement si le **consentement
+ *     courant** est toujours porté par la commande (CAS `autoRenew`, GO Q12-P2 :
+ *     la révocation de la chaîne — y compris la cascade vers la fille — précède
+ *     toujours le débit) ; prélevé mais non confirmé (crash entre le débit et
+ *     la confirmation) → re-confirmation idempotente.
  *  3. **Dunning** : facture UNPAID à `dueDate - dunningReminderDays` → UNE
  *     relance (marqueur `Invoice.dunningRemindedAt`, colonne P8) = audit +
  *     email best-effort.
@@ -287,8 +290,11 @@ export class RenewalService implements OnModuleInit, OnModuleDestroy {
    *            (l'admin peut réactiver ; le renouvellement reprendra) ;
    * - `stop` : lié CANCELLED/REJECTED, ou aucun abonnement lié ;
    * - `stop_product` : abonnement lié d'un AUTRE produit (upgrade).
-   * Fallback documenté : SANS lien de chaîne (données avant traçabilité
-   * facture→abonnement), repli sur l'ancien comportement P8.
+   * GO Q12-P2 : plus AUCUN fallback « dernier abonnement actif » (données
+   * pré-lien supprimé) — un rattachement ambigu (aucun abonnement dans la
+   * chaîne) est un **refus signalé** : `stop` (raison
+   * `no_active_subscription`), jamais une décision fondée sur un abonnement
+   * qui pourrait appartenir à une autre chaîne du même compte.
    */
   private async gateSubscription(
     head: { id: string; renewsOrderId: string | null; productId: string },
@@ -321,21 +327,8 @@ export class RenewalService implements OnModuleInit, OnModuleDestroy {
       }
       return 'stop'; // CANCELLED / REJECTED
     }
-    // Fallback données pré-lien : ancien comportement P8 conservé.
-    const active = await this.prisma.subscription.findFirst({
-      where: { userId, status: SubscriptionStatus.ACTIVE },
-      orderBy: { createdAt: 'desc' },
-      select: { productId: true },
-    });
-    if (active) return active.productId === head.productId ? 'ok' : 'stop_product';
-    const latest = await this.prisma.subscription.findFirst({
-      where: { userId },
-      orderBy: { createdAt: 'desc' },
-      select: { status: true },
-    });
-    if (latest && (latest.status === SubscriptionStatus.SUSPENDED || latest.status === SubscriptionStatus.PENDING)) {
-      return 'skip';
-    }
+    // GO Q12-P2 : rattachement ambigu → refus signalé (stop), JAMAIS un
+    // « dernier abonnement actif » qui pourrait concerner une autre chaîne.
     return 'stop';
   }
 
@@ -469,6 +462,13 @@ export class RenewalService implements OnModuleInit, OnModuleDestroy {
           addonsSnapshot: head.addonsSnapshot ?? Prisma.JsonNull,
           renewsOrderId: head.id,
           renewalConsentAt: head.renewalConsentAt,
+          // GO Q12-P2 : la fille porte le consentement de la chaîne DANS
+          // `autoRenew` (pas seulement la copie datée) — c'est LA signature que
+          // la reprise vérifiera par CAS avant tout débit. La révocation
+          // (contrôleur, cascade vers les descendants) la bascule à false et
+          // stoppe tout prélèvement ; une commande sans consentement ne part
+          // jamais avec autoRenew=true.
+          autoRenew: head.renewalConsentAt !== null,
         },
       });
 
@@ -531,6 +531,15 @@ export class RenewalService implements OnModuleInit, OnModuleDestroy {
    * mouvement). Retourne `paid` ou `pending` : solde insuffisant, devise non
    * prise en charge, commande non trouvée ou non au propriétaire → relancé par
    * la passe suivante (jamais de débit silencieux).
+   *
+   * GO Q12-P2 — **consentement courant AVANT tout débit** : un CAS sans effet
+   * (`autoRenew: true → true`) re-vérifie sous verrou que la commande porte
+   * encore le consentement de la chaîne. Une révocation committée entre la
+   * lecture de la passe et ce CAS (cascade du contrôleur) fait échouer le
+   * count → `pending`, AUCUN débit, AUCUNE confirmation — y compris sur la
+   * voie `amount <= 0`. Une révocation qui arrive APRÈS ce CAS concerne les
+   * périodes suivantes (même sémantique que le flip de création : le CAS
+   * tranche, la course est sérialisée par le verrou de ligne).
    */
   private async attemptPayment(
     orderId: string,
@@ -538,6 +547,16 @@ export class RenewalService implements OnModuleInit, OnModuleDestroy {
     owner: { userId: string | null; email: string },
     label: string,
   ): Promise<'paid' | 'pending'> {
+    const consent = await this.prisma.order.updateMany({
+      where: { id: orderId, autoRenew: true },
+      data: { autoRenew: true }, // no-op : verrou + existence + consentement
+    });
+    if (consent.count !== 1) {
+      this.log.warn(
+        `renewal payment order=${orderId} skipped: renouvellement révoqué (${label})`,
+      );
+      return 'pending';
+    }
     if (amountCents <= 0) {
       await this.checkout.confirmOrderPaid(orderId, { source: 'free' });
       return 'paid';
@@ -564,11 +583,15 @@ export class RenewalService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * Reprise : les renouvellements PENDING sont RE-VALIDÉS (garde d'éligibilité,
-   * Q-A : jamais de prélèvement sur une chaîne close/suspendue/produit changé
-   * depuis la création) puis re-prélevés/confirmés par le paiement atomique
-   * (`payOrderWithWallet`) — qui sait lui-même récupérer un débit legacy non
-   * compensé (confirmation SANS second débit) et refuser un double débit.
+   * Reprise : les renouvellements PENDING sont RE-VALIDÉS — d'abord le
+   * **consentement courant** (GO Q12-P2 : `autoRenew` de la commande, la
+   * copie datée seule ne prouve rien — la révocation peut avoir cascadié
+   * depuis la création), puis la garde d'éligibilité (Q-A : jamais de
+   * prélèvement sur une chaîne close/suspendue/produit changé depuis la
+   * création) — puis re-prélevés/confirmés par le paiement atomique
+   * (`payOrderWithWallet`), qui re-vérifie le consentement par CAS juste avant
+   * le débit et sait lui-même récupérer un débit legacy non compensé
+   * (confirmation SANS second débit) et refuser un double débit.
    */
   private async payPendingRenewals(): Promise<{ paid: number; pending: number }> {
     const pendingOrders = await this.prisma.order.findMany({
@@ -578,6 +601,7 @@ export class RenewalService implements OnModuleInit, OnModuleDestroy {
         renewsOrderId: true,
         productId: true,
         amountTtcCents: true,
+        autoRenew: true,
         customerEmail: true,
         customer: { select: { userId: true } },
         invoice: { select: { number: true } },
@@ -588,6 +612,12 @@ export class RenewalService implements OnModuleInit, OnModuleDestroy {
     let pending = 0;
     for (const o of pendingOrders) {
       try {
+        if (!o.autoRenew) {
+          // Consentement révoqué depuis la création (cascade de la chaîne) :
+          // AUCUN débit — la facture reste UNPAID (dunning/suspension gèrent).
+          pending += 1;
+          continue;
+        }
         const gate = await this.gateSubscription(o, o.customer.userId);
         if (gate !== 'ok') {
           // Chaîne close / suspendue / produit changé depuis la création :
