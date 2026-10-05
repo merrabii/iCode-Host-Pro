@@ -9,6 +9,10 @@ import { isPaymentSimulatorEnabled } from '../config/payment-simulator';
  * Renvoie UNE VUE PUBLIQUE (id, name, type, config NON secrète). Le champ
  * `config` des méthodes actives porte les coordonnées bancaires / instructions
  * d'affichage. `configEnc` (secrets carte) n'est JAMAIS renvoyé (§7).
+ * Q7 (GO item 7) : les frais du moyen (feeType/feePercent/feeFixedCents) sont
+ * aussi exposés — ce sont des paramètres de GRILLE tarifaire publique
+ * (affichés au client avant paiement), pas des secrets ; ils sont APPLIQUÉS
+ * dans `buildPricing` (devis + commande), plus seulement journalisés.
  * Carte : masquée honnêtement tant qu'aucun adaptateur réel n'est configuré
  * (aucun prestataire choisi) — visible uniquement sous simulateur de recette
  * explicitement activé.
@@ -31,6 +35,9 @@ export class PaymentMethodsController {
         type: true,
         isActive: true,
         config: true,
+        feeType: true,
+        feePercent: true,
+        feeFixedCents: true,
       },
     });
     // Vue lisible : on ne renvoie que les champs publics (jamais configEnc),
@@ -42,6 +49,9 @@ export class PaymentMethodsController {
         name: m.name,
         type: m.type,
         config: m.config,
+        feeType: m.feeType,
+        feePercent: m.feePercent !== null ? Number(m.feePercent) : null,
+        feeFixedCents: m.feeFixedCents,
       }));
   }
 }

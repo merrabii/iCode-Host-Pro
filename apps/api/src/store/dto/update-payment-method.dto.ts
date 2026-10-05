@@ -7,6 +7,7 @@ import {
   IsNumber,
   IsObject,
   IsOptional,
+  Max,
   Min,
 } from 'class-validator';
 
@@ -37,9 +38,11 @@ export class UpdatePaymentMethodDto {
   @IsEnum(FeeType)
   feeType?: FeeType;
 
-  @ApiPropertyOptional({ description: '% si feeType=PERCENT' })
+  @ApiPropertyOptional({ description: '% si feeType=PERCENT (0..100, appliquée par buildPricing — Q7)' })
   @IsOptional()
   @IsNumber()
+  @Min(0)
+  @Max(100)
   feePercent?: number;
 
   @ApiPropertyOptional({ description: 'frais fixe en cents si feeType=FIXED' })

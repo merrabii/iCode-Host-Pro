@@ -312,6 +312,11 @@ export const storeCheckout = async (payload: {
   /** Q-A (GO item 4) — consentement EXPLICITE au renouvellement automatique
    *  (case de la page paiement) ; ignoré pour un cycle ONETIME. */
   renewalConsent?: boolean;
+  /** Q7 (GO item 7) — total TTC (centimes) tel qu'affiché/accepté sur le
+   *  dernier devis serveur : si le tarif a changé depuis (prix, promo, taxe,
+   *  frais), le serveur répond 409 (code PRICING_CHANGED) pour imposer une
+   *  NOUVELLE acceptation. Le tunnel web l'envoie TOUJOURS. */
+  acceptedTotalTtcCents?: number;
 }): Promise<ApiResult> => {
   // Tunnel de commande UNIQUE (Bloc 2) : le checkout API reconnaît le client via
   // le header `Authorization: Bearer` (OptionalJwtAuthGuard). Sans token → invité.
@@ -332,12 +337,17 @@ export const storeCheckout = async (payload: {
 };
 
 /** Moyen de paiement PUBLIC du tunnel (GET /store/payment-methods) — vue
- *  serveur : id, name, type, config non-secrète uniquement (§7). */
+ *  serveur : id, name, type, config non-secrète uniquement (§7).
+ *  Q7 (GO item 7) : frais de la grille tarifaire publique (appliqués dans le
+ *  devis `quoteCart(paymentMethodId)` puis débités — plus seulement journalisés). */
 export interface PublicPaymentMethod {
   id: string;
   name: string;
   type: string;
   config?: unknown;
+  feeType?: string;
+  feePercent?: number | null;
+  feeFixedCents?: number | null;
 }
 
 export async function listPaymentMethods(): Promise<ApiResult> {
@@ -828,11 +838,14 @@ export interface QuoteResult {
 }
 
 /** Devis public (POST /store/quote) — re-fetch des prix du panier : mêmes
- *  lignes/totaux que la commande, aucun montant reçu du client. */
+ *  lignes/totaux que la commande, aucun montant reçu du client.
+ *  Q7 (GO item 7) : avec `paymentMethodId`, le devis inclut les frais du
+ *  moyen sélectionné (mêmes frais que la commande à confirmer). */
 export async function quoteCart(body: {
   productSlug: string;
   options?: { optionId: string; choiceId: string }[];
   addonIds?: string[];
+  paymentMethodId?: string;
 }): Promise<ApiResult<QuoteResult>> {
   try {
     const res = await fetch('/api/store/quote', {

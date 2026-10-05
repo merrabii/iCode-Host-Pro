@@ -3,7 +3,7 @@ import { Test } from '@nestjs/testing';
 import * as cookieParser from 'cookie-parser';
 import * as bcrypt from 'bcryptjs';
 import request = require('supertest');
-import { OrderStatus, PaymentMethodType, Role } from '@prisma/client';
+import { FeeType, OrderStatus, PaymentMethodType, Role } from '@prisma/client';
 import { AppModule } from './../src/app.module';
 import { PrismaService } from './../src/prisma/prisma.service';
 import { GlobalPrefix } from './../src/config/constants';
@@ -26,6 +26,10 @@ process.env.ORDER_SWEEP_ENABLED = 'false';
  *  B. CRUD des taux `/store/admin/tax-rates` (décision §6-6) : RBAC 401/403,
  *     nom dupliqué 409, un seul `isDefault`, suppression refusée (409) si
  *     produit rattaché, 404 inconnu, validation 0..100.
+ *  C. Q7 (GO item 7) — frais de paiement APPLIQUÉS dans devis/commande/facture
+ *     + NOUVELLE ACCEPTATION si le tarif change entre affichage et confirmation
+ *     (409 PRICING_CHANGED), gratuitité (promo à 0 → confirmation immédiate,
+ *     aucun débit) et débit wallet EXACT = total TTC frais inclus.
  *
  * Aucun réseau réel : MailTransportFactory + PanelTransportFactory stubbés,
  * PrismaService RÉEL sur la base dédiée du chantier (icode_host_pro_socle).
@@ -56,8 +60,11 @@ describe('Cohérence tarifaire & taux de taxe (e2e, P5)', () => {
   let equalSlug = ''; // 4900 / promo 4900 (promo ignorée), sans taxe
   let oddSlug = ''; // 333 + addon 333 @19,6 % (arrondi par ligne)
   let oddAddonId = '';
+  let feeMethodId = ''; // Q7 — frais 2,5 % (appliqués, plus seulement journalisés)
+  let freeSlug = ''; // Q7 — catalogue 4900, promo à 0 → gratuité
 
   const orderIds: string[] = [];
+  const q7GuestEmails: string[] = []; // comptes invités créés par la section C (nettoyés en afterAll)
   let createdMailId: string | null = null;
 
   const mailTransportStub = { sendMail: jest.fn().mockResolvedValue(undefined) };
@@ -90,6 +97,31 @@ describe('Cohérence tarifaire & taux de taxe (e2e, P5)', () => {
     request(app.getHttpServer())
       .get(`/${GlobalPrefix}${path}`)
       .set('Authorization', `Bearer ${adminToken}`);
+
+  // Q7 C6 — vrai parcours de fonds : recharge (justificatif) + validation admin.
+  const PNG_1PX = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+    'base64',
+  );
+
+  async function fundWallet(token: string, amountCents: number): Promise<void> {
+    const created = await request(app.getHttpServer())
+      .post(`/${GlobalPrefix}/client/wallet/recharges`)
+      .set('Authorization', `Bearer ${token}`)
+      .field('amountCents', String(amountCents))
+      .attach('proof', PNG_1PX, { filename: 'proof.png', contentType: 'image/png' })
+      .expect(201);
+    await request(app.getHttpServer())
+      .post(`/${GlobalPrefix}/store/admin/wallet/recharges/${created.body.id}/validate`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .expect(201);
+  }
+
+  function payWithWallet(orderId: string, token: string) {
+    return request(app.getHttpServer())
+      .post(`/${GlobalPrefix}/client/orders/${orderId}/pay-with-wallet`)
+      .set('Authorization', `Bearer ${token}`);
+  }
 
   // ── Boot + fixtures ────────────────────────────────────────────────────────
   beforeAll(async () => {
@@ -127,6 +159,20 @@ describe('Cohérence tarifaire & taux de taxe (e2e, P5)', () => {
       data: { name: `VIR-P5-${stamp}`, type: PaymentMethodType.BANK_TRANSFER, isActive: true },
     });
     virId = vir.id;
+
+    // Q7 — moyen AVEC frais 2,5 % : ces frais doivent être APPLIQUÉS dans le
+    // devis (`paymentMethodId`), la commande et la facture (P9 : ils n'étaient
+    // que journalisés côté admin).
+    const feeM = await prisma.paymentMethod.create({
+      data: {
+        name: `FEE-P5-${stamp}`,
+        type: PaymentMethodType.BANK_TRANSFER,
+        isActive: true,
+        feeType: FeeType.PERCENT,
+        feePercent: 2.5,
+      },
+    });
+    feeMethodId = feeM.id;
 
     const taxOdd = await prisma.taxRate.create({
       data: { name: `p5-tva-odd-${stamp}`, ratePercent: 19.6, isDefault: false },
@@ -191,6 +237,19 @@ describe('Cohérence tarifaire & taux de taxe (e2e, P5)', () => {
     oddSlug = odd.slug!;
     oddAddonId = odd.addons[0].id;
 
+    // Q7 — gratuité : promo à 0 (promo valide) → total 0 → confirmation immédiate.
+    const freeP = await prisma.product.create({
+      data: {
+        name: `p5-free-${stamp}`,
+        slug: `p5-free-${stamp}`,
+        status: 'ACTIVE',
+        hidden: false,
+        priceHtCents: 4900,
+        promoPriceHtCents: 0,
+      },
+    });
+    freeSlug = freeP.slug!;
+
     // Config mail minimale (host + fromEmail requis par getMailConfig) : le
     // transport est stubbé, aucun SMTP n'est jamais contactné. Snapshot/restore.
     const priorMail = await prisma.mailSetting.findFirst();
@@ -220,12 +279,21 @@ describe('Cohérence tarifaire & taux de taxe (e2e, P5)', () => {
     await prisma.orderStatusHistory.deleteMany({ where: { orderId: { in: orderIds } } }).catch(() => {});
     await prisma.invoice.deleteMany({ where: { orderId: { in: orderIds } } }).catch(() => {});
     await prisma.order.deleteMany({ where: { id: { in: orderIds } } }).catch(() => {});
-    await prisma.customer.deleteMany({ where: { email: { in: [guestEmail] } } }).catch(() => {});
-    await prisma.user.deleteMany({ where: { email: { in: [guestEmail, adminEmail, userEmail] } } }).catch(() => {});
+    await prisma.customer
+      .deleteMany({ where: { email: { in: [guestEmail, userEmail, ...q7GuestEmails] } } })
+      .catch(() => {});
+    await prisma.user
+      .deleteMany({
+        where: { email: { in: [guestEmail, adminEmail, userEmail, ...q7GuestEmails] } },
+      })
+      .catch(() => {});
     await prisma.product
-      .deleteMany({ where: { slug: { in: [promoSlug, equalSlug, oddSlug] } } })
+      .deleteMany({ where: { slug: { in: [promoSlug, equalSlug, oddSlug, freeSlug] } } })
       .catch(() => {});
     await prisma.taxRate.deleteMany({ where: { name: { contains: stamp } } }).catch(() => {});
+    await prisma.paymentMethod
+      .deleteMany({ where: { id: { in: [virId, feeMethodId] } } })
+      .catch(() => {});
     await prisma.paymentMethod.deleteMany({ where: { id: virId } }).catch(() => {});
     if (createdMailId) {
       await prisma.mailSetting.delete({ where: { id: createdMailId } }).catch(() => {});
@@ -479,6 +547,245 @@ describe('Cohérence tarifaire & taux de taxe (e2e, P5)', () => {
         .delete(`/${GlobalPrefix}/store/admin/tax-rates/p5-nope-${stamp}`)
         .set('Authorization', `Bearer ${adminToken}`)
         .expect(404);
+    });
+  });
+
+  // ── C — Q7 : frais APPLIQUÉS + ré-acceptation tarifaire (GO item 7) ──────
+  describe('C — frais de paiement & nouvelle acceptation (Q7, GO item 7)', () => {
+    const cfg = {
+      options: [] as { optionId: string; choiceId: string }[],
+      addonIds: [] as string[],
+    };
+
+    beforeAll(() => {
+      cfg.options = [{ optionId: promoOptionId, choiceId: promoChoiceLinuxId }];
+      cfg.addonIds = [promoAddonId];
+    });
+
+    const feeLineOf = (lines: { kind: string; label: string; unitPriceHtCents?: number; taxAmountCents?: number }[]) =>
+      lines.find((l) => l.kind === 'ADJUSTMENT' && l.label.startsWith('Frais de paiement'));
+
+    const checkout = (body: Record<string, unknown>) =>
+      request(app.getHttpServer()).post(`/${GlobalPrefix}/store/checkout`).send(body);
+
+    // Chaque test guest de la section C = un invité DISTINCT (un checkout
+    // guest existant → 409 « compte existe déjà », écrasant le 409 testé).
+    const q7Email = (tag: string) => {
+      const e = `p5q7${tag}_${stamp}@example.com`;
+      q7GuestEmails.push(e);
+      return e;
+    };
+
+    it('C1 — devis AVEC paymentMethodId inclut les frais ; commande + facture EXACTES', async () => {
+      const q = await quote({
+        productSlug: promoSlug,
+        options: cfg.options,
+        addonIds: cfg.addonIds,
+        paymentMethodId: feeMethodId,
+      }).expect(201);
+
+      // Frais APPLIQUÉS dans le devis (plus seulement journalisés) : base HT =
+      // 3900 promo + 0 option + 701 addon + 1500 installation = 6101 → 2,5 %.
+      const htBase = 3900 + 0 + 701 + 1500;
+      const expectedFee = Math.round((htBase * 2.5) / 100); // 152,525 → 153
+      const fee = feeLineOf(q.body.lines);
+      expect(fee).toBeDefined();
+      expect(fee!.unitPriceHtCents).toBe(expectedFee);
+      expect(fee!.taxAmountCents).toBe(0); // jamais taxé (même statut installation)
+      expect(q.body.amountHtCents).toBe(htBase + expectedFee);
+      expect(q.body.lines).toHaveLength(5);
+
+      const res = await checkout({
+        productSlug: promoSlug,
+        options: cfg.options,
+        addonIds: cfg.addonIds,
+        name: 'Client Q7',
+        email: q7Email('c1'),
+        paymentMethodId: feeMethodId,
+        acceptedTotalTtcCents: q.body.amountTtcCents,
+      }).expect(201);
+      const orderId = res.body.orderId as string;
+      orderIds.push(orderId);
+
+      // 0 écart devis ↔ commande ↔ facture (mêmes totaux, frais compris).
+      const order = await prisma.order.findUniqueOrThrow({ where: { id: orderId } });
+      expect(order.amountHtCents).toBe(q.body.amountHtCents);
+      expect(order.taxAmountCents).toBe(q.body.taxAmountCents);
+      expect(order.amountTtcCents).toBe(q.body.amountTtcCents);
+      const invoice = await prisma.invoice.findUniqueOrThrow({ where: { orderId } });
+      expect(invoice.amountHtCents).toBe(q.body.amountHtCents);
+      expect(invoice.taxAmountCents).toBe(q.body.taxAmountCents);
+      expect(invoice.amountTtcCents).toBe(q.body.amountTtcCents);
+      expect(invoice.status).toBe('UNPAID');
+    });
+
+    it('C2 — prix changé entre affichage et confirmation → 409 PRICING_CHANGED, puis ré-acceptation OK', async () => {
+      const email = q7Email('c2');
+      const before = await quote({ productSlug: equalSlug, paymentMethodId: virId }).expect(201);
+      expect(before.body.amountTtcCents).toBe(4900);
+
+      // Tarif change APRÈS l'acceptation du client (admin élève catalogue ET
+      // promo à 5900 — promo = catalogue → ignorée, prix facturé = 5900).
+      await prisma.product.update({
+        where: { slug: equalSlug },
+        data: { priceHtCents: 5900, promoPriceHtCents: 5900 },
+      });
+      try {
+        const ordersBefore = await prisma.order.count();
+        const refused = await checkout({
+          productSlug: equalSlug,
+          name: 'Client Q7 bis',
+          email,
+          paymentMethodId: virId,
+          acceptedTotalTtcCents: before.body.amountTtcCents,
+        }).expect(409);
+        expect(refused.body.code).toBe('PRICING_CHANGED');
+        expect(refused.body.currentTotalTtcCents).toBe(5900);
+        // Aucune commande créée sur ce refus.
+        expect(await prisma.order.count()).toBe(ordersBefore);
+
+        // Nouvelle acceptation : re-quote sur le tarif courant → 201.
+        const fresh = await quote({ productSlug: equalSlug, paymentMethodId: virId }).expect(201);
+        expect(fresh.body.amountTtcCents).toBe(5900);
+        const ok = await checkout({
+          productSlug: equalSlug,
+          name: 'Client Q7 bis',
+          email,
+          paymentMethodId: virId,
+          acceptedTotalTtcCents: fresh.body.amountTtcCents,
+        }).expect(201);
+        orderIds.push(ok.body.orderId as string);
+      } finally {
+        await prisma.product.update({
+          where: { slug: equalSlug },
+          data: { priceHtCents: 4900, promoPriceHtCents: 4900 },
+        });
+      }
+    });
+
+    it('C3 — total accepté ≠ total serveur → 409 (aucun montant non accepté n’est commandé)', async () => {
+      const q = await quote({ productSlug: equalSlug, paymentMethodId: virId }).expect(201);
+      const refused = await checkout({
+        productSlug: equalSlug,
+        name: 'Client Q7 ter',
+        email: q7Email('c3'),
+        paymentMethodId: virId,
+        acceptedTotalTtcCents: q.body.amountTtcCents - 1,
+      }).expect(409);
+      expect(refused.body.code).toBe('PRICING_CHANGED');
+      expect(refused.body.currentTotalTtcCents).toBe(q.body.amountTtcCents);
+    });
+
+    it('C4 — frais absents du devis panier → 409 à la confirmation avec le moyen à frais (ré-acceptation)', async () => {
+      // Étape /cart : devis SANS paymentMethodId (sans frais).
+      const cartQuote = await quote({ productSlug: equalSlug }).expect(201);
+      expect(feeLineOf(cartQuote.body.lines)).toBeUndefined();
+
+      // Confirmation avec un moyen qui AJOUTE des frais → total différent → 409.
+      const refused = await checkout({
+        productSlug: equalSlug,
+        name: 'Client Q7 quater',
+        email: q7Email('c4a'),
+        paymentMethodId: feeMethodId,
+        acceptedTotalTtcCents: cartQuote.body.amountTtcCents,
+      }).expect(409);
+      expect(refused.body.code).toBe('PRICING_CHANGED');
+
+      // Le client re-quote AVEC le moyen (page /checkout/payment) → acceptation OK.
+      const fresh = await quote({ productSlug: equalSlug, paymentMethodId: feeMethodId }).expect(201);
+      expect(feeLineOf(fresh.body.lines)).toBeDefined();
+      expect(fresh.body.amountTtcCents).toBe(cartQuote.body.amountTtcCents + Math.round((4900 * 2.5) / 100));
+      const ok = await checkout({
+        productSlug: equalSlug,
+        name: 'Client Q7 quater',
+        email: q7Email('c4b'),
+        paymentMethodId: feeMethodId,
+        acceptedTotalTtcCents: fresh.body.amountTtcCents,
+      }).expect(201);
+      orderIds.push(ok.body.orderId as string);
+    });
+
+    it('C5 — gratuité : promo à 0 → total 0 → confirmation immédiate, AUCUN débit', async () => {
+      const q = await quote({ productSlug: freeSlug, paymentMethodId: virId }).expect(201);
+      expect(q.body.product.activePriceHtCents).toBe(0);
+      expect(q.body.amountTtcCents).toBe(0);
+
+      const res = await checkout({
+        productSlug: freeSlug,
+        name: 'Client Q7 free',
+        email: q7Email('c5'),
+        paymentMethodId: virId,
+        acceptedTotalTtcCents: 0,
+      }).expect(201);
+      orderIds.push(res.body.orderId as string);
+      expect(res.body.nextStep).toBe('provisioning-pending');
+
+      const order = await prisma.order.findUniqueOrThrow({ where: { id: res.body.orderId } });
+      expect(order.amountTtcCents).toBe(0);
+      expect(order.status).toBe(OrderStatus.PAID);
+      expect(order.paidAt).not.toBeNull();
+      // Aucun mouvement de portefeuille pour une commande gratuite.
+      const wtx = await prisma.walletTransaction.findMany({ where: { orderId: order.id } });
+      expect(wtx).toHaveLength(0);
+    });
+
+    it('C6 — débit wallet EXACT = total TTC frais inclus (devis → commande → facture → débit)', async () => {
+      const q = await quote({
+        productSlug: promoSlug,
+        options: cfg.options,
+        addonIds: cfg.addonIds,
+        paymentMethodId: feeMethodId,
+      }).expect(201);
+
+      const res = await checkout({
+        productSlug: promoSlug,
+        options: cfg.options,
+        addonIds: cfg.addonIds,
+        name: 'User Q7',
+        email: userEmail,
+        paymentMethodId: feeMethodId,
+        acceptedTotalTtcCents: q.body.amountTtcCents,
+        renewalConsent: true,
+      })
+        .set('Authorization', `Bearer ${userToken}`)
+        .expect(201);
+      const orderId = res.body.orderId as string;
+      orderIds.push(orderId);
+
+      const order = await prisma.order.findUniqueOrThrow({ where: { id: orderId } });
+      expect(order.amountTtcCents).toBe(q.body.amountTtcCents);
+
+      // Solde insuffisant d'abord → 409 sans écriture (lien customer créé).
+      await payWithWallet(orderId, userToken).expect(409);
+      await fundWallet(userToken, 100_000);
+
+      const user = await prisma.user.findUniqueOrThrow({ where: { email: userEmail } });
+      const customer = await prisma.customer.findFirstOrThrow({
+        where: { userId: user.id },
+        select: { id: true, walletBalanceCents: true },
+      });
+      expect(customer.walletBalanceCents).toBe(100_000);
+
+      const paid = await payWithWallet(orderId, userToken).expect(201);
+      expect(paid.body.status).toBe('PAID');
+
+      const debits = await prisma.walletTransaction.findMany({
+        where: { orderId, status: 'SUCCEEDED' },
+      });
+      expect(debits).toHaveLength(1);
+      expect(debits[0].type).toBe('DEBIT');
+      expect(debits[0].amountCents).toBe(q.body.amountTtcCents); // frais DÉBITÉS, pas seulement journalisés
+
+      const after = await prisma.customer.findUniqueOrThrow({
+        where: { id: customer.id },
+        select: { walletBalanceCents: true },
+      });
+      expect(after.walletBalanceCents).toBe(100_000 - q.body.amountTtcCents);
+
+      const invoice = await prisma.invoice.findUniqueOrThrow({ where: { orderId } });
+      expect(invoice.status).toBe('PAID');
+      expect(invoice.amountTtcCents).toBe(q.body.amountTtcCents);
+      expect(invoice.taxAmountCents).toBe(q.body.taxAmountCents);
     });
   });
 });

@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useMemo, useState, type FormEvent, type ReactNode } from 'react';
+import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { StoreShell } from '@/components/store-shell';
@@ -10,8 +10,11 @@ import {
   billingCycleLabel,
   formatCents,
   listPaymentMethods,
+  promoActive,
+  quoteCart,
   storeCheckout,
   type PublicPaymentMethod,
+  type QuoteResult,
 } from '@/lib/api';
 import { buyerStorage } from '@/lib/cart';
 
@@ -42,6 +45,15 @@ function CheckoutPaymentView() {
   const [methodId, setMethodId] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Q7 (GO item 7) — total SERVEUR : devis `/store/quote` re-fetché à chaque
+  // changement (panier ou moyen sélectionné) avec les FRAIS du moyen — le
+  // total affiché EST le total confirmé/débité. Jamais de calcul local.
+  const [quote, setQuote] = useState<QuoteResult | null>(null);
+  const [quoteKey, setQuoteKey] = useState('');
+  const [quoteLoading, setQuoteLoading] = useState(false);
+  const [quoteError, setQuoteError] = useState(false);
+  const [quoteNonce, setQuoteNonce] = useState(0);
+  const quoteSeqRef = useRef(0);
   // Q-A (GO item 4) — consentement EXPLICITE au renouvellement automatique :
   // NON coché par défaut (aucun prélèvement sans action volontaire).
   const [renewalConsent, setRenewalConsent] = useState(false);
@@ -78,6 +90,54 @@ function CheckoutPaymentView() {
     if (ready && !item) router.replace('/shop');
   }, [ready, item, router]);
 
+  // Q7 — devis serveur : configuration EXACTE à confirmer + moyen sélectionné
+  // (frais inclus). Clé du devis = clé de la confirmation : le bouton reste
+  // bloqué tant que le total affiché n'est pas celui du moyen courant.
+  const quoteKeyNow = useMemo(() => {
+    const slug = item?.product.slug;
+    if (!slug) return '';
+    const options = Object.entries(item.options ?? {}).map(([optionId, c]) => ({
+      optionId,
+      choiceId: c.id,
+    }));
+    const addonIds = Object.keys(item.addons ?? {});
+    return JSON.stringify([slug, methodId, options, addonIds]);
+  }, [item, methodId]);
+
+  useEffect(() => {
+    if (!ready || !quoteKeyNow || !methodId) {
+      setQuote(null);
+      setQuoteKey('');
+      return;
+    }
+    let cancelled = false;
+    const [slug, mid, options, addonIds] = JSON.parse(quoteKeyNow) as [
+      string,
+      string,
+      { optionId: string; choiceId: string }[],
+      string[],
+    ];
+    const my = ++quoteSeqRef.current;
+    setQuoteLoading(true);
+    setQuoteError(false);
+    void (async () => {
+      const res = await quoteCart({ productSlug: slug, options, addonIds, paymentMethodId: mid });
+      if (cancelled || my !== quoteSeqRef.current) return;
+      setQuoteLoading(false);
+      if (!res.ok || !res.data) {
+        setQuote(null);
+        setQuoteKey('');
+        setQuoteError(true);
+        return;
+      }
+      setQuote(res.data);
+      setQuoteKey(quoteKeyNow);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [ready, quoteKeyNow, methodId, quoteNonce]);
+
   const subdomain = item?.subdomain;
   const requestedDomainId = item?.requestedDomainId;
   const productSlug = item?.product.slug ?? null;
@@ -88,6 +148,17 @@ function CheckoutPaymentView() {
     if (!item || !productSlug) { setError('Panier incomplet — repassez par la boutique.'); return; }
     if (!contact) { setError('Coordonnées manquantes — revenez à l’étape précédente.'); return; }
     if (!methodId) { setError('Choisissez un moyen de paiement.'); return; }
+    // Q7 — jamais de confirmation sur un total non servé/re-accepté.
+    if (quoteError || quoteLoading || !quote || quoteKey !== quoteKeyNow) {
+      setError('Le total n’est pas encore confirmé par le serveur — patientez puis réessayez.');
+      return;
+    }
+
+    const options = Object.entries(item.options ?? {}).map(([optionId, c]) => ({
+      optionId,
+      choiceId: c.id,
+    }));
+    const addonIds = Object.keys(item.addons ?? {});
 
     setLoading(true);
     try {
@@ -97,13 +168,29 @@ function CheckoutPaymentView() {
         email: contact.email,
         phone: contact.phone,
         paymentMethodId: methodId,
+        options,
+        addonIds,
         subdomain,
         requestedDomainId,
         useAccountDetails: contact.useAccountDetails,
         renewalConsent,
+        // Total serveur affiché ci-contre : toute divergence tarifaire survenant
+        // entre l'affichage et la confirmation → 409 PRICING_CHANGED (ré-acceptation).
+        acceptedTotalTtcCents: quote.amountTtcCents,
       });
       const data = res.data as unknown;
       if (!res.ok) {
+        if (res.status === 409 && (data as { code?: string } | null)?.code === 'PRICING_CHANGED') {
+          const current = (data as { currentTotalTtcCents?: number } | null)?.currentTotalTtcCents;
+          setError(
+            typeof current === 'number'
+              ? `Le tarif a changé : nouveau total ${formatCents(current)}. Vérifiez le récapitulatif, puis confirmez à nouveau.`
+              : 'Les conditions tarifaires ont changé. Vérifiez le nouveau total, puis confirmez à nouveau.',
+          );
+          // Re-fetch immédiat du devis courant : le récap affiche le NOUVEAU total.
+          setQuoteNonce((n) => n + 1);
+          return;
+        }
         const msg = (data as { message?: string } | null)?.message;
         setError(msg && typeof msg === 'string' ? msg : 'Échec de la commande. Réessayez.');
         return;
@@ -136,13 +223,14 @@ function CheckoutPaymentView() {
     );
   }
 
-  const subtotal = item.product.priceHtCents ?? 0;
-  const optionsHt = Object.values(item.options ?? {}).reduce((a, o) => a + o.priceDeltaHtCents, 0);
-  const addonsHt = Object.values(item.addons ?? {}).reduce((a, x) => a + x.priceHtCents, 0);
-  const installation = item.product.installationFeeCents ?? 0;
-  const taxRate = item.product.taxRatePercent ?? 0;
-  const tax = Math.round(((subtotal + optionsHt + addonsHt) * taxRate) / 100);
-  const total = subtotal + optionsHt + addonsHt + installation + tax;
+  // Q7 (GO item 7) — TOTAUX SERVEUR uniquement : lignes du devis `/store/quote`
+  // correspondant à la config + au moyen courants (frais inclus). Aucun calcul
+  // local de prix/taxe : ce qui s'affiche ici EST le total débité.
+  const quoteFresh = !!quote && quoteKey === quoteKeyNow;
+  const lines = quoteFresh ? quote.lines : [];
+  const total = quoteFresh ? quote.amountTtcCents : null;
+  const taxRate = quoteFresh ? Number(quote.taxRatePercent) : 0;
+  const quoteTax = quoteFresh ? quote.taxAmountCents : 0;
 
   return (
     <div className="store-single">
@@ -209,6 +297,7 @@ function CheckoutPaymentView() {
                     <span className="store-payment-body">
                       <span className="store-payment-name">{m.name}</span>
                       {m.type === 'CARD' && <span className="muted" style={{ fontSize: 12 }}>Carte bancaire</span>}
+                      {feeLabel(m) && <span className="muted" style={{ fontSize: 12 }}>{feeLabel(m)}</span>}
                       {configText(m.config) && <span className="muted store-payment-config">{configText(m.config)}</span>}
                     </span>
                   </label>
@@ -251,8 +340,19 @@ function CheckoutPaymentView() {
             )}
           </div>
 
-          <button type="submit" className="btn-primary store-cta" disabled={loading || methods === null || methods.length === 0}>
-            {loading ? 'Commande en cours…' : 'Confirmer la commande'}
+          <button
+            type="submit"
+            className="btn-primary store-cta"
+            disabled={
+              loading ||
+              methods === null ||
+              methods.length === 0 ||
+              quoteLoading ||
+              quoteError ||
+              !quoteFresh
+            }
+          >
+            {loading ? 'Commande en cours…' : !quoteFresh && !quoteError ? 'Total en cours de calcul…' : 'Confirmer la commande'}
           </button>
         </form>
 
@@ -271,16 +371,49 @@ function CheckoutPaymentView() {
             )}
 
             <ul className="store-totals">
-              <li><span>Souscription</span><span>{formatCents(subtotal)}</span></li>
-              {optionsHt !== 0 && <li><span>Options</span><span>+{formatCents(optionsHt)}</span></li>}
-              {addonsHt !== 0 && <li><span>Suppléments</span><span>+{formatCents(addonsHt)}</span></li>}
-              <li><span>Installation</span><span>{formatCents(installation)}</span></li>
-              {tax !== 0 && <li><span>Taxe ({taxRate} %)</span><span>{formatCents(tax)}</span></li>}
+              {quoteFresh ? (
+                <>
+                  {lines.map((l, i) => (
+                    <li key={i}>
+                      <span>{l.kind === 'PRODUCT' ? 'Souscription' : l.label}</span>
+                      <span>{formatCents(l.unitPriceHtCents)}</span>
+                    </li>
+                  ))}
+                  <li>
+                    <span>Taxe ({taxRate} %)</span>
+                    <span>{formatCents(quoteTax)}</span>
+                  </li>
+                </>
+              ) : (
+                <li>
+                  <span>Total</span>
+                  <span aria-hidden="true">…</span>
+                </li>
+              )}
             </ul>
             <div className="store-total">
               <span>Total</span>
-              <strong>{formatCents(total)}</strong>
+              <strong>{total !== null ? formatCents(total) : quoteError ? '—' : '…'}</strong>
             </div>
+            {quoteFresh && promoActive(quote.product) && (
+              <p className="muted" style={{ fontSize: 12, marginTop: -4 }}>
+                Prix catalogue <s>{formatCents(quote.product.priceHtCents)}</s> — promo appliquée
+                au tarif affiché.
+              </p>
+            )}
+            {quoteLoading && !quoteFresh && (
+              <p className="muted" style={{ fontSize: 12 }} role="status">
+                Calcul du total par le serveur…
+              </p>
+            )}
+            {quoteError && (
+              <div className="alert error" role="alert" style={{ marginTop: 8 }}>
+                Impossible de calculer le total serveur.{' '}
+                <button type="button" className="alert-retry" onClick={() => setQuoteNonce((n) => n + 1)}>
+                  Réessayer
+                </button>
+              </div>
+            )}
 
             <div className="store-contact-note">
               <IconMail size={16} />
@@ -303,6 +436,23 @@ function CheckoutPaymentView() {
  */
 function isUpgradeRefusal(msg: string): boolean {
   return /upgrade non pris en charge|abonnement actif existant/i.test(msg);
+}
+
+/** Q7 (GO item 7) — libellé des frais d'un moyen (grille publique APPLIQUÉE
+ *  dans le devis/commande, affichée ici pour que le client la voie AVANT de
+ *  sélectionner le moyen). `NONE` ou frais nuls → rien. */
+function feeLabel(m: PublicPaymentMethod): string | null {
+  const t = m.feeType;
+  if (!t || t === 'NONE') return null;
+  const parts: string[] = [];
+  if ((t === 'PERCENT' || t === 'PERCENT_AND_FIXED') && m.feePercent) {
+    parts.push(`${m.feePercent} %`);
+  }
+  if ((t === 'FIXED' || t === 'PERCENT_AND_FIXED') && m.feeFixedCents) {
+    parts.push(formatCents(m.feeFixedCents));
+  }
+  if (!parts.length) return null;
+  return `Frais de paiement en sus : ${parts.join(' + ')}`;
 }
 
 /** Extrait un court texte d'instruction d'un `config` (objet Json non secret). */

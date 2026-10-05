@@ -242,9 +242,28 @@ export class CheckoutService {
       );
     }
 
-    // 3. Montants recalculés serveur (produit + options + addons + installation).
+    // 3. Montants recalculés serveur (produit + options + addons +
+    //    installation + FRAIS du moyen — Q7).
     const { lines, amountHtCents, taxAmountCents, amountTtcCents, taxRatePercent } =
-      this.buildPricing(product, dto);
+      this.buildPricing(product, dto, method);
+
+    // 3b. Q7 (GO item 7) — NOUVELLE ACCEPTATION si les conditions tarifaires
+    //     ont changé depuis leur acceptation (prix, promo, taxe, frais…) :
+    //     le total accepté par le client à l'affichage doit être EXACTEMENT
+    //     le total serveur recalculé ici, sinon 409 (code PRICING_CHANGED) —
+    //     jamais de débit sur un montant non réaccepté. Champ optionnel :
+    //     omis = compatibilité API (le tunnel web l'envoie toujours).
+    if (
+      dto.acceptedTotalTtcCents !== undefined &&
+      dto.acceptedTotalTtcCents !== amountTtcCents
+    ) {
+      throw new ConflictException({
+        message:
+          'Les conditions tarifaires ont changé depuis votre dernier affichage — nouvelle acceptation requise.',
+        code: 'PRICING_CHANGED',
+        currentTotalTtcCents: amountTtcCents,
+      });
+    }
 
     // 4. Résolution du compte. Invité → User+Customer créés dans la transaction.
     //    Client connecté (OptionalJwtAuthGuard) → on RÉUTILISE le User + Customer
@@ -1439,6 +1458,10 @@ export class CheckoutService {
    * le checkout (mème `buildPricing`), sans aucune écriture et sans jamais
    * recevoir de montant du client. C'est la référence affichée au panier :
    * prix affiché = prix débité, zéro écart client/serveur.
+   *
+   * Q7 (GO item 7) : avec `paymentMethodId`, le devis inclut les frais du
+   * moyen sélectionné — mêmes frais que le checkout (le total affiché sur la
+   * page /checkout/payment EST le total débité).
    */
   async quote(dto: QuoteDto): Promise<{
     lines: InvoiceLineInput[];
@@ -1454,7 +1477,19 @@ export class CheckoutService {
     };
   }> {
     const product = await this.products.findPublicBySlug(dto.productSlug);
-    const pricing = this.buildPricing(product, dto);
+    let method:
+      | { name: string; feeType: string; feePercent: Prisma.Decimal | number | null; feeFixedCents: number | null }
+      | null = null;
+    if (dto.paymentMethodId) {
+      method = await this.prisma.paymentMethod.findFirst({
+        where: { id: dto.paymentMethodId, isActive: true },
+        select: { name: true, feeType: true, feePercent: true, feeFixedCents: true },
+      });
+      if (!method) {
+        throw new BadRequestException('Ce moyen de paiement n’est pas disponible.');
+      }
+    }
+    const pricing = this.buildPricing(product, dto, method);
     return {
       ...pricing,
       product: {
@@ -1477,10 +1512,24 @@ export class CheckoutService {
    * promo quand celui-ci existe et est strictement inférieur au prix catalogue
    * (un promo ≥ catalogue est ignoré — jamais de prix facturé supérieur au
    * prix affiché).
+   *
+   * Frais du moyen de paiement (Q7, GO item 7) : quand un `method` est passé
+   * (étape /checkout, et /store/quote via `paymentMethodId`), les frais
+   * configurés en admin sont APPLIQUÉS au montant — plus seulement journalisés.
+   * Ligne ADJUSTMENT jamais taxée (même statut que les frais d'installation),
+   * incluse dans le HT/TTC : pourcentage arrondi au centime le plus proche sur
+   * le HT courant (produit + options + suppléments + installation) ;
+   * PERCENT_AND_FIXED = parties pourcentage ET fixe cumulées.
    */
   private buildPricing(
     product: PublicProduct,
     dto: Pick<CheckoutDto, 'options' | 'addonIds'>,
+    method?: {
+      name: string;
+      feeType: string;
+      feePercent: Prisma.Decimal | number | null;
+      feeFixedCents: number | null;
+    } | null,
   ): {
     lines: InvoiceLineInput[];
     amountHtCents: number;
@@ -1567,6 +1616,33 @@ export class CheckoutService {
         taxAmountCents: 0,
         totalTtcCents: installation,
       });
+    }
+
+    // Frais du moyen de paiement (Q7, GO item 7) — APPLIQUÉS, jamais taxés.
+    if (method && (method.feeType === 'PERCENT' || method.feeType === 'FIXED' || method.feeType === 'PERCENT_AND_FIXED')) {
+      const pct =
+        method.feePercent !== null && method.feePercent !== undefined
+          ? Number(method.feePercent)
+          : 0;
+      const fixed = method.feeFixedCents ?? 0;
+      const htSoFar = lines.reduce((s, l) => s + l.unitPriceHtCents, 0);
+      let fee = 0;
+      if ((method.feeType === 'PERCENT' || method.feeType === 'PERCENT_AND_FIXED') && pct > 0) {
+        fee += Math.round((htSoFar * pct) / 100);
+      }
+      if ((method.feeType === 'FIXED' || method.feeType === 'PERCENT_AND_FIXED') && fixed > 0) {
+        fee += fixed;
+      }
+      if (fee > 0) {
+        lines.push({
+          kind: InvoiceLineKind.ADJUSTMENT,
+          label: `Frais de paiement — ${method.name}`,
+          unitPriceHtCents: fee,
+          taxRatePercent: 0,
+          taxAmountCents: 0,
+          totalTtcCents: fee,
+        });
+      }
     }
 
     const amountHtCents = lines.reduce((s, l) => s + l.unitPriceHtCents, 0);

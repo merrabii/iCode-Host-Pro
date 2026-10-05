@@ -4,11 +4,14 @@ import {
   IsArray,
   IsBoolean,
   IsEmail,
+  IsInt,
   IsNotEmpty,
   IsOptional,
   IsString,
   Matches,
+  Max,
   MaxLength,
+  Min,
   MinLength,
   ValidateNested,
 } from 'class-validator';
@@ -109,6 +112,20 @@ export class CheckoutDto {
   @IsOptional()
   @IsBoolean()
   renewalConsent?: boolean;
+
+  @ApiPropertyOptional({
+    description:
+      'Total TTC (centimes) tel qu’AFFICHÉ/accepté par le client sur son dernier devis serveur ' +
+      '— Q7 (GO item 7). Si le tarif a changé depuis (prix, promo, taxe, frais), le serveur ' +
+      'refuse en 409 (code PRICING_CHANGED) pour imposer une NOUVELLE acceptation. ' +
+      'Omis = compatibilité API (aucune vérification d’acceptation).',
+  })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(0)
+  @Max(1_000_000_000)
+  acceptedTotalTtcCents?: number;
 }
 
 /** Représentation lisible (jamais les secrets) d’un moyen de paiement pour /cart/checkout. */
@@ -117,6 +134,10 @@ export class PaymentMethodPublicView {
   name!: string;
   type!: string;
   config?: Record<string, unknown> | null;
+  /** Q7 — frais APPLIQUÉS au total (plus seulement journalisés côté admin). */
+  feeType!: string;
+  feePercent?: number | null;
+  feeFixedCents?: number | null;
 }
 
 /**
@@ -144,4 +165,16 @@ export class QuoteDto {
   @IsArray()
   @IsString({ each: true })
   addonIds?: string[];
+
+  @ApiPropertyOptional({
+    description:
+      'Moyen de paiement cible (Q7, GO item 7) : les FRAIS configurés sur ce moyen ' +
+      '(feeType/feePercent/feeFixedCents) sont alors APPLIQUÉS dans le devis, comme dans la ' +
+      'commande. Omis (étape /cart) = devis sans frais de paiement.',
+  })
+  @IsOptional()
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(120)
+  paymentMethodId?: string;
 }
