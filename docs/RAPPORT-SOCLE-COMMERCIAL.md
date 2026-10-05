@@ -2,8 +2,8 @@
 
 **Date :** 2026-10-05 · **Branche :** `feat/socle-commercial` (worktree `C:\Users\mourad.errabii\Documents\iCode-Host-Recette`)
 **Base de tests :** `icode_host_pro_socle` (docker `icode-postgres`, 58 migrations) · **Base recette UI :** `icode_host_pro_recette` (58 migrations) · **Bases legacy :** `icode_host_pro_c3premig`, `icode_host_pro_c4premig`, `icode_host_pro_c4test`
-**Commits :** `git log main..HEAD` = **32 commits** (`86c9f61`→`20b2dc5` ; code de dernière validation = `3eb0852`) — **aucun push, aucun merge** (`main`/`origin/main` = `3245694` intact).
-**Diff complet :** `git diff 3245694 HEAD` = **128 fichiers, +27 326 / −450** (patch : `recette/diff-socle-commercial.patch`, 1 439 816 octets).
+**Commits :** `git log main..HEAD` = **34 commits** (`86c9f61`→`5084864` + cachet docs final ; code testé = `3eb0852`, docs Q10 = `20b2dc5`, docs Q11 = `5084864`) — **aucun push, aucun merge** (`main`/`origin/main` = `3245694` intact).
+**Diff complet :** `git diff 3245694 5084864` = **128 fichiers, +27 383 / −452** (patch : `recette/diff-socle-commercial.patch`, 1 470 716 octets, couvre **33 commits** — le seul commit hors patch est le cachet docs final qui rapporte son SHA, auto-référence non composable sans récursion).
 **Environnement de preuve (toutes capacités ci-dessous, sauf mention contraire) :** local uniquement — docker `icode-postgres`, API Nest sur 3011 (PORT 3001 interdit), web Next sur 3002, proxy nav 3999, compte `admin-recette@icode.test` / `client-a-recette@icode.test`. Aucun appel réseau sortant vers un panneau/paiement réel (transports simulés).
 
 ---
@@ -75,7 +75,7 @@ Logs de référence antérieurs : `recette/logs/e2e-final-p10*.log` (P10), conso
 - **Migrations ajoutées : 10 additives** (aucune ancienne modifiée ; total **48 → 58**) : `20261002000000_add_payment_confirmation`, `20261002100000_add_password_reset`, `20261003000000_add_invoice_billing_terms`, `20261003000001_add_invoice_dunning`, `20261004045500_q_a_renewal_consent_invoice_subscription`, `20261004045643_q_a_index_invoice_subscription`, `20261004104124_q6_sweep_lease`, `20261004114140_q3_email_change_closure`, `20261005000001_q8_wallet_bankref_invoice_pdfstatus`, `20261005000002_q9_refunds_credit_notes`.
 - **Dépendances ajoutées (2)** : `pdfkit` + `@types/pdfkit` (PDF facture) — `pnpm-lock.yaml` à jour.
 - **Commits : 32** — liste exacte : `git log --oneline main..HEAD` (feature = `076a5ab`, `3fbbf62`, `2f3948c`, `8bd07d3`, `c498fda`, `ada8bed`, `73a6061`, `3eb0852` ; tests/docs = commits `test(*)`, `docs(*)` ; le reste = P0→P10).
-- **Fichiers : 128 modifiés (+27 326 / −450)** — détails : `git diff --stat 3245694 HEAD`. Nouveaux services notables : `RenewalService`, `InvoicePdfService`, `WalletService`, `RefundService`, `SuspensionEffectsService`, `sweep-guards` ; pages `/client/{commandes,factures,portefeuille}`, `/manager/{commandes,factures,facturation,taxe,recharges,moyens-paiement,subscriptions}`.
+- **Fichiers : 128 modifiés (+27 383 / −452)** — détails : `git diff --stat 3245694 5084864`. Nouveaux services notables : `RenewalService`, `InvoicePdfService`, `WalletService`, `RefundService`, `SuspensionEffectsService`, `sweep-guards` ; pages `/client/{commandes,factures,portefeuille}`, `/manager/{commandes,factures,facturation,taxe,recharges,moyens-paiement,subscriptions}`.
 - **CI** : `.github/workflows/ci.yml` — typecheck×2, unit, e2e principal, **étape next build (heap 6144)**, **étapes bases dédiées + 3 suites legacy**.
 
 ---
@@ -84,10 +84,10 @@ Logs de référence antérieurs : `recette/logs/e2e-final-p10*.log` (P10), conso
 
 1. **Rapport (ce fichier)** : `docs/RAPPORT-SOCLE-COMMERCIAL.md`.
 2. **HTML de suivi actualisé** : `docs/suivi-projet.html` (v8, ouverture locale + navigation vérifiées).
-3. **Patch complet depuis `3245694`** : `recette/diff-socle-commercial.patch` — 128 fichiers, +27 326/−450, 1 439 816 octets, nouveaux fichiers inclus, généré par `git diff 3245694 HEAD --binary --full-index --output=…` (écriture par Git lui-même = **aucune redirection d'encodage**).
+3. **Patch complet depuis `3245694`** : `recette/diff-socle-commercial.patch` — **couvre `3245694`→`5084864` (33 commits)** : 128 fichiers, +27 383/−452, 1 470 716 octets, nouveaux fichiers inclus, généré par `git diff 3245694 5084864 --binary --full-index --output=…` (écriture par Git lui-même = **aucune redirection d'encodage**).
 4. **Vérification de fidélité (corruption d'export vs corruption source)** :
-   - *Export* : deux exports successifs → **SHA-256 identiques** `3CE646E4C0AB2D7DA6139796D40E13BAF644F4EBE6C81EBB21E34D384891795B` (export déterministe, non corrompu).
-   - *Source* : `git apply --check --reverse` du patch contre l'arbre `HEAD` → **exit 0** (le patch est exactement reproductible des blobs Git ; tout écart blob/arbre aurait fait échouer le reverse-apply).
+   - *Export* : deux exports successifs → **SHA-256 identiques** `71A13FD34B2D188B67C582856119F839CCB454631A58BFEBAED68CD93A259542` (export déterministe, non corrompu).
+   - *Source* : `git apply --check --reverse` du patch contre l'arbre `5084864` → **exit 0** (le patch est exactement reproductible des blobs Git ; tout écart blob/arbre aurait fait échouer le reverse-apply).
 5. **Guide court de recette manuelle** : `recette/GUIDE-RECETTE-P10.md` (mise à jour Q10/Q11).
 6. **Commit/états** : `git status` propre ; `main`/`origin/main` = `3245694` intact.
 
