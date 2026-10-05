@@ -1,101 +1,109 @@
-# RAPPORT — GO socle commercial (P0→P10)
+# RAPPORT — GO socle commercial (P0→P10 + correction/achèvement Q-A→Q11)
 
-**Date :** 2026-10-04 · **Branche :** `feat/socle-commercial` (worktree `C:\Users\mourad.errabii\Documents\iCode-Host-Recette`)
-**Base :** `icode_host_pro_socle` (docker `icode-postgres`) — 52 migrations · **Base recette UI :** `icode_host_pro_recette` (52 migrations depuis P10)
-**Commits :** `86c9f61` (A0) → `17f1bf2` (P2) → `792dab8` (P3) → `4b931e1` (P4) → `9d96a83` (P5) → `d5fdae1` (P6) → `62d68fb` (P7) → `d8b55e4` (P8) → `763ae38` (P9) → `d989dbe` (P10, clôture/docs) → correctifs de fin de session (liste exacte : `git log main..HEAD`) — **aucun push, aucun merge** (`main` = `3245694` intact).
-**Diff complet :** `main...HEAD` = **93 fichiers, +15 848 / −355** (patch : `recette/diff-socle-commercial.patch`).
-**Portée :** socle commercial de bout en bout (sécurité/paiement → comptes → visibilité → tarifs → factures → portefeuille → recharges → abonnements → exploitation/CI), cadres GO P0→P10 respectés.
+**Date :** 2026-10-05 · **Branche :** `feat/socle-commercial` (worktree `C:\Users\mourad.errabii\Documents\iCode-Host-Recette`)
+**Base de tests :** `icode_host_pro_socle` (docker `icode-postgres`, 58 migrations) · **Base recette UI :** `icode_host_pro_recette` (58 migrations) · **Bases legacy :** `icode_host_pro_c3premig`, `icode_host_pro_c4premig`, `icode_host_pro_c4test`
+**Commits :** `git log main..HEAD` = **32 commits** (`86c9f61`→`20b2dc5` ; code de dernière validation = `3eb0852`) — **aucun push, aucun merge** (`main`/`origin/main` = `3245694` intact).
+**Diff complet :** `git diff 3245694 HEAD` = **128 fichiers, +27 326 / −450** (patch : `recette/diff-socle-commercial.patch`, 1 439 816 octets).
+**Environnement de preuve (toutes capacités ci-dessous, sauf mention contraire) :** local uniquement — docker `icode-postgres`, API Nest sur 3011 (PORT 3001 interdit), web Next sur 3002, proxy nav 3999, compte `admin-recette@icode.test` / `client-a-recette@icode.test`. Aucun appel réseau sortant vers un panneau/paiement réel (transports simulés).
 
 ---
 
 ## 1. Synthèse par capacité (statut · preuve · limite)
 
-| Capacité (audit) | Lot | Statut | Preuve principale | Limite / réserve |
+Statuts GO : **terminée / partielle / bloquée / non testée**. Aucun « PASS global » : chaque ligne porte sa preuve et sa limite.
+
+| # | Capacité (origine) | Lot | Statut | Preuve principale | Limite / réserve |
+|---|---|---|---|---|---|
+| 1 | RBAC administration (C-02) | A0 | **terminée** | e2e `rbac-deployment-modules` (USER → 403, 0 appel panneau) ; commit `86c9f61` | — |
+| 2 | Récupération mdp oublié + sessions + email vérifié + clôture (E-06, GO 3) | A1/Q-D | **terminée** | e2e `account-recovery` **35/35** : reset CAS concurrence `[201,400]`, double-refresh, `ownedBy`/`ensureOwnedCustomer` stalés, clôture sans touche financière ; commit `8bd07d3` | Exécution RGPD/anonymisation = décision owner (§6-7) |
+| 3 | Édition profil (`/profil`, pendingEmail) | A1/Q-D | **terminée** | e2e `account-recovery` + page `/profil` + `/auth/verifier-email` | — |
+| 4 | Visibilité client/admin : mes commandes, mes factures, listings admin (E-03/E-07) | B1 | **terminée** | e2e `visibility-lists` (15) ; captures P10 | Dashboard home = pages listes (KPI dédié hors périmètre, décision) |
+| 5 | Cohérence tarifaire : promo facturée, devis, taux (E-01/M-02) | B2/Q-E | **terminée** | e2e `pricing-consistency` **18/18** (dévis serveur = commande = facture = débit, `PRICING_CHANGED` 409 + ré-acceptation, gratuité 0, frais côté serveur) ; commits `9d96a83` + `c498fda` | Décision **§6-2a appliquée** : le prix promo est facturé |
+| 6 | Fondations paiement : `PENDING_PAYMENT→PAID`, confirmation serveur, rejeu/annulation (C-01/E-08) | C0 | **terminée** | e2e `store-payment-confirmation` (25) + `store-order-status` + `store-checkout-domains` ; commit `17f1bf2` | Webhook prestataire réel = C1 (bloqué §6-1) |
+| 7 | Confirmation avant livraison (virement) | C0/C3a | **terminée** | `confirm-payment` admin → provisioning seulement après confirmation ; e2e concernés verts | — |
+| 8 | Portefeuille : solde, idempotence stricte, concurrence, **règlement de commande par solde** (C-03, GO 1+2) | C2/Q-A | **terminée** | e2e `wallet-recharge` (12) + `wallet-payment` **14/14** (double-clic 2×201/1 débit, rejeu même clé, contenu divergent 409, EUR 409, rollback `payment.confirm_failed`) ; boutons « Régler par solde » `/client/commandes`, `/client/factures`, `/checkout/success` ; **parcours navigateur 22/22** (refus solde 0 = 409 puis « Commande payée ») ; commits `d5fdae1` + `076a5ab` | USD uniquement ; rollback = seul compensateur |
+| 9 | Recharge par virement + validation admin (C-04, GO 8) | C3a/Q-F | **terminée** | e2e `wallet-recharge` (refusé → 0 crédit ; validé → 1 crédit) ; `bankRef` obligatoire **3..64 + unicité globale** (409 en cas de réutilisation), contenu réel du fichier sniffé (magic bytes), stockage `apps/api/storage/` privé, parcours navigateur (dépôt justificatif + validation prompt) ; commits `ada8bed` | — |
+| 10 | Facturation : PDF figé, mentions, échéance, numérotation, statut re-stampé (E-02, GO 8) | D1/Q-F | **terminée** | e2e `invoice-billing` (11) : unicité sous concurrence PG, PDF octet-identique dans un statut, pagination longs documents, régénération si statut changé ; commits `62d68fb` + `ada8bed` | Numérotation **sans remise à zéro annuelle** = décision **§6-6** (réversible) |
+| 11 | **Remboursements internes + avoirs** (GO 9) | Q9/Q10 | **terminée** | e2e `refunds-credit-notes` **27/27** (plafond exact ≤ encaissé, idempotence par clé, concurrence 2×10+même clé, avoir cumulatif, RBAC, zéro `SUCCEEDED EXTERNAL_CARD` sans confirmation) + `refund.service.spec` 22/22 ; UI « Rembourser (wallet) » sur **PAID et ACTIVE** ; **parcours navigateur : remboursement 5,50 → wallet + avoir AV- émis** ; commits `73a6061` + `3eb0852` | **Confirmation externe réelle** = adaptateur carte → **§6-1 (bloqué)** ; machine `applyExternalConfirmation` = simulation interne étiquetée, jamais exposée admin |
+| 12 | Abonnements : échéances, renouvellement par solde, dunning, **consentement**, suspension/réactivation (E-04, GO 4+5) | D2/Q-A/Q-B | **terminée** | e2e `recurring-billing` (9) + `wallet-payment` L + `suspension-reactivation` **7/7** (verrous Invoice→Subscription, effets panel `stop/start` post-commit sous `HOSTING_C4_ENABLED`, capacité manquante → `blocked` sans invalider le statut, zéro suppression, réactivation sans double facture) ; toggle **Activer/Révoquer** consentement daté ; commits `d8b55e4`, `076a5ab`, `3fbbf62` | Effet **sur l'infra live** = arrêt exact des apps à trancher (**§6-4**) ; §6-2a tarif renouvellement conforme |
+| 13 | Timers de sweep : activation explicite, prérequis schéma, invariants multi-processus (GO 6) | Q-C | **terminée** | e2e `sweep-timers` **4/4** (config absente → aucun timer/aucune mutation ; lease tenu → refus ; 2 instances concurrentes → 1 seule expiration + 1 audit) ; défaut **OFF strict `=== 'true'`**, lease `SweepLease` TTL 180 s ; commit `2f3948c` | `.env` local non modifié (timers éteints en dev) ; activation documentée dans `.env.example` |
+| 14 | Exploitation : UI des 5 actions admin (M-06) | E1 | **terminée** | capture `socle-p10-manager-commandes-detail-actions.png` + e2e `audit-completeness` | — |
+| 15 | Écran moyens de paiement + **frais réellement appliqués** (M-06, GO 7) | E1/Q-E | **terminée** | capture `socle-p10-manager-moyens-paiement.png` ; `buildPricing(method)` = frais en ADJUSTMENT non taxée figés Order+Invoice, devis public les expose, badge = devis serveur ; commit `c498fda` | Ancien constat « frais seulement journalisés » **corrigé par Q-E** ; affichage client = devis (badge = grille indicative) |
+| 16 | Audit complet : acteur, transitions, frais (M-05) | E1 | **terminée** | e2e `audit-completeness` (5/5) ; audits `refund.*`, `suspension.*`, `auth.*` ajoutés | `payment.checkout.error` garde l'acteur créateur |
+| 17 | **Suites e2e legacy 17B** (`c3-premig`, `c4-premig`, `c4-release`, `c4-rollback`) | Q10a | **terminée** | **39/39 PASS** sur 3 bases dédiées refabriquées (`c3premig` = 58 migrations + DROP tables C1/C3/C4, `c4premig` = 58/58 sans C4, `c4test` complète partagée release/rollback) ; scénarios pré-migration intacts, garde `current_database()` ; **réintégrées en CI** (étapes dédiées) ; commit `3eb0852` | Bases **regénérées à chaque run CI** (aucun dump binaire committé) |
+| 18 | **`next build`** (GO 10) | Q10b | **terminée** | `NODE_OPTIONS=--max-old-space-size=6144 npx next build` → **EXIT 0** (cause racine = OOM du heap V8 par défaut, pas de la RAM machine) ; étape CI dédiée ajoutée ; commit `3eb0852` | Routage/tsc = validation quotidienne ; `next build` en CI + avant release |
+| 19 | **Parcours navigateur réels** : droits, achat par solde, recharge/validation, refus, renouvellement, remboursement (GO 10) | Q10d | **terminée** | `node recette\parcours-q10.mjs` = **22/22 PASS** (19 captures `recette/q10-*.png` + `q10-checks.json`) : droits client refusé `/manager`, boutique→panier→paiement→success, refus solde 0, justificatif déposé, validation admin (prompt `bankRef`), règlement par solde → « Commande payée », armer/révoquer renouvellement, refus plafond (« dépasse le total encaissé »), remboursement → « + avoir émis », après-coups portefeuille et factures `AV-` | Exécuté sur `next dev` (profil Edge dédié) ; scripts/preuves hors git |
+| 20 | Déclenchement du pipeline CI GitHub (exécution réelle) | E1/Q10 | **non testée** | `.github/workflows/ci.yml` lint OK ; étapes **équivalentes exécutées en local** (typecheck×2, unit, e2e, legacy, next build) | Push interdit par le GO → le pipeline n'a jamais été exécuté sur GitHub |
+| 21 | Adaptateur carte (webhook/signature) | C1 | **bloquée** | — | Décision **§6-1** (prestataire) non rendue |
+| 22 | Recharge par carte + remboursement carte réel (`EXTERNAL_CARD` confirmé) | C3b | **bloquée** | — | Dépend C1 (§6-1) ; fondations internes (liens/plafonds/idempotence) = terminées en 11 |
+| 23 | Suppression/anonymisation RGPD (M-07) + switch admin inscription gratuite (R-AUT-06) | — | **non testée** | — | Décisions owner (§6-7) ; la **demande** de clôture (tracée, sans exécution) = terminée en 2 |
+
+**Ce que la table ne prétend PAS :** aucune ligne ne couvre un prestataire réel, une mise en production, un push ou une activation commerciale.
+
+---
+
+## 2. Résultats finaux (commandes · logs · bases · commit testé)
+
+**Commit testé :** `3eb0852` (code) — docs de clôture = `20b2dc5`. Exécution consolidée Q11 via `recette/final-validation-q11.ps1`, logs `recette/logs/final-q11-*.log` :
+
+| Étape | Commande (cwd) | Base | Résultat | Log |
 |---|---|---|---|---|
-| RBAC administration (C-02) | A0 | **PASS** | e2e `rbac-deployment-modules` (USER → 403, 0 appel panneau) ; commit `86c9f61` | — |
-| Récupération mdp oublié (E-06) | A1 | **PASS** | e2e `account-recovery` (16) ; commit `792dab8` | Suppression/anonymisation de compte (M-07/§6-7) = **non traité** (décision owner) |
-| Édition profil | A1 | **PASS** | e2e recovery + pages `/profil` | — |
-| Visibilité client/admin : mes commandes, mes factures, listings admin (E-03/E-07) | B1 | **PASS** | e2e `visibility-lists` (15) ; pages `/client/commandes`, `/client/factures`, `/manager/commandes`, `/manager/factures` ; captures P10 | Dashboard home : inchangé (KPI = pages listes) |
-| Cohérence tarifaire : promo + arrondi + taux de taxe (E-01/M-02) | B2 | **PASS** | e2e `pricing-consistency` (prix affiché = prix débité, `taxAmountCents ≥ 0`) ; `/manager/taxe` (capture) ; commit `9d96a83` | Décision **§6-2a appliquée** : le prix promo est facturé |
-| Fondations paiement : machine d'états `PENDING_PAYMENT→PAID`, confirmation serveur, rejeu/annulation (C-01/E-08) | C0 | **PASS** | e2e `store-payment-confirmation` (25) + `store-order-status` + `store-checkout-domains` ; commit `17f1bf2` | Webhook prestataire = hors périmètre (C1) |
-| Confirmation avant livraison (virement) | C0/C3a | **PASS** | `confirm-payment` admin (UI P4) → provisioning seulement après confirmation ; e2e concernés verts | — |
-| Portefeuille (solde, idempotence, concurrence) (C-03) | C2 | **PASS** | e2e `wallet-recharge` (12) ; page `/client/portefeuille` (capture) ; commit `d5fdae1` | « Payer une commande par solde au checkout » = **non câblé** (décision restante P6 documentée) |
-| Recharge par virement (validation admin) (C-04) | C3a | **PASS** | e2e `wallet-recharge` (preuve refusée → 0 crédit ; validée → 1 crédit) ; `/manager/recharges` (capture) | — |
-| Facturation : PDF figé, mentions, échéance, numérotation sûre, consultation (E-02) | D1 | **PASS** | e2e `invoice-billing` (11) : numéros uniques sous concurrence PG réelle, PDF octet-identique, mentions figées ; captures `client-factures` + `manager-facturation` ; commit `62d68fb` | Numérotation **sans remise à zéro annuelle** = décision **§6-6 restante** (tranchée côté code, réversible) |
-| Avoirs / remboursements (facture) | — | **NON TRAITÉ** | — | Pas dans les lots GO (dépend C1/C3b) ; enums prêts |
-| Abonnements : échéances, renouvellement par solde, dunning, suspension (E-04) | D2 | **PASS** | e2e `recurring-billing` (9) : 2e facture + débit unique, relance UNE fois, suspension CAS **statut seul**, reprise sans double débit ; commit `d8b55e4` | **§6-4 BLOQUÉ** : effet infrastructure de suspension non tranché (statut seul documenté) |
-| Exploitation : UI des 5 actions admin (M-06) | E1 | **PASS** | capture `socle-p10-manager-commandes-detail-actions.png` (panneau « Actions administrateur » sur commande ACTIVE) ; e2e `audit-completeness` RBAC 401/403 | — |
-| Exploitation : écran moyens de paiement (M-06) | E1 | **PASS** | capture `socle-p10-manager-moyens-paiement.png` (3 moyens, édition activé/ordre/frais/config) ; secrets `configEnc` jamais exposés | Frais **journalisés mais jamais appliqués** au calcul (R-FEE-05 = décision) |
-| Audit complet (M-05) : acteur, transitions, frais | E1 | **PASS** | e2e `audit-completeness` (5/5) : acteur sur `payment.checkout`, acteur+from/to sur `payment.confirmed`, `order.transition` (confirm/claim/activation), frais en valeurs | `payment.checkout.error` garde l'acteur créateur (jamais inconnu) |
-| CI unit + e2e (R-CI-07) | E1 | **PASS (locale)** | `.github/workflows/ci.yml` (1er du dépôt, `yaml-lint` OK) ; étapes équivalentes exécutées en local | **Pipeline GitHub non exécuté** (push interdit en chantier) |
-| Adaptateur carte (webhook/signature) | C1 | **BLOQUÉ** | — | Décision **§6-1** (prestataire) non rendue |
-| Recharge par carte + remboursements carte | C3b | **BLOQUÉ** | — | Dépend C1 |
-| Suites e2e legacy 17B à base dédiée (c3-premig, c4-premig, c4-release, c4-rollback) | — | **NON TESTÉ** | — | Bases figées avant le GO (colonnes `Order.paidAt` etc. absentes) ; échec par design hors leur base ; **exclues du run complet et de la CI avec commentaire** ; réparation = refabrique des dumps dédiés |
-| Switch admin inscription gratuite (R-AUT-06), RGPD (M-07) | — | **NON TRAITÉ** | — | Décisions owner restantes |
+| Typecheck API | `npx tsc --noEmit -p tsconfig.json` (`apps/api`) | — | **PASS** | `final-q11-tsc-api.log` |
+| Build API | `npx nest build` (`apps/api`) | — | **PASS** | `final-q11-nest-build.log` |
+| Unit complet | `npx jest src --maxWorkers=4` (`apps/api`) | — | **1203/1203 PASS — 65 suites** | `final-q11-unit.log` |
+| e2e complet | `npx jest --config ./test/jest-e2e.json --runInBand --testPathIgnorePatterns c3-premig c4-premig c4-release c4-rollback` (`apps/api`) | `icode_host_pro_socle` | **488/488 PASS — 42 suites** | `final-q11-e2e.log` |
+| e2e legacy (3) | idem avec `DATABASE_URL` = base dédiée + `--testPathPattern` | `icode_host_pro_c3premig` / `icode_host_pro_c4premig` / `icode_host_pro_c4test` | **39/39 PASS** | `final-q11-legacy-*.log` |
+| Typecheck Web | `npx tsc --noEmit -p tsconfig.json` (`apps/web`) | — | **PASS** | `final-q11-tsc-web.log` |
+| Build Web | `NODE_OPTIONS=--max-old-space-size=6144 npx next build` (`apps/web`) | — | **EXIT 0** (Q10b, étape CI) | console Q10b |
+| Parcours navigateur | `node recette\parcours-q10.mjs` | `icode_host_pro_recette` | **22/22 PASS** | `recette/q10-checks.json` |
+| Lint CI | `npx js-yaml .github/workflows/ci.yml` | — | PASS | — |
 
-**Légende :** PASS = implémenté + testé ici · BLOQUÉ = GO requis (décision) · NON TESTÉ = connu, non rejoué · NON TRAITÉ = hors périmètre GO.
+Logs de référence antérieurs : `recette/logs/e2e-final-p10*.log` (P10), console des lots Q-A→Q10 (détail : `TASKS.md`).
 
 ---
 
-## 2. Tests (validation finale P10)
+## 3. Preuves visuelles et parcours
 
-| Suite | Résultat | Log |
-|---|---|---|
-| **Unit complet** (`jest src --maxWorkers=4`) | **1077/1077 PASS — 60 suites** | console P10 |
-| **e2e complet** (`jest --config test/jest-e2e.json --runInBand`, 4 suites legacy exclues) | **407/407 PASS — 38 suites** | `recette/logs/e2e-final-p10-run2.log` |
-| e2e complet INCLUANT les 4 legacy (première passe) | 407/407 verts + **39 échecs attendus** des 4 suites legacy sur mauvaise base | `recette/logs/e2e-final-p10.log` |
-| e2e `audit-completeness` (nouveau P9) | **5/5 PASS** | — |
-| `tsc --noEmit` API | PASS | — |
-| `tsc --noEmit` Web | PASS | — |
-| `yaml-lint` CI | PASS | — |
-| Smoke e2e (63), suites ciblées P9 (128 unit), non-régression (80) | PASS (déjà acquis, repris dans les totaux ci-dessus) | — |
-| `next build` | **ÉCHEC outil** (worker exit 134 / OOM — machine) ; `nest build` OK ; web validé par `tsc` ; UI servie en `next dev` pour preuves | limitation machine, non bloquante |
-| Lint ESLint | absent du workspace (préexistant, non bloquant) | — |
+- **11 captures** `recette/socle-p10-*.png` (listing admin, **panneau Actions administrateur**, **moyens de paiement**, taxe, facturation, factures, abonnements, recharges, portefeuille, mes factures, mes commandes).
+- **19 captures** `recette/q10-*.png` + `recette/q10-checks.json` : parcours complet achat/réappro/renouvellement/remboursement (22 checks).
+- Rejeu : `powershell -File recette\up-p10.ps1` puis `node recette\capture-socle-p10.mjs` / `node recette\parcours-q10.mjs` (voir `recette/GUIDE-RECETTE-P10.md`). Arrêt : `recette\down.ps1`.
 
 ---
 
-## 3. Preuves visuelles (recette locale, stack P10 : API 3011 + web 3002 `next dev`)
+## 4. Migrations, dépendances, fichiers (GO 11.5)
 
-11 captures dans `recette/socle-p10-*.png` (script : `recette/capture-socle-p10.mjs`) :
-
-| Capture | Ce qu'elle prouve |
-|---|---|
-| `manager-commandes-liste` | Listing admin paginé + filtres (P4) |
-| **`manager-commandes-detail-actions`** | Détail + **panneau « Actions administrateur »** (Terminer / Ré-synchroniser) — P9b |
-| **`manager-moyens-paiement`** | Écran complet moyens de paiement (actifs/ordre/frais/config) — P9c |
-| `manager-taxe` | Taux de taxe admin (P5) |
-| `manager-facturation` | Paramètres facturation + mentions (P7) |
-| `manager-factures` | Factures admin (P4/P7) |
-| `manager-subscriptions` | Abonnements : statut + Suspendre/Ré-synchroniser (P8) |
-| `manager-recharges` | Validation recharges admin (P6) |
-| `client-portefeuille` | Portefeuille client (P6) |
-| `client-factures` | Mes factures + Détail/PDF (P4/P7) |
-| `client-commandes` | Mes commandes + statuts (P4) |
-
-Rejeu : `powershell -File recette\up-p10.ps1` puis `node recette\capture-socle-p10.mjs` (voir `recette/GUIDE-RECETTE-P10.md`). Arrêt : `recette\down.ps1`.
+- **Migrations ajoutées : 10 additives** (aucune ancienne modifiée ; total **48 → 58**) : `20261002000000_add_payment_confirmation`, `20261002100000_add_password_reset`, `20261003000000_add_invoice_billing_terms`, `20261003000001_add_invoice_dunning`, `20261004045500_q_a_renewal_consent_invoice_subscription`, `20261004045643_q_a_index_invoice_subscription`, `20261004104124_q6_sweep_lease`, `20261004114140_q3_email_change_closure`, `20261005000001_q8_wallet_bankref_invoice_pdfstatus`, `20261005000002_q9_refunds_credit_notes`.
+- **Dépendances ajoutées (2)** : `pdfkit` + `@types/pdfkit` (PDF facture) — `pnpm-lock.yaml` à jour.
+- **Commits : 32** — liste exacte : `git log --oneline main..HEAD` (feature = `076a5ab`, `3fbbf62`, `2f3948c`, `8bd07d3`, `c498fda`, `ada8bed`, `73a6061`, `3eb0852` ; tests/docs = commits `test(*)`, `docs(*)` ; le reste = P0→P10).
+- **Fichiers : 128 modifiés (+27 326 / −450)** — détails : `git diff --stat 3245694 HEAD`. Nouveaux services notables : `RenewalService`, `InvoicePdfService`, `WalletService`, `RefundService`, `SuspensionEffectsService`, `sweep-guards` ; pages `/client/{commandes,factures,portefeuille}`, `/manager/{commandes,factures,facturation,taxe,recharges,moyens-paiement,subscriptions}`.
+- **CI** : `.github/workflows/ci.yml` — typecheck×2, unit, e2e principal, **étape next build (heap 6144)**, **étapes bases dédiées + 3 suites legacy**.
 
 ---
 
-## 4. Migrations, dépendances, fichiers
+## 5. Livrables de revue (GO 11.1–11.3, 11.6)
 
-- **4 migrations additives** (aucune ancienne modifiée ; total **52**) : `20261002000000_add_payment_confirmation` (49e), `20261002100000_add_password_reset` (50e), `20261003000000_add_invoice_billing_terms` (51e), `20261003000001_add_invoice_dunning` (52e).
-- **Dépendances ajoutées (2)** : `pdfkit` + `@types/pdfkit` (P7, justifié PDF facture) — lockfile à jour.
-- **Nouveaux services/pages notables** : `RenewalService` (D2), `InvoicePdfService` (D1), `WalletService` (C2), pages `/client/{commandes,factures,portefeuille}`, `/manager/{commandes,factures,facturation,taxe,recharges,moyens-paiement,subscriptions}`.
-- **CI** : `.github/workflows/ci.yml` (postinstall `@prisma/engines`, service `postgres:16`, typecheck×2, unit, e2e avec exclusion commentée des 4 suites legacy).
-
----
-
-## 5. Décisions restantes (arbitrage owner — aucune tranchée seul)
-
-1. **§6-1 prestataire de paiement** → C1/C3b **BLOQUÉS**.
-2. **§6-4 effet infra de la suspension** → implémenté = statut seul (P8) ; un vrai arrêt d'apps reste à trancher.
-3. **§6-6 numérotation par exercice** → pas de remise à zéro annuelle (séquence continue `AAAA-seq`) ; réversible.
-4. **§6-7 suppression/anonymisation RGPD + switch inscription gratuite** → non traités.
-5. **« Payer par solde au checkout »** → non câblé (P6) ; le renouvellement D2 passe bien par le solde.
-6. **Frais de paiement (R-FEE-05)** → journalisés (P9) mais non appliqués au calcul : appliquer ou masquer.
+1. **Rapport (ce fichier)** : `docs/RAPPORT-SOCLE-COMMERCIAL.md`.
+2. **HTML de suivi actualisé** : `docs/suivi-projet.html` (v8, ouverture locale + navigation vérifiées).
+3. **Patch complet depuis `3245694`** : `recette/diff-socle-commercial.patch` — 128 fichiers, +27 326/−450, 1 439 816 octets, nouveaux fichiers inclus, généré par `git diff 3245694 HEAD --binary --full-index --output=…` (écriture par Git lui-même = **aucune redirection d'encodage**).
+4. **Vérification de fidélité (corruption d'export vs corruption source)** :
+   - *Export* : deux exports successifs → **SHA-256 identiques** `3CE646E4C0AB2D7DA6139796D40E13BAF644F4EBE6C81EBB21E34D384891795B` (export déterministe, non corrompu).
+   - *Source* : `git apply --check --reverse` du patch contre l'arbre `HEAD` → **exit 0** (le patch est exactement reproductible des blobs Git ; tout écart blob/arbre aurait fait échouer le reverse-apply).
+5. **Guide court de recette manuelle** : `recette/GUIDE-RECETTE-P10.md` (mise à jour Q10/Q11).
+6. **Commit/états** : `git status` propre ; `main`/`origin/main` = `3245694` intact.
 
 ---
 
-## 6. Ce que ce rapport NE dit PAS
+## 6. Décisions réellement restantes (arbitrage owner — GO 11.7)
 
-Aucune mise en production, aucun push/merge, aucun prestataire réel, aucun appel réseau sortant (panneaux/DNS/paiement simulés ou stubés en recette), aucune activation commerciale. Le statut = **branche locale prête pour revue**.
+1. **§6-1 prestataire de paiement** → **C1 (adaptateur carte) et C3b (recharge + remboursement carte réels) restent bloqués**. Tout le reste du socle (fondations internes de remboursement, confirmation externe simulée étiquetée, paiement par solde, virement) est **terminé et testé** — la décision n'a pas été reclassée hors périmètre.
+2. **§6-4 effet infrastructure exact de la suspension** → stop/start des apps via `PanelTransport` implémenté et testé en simulation (C4) ; **l'arrêt réel sur le panel live à activer en production** reste à trancher.
+3. **§6-6 numérotation par exercice** → pas de remise à zéro annuelle aujourd'hui (`AAAA-seq` continu) ; trancher avant facturation en prod (réversible).
+4. **§6-7 exécution RGPD** (suppression/anonymisation) **+ switch admin d'inscription gratuite** → non tranchés ; la demande de clôture avec tracé est terminée (exécution = décision).
+
+*(Aucune autre décision ouverte : frais **appliqués** (Q-E), « payer par solde » **câblé** (Q-A), suites legacy **restaurées** (Q10a), `next build` **résolu** (Q10b).)*
+
+---
+
+## 7. Ce que ce rapport NE dit PAS
+
+Aucune mise en production, aucun push/merge, aucun prestataire réel, aucun appel réseau sortant vers un panneau/DNS/paiement réel (simulations en recette), aucune activation commerciale. **ARRÊT ici pour revue globale unique** (GO item 11) : le statut = **branche locale prête pour revue**, à rejouer avec `recette/GUIDE-RECETTE-P10.md`.
