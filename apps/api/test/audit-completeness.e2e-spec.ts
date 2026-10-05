@@ -9,6 +9,7 @@ import { PrismaService } from './../src/prisma/prisma.service';
 import { GlobalPrefix } from './../src/config/constants';
 import { SaRateLimiter } from './../src/auth/rate-limiter';
 import { MailTransportFactory } from './../src/mail/mail-transport.factory';
+import { acceptanceOrThrow, preloadAcceptance } from './pricing-acceptance.fixture';
 import {
   PanelTransport,
   PanelTransportFactory,
@@ -85,6 +86,8 @@ describe('Complétude audit & transitions (e2e, P9)', () => {
         name,
         email: aliceEmail,
         paymentMethodId: virId,
+        // P7 : preuve d'acceptation tarifaire obligatoire (préchargée).
+        ...acceptanceOrThrow(`p9-audit-${stamp}`, virId),
       });
   }
 
@@ -154,6 +157,9 @@ describe('Complétude audit & transitions (e2e, P9)', () => {
       },
     });
     productId = product.id;
+
+    // P7 : preuve d'acceptation préchargée (produit + moyen créés ci-dessus).
+    await preloadAcceptance(app.getHttpServer(), `p9-audit-${stamp}`, virId);
 
     // Config mail minimale (transport stubbé, 0 SMTP).
     const priorMail = await prisma.mailSetting.findFirst();

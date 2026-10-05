@@ -16,6 +16,7 @@ import { PrismaService } from './../src/prisma/prisma.service';
 import { GlobalPrefix } from './../src/config/constants';
 import { SaRateLimiter } from './../src/auth/rate-limiter';
 import { MailTransportFactory } from './../src/mail/mail-transport.factory';
+import { acceptanceFor, preloadAcceptance } from './pricing-acceptance.fixture';
 import {
   PanelTransport,
   PanelTransportFactory,
@@ -128,7 +129,15 @@ describe('Abonnements récurrents (e2e, P8)', () => {
       .post(`/${GlobalPrefix}/store/checkout`)
       // Q-A (item 4) : consentement EXPLICITE au renouvellement (case du
       // checkout) — sans lui, aucun prélèvement automatique n'est planifié.
-      .send({ productSlug, name, email, paymentMethodId: virId, renewalConsent: true });
+      // P7 : preuve d'acceptation tarifaire obligatoire (préchargée).
+      .send({
+        productSlug,
+        name,
+        email,
+        paymentMethodId: virId,
+        renewalConsent: true,
+        ...(acceptanceFor(productSlug, virId) ?? {}),
+      });
     if (token) req.set('Authorization', `Bearer ${token}`);
     return req;
   }
@@ -264,6 +273,10 @@ describe('Abonnements récurrents (e2e, P8)', () => {
         })
       ).id;
     }
+
+    // P7 : preuves d'acceptation pour les 2 produits × VIR unique.
+    await preloadAcceptance(app.getHttpServer(), monthlySlug, virId);
+    await preloadAcceptance(app.getHttpServer(), onetimeSlug, virId);
   });
 
   beforeEach(() => {

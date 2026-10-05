@@ -18,6 +18,7 @@ import { CryptoService } from './../src/crypto/crypto.service';
 import { GlobalPrefix } from './../src/config/constants';
 import { SaRateLimiter } from './../src/auth/rate-limiter';
 import { MailTransportFactory } from './../src/mail/mail-transport.factory';
+import { acceptanceFor, preloadAcceptance } from './pricing-acceptance.fixture';
 import { PanelTransport, PanelTransportFactory } from './../src/servers/panel-transport.factory';
 import { ProvisioningService } from './../src/store/provisioning.service';
 import { HostingServicesService } from './../src/hosting/hosting-services.service';
@@ -143,11 +144,16 @@ describe('Provisioning C3 — e2e base isolée (HOSTING_C3_ENABLED=true)', () =>
   }
 
   function checkoutBody(over: Record<string, unknown>, email: string = memberEmail) {
+    const productSlug = String(over.productSlug ?? '');
+    const paymentMethodId = (over.paymentMethodId as string | undefined) ?? pmId;
     return {
-      productSlug: '',
-      paymentMethodId: pmId,
+      productSlug,
+      paymentMethodId,
       name: 'Membre C3',
       email,
+      // P7 : preuve d'acceptation tarifaire obligatoire (préchargée ; absente
+      // si combinaison inconnue → 409 explicite si le chemin est payant).
+      ...(acceptanceFor(productSlug, paymentMethodId) ?? {}),
       ...over,
     };
   }
@@ -386,6 +392,11 @@ describe('Provisioning C3 — e2e base isolée (HOSTING_C3_ENABLED=true)', () =>
     prodAId = await mkProduct(`c3-a-${stamp}`);
     prodBId = await mkProduct(`c3-b-${stamp}`);
     prodCId = await mkProduct(`c3-c-${stamp}`);
+
+    // P7 : preuves d'acceptation pour les 3 produits × moyen unique.
+    for (const s of [`c3-a-${stamp}`, `c3-b-${stamp}`, `c3-c-${stamp}`]) {
+      await preloadAcceptance(app.getHttpServer(), s, pmId);
+    }
   });
 
   afterAll(async () => {

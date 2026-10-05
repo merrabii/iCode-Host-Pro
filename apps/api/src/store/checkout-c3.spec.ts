@@ -4,6 +4,7 @@ import {
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { CheckoutService, CheckoutReplaySignal } from './checkout.service';
+import { pricingQuoteKey } from './pricing-acceptance';
 
 /**
  * 17B.4F-C3 + GO socle commercial — checkout sous garde ON :
@@ -184,6 +185,11 @@ describe('checkout C3 (17B.4F-C3) + confirmation de paiement', () => {
       },
       domain: { findMany: jest.fn(async () => []) },
       cloudflareSetting: { findFirst: jest.fn(async () => null) },
+      // P7 (GO Q12) : devise de facturation lue hors tx pour valider la
+      // preuve d'acceptation tarifaire.
+      billingSetting: {
+        findFirst: jest.fn(async () => ({ id: 'b1', currency: 'EUR' })),
+      },
     };
 
     c3 = {
@@ -207,12 +213,37 @@ describe('checkout C3 (17B.4F-C3) + confirmation de paiement', () => {
     );
   };
 
+  /** Conditions serveur du fixture (tax 0, sans frais) → empreinte P7. */
+  const unitQuoteConditions = {
+    productSlug: 'site-starter',
+    options: [] as { optionId: string; choiceId: string }[],
+    addonIds: [] as string[],
+    paymentMethodId: 'pm1',
+    feeType: null as string | null,
+    feePercent: null as number | null,
+    feeFixedCents: null as number | null,
+    currency: 'EUR',
+    activePriceHtCents: 4900,
+    promoPriceHtCents: null as number | null,
+    taxRatePercent: 0,
+    installationFeeCents: 0,
+    amountHtCents: 4900,
+    taxAmountCents: 0,
+    amountTtcCents: 4900,
+  };
+
   const dto = (over: Record<string, unknown> = {}) =>
     ({
       productSlug: 'site-starter',
       paymentMethodId: 'pm1',
       email: 'guest@example.com',
       name: 'Guest',
+      // P7 (GO Q12) : preuve d'acceptation OBLIGATOIRE sur commande payante
+      // (l'omission vaudrait 409 PRICING_CHANGED avant tout test C3).
+      acceptedTotalTtcCents: 4900,
+      acceptedCurrency: 'EUR',
+      acceptedPaymentMethodId: 'pm1',
+      acceptedQuoteKey: pricingQuoteKey(unitQuoteConditions),
       ...over,
     }) as any;
 

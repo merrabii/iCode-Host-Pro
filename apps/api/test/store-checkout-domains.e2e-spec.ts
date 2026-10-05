@@ -22,6 +22,7 @@ import {
   CfDnsRecord,
 } from './../src/cloudflare/cloudflare.transport';
 import { MailTransportFactory } from './../src/mail/mail-transport.factory';
+import { acceptanceFor, preloadAcceptance } from './pricing-acceptance.fixture';
 import { PanelTransport, PanelTransportFactory } from './../src/servers/panel-transport.factory';
 
 // Sweep de reprise (P2) : désactivé ici pour ne jamais relancer un provisioning
@@ -213,11 +214,16 @@ describe('Store checkout multi-domaines (e2e, Phase 4)', () => {
   }
 
   function checkoutBody(over: Record<string, unknown>) {
+    const productSlug = String(over.productSlug ?? '');
+    const paymentMethodId = (over.paymentMethodId as string | undefined) ?? pmId;
     return {
-      productSlug: '',
-      paymentMethodId: pmId,
+      productSlug,
+      paymentMethodId,
       name: 'Client E2E',
       email: '',
+      // P7 : preuve d'acceptation tarifaire obligatoire (préchargée ; absente
+      // si combinaison inconnue → 409 explicite si le chemin est payant).
+      ...(acceptanceFor(productSlug, paymentMethodId) ?? {}),
       ...over,
     };
   }
@@ -326,6 +332,11 @@ describe('Store checkout multi-domaines (e2e, Phase 4)', () => {
     prodBId = await mk(`prod-b-${stamp}`, [domB.id]);
     prodACId = await mk(`prod-ac-${stamp}`, [domA.id, domC.id]);
     prodEdgeId = await mk(`prod-edge-${stamp}`, [domA.id]);
+
+    // P7 : preuves d'acceptation pour les 4 produits × VIR unique.
+    for (const s of [`prod-ab-${stamp}`, `prod-b-${stamp}`, `prod-ac-${stamp}`, `prod-edge-${stamp}`]) {
+      await preloadAcceptance(app.getHttpServer(), s, pmId);
+    }
 
     // Singleton CloudflareSetting : on conserve la row préexistante (s'il y en a
     // une) mais on lui affuble un token factice CHIFFRÉ (CryptoService RÉEL) pour

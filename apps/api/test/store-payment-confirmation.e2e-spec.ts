@@ -14,6 +14,7 @@ import { PrismaService } from './../src/prisma/prisma.service';
 import { GlobalPrefix } from './../src/config/constants';
 import { SaRateLimiter } from './../src/auth/rate-limiter';
 import { MailTransportFactory } from './../src/mail/mail-transport.factory';
+import { acceptanceFor, preloadAcceptance } from './pricing-acceptance.fixture';
 import { PanelTransport, PanelTransportFactory } from './../src/servers/panel-transport.factory';
 import { OrderLifecycleService } from './../src/store/order-lifecycle.service';
 
@@ -101,11 +102,16 @@ describe('Confirmation de paiement (e2e, P2)', () => {
   }
 
   function checkoutBody(over: Record<string, unknown>, email: string = memberEmail) {
+    const productSlug = String(over.productSlug ?? '');
+    const paymentMethodId = (over.paymentMethodId as string | undefined) ?? virId;
     return {
-      productSlug: '',
-      paymentMethodId: virId,
+      productSlug,
+      paymentMethodId,
       name: 'Client P2',
       email,
+      // P7 : preuve d'acceptation tarifaire obligatoire (préchargée ; absente
+      // si combinaison inconnue → 409 explicite si le chemin est payant).
+      ...(acceptanceFor(productSlug, paymentMethodId) ?? {}),
       ...over,
     };
   }
@@ -254,6 +260,12 @@ describe('Confirmation de paiement (e2e, P2)', () => {
     pack1Slug = await mk(`p2-pack-${stamp}`, 2500, true);
     pack2Slug = await mk(`p2-pack2-${stamp}`, 3500, true);
     freeSlug = await mk(`p2-free-${stamp}`, 0, false);
+
+    // P7 : preuves d'acceptation pour les 4 produits × VIR, + payant × CARTe.
+    for (const s of [paidSlug, pack1Slug, pack2Slug, freeSlug]) {
+      await preloadAcceptance(app.getHttpServer(), s, virId);
+    }
+    await preloadAcceptance(app.getHttpServer(), paidSlug, cardId);
 
     // Config mail minimale (host + fromEmail requis par getMailConfig) : le
     // transport est stubbé, aucun SMTP n'est jamais contacté. Snapshot/restore.

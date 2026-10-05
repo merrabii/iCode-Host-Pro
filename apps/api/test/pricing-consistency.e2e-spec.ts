@@ -29,7 +29,11 @@ process.env.ORDER_SWEEP_ENABLED = 'false';
  *  C. Q7 (GO item 7) — frais de paiement APPLIQUÉS dans devis/commande/facture
  *     + NOUVELLE ACCEPTATION si le tarif change entre affichage et confirmation
  *     (409 PRICING_CHANGED), gratuitité (promo à 0 → confirmation immédiate,
- *     aucun débit) et débit wallet EXACT = total TTC frais inclus.
+ *     aucun débit) et débit wallet EXACT = total TTC frais inclus ;
+ *  D. P7 (GO Q12) — preuve d'acceptation tarifaire OBLIGATOIRE sur commande
+ *     payante : omission → 409 sans écriture ni débit, devise/frais/empreinte
+ *     couverts (pas seulement le total), ré-acceptation explicite, rejeu d'une
+ *     intention déjà acceptée avant tout refus, contrat des chemins gratuits.
  *
  * Aucun réseau réel : MailTransportFactory + PanelTransportFactory stubbés,
  * PrismaService RÉEL sur la base dédiée du chantier (icode_host_pro_socle).
@@ -366,6 +370,7 @@ describe('Cohérence tarifaire & taux de taxe (e2e, P5)', () => {
         productSlug: promoSlug,
         options: cfg.options,
         addonIds: cfg.addonIds,
+        paymentMethodId: virId,
       }).expect(201);
 
       const checkout = await request(app.getHttpServer())
@@ -377,6 +382,11 @@ describe('Cohérence tarifaire & taux de taxe (e2e, P5)', () => {
           name: 'Client P5',
           email: guestEmail,
           paymentMethodId: virId,
+          // P7 : preuve d'acceptation complète tirée du devis serveur.
+          acceptedTotalTtcCents: q.body.amountTtcCents,
+          acceptedCurrency: q.body.currency,
+          acceptedPaymentMethodId: q.body.paymentMethodId,
+          acceptedQuoteKey: q.body.quoteKey,
         })
         .expect(201);
 
@@ -604,6 +614,9 @@ describe('Cohérence tarifaire & taux de taxe (e2e, P5)', () => {
         email: q7Email('c1'),
         paymentMethodId: feeMethodId,
         acceptedTotalTtcCents: q.body.amountTtcCents,
+        acceptedCurrency: q.body.currency,
+        acceptedPaymentMethodId: q.body.paymentMethodId,
+        acceptedQuoteKey: q.body.quoteKey,
       }).expect(201);
       const orderId = res.body.orderId as string;
       orderIds.push(orderId);
@@ -638,7 +651,11 @@ describe('Cohérence tarifaire & taux de taxe (e2e, P5)', () => {
           name: 'Client Q7 bis',
           email,
           paymentMethodId: virId,
+          // Preuve COMPLÈTE mais datée du tarif d'avant : total différent.
           acceptedTotalTtcCents: before.body.amountTtcCents,
+          acceptedCurrency: before.body.currency,
+          acceptedPaymentMethodId: before.body.paymentMethodId,
+          acceptedQuoteKey: before.body.quoteKey,
         }).expect(409);
         expect(refused.body.code).toBe('PRICING_CHANGED');
         expect(refused.body.currentTotalTtcCents).toBe(5900);
@@ -654,6 +671,9 @@ describe('Cohérence tarifaire & taux de taxe (e2e, P5)', () => {
           email,
           paymentMethodId: virId,
           acceptedTotalTtcCents: fresh.body.amountTtcCents,
+          acceptedCurrency: fresh.body.currency,
+          acceptedPaymentMethodId: fresh.body.paymentMethodId,
+          acceptedQuoteKey: fresh.body.quoteKey,
         }).expect(201);
         orderIds.push(ok.body.orderId as string);
       } finally {
@@ -672,6 +692,9 @@ describe('Cohérence tarifaire & taux de taxe (e2e, P5)', () => {
         email: q7Email('c3'),
         paymentMethodId: virId,
         acceptedTotalTtcCents: q.body.amountTtcCents - 1,
+        acceptedCurrency: q.body.currency,
+        acceptedPaymentMethodId: q.body.paymentMethodId,
+        acceptedQuoteKey: q.body.quoteKey,
       }).expect(409);
       expect(refused.body.code).toBe('PRICING_CHANGED');
       expect(refused.body.currentTotalTtcCents).toBe(q.body.amountTtcCents);
@@ -688,7 +711,13 @@ describe('Cohérence tarifaire & taux de taxe (e2e, P5)', () => {
         name: 'Client Q7 quater',
         email: q7Email('c4a'),
         paymentMethodId: feeMethodId,
+        // Preuve du devis PANIER (sans frais), moyens visés : total serveur
+        // avec frais différent → refus (le champ moyen renseigné doit quand
+        // même correspondre au dto — il correspond, c'est le total qui bouge).
         acceptedTotalTtcCents: cartQuote.body.amountTtcCents,
+        acceptedCurrency: cartQuote.body.currency,
+        acceptedPaymentMethodId: feeMethodId,
+        acceptedQuoteKey: cartQuote.body.quoteKey,
       }).expect(409);
       expect(refused.body.code).toBe('PRICING_CHANGED');
 
@@ -702,6 +731,9 @@ describe('Cohérence tarifaire & taux de taxe (e2e, P5)', () => {
         email: q7Email('c4b'),
         paymentMethodId: feeMethodId,
         acceptedTotalTtcCents: fresh.body.amountTtcCents,
+        acceptedCurrency: fresh.body.currency,
+        acceptedPaymentMethodId: fresh.body.paymentMethodId,
+        acceptedQuoteKey: fresh.body.quoteKey,
       }).expect(201);
       orderIds.push(ok.body.orderId as string);
     });
@@ -730,6 +762,35 @@ describe('Cohérence tarifaire & taux de taxe (e2e, P5)', () => {
       expect(wtx).toHaveLength(0);
     });
 
+    it('C5b — contrat gratuit (P7) : SANS preuve d’acceptation → 201 (preuve non requise à 0)', async () => {
+      const res = await checkout({
+        productSlug: freeSlug,
+        name: 'Client Q7 free2',
+        email: q7Email('c5b'),
+        paymentMethodId: virId,
+        // aucun champ accepted*
+      }).expect(201);
+      orderIds.push(res.body.orderId as string);
+      const order = await prisma.order.findUniqueOrThrow({ where: { id: res.body.orderId } });
+      expect(order.amountTtcCents).toBe(0);
+      expect(order.status).toBe(OrderStatus.PAID);
+    });
+
+    it('C5c — contrat gratuit (P7) : preuve FOURNIE mais incorrecte → 409 (jamais acceptée par défaut)', async () => {
+      const ordersBefore = await prisma.order.count();
+      const refused = await checkout({
+        productSlug: freeSlug,
+        name: 'Client Q7 free3',
+        email: q7Email('c5c'),
+        paymentMethodId: virId,
+        acceptedTotalTtcCents: 123, // ≠ 0 (total serveur gratuit)
+      }).expect(409);
+      expect(refused.body.code).toBe('PRICING_CHANGED');
+      expect(refused.body.reason).toBe('TOTAL_MISMATCH');
+      expect(refused.body.currentTotalTtcCents).toBe(0);
+      expect(await prisma.order.count()).toBe(ordersBefore);
+    });
+
     it('C6 — débit wallet EXACT = total TTC frais inclus (devis → commande → facture → débit)', async () => {
       const q = await quote({
         productSlug: promoSlug,
@@ -746,6 +807,9 @@ describe('Cohérence tarifaire & taux de taxe (e2e, P5)', () => {
         email: userEmail,
         paymentMethodId: feeMethodId,
         acceptedTotalTtcCents: q.body.amountTtcCents,
+        acceptedCurrency: q.body.currency,
+        acceptedPaymentMethodId: q.body.paymentMethodId,
+        acceptedQuoteKey: q.body.quoteKey,
         renewalConsent: true,
       })
         .set('Authorization', `Bearer ${userToken}`)
@@ -787,6 +851,289 @@ describe('Cohérence tarifaire & taux de taxe (e2e, P5)', () => {
       expect(invoice.status).toBe('PAID');
       expect(invoice.amountTtcCents).toBe(q.body.amountTtcCents);
       expect(invoice.taxAmountCents).toBe(q.body.taxAmountCents);
+    });
+  });
+
+  // ── D — P7 (GO Q12) : preuve d'acceptation tarifaire obligatoire ──────────
+  describe('D — preuve d’acceptation obligatoire (P7, GO Q12)', () => {
+    // Locaux (ceux de la section C sont hors portée) : invités D distincts.
+    const checkout = (body: Record<string, unknown>) =>
+      request(app.getHttpServer()).post(`/${GlobalPrefix}/store/checkout`).send(body);
+    const q7Email = (tag: string) => {
+      const e = `p5q7${tag}_${stamp}@example.com`;
+      q7GuestEmails.push(e);
+      return e;
+    };
+
+    const fullAcceptance = (q: {
+      body: {
+        amountTtcCents: number;
+        currency: string;
+        paymentMethodId: string | null;
+        quoteKey: string;
+      };
+    }) => ({
+      acceptedTotalTtcCents: q.body.amountTtcCents,
+      acceptedCurrency: q.body.currency,
+      acceptedPaymentMethodId: q.body.paymentMethodId ?? undefined,
+      acceptedQuoteKey: q.body.quoteKey,
+    });
+
+    it('D1 — omission sur commande payante → 409 ACCEPTANCE_REQUIRED, zéro écriture, conditions courantes renvoyées', async () => {
+      const before = {
+        orders: await prisma.order.count(),
+        users: await prisma.user.count(),
+        invoices: await prisma.invoice.count(),
+      };
+      const refused = await checkout({
+        productSlug: equalSlug,
+        name: 'Client P7 D1',
+        email: q7Email('d1'),
+        paymentMethodId: virId,
+        // aucun champ accepted* : l'omission ne doit PLUS contourner le contrôle
+      }).expect(409);
+      expect(refused.body.code).toBe('PRICING_CHANGED');
+      expect(refused.body.reason).toBe('ACCEPTANCE_REQUIRED');
+      expect(refused.body.missing).toEqual([
+        'acceptedTotalTtcCents',
+        'acceptedCurrency',
+        'acceptedPaymentMethodId',
+        'acceptedQuoteKey',
+      ]);
+      // Conditions courantes fournies pour ré-accepter (jamais un mur muet).
+      expect(typeof refused.body.currentTotalTtcCents).toBe('number');
+      expect(refused.body.currentTotalTtcCents).toBeGreaterThan(0);
+      expect(refused.body.currentCurrency).toBe('USD');
+      expect(refused.body.currentPaymentMethodId).toBe(virId);
+      expect(typeof refused.body.currentQuoteKey).toBe('string');
+      // Aucune écriture (ni commande, ni compte, ni facture).
+      expect(await prisma.order.count()).toBe(before.orders);
+      expect(await prisma.user.count()).toBe(before.users);
+      expect(await prisma.invoice.count()).toBe(before.invoices);
+    });
+
+    it('D2 — membre sans acceptation valide → 409, solde portefeuille et débits INTACTS (aucun débit)', async () => {
+      const user = await prisma.user.findUniqueOrThrow({ where: { email: userEmail } });
+      const customer = await prisma.customer.findFirstOrThrow({
+        where: { userId: user.id },
+      });
+      const balanceBefore = customer.walletBalanceCents;
+      const debitsBefore = await prisma.walletTransaction.count({
+        where: { customerId: customer.id },
+      });
+      const ordersBefore = await prisma.order.count();
+
+      const refused = await checkout({
+        productSlug: equalSlug,
+        name: 'User P7 D2',
+        email: userEmail,
+        paymentMethodId: virId,
+        // omission de la preuve sur un compte AVEC solde : jamais de débit
+      })
+        .set('Authorization', `Bearer ${userToken}`)
+        .expect(409);
+      expect(refused.body.reason).toBe('ACCEPTANCE_REQUIRED');
+
+      const after = await prisma.customer.findUniqueOrThrow({
+        where: { id: customer.id },
+      });
+      expect(after.walletBalanceCents).toBe(balanceBefore);
+      expect(
+        await prisma.walletTransaction.count({ where: { customerId: customer.id } }),
+      ).toBe(debitsBefore);
+      expect(await prisma.order.count()).toBe(ordersBefore);
+    });
+
+    it('D3 — frais du moyen modifiés après le devis → 409, puis ré-acceptation explicite → 201', async () => {
+      const email = q7Email('d3');
+      const before = await quote({
+        productSlug: equalSlug,
+        paymentMethodId: feeMethodId,
+      }).expect(201);
+
+      await prisma.paymentMethod.update({
+        where: { id: feeMethodId },
+        data: { feePercent: 5 },
+      });
+      try {
+        const refused = await checkout({
+          productSlug: equalSlug,
+          name: 'Client P7 D3',
+          email,
+          paymentMethodId: feeMethodId,
+          ...fullAcceptance(before),
+        }).expect(409);
+        expect(refused.body.code).toBe('PRICING_CHANGED');
+        expect(refused.body.currentTotalTtcCents).not.toBe(before.body.amountTtcCents);
+
+        // Ré-acceptation : re-quote sur les frais courants → 201.
+        const fresh = await quote({
+          productSlug: equalSlug,
+          paymentMethodId: feeMethodId,
+        }).expect(201);
+        expect(fresh.body.amountTtcCents).not.toBe(before.body.amountTtcCents);
+        const ok = await checkout({
+          productSlug: equalSlug,
+          name: 'Client P7 D3',
+          email,
+          paymentMethodId: feeMethodId,
+          ...fullAcceptance(fresh),
+        }).expect(201);
+        orderIds.push(ok.body.orderId as string);
+      } finally {
+        await prisma.paymentMethod.update({
+          where: { id: feeMethodId },
+          data: { feePercent: 2.5 },
+        });
+      }
+    });
+
+    it('D4 — devise facturation changée après le devis → 409 CURRENCY_MISMATCH à total IDENTIQUE', async () => {
+      const email = q7Email('d4');
+      const before = await quote({
+        productSlug: equalSlug,
+        paymentMethodId: virId,
+      }).expect(201);
+      expect(before.body.currency).toBe('USD');
+      const row = await prisma.billingSetting.findFirstOrThrow({
+        orderBy: { createdAt: 'asc' },
+      });
+      await prisma.billingSetting.update({
+        where: { id: row.id },
+        data: { currency: 'EUR' },
+      });
+      try {
+        const refused = await checkout({
+          productSlug: equalSlug,
+          name: 'Client P7 D4',
+          email,
+          paymentMethodId: virId,
+          ...fullAcceptance(before),
+        }).expect(409);
+        expect(refused.body.code).toBe('PRICING_CHANGED');
+        expect(refused.body.reason).toBe('CURRENCY_MISMATCH');
+        expect(refused.body.currentCurrency).toBe('EUR');
+        // Le total n'a PAS bougé : la devise est couverte indépendamment.
+        expect(refused.body.currentTotalTtcCents).toBe(before.body.amountTtcCents);
+
+        // Ré-acceptation sur la devise courante → 201 (empreinte aussi changée).
+        const fresh = await quote({
+          productSlug: equalSlug,
+          paymentMethodId: virId,
+        }).expect(201);
+        expect(fresh.body.currency).toBe('EUR');
+        expect(fresh.body.amountTtcCents).toBe(before.body.amountTtcCents);
+        expect(fresh.body.quoteKey).not.toBe(before.body.quoteKey);
+        const ok = await checkout({
+          productSlug: equalSlug,
+          name: 'Client P7 D4',
+          email,
+          paymentMethodId: virId,
+          ...fullAcceptance(fresh),
+        }).expect(201);
+        orderIds.push(ok.body.orderId as string);
+      } finally {
+        await prisma.billingSetting.update({
+          where: { id: row.id },
+          data: { currency: 'USD' },
+        });
+      }
+    });
+
+    it('D5 — configuration/frais divergents à total IDENTIQUE → 409 QUOTE_KEY_MISMATCH (pas seulement un total numérique)', async () => {
+      const email = q7Email('d5');
+      const before = await quote({
+        productSlug: equalSlug,
+        paymentMethodId: virId,
+      }).expect(201);
+      expect(before.body.amountTtcCents).toBe(4900);
+
+      // Prix catalogue −100 ET frais FIXES +100 sur le moyen : le total reste
+      // 4900, mais configuration, prix et frais changent → empreinte différente.
+      await prisma.product.update({
+        where: { slug: equalSlug },
+        data: { priceHtCents: 4800, promoPriceHtCents: 4800 },
+      });
+      await prisma.paymentMethod.update({
+        where: { id: virId },
+        data: { feeType: FeeType.FIXED, feeFixedCents: 100 },
+      });
+      try {
+        const mid = await quote({
+          productSlug: equalSlug,
+          paymentMethodId: virId,
+        }).expect(201);
+        expect(mid.body.amountTtcCents).toBe(before.body.amountTtcCents); // 4800 + 100
+        expect(mid.body.quoteKey).not.toBe(before.body.quoteKey);
+
+        const refused = await checkout({
+          productSlug: equalSlug,
+          name: 'Client P7 D5',
+          email,
+          paymentMethodId: virId,
+          ...fullAcceptance(before),
+        }).expect(409);
+        expect(refused.body.code).toBe('PRICING_CHANGED');
+        expect(refused.body.reason).toBe('QUOTE_KEY_MISMATCH');
+        expect(refused.body.currentTotalTtcCents).toBe(before.body.amountTtcCents); // total IDENTIQUE
+        expect(refused.body.currentQuoteKey).toBe(mid.body.quoteKey);
+
+        // Ré-acceptation explicite du devis courant → 201.
+        const ok = await checkout({
+          productSlug: equalSlug,
+          name: 'Client P7 D5',
+          email,
+          paymentMethodId: virId,
+          ...fullAcceptance(mid),
+        }).expect(201);
+        orderIds.push(ok.body.orderId as string);
+      } finally {
+        await prisma.product.update({
+          where: { slug: equalSlug },
+          data: { priceHtCents: 4900, promoPriceHtCents: 4900 },
+        });
+        await prisma.paymentMethod.update({
+          where: { id: virId },
+          data: { feeType: FeeType.NONE, feeFixedCents: null },
+        });
+      }
+    });
+
+    it('D6 — rejeu d’une intention déjà acceptée : tarif changé entre-temps → MÊME commande (rejeu avant refus)', async () => {
+      const email = q7Email('d6');
+      const before = await quote({
+        productSlug: equalSlug,
+        paymentMethodId: virId,
+      }).expect(201);
+      const payload = {
+        productSlug: equalSlug,
+        name: 'Client P7 D6',
+        email,
+        paymentMethodId: virId,
+        ...fullAcceptance(before),
+      };
+      const first = await checkout(payload).expect(201);
+      const firstOrderId = first.body.orderId as string;
+      orderIds.push(firstOrderId);
+      const ordersBefore = await prisma.order.count();
+
+      await prisma.product.update({
+        where: { slug: equalSlug },
+        data: { priceHtCents: 6100, promoPriceHtCents: 6100 },
+      });
+      try {
+        // Même contenu (même intention, acceptation déjà donnée) : le rejeu
+        // renvoie la commande EXISTANTE malgré le tarif courant « périmé » —
+        // jamais de 409, jamais de seconde commande.
+        const replay = await checkout(payload).expect(201);
+        expect(replay.body.orderId).toBe(firstOrderId);
+        expect(await prisma.order.count()).toBe(ordersBefore);
+      } finally {
+        await prisma.product.update({
+          where: { slug: equalSlug },
+          data: { priceHtCents: 4900, promoPriceHtCents: 4900 },
+        });
+      }
     });
   });
 });

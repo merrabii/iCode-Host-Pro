@@ -116,9 +116,11 @@ export class CheckoutDto {
   @ApiPropertyOptional({
     description:
       'Total TTC (centimes) tel qu’AFFICHÉ/accepté par le client sur son dernier devis serveur ' +
-      '— Q7 (GO item 7). Si le tarif a changé depuis (prix, promo, taxe, frais), le serveur ' +
-      'refuse en 409 (code PRICING_CHANGED) pour imposer une NOUVELLE acceptation. ' +
-      'Omis = compatibilité API (aucune vérification d’acceptation).',
+      '— Q7 (GO item 7). OBLIGATOIRE pour toute commande payante (GO P7 : l’omission est un ' +
+      'refus 409 PRICING_CHANGED, jamais un contournement) ; commande gratuite (total 0) : ' +
+      'facultatif, mais si fourni il doit valoir 0. Si le tarif a changé depuis (prix, promo, ' +
+      'taxe, frais), le serveur refuse en 409 (code PRICING_CHANGED) pour imposer une NOUVELLE ' +
+      'acceptation.',
   })
   @IsOptional()
   @Type(() => Number)
@@ -126,6 +128,39 @@ export class CheckoutDto {
   @Min(0)
   @Max(1_000_000_000)
   acceptedTotalTtcCents?: number;
+
+  @ApiPropertyOptional({
+    description:
+      'Devise (ISO 4217, ex « USD ») affichée/acceptée par le client — OBLIGATOIRE pour une ' +
+      'commande payante (GO P7 : la preuve couvre la devise, pas seulement un total numérique).',
+  })
+  @IsOptional()
+  @IsString()
+  @Matches(/^[A-Z]{3}$/, { message: 'acceptedCurrency invalide (ISO 4217, ex USD).' })
+  acceptedCurrency?: string;
+
+  @ApiPropertyOptional({
+    description:
+      'Moyen de paiement affiché/accepté (ses frais inclus dans le total accepté) — ' +
+      'OBLIGATOIRE pour une commande payante (GO P7). Doit correspondre au paymentMethodId ' +
+      'de la commande.',
+  })
+  @IsOptional()
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(120)
+  acceptedPaymentMethodId?: string;
+
+  @ApiPropertyOptional({
+    description:
+      'Empreinte (sha256) du devis accepté, renvoyée par POST /store/quote — OBLIGATOIRE ' +
+      'pour une commande payante (GO P7 : couvre configuration, prix, promo, taux de taxe, ' +
+      'installation et frais ; toute divergence refuse en 409 même à total inchangé).',
+  })
+  @IsOptional()
+  @IsString()
+  @MaxLength(128)
+  acceptedQuoteKey?: string;
 }
 
 /** Représentation lisible (jamais les secrets) d’un moyen de paiement pour /cart/checkout. */

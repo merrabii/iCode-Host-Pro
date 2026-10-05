@@ -83,7 +83,10 @@ describe('P5 — règle promo active (§6-2a, activeBasePrice)', () => {
 });
 
 describe('P5 — buildPricing : prix actif + taxe ARRONDIE PAR LIGNE (B2)', () => {
-  const mockPrisma = {};
+  const mockPrisma = {
+    // P7 — quote() lit la devise de facturation (helpers quoteConditions).
+    billingSetting: { findFirst: jest.fn().mockResolvedValue({ currency: 'USD' }) },
+  };
   const mockAudit = {};
   const mockLimiter = {};
   const mockMail = {};
@@ -274,7 +277,11 @@ describe('P5 — buildPricing : prix actif + taxe ARRONDIE PAR LIGNE (B2)', () =
 // journalisés côté admin) : ligne ADJUSTMENT jamais taxée, incluse dans le
 // HT/TTC, même base que les frais d'installation.
 describe('Q7 — buildPricing/quote : frais du moyen de paiement APPLIQUÉS (GO item 7)', () => {
-  const mockPrisma = { paymentMethod: { findFirst: jest.fn() } };
+  const mockPrisma = {
+    paymentMethod: { findFirst: jest.fn() },
+    // P7 — quote() lit la devise de facturation (helpers quoteConditions).
+    billingSetting: { findFirst: jest.fn().mockResolvedValue({ currency: 'USD' }) },
+  };
   const mockAudit = {};
   const mockLimiter = {};
   const mockMail = {};
@@ -406,9 +413,10 @@ describe('Q7 — buildPricing/quote : frais du moyen de paiement APPLIQUÉS (GO 
 
     // Avec moyen : mêmes frais que buildPricing direct.
     const q2 = await quote({ productSlug: 'offre-test', paymentMethodId: 'pm1' });
+    // P7 : le devis retourne `paymentMethodId` (preuve accepted*) → select +id.
     expect(mockPrisma.paymentMethod.findFirst).toHaveBeenCalledWith({
       where: { id: 'pm1', isActive: true },
-      select: { name: true, feeType: true, feePercent: true, feeFixedCents: true },
+      select: { id: true, name: true, feeType: true, feePercent: true, feeFixedCents: true },
     });
     const direct = svc.buildPricing(p, {}, fee({ feeType: 'PERCENT', feePercent: 2.5 }));
     expect(q2.lines).toEqual(direct.lines);

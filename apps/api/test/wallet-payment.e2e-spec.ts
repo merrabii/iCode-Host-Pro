@@ -17,6 +17,7 @@ import { PrismaService } from './../src/prisma/prisma.service';
 import { GlobalPrefix } from './../src/config/constants';
 import { SaRateLimiter } from './../src/auth/rate-limiter';
 import { MailTransportFactory } from './../src/mail/mail-transport.factory';
+import { acceptanceFor, preloadAcceptance } from './pricing-acceptance.fixture';
 import {
   PanelTransport,
   PanelTransportFactory,
@@ -143,7 +144,16 @@ describe('Règlement par solde portefeuille (e2e, Q-A)', () => {
     const req = request(app.getHttpServer())
       .post(`/${GlobalPrefix}/store/checkout`)
       .set('Authorization', `Bearer ${token}`)
-      .send({ productSlug, name, email, paymentMethodId: methodId, renewalConsent });
+      .send({
+        productSlug,
+        name,
+        email,
+        paymentMethodId: methodId,
+        renewalConsent,
+        // P7 : preuve d'acceptation tarifaire obligatoire (préchargée pour
+        // chaque combinaison (slug, moyen rotatif)).
+        ...(acceptanceFor(productSlug, methodId) ?? {}),
+      });
     if (opts?.clientKey) req.set('Idempotency-Key', opts.clientKey);
     return req;
   }
@@ -264,6 +274,14 @@ describe('Règlement par solde portefeuille (e2e, Q-A)', () => {
         },
       });
       virIds.push(m.id);
+    }
+
+    // P7 : preuves d'acceptation pour (2 produits × 16 moyens rotatifs) —
+    // chaque scénario de checkout utilise un (slug, moyen) distinct (§7).
+    for (const s of [monthlySlug, onetimeSlug]) {
+      for (const m of virIds) {
+        await preloadAcceptance(app.getHttpServer(), s, m);
+      }
     }
 
     const priorMail = await prisma.mailSetting.findFirst();

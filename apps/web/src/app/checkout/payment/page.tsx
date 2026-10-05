@@ -177,6 +177,11 @@ function CheckoutPaymentView() {
         // Total serveur affiché ci-contre : toute divergence tarifaire survenant
         // entre l'affichage et la confirmation → 409 PRICING_CHANGED (ré-acceptation).
         acceptedTotalTtcCents: quote.amountTtcCents,
+        // P7 — preuve COMPLÈTE du devis serveur (devise + moyen + empreinte) :
+        // le serveur recompare total, devise, moyen et empreinte tarifaire.
+        acceptedCurrency: quote.currency,
+        acceptedPaymentMethodId: quote.paymentMethodId ?? methodId,
+        acceptedQuoteKey: quote.quoteKey,
       });
       const data = res.data as unknown;
       if (!res.ok) {

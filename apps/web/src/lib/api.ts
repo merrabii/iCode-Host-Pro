@@ -317,6 +317,16 @@ export const storeCheckout = async (payload: {
    *  frais), le serveur répond 409 (code PRICING_CHANGED) pour imposer une
    *  NOUVELLE acceptation. Le tunnel web l'envoie TOUJOURS. */
   acceptedTotalTtcCents?: number;
+  /** P7 (GO socle Q12) — preuve d'acceptation COMPLÈTE du devis serveur :
+   *  devise, moyen de paiement et empreinte `quoteKey` (configuration, prix,
+   *  promo, taxe, installation, frais, totaux). OBLIGATOIRE avec le total pour
+   *  toute commande payante (omission → 409 PRICING_CHANGED, raison
+   *  ACCEPTANCE_REQUIRED ; gratuit à 0 : facultatif). Le tunnel web les envoie
+   *  TOUJOURS depuis le dernier `/store/quote` — jamais de valeur calculée
+   *  côté client. */
+  acceptedCurrency?: string;
+  acceptedPaymentMethodId?: string;
+  acceptedQuoteKey?: string;
 }): Promise<ApiResult> => {
   // Tunnel de commande UNIQUE (Bloc 2) : le checkout API reconnaît le client via
   // le header `Authorization: Bearer` (OptionalJwtAuthGuard). Sans token → invité.
@@ -876,6 +886,13 @@ export interface QuoteResult {
     promoPriceHtCents: number | null;
     activePriceHtCents: number;
   };
+  /** P7 — conditions tarifaires exactes du devis : à renvoyer TELLES QUELLES
+   *  dans les champs `accepted*` du checkout (le serveur recompare, jamais le
+   *  client). `quoteKey` n'est valable que pour cette configuration ET ce
+   *  moyen de paiement. */
+  currency: string;
+  paymentMethodId: string | null;
+  quoteKey: string;
 }
 
 /** Devis public (POST /store/quote) — re-fetch des prix du panier : mêmes

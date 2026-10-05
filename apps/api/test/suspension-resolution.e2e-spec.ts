@@ -22,6 +22,7 @@ import { SaRateLimiter } from './../src/auth/rate-limiter';
 import { MailTransportFactory } from './../src/mail/mail-transport.factory';
 import { PanelTransport, PanelTransportFactory } from './../src/servers/panel-transport.factory';
 import { installFingerprintEnv } from './hosting-reservation.fixture';
+import { acceptanceFor, preloadAcceptance } from './pricing-acceptance.fixture';
 
 /**
  * Q12-P3 — résolution abonnement → service « réelle » (e2e, PostgreSQL réel) :
@@ -145,11 +146,16 @@ describe('Résolution abonnement → service réelle (e2e, Q12-P3)', () => {
   }
 
   function checkoutBody(over: Record<string, unknown>) {
+    const productSlug = String(over.productSlug ?? '');
+    const paymentMethodId = (over.paymentMethodId as string | undefined) ?? pmId;
     return {
-      productSlug: '',
-      paymentMethodId: pmId,
+      productSlug,
+      paymentMethodId,
       name: 'Membre P3',
       email: memberEmail,
+      // P7 : preuve d'acceptation tarifaire obligatoire (préchargée ; absente
+      // si combinaison inconnue → 409 explicite si le chemin est payant).
+      ...(acceptanceFor(productSlug, paymentMethodId) ?? {}),
       ...over,
     };
   }
@@ -298,6 +304,9 @@ describe('Résolution abonnement → service réelle (e2e, Q12-P3)', () => {
       },
     });
     prodId = p.id;
+
+    // P7 : preuve d'acceptation préchargée (produit + moyen créés ci-dessus).
+    await preloadAcceptance(app.getHttpServer(), prodSlug, pmId);
   });
 
   afterAll(async () => {

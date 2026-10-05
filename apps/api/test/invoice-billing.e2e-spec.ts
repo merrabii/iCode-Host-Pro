@@ -18,6 +18,7 @@ import { PrismaService } from './../src/prisma/prisma.service';
 import { GlobalPrefix } from './../src/config/constants';
 import { SaRateLimiter } from './../src/auth/rate-limiter';
 import { MailTransportFactory } from './../src/mail/mail-transport.factory';
+import { acceptanceFor, preloadAcceptance } from './pricing-acceptance.fixture';
 import {
   PanelTransport,
   PanelTransportFactory,
@@ -117,6 +118,8 @@ describe('Facturation & PDF de facture (e2e, P7)', () => {
         name,
         email,
         paymentMethodId: virId,
+        // P7 : preuve d'acceptation tarifaire obligatoire (préchargée).
+        ...(acceptanceFor(productSlug, virId) ?? {}),
       });
     if (token) req.set('Authorization', `Bearer ${token}`);
     return req;
@@ -228,6 +231,9 @@ describe('Facturation & PDF de facture (e2e, P7)', () => {
       invoiceDueDays: 7,
     }).expect(200);
     settingsId = (patched.body as { id: string }).id;
+
+    // P7 : preuve d'acceptation préchargée (après toute fixture de tarif).
+    await preloadAcceptance(app.getHttpServer(), productSlug, virId);
   });
 
   beforeEach(() => {

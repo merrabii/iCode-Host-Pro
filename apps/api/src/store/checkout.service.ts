@@ -37,6 +37,11 @@ import { addBillingCycle } from './billing-cycle';
 import { claimInvoiceSequence } from './invoice-sequence';
 import { ProductsService, PublicProduct } from '../products/products.service';
 import { CheckoutDto, QuoteDto } from './dto/checkout.dto';
+import {
+  evaluatePricingAcceptance,
+  PricingQuoteConditions,
+  pricingQuoteKey,
+} from './pricing-acceptance';
 import { ProvisioningService } from './provisioning.service';
 import { isHostingC3Enabled } from '../hosting/c3-flag';
 import { C3CapabilityService } from '../hosting/c3-capability.service';
@@ -167,6 +172,11 @@ export interface InvoiceLineInput {
  *   replay tant que la commande est vivante ; un rachat APRÈS annulation crée
  *   une NOUVELLE clé sans jamais supprimer les anciennes ; la clé client
  *   (header `Idempotency-Key`) liée à un contenu différent = conflit 409.
+ * - Acceptation tarifaire (P7, GO Q12) : commande payante exige la preuve
+ *   complète des 4 conditions `accepted*` (total, devise, moyen de paiement,
+ *   empreinte du devis) — l'omission vaut 409 PRICING_CHANGED, jamais un
+ *   contournement ; commande gratuite = preuve facultative (si fournie, elle
+ *   doit correspondre) ; rejeu d'une intention déjà acceptée AVANT tout refus.
  * - Email best-effort : si l'envoi échoue, la commande reste valide et l'échec
  *   est tracé en audit (l'admin peut récupérer le mot de passe).
  */
@@ -247,23 +257,10 @@ export class CheckoutService {
     const { lines, amountHtCents, taxAmountCents, amountTtcCents, taxRatePercent } =
       this.buildPricing(product, dto, method);
 
-    // 3b. Q7 (GO item 7) — NOUVELLE ACCEPTATION si les conditions tarifaires
-    //     ont changé depuis leur acceptation (prix, promo, taxe, frais…) :
-    //     le total accepté par le client à l'affichage doit être EXACTEMENT
-    //     le total serveur recalculé ici, sinon 409 (code PRICING_CHANGED) —
-    //     jamais de débit sur un montant non réaccepté. Champ optionnel :
-    //     omis = compatibilité API (le tunnel web l'envoie toujours).
-    if (
-      dto.acceptedTotalTtcCents !== undefined &&
-      dto.acceptedTotalTtcCents !== amountTtcCents
-    ) {
-      throw new ConflictException({
-        message:
-          'Les conditions tarifaires ont changé depuis votre dernier affichage — nouvelle acceptation requise.',
-        code: 'PRICING_CHANGED',
-        currentTotalTtcCents: amountTtcCents,
-      });
-    }
+    // 3b. Contrôle d'acceptation tarifaire déplacé en **6b** (après la
+    //     résolution d'idempotence, avant toute écriture) : voir P7/GO Q12 —
+    //     la preuve d'acceptation est OBLIGATOIRE sur commande payante et le
+    //     rejeu d'une intention déjà acceptée doit passer AVANT le refus.
 
     // 4. Résolution du compte. Invité → User+Customer créés dans la transaction.
     //    Client connecté (OptionalJwtAuthGuard) → on RÉUTILISE le User + Customer
@@ -319,12 +316,16 @@ export class CheckoutService {
       ? member!.phone ?? null
       : (dto.phone ?? null);
 
-    // 5. Hash d'INTENTION : configuration + montant + coordonnées de
+    // 5. Hash d'INTENTION : configuration + montant accepté + coordonnées de
     //    facturation. Base de l'idempotence (§7) et du chaînage des rachats.
+    //    P7 : le montant embarqué est le total ACCEPTÉ par le client (égal au
+    //    total serveur à la création — la preuve 6b l'exige) pour qu'un REJEU
+    //    d'intention déjà acceptée retrouve sa commande même si le tarif a
+    //    bougé entre-temps (jamais de hash « périmé » par le prix courant).
     const baseKey = this.idempotencyKey(
       dto,
       method.id,
-      amountTtcCents,
+      dto.acceptedTotalTtcCents ?? amountTtcCents,
       billingEmail,
       requestedSubdomain,
       requestedDomainId,
@@ -342,6 +343,68 @@ export class CheckoutService {
     if (replay) {
       return this.replayResult(replay, receiptEmail);
     }
+
+    // 6b. P7 (GO socle Q12) — preuve d'acceptation tarifaire OBLIGATOIRE sur
+    //     commande payante : total + devise + moyen de paiement + empreinte du
+    //     devis (configuration, prix, promo, taxe, installation, frais). Le
+    //     contrôle court APRÈS la résolution d'idempotence (« rejeu avant
+    //     refus ») : un rejeu d'intention déjà acceptée renvoie la commande
+    //     existante même si le tarif a changé entre-temps ; toute nouvelle
+    //     commande respecte la preuve, sous peine de 409 PRICING_CHANGED —
+    //     aucune écriture, aucun débit sur un montant non réaccepté.
+    //     Contrat gratuit (total 0) : preuve NON requise ; si fournie, chaque
+    //     champ fourni doit correspondre (jamais de valeur « acceptée » par
+    //     défaut). Historique : aucun contournement possible pour le payant.
+    const serverCurrency = await this.billingCurrency();
+    const serverQuoteKey = pricingQuoteKey(
+      this.quoteConditions({
+        dto,
+        product,
+        methodId: method.id,
+        method,
+        currency: serverCurrency,
+        pricing: { amountHtCents, taxAmountCents, amountTtcCents, taxRatePercent },
+      }),
+    );
+    const refusal = evaluatePricingAcceptance({
+      amountTtcCents,
+      server: {
+        currency: serverCurrency,
+        paymentMethodId: method.id,
+        quoteKey: serverQuoteKey,
+      },
+      accepted: {
+        acceptedTotalTtcCents: dto.acceptedTotalTtcCents,
+        acceptedCurrency: dto.acceptedCurrency,
+        acceptedPaymentMethodId: dto.acceptedPaymentMethodId,
+        acceptedQuoteKey: dto.acceptedQuoteKey,
+      },
+    });
+    if (refusal) {
+      const messages: Record<string, string> = {
+        ACCEPTANCE_REQUIRED:
+          'Preuve d’acceptation tarifaire obligatoire : affichez le devis courant (POST /store/quote) puis renvoyez les champs accepted* — aucune commande n’est créée sans acceptation valide.',
+        TOTAL_MISMATCH:
+          'Les conditions tarifaires ont changé depuis votre dernier affichage — nouvelle acceptation requise.',
+        CURRENCY_MISMATCH:
+          'La devise acceptée ne correspond plus aux conditions serveur — nouvelle acceptation requise.',
+        PAYMENT_METHOD_MISMATCH:
+          'Le moyen de paiement accepté ne correspond plus aux conditions serveur (frais inclus) — nouvelle acceptation requise.',
+        QUOTE_KEY_MISMATCH:
+          'La configuration ou les conditions tarifaires du devis ont changé — nouvelle acceptation requise.',
+      };
+      throw new ConflictException({
+        message: messages[refusal.reason] ?? messages.TOTAL_MISMATCH,
+        code: 'PRICING_CHANGED',
+        reason: refusal.reason,
+        ...(refusal.missing ? { missing: refusal.missing } : {}),
+        currentTotalTtcCents: amountTtcCents,
+        currentCurrency: serverCurrency,
+        currentPaymentMethodId: method.id,
+        currentQuoteKey: serverQuoteKey,
+      });
+    }
+
     // Clé du NOUVEAU départ : base, ou chaînée à la commande annulée/remboursée.
     const key = chainFrom
       ? createHash('sha256').update(`${baseKey}|${chainFrom.id}`).digest('hex')
@@ -1480,6 +1543,11 @@ export class CheckoutService {
     taxAmountCents: number;
     amountTtcCents: number;
     taxRatePercent: number;
+    /** P7 (GO Q12) — conditions renvoyées avec le devis pour que le client
+     *  prouve leur acceptation au checkout (jamais recalculées côté client). */
+    currency: string;
+    quoteKey: string;
+    paymentMethodId: string | null;
     product: {
       name: string;
       priceHtCents: number;
@@ -1489,26 +1557,108 @@ export class CheckoutService {
   }> {
     const product = await this.products.findPublicBySlug(dto.productSlug);
     let method:
-      | { name: string; feeType: string; feePercent: Prisma.Decimal | number | null; feeFixedCents: number | null }
+      | {
+          id: string;
+          name: string;
+          feeType: string;
+          feePercent: Prisma.Decimal | number | null;
+          feeFixedCents: number | null;
+        }
       | null = null;
     if (dto.paymentMethodId) {
       method = await this.prisma.paymentMethod.findFirst({
         where: { id: dto.paymentMethodId, isActive: true },
-        select: { name: true, feeType: true, feePercent: true, feeFixedCents: true },
+        select: { id: true, name: true, feeType: true, feePercent: true, feeFixedCents: true },
       });
       if (!method) {
         throw new BadRequestException('Ce moyen de paiement n’est pas disponible.');
       }
     }
     const pricing = this.buildPricing(product, dto, method);
+    const currency = await this.billingCurrency();
+    const quoteKey = pricingQuoteKey(
+      this.quoteConditions({
+        dto,
+        product,
+        methodId: method?.id ?? null,
+        method,
+        currency,
+        pricing,
+      }),
+    );
     return {
       ...pricing,
+      currency,
+      quoteKey,
+      paymentMethodId: method?.id ?? null,
       product: {
         name: product.name,
         priceHtCents: product.priceHtCents ?? 0,
         promoPriceHtCents: product.promoPriceHtCents ?? null,
         activePriceHtCents: CheckoutService.activeBasePrice(product),
       },
+    };
+  }
+
+  /**
+   * Devise de facturation (ligne singleton `BillingSetting`, défaut « USD » =
+   * même valeur que le seed de `claimInvoiceSequence`) — lue HORS transaction
+   * pour évaluer la preuve d'acceptation tarifaire (P7) avant toute écriture.
+   */
+  private async billingCurrency(): Promise<string> {
+    const row = await this.prisma.billingSetting.findFirst({
+      orderBy: { createdAt: 'asc' },
+      select: { currency: true },
+    });
+    return row?.currency ?? 'USD';
+  }
+
+  /**
+   * Conditions tarifaires pertinentes d'un devis (P7) — partagées par
+   * `quote()` et le checkout : la même saisie produit le même empreinte,
+   * toute divergence (prix, promo, taxe, frais, devise, moyen, config)
+   * change la clé et fait refuser la commande même à total inchangé.
+   */
+  private quoteConditions(params: {
+    dto: Pick<CheckoutDto, 'productSlug' | 'options' | 'addonIds'>;
+    product: PublicProduct;
+    methodId: string | null;
+    method: {
+      feeType?: string;
+      feePercent?: Prisma.Decimal | number | null;
+      feeFixedCents?: number | null;
+    } | null;
+    currency: string;
+    pricing: {
+      amountHtCents: number;
+      taxAmountCents: number;
+      amountTtcCents: number;
+      taxRatePercent: number;
+    };
+  }): PricingQuoteConditions {
+    const { dto, product, methodId, method, currency, pricing } = params;
+    return {
+      productSlug: dto.productSlug,
+      options: (dto.options ?? []).map((o) => ({
+        optionId: o.optionId,
+        choiceId: o.choiceId,
+      })),
+      addonIds: [...(dto.addonIds ?? [])],
+      paymentMethodId: methodId,
+      feeType: method?.feeType ?? null,
+      feePercent:
+        method?.feePercent !== null && method?.feePercent !== undefined
+          ? Number(method.feePercent)
+          : null,
+      feeFixedCents: method?.feeFixedCents ?? null,
+      currency,
+      activePriceHtCents: CheckoutService.activeBasePrice(product),
+      promoPriceHtCents: product.promoPriceHtCents ?? null,
+      taxRatePercent: pricing.taxRatePercent,
+      installationFeeCents: product.installationFeeCents ?? 0,
+      amountHtCents: pricing.amountHtCents,
+      taxAmountCents: pricing.taxAmountCents,
+      amountTtcCents: pricing.amountTtcCents,
     };
   }
 
