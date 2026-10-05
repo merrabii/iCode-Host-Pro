@@ -794,6 +794,36 @@ describe('Compte client — reset mdp, profil, email vérifié, sessions, dossie
       }).expect(201);
     });
 
+    it('GO Q12: a REVOKED (rotated) token dies with the password kill — no 10 s resurrection', async () => {
+      const loginRes = await login(charlieEmail, password).expect(201);
+      const oldCookie = cookieOf(loginRes);
+
+      // Rotation : oldCookie -> ligne R0 RÉVOQUÉE ; newCookie -> R1 active.
+      const rotated = await refresh(oldCookie).expect(201);
+      const newCookie = cookieOf(rotated);
+      expect(newCookie).not.toBe(oldCookie);
+
+      await changePw(rotated.body.accessToken as string, {
+        currentPassword: password,
+        newPassword: charliePw,
+      }).expect(201);
+
+      // TOUTES les lignes sont détruites — y compris R0 révoquée, qui sinón
+      // resterait dans la fenêtre de rejeu 10 s et ressusciterait la session.
+      expect(
+        await prisma.refreshToken.count({ where: { userId: charlieId } }),
+      ).toBe(0);
+      await refresh(oldCookie).expect(401); // l'ancien révoqué : 401, pas 201
+      await refresh(newCookie).expect(401); // le roté non plus
+
+      // Restauration : nouvel login avec le nouveau mdp, puis retour à `password`.
+      const restored = await login(charlieEmail, charliePw).expect(201);
+      await changePw(restored.body.accessToken as string, {
+        currentPassword: charliePw,
+        newPassword: password,
+      }).expect(201);
+    });
+
     it('isActive=false blocks refresh (admin kill-switch), reactivation restores it', async () => {
       const loginRes = await login(charlieEmail, password).expect(201);
       const cookie = cookieOf(loginRes);

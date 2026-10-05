@@ -72,6 +72,14 @@ describe('AuthService (impersonation + order-time registration, ADR-027)', () =>
     // clearAllMocks ne remet PAS les implémentations : on reprend la main sur
     // $transaction (chaque bloc pose la sienne : fonction interactive vs tableau).
     mockPrisma.$transaction.mockReset();
+    // Par défaut, la forme interactive exécute le callback sur le MÊME mock
+    // (refresh/logout testent les barrières de famille en cours de tx) ; les
+    // blocs qui ont besoin d'un tx dédié ou de la forme tableau overrident.
+    mockPrisma.$transaction.mockImplementation(async (arg: unknown) =>
+      typeof arg === 'function'
+        ? (arg as (t: typeof mockPrisma) => Promise<unknown>)(mockPrisma)
+        : (arg as unknown[]),
+    );
     mockConfig.get.mockReturnValue(undefined);
     mockSettings.isSelfRegistrationEnabled.mockResolvedValue(true);
     mockMailSettings.isEnabled.mockResolvedValue(true);
@@ -407,8 +415,10 @@ describe('AuthService (impersonation + order-time registration, ADR-027)', () =>
         where: { id: 'u1' },
         data: { passwordHash: 'hashed:new-password-1' },
       });
+      // GO Q12 : TOUTES les lignes refresh (actives ET révoquées) — aucune
+      // survivante pour la fenêtre de rejeu de refresh().
       expect(tx.refreshToken.deleteMany).toHaveBeenCalledWith({
-        where: { userId: 'u1', revokedAt: null },
+        where: { userId: 'u1' },
       });
       expect(mockAudit.record).toHaveBeenCalledWith(
         expect.objectContaining({ action: 'auth.password.reset', actorId: 'u1' }),
@@ -461,17 +471,18 @@ describe('AuthService (impersonation + order-time registration, ADR-027)', () =>
     });
   });
 
-  // ── GO Q3: rotation CAS, fenêtre de rejeu, isActive, session déconnectée ───
+  // ── GO Q3/Q12: rotation CAS, fenêtre de rejeu, familles, isActive ─────────
   describe('refresh (CAS rotation, reuse window, isActive, logout absence)', () => {
     const rt = {
       id: 'rt1',
       userId: 'u1',
       tokenHash: 'hash',
+      sessionId: 's1',
       revokedAt: null as Date | null,
       expiresAt: new Date(Date.now() + 60_000),
     };
 
-    it('active row: CAS rotation + audit auth.refresh + new pair', async () => {
+    it('active row: CAS rotation + audit auth.refresh + new pair in the SAME family', async () => {
       mockPrisma.refreshToken.findUnique.mockResolvedValue(rt);
       mockPrisma.refreshToken.updateMany.mockResolvedValue({ count: 1 });
       mockPrisma.user.findUnique.mockResolvedValue(client);
@@ -484,22 +495,38 @@ describe('AuthService (impersonation + order-time registration, ADR-027)', () =>
         where: { id: 'rt1', revokedAt: null },
         data: { revokedAt: expect.any(Date) },
       });
+      // Le successeur hérite de la famille (logout devra couper les deux).
+      expect(mockPrisma.refreshToken.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ userId: 'u1', sessionId: 's1' }),
+        }),
+      );
       expect(mockAudit.record).toHaveBeenCalledWith(
         expect.objectContaining({ action: 'auth.refresh', actorId: 'u1' }),
       );
     });
 
-    it('rotated <10 s ago (concurrent double-refresh) → reuse window: new pair, NO re-revoke', async () => {
-      mockPrisma.refreshToken.findUnique.mockResolvedValue({
-        ...rt,
-        revokedAt: new Date(Date.now() - 1_000),
-      });
+    it('rotated <10 s ago (concurrent double-refresh) → reuse window: new pair SAME family, NO re-CAS', async () => {
+      const revoked = new Date(Date.now() - 1_000);
+      mockPrisma.refreshToken.findUnique.mockResolvedValue({ ...rt, revokedAt: revoked });
+      mockPrisma.refreshToken.updateMany.mockResolvedValue({ count: 1 });
       mockPrisma.user.findUnique.mockResolvedValue(client);
       mockPrisma.refreshToken.create.mockResolvedValue({});
 
       const res = await service.refresh('raw-refresh');
       expect(res.accessToken).toBe('jwt.token');
-      expect(mockPrisma.refreshToken.updateMany).not.toHaveBeenCalled();
+      // Pas de CAS `revokedAt: null` (déjà révoquée) : SEULEMENT le probe
+      // atomique sous verrou — no-op sur revokedAt, existence de la famille.
+      expect(mockPrisma.refreshToken.updateMany).toHaveBeenCalledTimes(1);
+      expect(mockPrisma.refreshToken.updateMany).toHaveBeenCalledWith({
+        where: { id: 'rt1', sessionId: 's1' },
+        data: { revokedAt: revoked },
+      });
+      expect(mockPrisma.refreshToken.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ sessionId: 's1' }),
+        }),
+      );
       expect(mockAudit.record).toHaveBeenCalledWith(
         expect.objectContaining({ action: 'auth.refresh.reuse' }),
       );
@@ -549,30 +576,72 @@ describe('AuthService (impersonation + order-time registration, ADR-027)', () =>
       expect(actions).not.toContain('auth.refresh');
     });
 
-    it('CAS lost (count 0, concurrent winner) → reuse path issues a pair + audit', async () => {
-      mockPrisma.refreshToken.findUnique.mockResolvedValue(rt);
-      mockPrisma.refreshToken.updateMany.mockResolvedValue({ count: 0 });
+    it('CAS lost (count 0, concurrent winner rotated it) → re-read + locked reissue + audit', async () => {
+      const revokedRecently = new Date(Date.now() - 1_000);
+      mockPrisma.refreshToken.findUnique
+        .mockResolvedValueOnce(rt) // lecture initiale (ligne encore active)
+        .mockResolvedValueOnce({ ...rt, revokedAt: revokedRecently }); // relecture tx : état réel
+      mockPrisma.refreshToken.updateMany
+        .mockResolvedValueOnce({ count: 0 }) // CAS perdu (le gagnant a roté)
+        .mockResolvedValueOnce({ count: 1 }); // probe verrou : famille toujours vivante
       mockPrisma.user.findUnique.mockResolvedValue(client);
       mockPrisma.refreshToken.create.mockResolvedValue({});
 
       const res = await service.refresh('raw-refresh');
       expect(res.accessToken).toBe('jwt.token');
+      expect(mockPrisma.refreshToken.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ sessionId: 's1' }),
+        }),
+      );
       expect(mockAudit.record).toHaveBeenCalledWith(
         expect.objectContaining({ action: 'auth.refresh.reuse' }),
       );
     });
+
+    it('GO Q12 barrier: logout committed BETWEEN the pre-read and the CAS → 401, no issuance', async () => {
+      mockPrisma.refreshToken.findUnique
+        .mockResolvedValueOnce(rt) // lecture initiale : AVANT le commit logout
+        .mockResolvedValueOnce(null); // relecture en tx : ligne déjà détruite
+      mockPrisma.refreshToken.updateMany.mockResolvedValue({ count: 0 }); // CAS sur ligne absente
+      mockPrisma.user.findUnique.mockResolvedValue(client);
+
+      await expect(service.refresh('raw-refresh')).rejects.toBeInstanceOf(UnauthorizedException);
+      expect(mockPrisma.refreshToken.create).not.toHaveBeenCalled();
+      const actions = mockAudit.record.mock.calls.map((c) => c[0]?.action);
+      expect(actions).not.toContain('auth.refresh');
+      expect(actions).not.toContain('auth.refresh.reuse');
+    });
+
+    it('GO Q12 barrier: family destroyed during the reuse window (reset <10 s) → 401, no resurrection', async () => {
+      mockPrisma.refreshToken.findUnique.mockResolvedValue({
+        ...rt,
+        revokedAt: new Date(Date.now() - 1_000),
+      });
+      mockPrisma.refreshToken.updateMany.mockResolvedValue({ count: 0 }); // probe : ligne détruite
+      mockPrisma.user.findUnique.mockResolvedValue(client);
+
+      await expect(service.refresh('raw-refresh')).rejects.toBeInstanceOf(UnauthorizedException);
+      expect(mockPrisma.refreshToken.create).not.toHaveBeenCalled();
+      const actions = mockAudit.record.mock.calls.map((c) => c[0]?.action);
+      expect(actions).not.toContain('auth.refresh.reuse');
+    });
   });
 
-  // ── GO Q3: logout supprime la ligne (aucune ressuscitation) ────────────────
-  describe('logout (deletes the session row — no resurrection)', () => {
-    it('deletes the session row (not just revoking) + audits', async () => {
-      mockPrisma.refreshToken.findUnique.mockResolvedValue({ id: 'rt1', userId: 'u1' });
-      mockPrisma.refreshToken.deleteMany.mockResolvedValue({ count: 1 });
+  // ── GO Q12: logout détruit TOUTE la famille de session ─────────────────────
+  describe('logout (deletes the whole session family — no resurrection)', () => {
+    it('deletes EVERY row of the family (active + rotated), not just the presented hash', async () => {
+      mockPrisma.refreshToken.findUnique.mockResolvedValue({
+        id: 'rt1',
+        userId: 'u1',
+        sessionId: 's1',
+      });
+      mockPrisma.refreshToken.deleteMany.mockResolvedValue({ count: 3 });
       mockPrisma.user.findUnique.mockResolvedValue(client);
 
       await service.logout('raw-refresh');
       expect(mockPrisma.refreshToken.deleteMany).toHaveBeenCalledWith({
-        where: { tokenHash: createHash('sha256').update('raw-refresh').digest('hex') },
+        where: { userId: 'u1', sessionId: 's1' },
       });
       expect(mockPrisma.refreshToken.updateMany).not.toHaveBeenCalled();
       expect(mockAudit.record).toHaveBeenCalledWith(
@@ -589,8 +658,8 @@ describe('AuthService (impersonation + order-time registration, ADR-027)', () =>
     });
   });
 
-  // ── GO Q3: changement de mot de passe détruit toutes les sessions ──────────
-  describe('changePassword (kills ALL active sessions)', () => {
+  // ── GO Q12: changement de mot de passe détruit TOUTES les lignes refresh ───
+  describe('changePassword (kills EVERY refresh row — active AND revoked)', () => {
     it('wrong current password → 401, no write', async () => {
       mockPrisma.user.findUnique.mockResolvedValue(client);
       bcryptMock.compare.mockResolvedValueOnce(false);
@@ -620,7 +689,7 @@ describe('AuthService (impersonation + order-time registration, ADR-027)', () =>
         data: { passwordHash: 'hashed:new-password-1' },
       });
       expect(mockPrisma.refreshToken.deleteMany).toHaveBeenCalledWith({
-        where: { userId: 'u1', revokedAt: null },
+        where: { userId: 'u1' },
       });
       expect(mockAudit.record).toHaveBeenCalledWith(
         expect.objectContaining({

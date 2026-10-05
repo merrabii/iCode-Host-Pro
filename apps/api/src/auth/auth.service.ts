@@ -10,7 +10,7 @@ import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import { Inject, forwardRef } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
-import { ProductStatus, Role, SubscriptionStatus, User } from '@prisma/client';
+import { Prisma, ProductStatus, Role, SubscriptionStatus, User } from '@prisma/client';
 import { createHash, randomBytes } from 'crypto';
 import * as bcrypt from 'bcryptjs';
 import { AuditService } from '../audit/audit.service';
@@ -369,24 +369,42 @@ export class AuthService {
 
   // ───────────────────────── Tokens ─────────────────────────────────────────
   /**
-   * Rotation du refresh token.
+   * Rotation du refresh token — **contrat GO Q12 (revue)** :
    *
-   * Comportement documenté (GO Q3) :
-   *  - **CAS de rotation** : l'ancienne ligne n'est révoquée QUE si elle est
-   *    encore active (`revokedAt: null`) — deux renouvellements concurrents
-   *    ne peuvent pas « double-révoquer » ; le perdant (count 0) suit la
-   *    même fenêtre de rejeu qu'une réutilisation de rotation.
-   *  - **Fenêtre de rejeu 10 s** (réutilisation LÉGITIME de rotation :
-   *    2 onglets / appel en double) : audit `auth.refresh.reuse`. Une ligne
-   *    ABSENTE (session détruite par logout/reset) n'entre JAMAIS dans cette
-   *    fenêtre → 401, aucune ressurrection.
-   *  - **Compte désactivé** (`isActive=false`) : refus (le logout admin coupe
-   *    donc aussi le renouvellement, pas seulement le login).
+   * Deux portées de révocation, nettement distinctes :
    *
-   * Access tokens = **stateless JWT** (signature + exp, aucun contrôle serveur,
-   * voir JwtAuthGuard) : déconnexion/désactivation ne révoque PAS un bearer
-   * déjà émis, il expire de lui-même (durée `jwtExpiresIn`, défaut 15 min).
-   * Seul le refresh est un point de révocation serveur.
+   * 1. **Access token = stateless JWT** (voir `issueTokens`) : signature + `exp`
+   *    seuls, aucun appel base dans JwtAuthGuard. Durée = `jwtExpiresIn`
+   *    (défaut 15 min). Logout / reset / kill-switch admin **ne révoquent PAS**
+   *    un bearer déjà émis : il expire tout seul. C'est une garantie de DURÉE
+   *    (au plus 15 min de résiduel), pas une révocation forte.
+   *
+   * 2. **Refresh token = révocation serveur FORTE, par famille (`sessionId`)** :
+   *    chaque login crée une famille ; la rotation reste dans la même famille ;
+   *    logout détruit **toute la famille** (toutes lignes, actives ET en cours
+   *    de rotation) ; reset/changePassword détruisent **toutes les lignes de
+   *    l'utilisateur** (toutes familles, actives ET révoquées — une ligne
+   *    révoquée survivant à un reset reste dans la fenêtre de rejeu et
+   *    ressusciterait une session).
+   *
+   * Détails de rotation :
+   *  - **CAS de rotation** : la ligne n'est révoquée que si elle est encore
+   *    active (`revokedAt: null`). CAS + création du successeur s'exécutent
+   *    dans **une même transaction** : un logout/reset concurrent est soit
+   *    traité AVANT (lignes déjà détruites → count 0 → relecture → 401), soit
+   *    APRÈS (il détruit aussi le successeur, même famille) — jamais « token
+   *    émis dans une famille déjà détruite ».
+   *  - **Course perdue (count 0)** : relecture de la ligne réelle en base.
+   *    Absente (logout/reset committé entre la lecture initiale et le CAS) →
+   *    401, aucun émetteur, aucune ressurrection. Présente mais pas révoquée /
+   *    expirée / révoquée > 10 s → 401. Présente révoquée ≤ 10 s → rotation
+   *    concurrente légitime, ré-émission SOUS VERROU (probe `updateMany` sur la
+   *    ligne : count 0 = famille détruite pendant la course → 401).
+   *  - **Fenêtre de rejeu 10 s** (réutilisation LÉGITIME de rotation : 2
+   *    onglets / appel en double) : audit `auth.refresh.reuse`, nouveau jeton
+   *    **dans la même famille**. Une ligne ABSENTE n'entre jamais dans cette
+   *    fenêtre.
+   *  - **Compte désactivé** (`isActive=false`) : refus avant toute rotation.
    */
   async refresh(refreshToken: string): Promise<AuthTokens> {
     const record = await this.prisma.refreshToken.findUnique({
@@ -401,27 +419,6 @@ export class AuthService {
     if (!user) {
       throw new UnauthorizedException('User not found');
     }
-    // Rotation race (2 onglets / calls concurrentes) : quand un token vient d'être
-    // roté (révoqué il y a ≤ REUSE_WINDOW_MS), on le considère comme une réutilisation
-    // LÉGITIME concurrente et on émet un nouveau jeu pour le même utilisateur, au lieu
-    // de déconnecter le client « pour rien ». Une vraie réutilisation malveillante
-    // (token volé) est elle aussi marquée `revokedAt` — la fenêtre courte (10 s) la rend
-    // négligeable et l'audit `auth.refresh.reuse` trace l'événement.
-    if (record.revokedAt !== null) {
-      const ageMs = Date.now() - record.revokedAt.getTime();
-      if (ageMs <= 10_000 && user.isActive) {
-        await this.audit.record({
-          actorId: user.id,
-          actorEmail: user.email,
-          action: 'auth.refresh.reuse',
-          resourceType: 'user',
-          resourceId: user.id,
-          details: { reason: 'rotation-concurrente' },
-        });
-        return this.issueTokens(user);
-      }
-      throw new UnauthorizedException('Invalid refresh token');
-    }
     if (record.expiresAt < new Date()) {
       throw new UnauthorizedException('Invalid refresh token');
     }
@@ -432,14 +429,19 @@ export class AuthService {
       throw new UnauthorizedException('Account disabled');
     }
 
-    // CAS de rotation : seule une ligne ENCORE ACTIVE peut être révoquée.
-    const cas = await this.prisma.refreshToken.updateMany({
-      where: { id: record.id, revokedAt: null },
-      data: { revokedAt: new Date() },
-    });
-    if (cas.count !== 1) {
-      // Course perdue : un autre renouvellement a pris la rotation avant nous —
-      // même traitement que la fenêtre de rejeu (audit + nouveau jeu).
+    // Déjà roté : fenêtre de réutilisation légitime (≤ 10 s), MAIS seulement
+    // si la ligne existe toujours (famille NON détruite entre-temps).
+    if (record.revokedAt !== null) {
+      const ageMs = Date.now() - record.revokedAt.getTime();
+      if (ageMs > 10_000) {
+        throw new UnauthorizedException('Invalid refresh token');
+      }
+      const reissued = await this.prisma.$transaction((tx) =>
+        this.reissueInFamily(tx, user, record),
+      );
+      if (reissued === null) {
+        throw new UnauthorizedException('Invalid refresh token');
+      }
       await this.audit.record({
         actorId: user.id,
         actorEmail: user.email,
@@ -448,31 +450,118 @@ export class AuthService {
         resourceId: user.id,
         details: { reason: 'rotation-concurrente' },
       });
-      return this.issueTokens(user);
+      return { accessToken: await this.signAccess(user), refreshToken: reissued };
     }
-    await this.audit.record({
-      actorId: user.id,
-      actorEmail: user.email,
-      action: 'auth.refresh',
-      resourceType: 'user',
-      resourceId: user.id,
-    });
-    return this.issueTokens(user);
+
+    // CAS de rotation + création du successeur dans UNE transaction : le verrou
+    // de ligne sérialise logout/reset concurrents (cf. contrat ci-dessus).
+    // Sortie : null = refus (famille détruite / révocation trop vieille),
+    //          sinon { raw, reuse } avec reuse = fenêtre de rejeu 10 s.
+    const outcome = await this.prisma.$transaction(
+      async (tx): Promise<{ raw: string; reuse: boolean } | null> => {
+        const cas = await tx.refreshToken.updateMany({
+          where: { id: record.id, revokedAt: null },
+          data: { revokedAt: new Date() },
+        });
+        if (cas.count !== 1) {
+          // Course perdue : relire l'état RÉEL de la ligne (un logout/reset a
+          // pu committer entre la lecture initiale et ce CAS).
+          const row = await tx.refreshToken.findUnique({ where: { id: record.id } });
+          if (!row) return null; // famille détruite → 401
+          if (row.revokedAt === null || row.expiresAt < new Date()) return null;
+          if (Date.now() - row.revokedAt.getTime() > 10_000) return null;
+          const reissued = await this.reissueInFamily(tx, user, row);
+          return reissued === null ? null : { raw: reissued, reuse: true };
+        }
+        const fresh = await this.createRefreshRow(tx, user.id, record.sessionId);
+        return { raw: fresh, reuse: false };
+      },
+    );
+
+    if (outcome === null) {
+      throw new UnauthorizedException('Invalid refresh token');
+    }
+    if (outcome.reuse) {
+      await this.audit.record({
+        actorId: user.id,
+        actorEmail: user.email,
+        action: 'auth.refresh.reuse',
+        resourceType: 'user',
+        resourceId: user.id,
+        details: { reason: 'rotation-concurrente' },
+      });
+    } else {
+      await this.audit.record({
+        actorId: user.id,
+        actorEmail: user.email,
+        action: 'auth.refresh',
+        resourceType: 'user',
+        resourceId: user.id,
+      });
+    }
+    return { accessToken: await this.signAccess(user), refreshToken: outcome.raw };
   }
 
   /**
-   * Déconnexion = **suppression** de la ligne de session (pas simple
-   * révocation) : la ligne absente fait échouer tout refresh concurrent — y
-   * compris la fenêtre de rejeu de rotation, qui ne voit QUE des lignes
-   * révoquées-rotation, jamais une session déconnectée (GO Q3 : révocation
-   * vérifiable, pas de ressurrection après logout). Idempotent.
+   * Ré-émission dans la famille d'une ligne DÉJÀ révoquée (fenêtre de rejeu).
+   * Le `updateMany` no-op est un **probe atomique sous verrou** : count 0 = la
+   * ligne a été détruite (logout/reset committé pendant la course) → null →
+   * 401, aucun token n'est émis pour une famille morte.
+   */
+  private async reissueInFamily(
+    tx: Prisma.TransactionClient,
+    user: User,
+    row: { id: string; sessionId: string; revokedAt: Date | null },
+  ): Promise<string | null> {
+    if (row.revokedAt === null) return null;
+    const probe = await tx.refreshToken.updateMany({
+      where: { id: row.id, sessionId: row.sessionId },
+      data: { revokedAt: row.revokedAt }, // no-op : verrou + existence uniquement
+    });
+    if (probe.count !== 1) return null;
+    return this.createRefreshRow(tx, user.id, row.sessionId);
+  }
+
+  /** Crée une ligne refresh (successeur de rotation OU nouveau login). */
+  private async createRefreshRow(
+    client: Prisma.TransactionClient | PrismaService,
+    userId: string,
+    sessionId?: string,
+  ): Promise<string> {
+    const raw = randomBytes(48).toString('base64url');
+    const days = this.config.get<number>('refreshExpiresInDays') ?? 30;
+    await client.refreshToken.create({
+      data: {
+        tokenHash: this.hashToken(raw),
+        userId,
+        sessionId, // undefined → nouvelle famille (login)
+        expiresAt: new Date(Date.now() + days * 24 * 60 * 60 * 1000),
+      },
+    });
+    return raw;
+  }
+
+  /**
+   * Déconnexion = **suppression de TOUTE la famille de session** (`sessionId` :
+   * toutes les lignes, actives et en cours de rotation) — pas seulement le hash
+   * présenté. La ligne absente fait échouer tout refresh concurrent, y compris
+   * la fenêtre de rejeu (GO Q12 : le logout doit couper aussi les rotations de
+   * la même session, jamais « déconnecter l'onglet 1 mais laisser l'onglet 2 »).
+   * Idempotent.
    */
   async logout(refreshToken: string): Promise<void> {
     const hash = this.hashToken(refreshToken);
     const record = await this.prisma.refreshToken.findUnique({
       where: { tokenHash: hash },
     });
-    await this.prisma.refreshToken.deleteMany({ where: { tokenHash: hash } });
+    if (record) {
+      await this.prisma.refreshToken.deleteMany({
+        where: { userId: record.userId, sessionId: record.sessionId },
+      });
+    } else {
+      // Idempotent : ligne déjà détruite → no-op défensif sur le hash.
+      await this.prisma.refreshToken.deleteMany({ where: { tokenHash: hash } });
+    }
     if (record?.userId) {
       const user = await this.prisma.user.findUnique({ where: { id: record.userId } });
       await this.audit.record({
@@ -487,9 +576,10 @@ export class AuthService {
 
   /**
    * Self-service password change (re-verifies the current password).
-   * GO Q3 : toute réussite **détruit toutes les sessions actives** (même
-   * contrat que le reset) — un changement de mot de passe ne laisse aucune
-   * session existante survivre. La session courante doit se reconnecter.
+   * GO Q12 : toute réussite **détruit TOUTES les lignes refresh de
+   * l'utilisateur** (toutes familles, actives ET révoquées) — identique au
+   * reset. Une ligne révoquée survivante resterait dans la fenêtre de rejeu et
+   * ressusciterait une session. La session courante doit se reconnecter.
    */
   async changePassword(
     userId: string,
@@ -510,10 +600,10 @@ export class AuthService {
         where: { id: userId },
         data: { passwordHash },
       }),
-      // Suppression (pas seulement révocation) : identique au reset — la
-      // fenêtre de rejeu 10 s de refresh() ne ressuscite pas une ligne absente.
+      // Toutes lignes, sans filtre revokedAt : pas de ligne survivante qui
+      // puisse entrer dans la fenêtre de rejeu de refresh().
       this.prisma.refreshToken.deleteMany({
-        where: { userId, revokedAt: null },
+        where: { userId },
       }),
     ]);
     await this.audit.record({
@@ -619,11 +709,11 @@ export class AuthService {
    * CONCURRENT consumptions of the same token can only have `count === 1`
    * once, the loser rolls back with the generic 400 (single-use enforced by
    * PostgreSQL, not by a pre-read). Password update + DESTRUCTION of every
-   * active refresh token happen in the same transaction. Deletion, not
-   * revocation — refresh() re-issues a token revoked <10 s ago (rotation race
-   * window), which must NOT resurrect a session killed by a password reset,
-   * and a deleted row can never enter that window. Journals auth.password.reset
-   * — never the raw token nor the password.
+   * refresh row of the user happen in the same transaction — **all rows,
+   * active AND revoked** (GO Q12): a revoked line survives a `revokedAt: null`
+   * filter, stays inside the 10 s reuse window and would resurrect the session.
+   * Deletion, not revocation — a deleted row can never enter that window.
+   * Journals auth.password.reset — never the raw token nor the password.
    */
   async resetPassword(token: string, newPassword: string, ip?: string): Promise<{ ok: true }> {
     if (newPassword.length < 8) {
@@ -655,8 +745,10 @@ export class AuthService {
       });
       if (cas.count !== 1) return false;
       await tx.user.update({ where: { id: user.id }, data: { passwordHash } });
+      // Toutes lignes refresh de l'utilisateur (toutes familles, actives ET
+      // révoquées) : aucune survivante pour la fenêtre de rejeu de refresh().
       await tx.refreshToken.deleteMany({
-        where: { userId: user.id, revokedAt: null },
+        where: { userId: user.id },
       });
       return true;
     });
@@ -817,33 +909,29 @@ export class AuthService {
    * Issue a token pair. With an `imp` marker, NO refresh row is created and
    * refreshToken is returned empty (the controller must not set a cookie).
    *
-   * **Access token = stateless JWT (documenté GO Q3)** : payload
+   * **Access token = stateless JWT (GO Q3, portées clarifiées GO Q12)** : payload
    * `sub/email/role` figé à l'émission, vérifié par signature + `exp` UNIQUEMENT
    * (aucun appel base dans JwtAuthGuard) ; conséquences :
-   *  - déconnexion (logout) et désactivation admin ne révoquent PAS un bearer
-   *    déjà émis — il expire tout seul après `jwtExpiresIn` (défaut 15 min) ;
+   *  - logout et désactivation admin ne révoquent PAS un bearer déjà émis —
+   *    il expire tout seul après `jwtExpiresIn` (défaut 15 min) : garantie de
+   *    DURÉE résiduelle, PAS une révocation forte ;
    *  - l'claim `email` peut être périmé (changement d'email confirmé entre-temps)
    *    — toute propriété de ressource doit se fier à `sub` (jamais à l'email) ;
-   *  - seul le refresh token (ligne en base) est un point de révocation serveur.
+   *  - le refresh token (ligne en base, famille `sessionId`) est le SEUL point
+   *    de révocation serveur forte (logout/reset/changePassword).
    */
   async issueTokens(user: User): Promise<AuthTokens> {
+    const accessToken = await this.signAccess(user);
+    const refreshToken = await this.createRefreshRow(this.prisma, user.id);
+    return { accessToken, refreshToken };
+  }
+
+  private async signAccess(user: User): Promise<string> {
     const payload: JwtPayload = {
       sub: user.id,
       email: user.email,
       role: user.role,
     };
-    const accessToken = await this.jwt.signAsync(payload);
-
-    const refreshToken = randomBytes(48).toString('base64url');
-    const days = this.config.get<number>('refreshExpiresInDays') ?? 30;
-    await this.prisma.refreshToken.create({
-      data: {
-        tokenHash: this.hashToken(refreshToken),
-        userId: user.id,
-        expiresAt: new Date(Date.now() + days * 24 * 60 * 60 * 1000),
-      },
-    });
-
-    return { accessToken, refreshToken };
+    return this.jwt.signAsync(payload);
   }
 }

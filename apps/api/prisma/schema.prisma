@@ -188,8 +188,13 @@ model RefreshToken {
   expiresAt DateTime
   revokedAt DateTime?
   createdAt DateTime  @default(now())
+  // GO Q12 (revue): la rotation reste DANS la même famille de session — logout
+  // et reset/changePassword révoquent TOUTES les lignes de la famille, jamais
+  // seulement le hash présenté ou les lignes encore actives.
+  sessionId String   @default(cuid())
 
   @@index([userId])
+  @@index([userId, sessionId])
 }
 
 // ── GO socle (lot A1): one-time "forgot password" tokens ──────────────────────
