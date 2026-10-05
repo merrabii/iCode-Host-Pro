@@ -1,5 +1,6 @@
-# CI (GO socle P9 / lot E1) — pipeline exécutant les tests UNITAIRES puis
-# les tests d'intégration e2e contre un PostgreSQL de service isolé.
+# CI (GO socle P9 / lot E1 — revue Q10) — pipeline exécutant les tests
+# UNITAIRES puis les tests d'intégration e2e contre un PostgreSQL de service
+# isolé, plus les 4 suites legacy 17B sur leurs bases dédiées refabriquées.
 #
 # Notes de chantier :
 #  - aucune seed n'est nécessaire : chaque spec crée ses fixtures ;
@@ -10,8 +11,8 @@
 #    défensif et explicite — les specs pilotent les sweeps à la main ;
 #  - PAYMENT_SIMULATOR_ENABLED n'est PAS défini : les specs le pilotent elles-
 #    mêmes (activation/refus) ;
-#  - `next build` n'est PAS exécuté (voir mémoire de chantier) : la validation
-#    TypeScript du web = tsc --noEmit.
+#  - `next build` est exécuté avec `--max-old-space-size=6144` (Q10 : exit 134
+#    = OOM du HEAP V8 par défaut, pas de la RAM machine — même fix local).
 name: CI
 
 on:
@@ -77,17 +78,66 @@ jobs:
       - name: Typecheck Web
         run: pnpm -C apps/web exec tsc --noEmit -p tsconfig.json
 
+      - name: Build web (next build — fix heap Q10)
+        env:
+          NODE_OPTIONS: --max-old-space-size=6144
+        run: pnpm -C apps/web exec next build
+
       - name: Tests unitaires (API)
         run: pnpm -C apps/api exec jest src --maxWorkers=4
 
       - name: Tests e2e (API, base CI isolée)
-        # 4 suites legacy 17B EXCLUES (état connu, décrit dans
-        # docs/RAPPORT-SOCLE-COMMERCIAL.md) : c3-premig / c4-premig /
-        # c4-release / c4-rollback tournent sur des bases dédiées figées à
-        # l'état d'avant le GO (colonnes Order.paidAt etc. absentes) et
-        # échouent par design ailleurs. Elles exigent la refabrique de leurs
-        # dumps dédiés (NON TESTÉ documenté) — ne pas les réintroduire ici
-        # sans cette refabrique.
+        # Les 4 suites legacy 17B (c3-premig / c4-premig / c4-release /
+        # c4-rollback) s'exécutent dans l'étape dédiée ci-dessous : elles
+        # exigent chacune SA base dédiée (garde current_database()) — impossible
+        # de les mixter avec la base CI principale. Leurs bases sont refabriquées
+        # à l'étape « bases dédiées » (Q10 : 58 migrations puis retrait des
+        # tables C1/C3/C4 pour l'état pré-migratoire).
         run: >-
           pnpm -C apps/api exec jest --config ./test/jest-e2e.json --runInBand
           --testPathIgnorePatterns c3-premig c4-premig c4-release c4-rollback
+
+      - name: Bases dédiées des suites legacy 17B (refabrique Q10)
+        # Recette reproductible (identique à la refabrique locale Q10) :
+        #   1. 3 bases neuves migrées à 58/58 (colonnes du socle présentes) ;
+        #   2. c3premig : DROP des tables C1/C3 (+ C4) = état « pré-migrations »
+        #      historique (43/47) sur base à jour ;
+        #   3. c4premig : la migration C4 est déjà journalisée (record présent
+        #      depuis l'ancienne base) → les tables C4 restent absentes ;
+        #   4. c4test : base COMPLÈTE (C4 présent) = c4-release/c4-rollback.
+        env:
+          PGPASSWORD: icode
+        run: |
+          set -euo pipefail
+          PSQL="psql postgresql://icode:icode@localhost:5432/postgres -v ON_ERROR_STOP=1 -q"
+          $PSQL -c 'CREATE DATABASE icode_host_pro_c3premig'
+          $PSQL -c 'CREATE DATABASE icode_host_pro_c4premig'
+          $PSQL -c 'CREATE DATABASE icode_host_pro_c4test'
+          for db in icode_host_pro_c3premig icode_host_pro_c4premig icode_host_pro_c4test; do
+            DATABASE_URL="postgresql://icode:icode@localhost:5432/$db" \
+              pnpm -C apps/api exec prisma migrate deploy
+          done
+          psql "postgresql://icode:icode@localhost:5432/icode_host_pro_c3premig" -v ON_ERROR_STOP=1 <<'SQL'
+          DROP TABLE IF EXISTS "OrderProvisioningTracking";
+          DROP TABLE IF EXISTS "HostingServiceAllocation";
+          DROP TABLE IF EXISTS "HostingService" CASCADE;
+          DROP TABLE IF EXISTS "C4ProviderAttempt";
+          DROP TABLE IF EXISTS "C4Takeover";
+          DROP TABLE IF EXISTS "C4StopRequest";
+          DROP TABLE IF EXISTS "C4ReleaseEvidence";
+          DROP TABLE IF EXISTS "C4ReadinessProof";
+          SQL
+
+      - name: Tests e2e legacy 17B (4 suites, bases dédiées)
+        # 3 suites = 3 bases (une garde d'identité par suite) ; c4-release et
+        # c4-rollback partagent icode_host_pro_c4test (lancées ensemble).
+        env:
+          PGPASSWORD: icode
+        run: |
+          set -euo pipefail
+          DATABASE_URL="postgresql://icode:icode@localhost:5432/icode_host_pro_c3premig" \
+            pnpm -C apps/api exec jest --config ./test/jest-e2e.json --runInBand c3-premig
+          DATABASE_URL="postgresql://icode:icode@localhost:5432/icode_host_pro_c4premig" \
+            pnpm -C apps/api exec jest --config ./test/jest-e2e.json --runInBand c4-premig
+          DATABASE_URL="postgresql://icode:icode@localhost:5432/icode_host_pro_c4test" \
+            pnpm -C apps/api exec jest --config ./test/jest-e2e.json --runInBand c4-release c4-rollback

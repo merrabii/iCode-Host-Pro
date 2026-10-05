@@ -100,6 +100,16 @@ export default function ManagerOrdersPage() {
         needsReason: true,
       });
     }
+    // Le remboursement reste possible après provisionnement (ACTIVE) : le
+    // serveur gate sur `paidAt`, pas sur le statut de service.
+    if (o.status === 'ACTIVE') {
+      list.push({
+        key: 'refund',
+        label: 'Rembourser (wallet)',
+        hint: 'Crédite le portefeuille du client dans la même transaction — plafond = montant encaissé, idempotent (clé unique).',
+        needsReason: true,
+      });
+    }
     if (o.status === 'PROVISIONING') {
       list.push({
         key: 'force-provision',
