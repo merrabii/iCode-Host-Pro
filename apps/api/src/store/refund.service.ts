@@ -79,14 +79,84 @@ export function refundCapExceeded(
   return usedCents + amountCents > capturedCents;
 }
 
-/** Découpage TTC → HT/taxe d'un avoir (arrondi taxe au centime le plus proche). */
-export function creditNoteSplit(
+/** GO P5 — ligne source (facture d'origine) qu'une pièce de crédit recrédite. */
+export interface CreditNoteSourceLine {
+  id: string;
+  label: string;
+  taxRatePercent: Prisma.Decimal | number | string;
+  taxAmountCents: number;
+  totalTtcCents: number;
+  sortOrder: number;
+}
+
+/** GO P5 — brouillon d'une ligne CREDIT d'un avoir. */
+export interface CreditNoteLineDraft {
+  sourceLineId: string;
+  label: string;
+  qty: number;
+  unitPriceHtCents: number;
+  taxRatePercent: number;
+  taxAmountCents: number;
+  totalTtcCents: number;
+  sortOrder: number;
+}
+
+/**
+ * GO P5 — allocation d'un remboursement sur les lignes RÉELLEMENT
+ * recréditées de la facture d'origine (ordre `sortOrder`) :
+ *  • chaque ligne conserve son TRAITEMENT FISCAL propre — aucun taux global
+ *    appliqué à des frais non taxés ;
+ *  • une fraction partielle arrondit la taxe au centime, HT = TTC − taxe ;
+ *  • une couverture TOTALE de la ligne reprend le reste EXACT (aucune dérive
+ *    d'arrondi : somme des pièces = totaux source) ;
+ *  • `creditedBySource` = sommes déjà émises sur chaque ligne source par
+ *    les avoirs précédents (restes disponibles).
+ * Lève ConflictException si le montant dépasse les lignes disponibles.
+ */
+export function allocateCreditLines(
+  sourceLines: readonly CreditNoteSourceLine[],
+  creditedBySource: ReadonlyMap<string, { ttc: number; tax: number }>,
   amountCents: number,
-  ratePercent: number,
-): { ht: number; tax: number } {
-  const rate = Number(ratePercent);
-  const tax = rate > 0 ? Math.round((amountCents * rate) / (100 + rate)) : 0;
-  return { ht: amountCents - tax, tax };
+): { lines: CreditNoteLineDraft[]; ht: number; tax: number; ttc: number } {
+  const ordered = [...sourceLines].sort((a, b) => a.sortOrder - b.sortOrder);
+  const lines: CreditNoteLineDraft[] = [];
+  let rem = amountCents;
+  let ht = 0;
+  let tax = 0;
+  let ttc = 0;
+  for (const src of ordered) {
+    if (rem <= 0) break;
+    const taken = creditedBySource.get(src.id) ?? { ttc: 0, tax: 0 };
+    const remLineTtc = src.totalTtcCents - taken.ttc;
+    const remLineTax = src.taxAmountCents - taken.tax;
+    if (remLineTtc <= 0) continue;
+    const part = Math.min(rem, remLineTtc);
+    const partTax =
+      part === remLineTtc
+        ? remLineTax // couverture totale : reste EXACT de la ligne
+        : Math.round((remLineTax * part) / remLineTtc); // fraction : taxe arrondie
+    const partHt = part - partTax;
+    lines.push({
+      sourceLineId: src.id,
+      label: src.label,
+      qty: 1,
+      unitPriceHtCents: partHt,
+      taxRatePercent: Number(src.taxRatePercent),
+      taxAmountCents: partTax,
+      totalTtcCents: part,
+      sortOrder: lines.length,
+    });
+    ht += partHt;
+    tax += partTax;
+    ttc += part;
+    rem -= part;
+  }
+  if (rem > 0) {
+    throw new ConflictException(
+      `Lignes de facture insuffisantes pour l'avoir : ${amountCents} cents demandés, ${ttc} cents disponibles.`,
+    );
+  }
+  return { lines, ht, tax, ttc };
 }
 
 /** Header Idempotency-Key : 8..128 caractères imprimables ASCII. */
@@ -118,8 +188,12 @@ export function assertRefundIdempotencyKey(raw: string | undefined): string {
  *    EXTERNAL_CARD reste PENDING tant que le prestataire n'a pas confirmé
  *    réellement — AUCUN succès externe n'est déclarable aujourd'hui (l'adaptateur
  *    carte n'est pas configuré, décision GO : carte réelle désactivée) ;
- *  • avoirs : `issueCreditNote` émet un Invoice `CREDITED` lié par
- *    `creditNoteOfId` (numéros `AV-` sur la séquence partagée) ;
+ *  • avoirs : `issueCreditNote` émet UNE PIÈCE `CREDITED` par remboursement,
+ *    liée par `creditNoteOfId` (numéros `AV-` sur la séquence partagée) — un
+ *    avoir déjà émis n'est jamais augmenté ni re-rendu (GO P5) ; montants
+ *    HT/taxe depuis les lignes réellement recréditées (`allocateCreditLines`,
+ *    traitement fiscal par ligne, restes exacts via `InvoiceLine.sourceLineId`,
+ *    coordonnées de facturation reprises) ;
  *  • traçabilité : audits `refund.created` / `refund.succeeded` /
  *    `refund.provider_confirmation_refused` + snapshots acteur.
  */
@@ -212,6 +286,7 @@ export class RefundService {
             taxRatePercent: true,
             customerId: true,
             legalMentionsSnapshot: true,
+            billingAddress: true,
           },
         });
 
@@ -255,10 +330,13 @@ export class RefundService {
             select: { id: true },
           });
 
-          // 6) Avoir éventuel : UN SEUL avoir par facture (invariant
-          //    hérité, Invoice.creditNoteOfId unique) → le 2e remboursement
-          //    CUMULE l'avoir existant (totaux recalculés) et ajoute une
-          //    ligne CREDIT par remboursement (traçabilité).
+          // 6) Avoir : UNE PIÈCE par remboursement (GO P5). Un avoir déjà
+          //    émis n'est JAMAIS augmenté — documents et PDF des pièces
+          //    émises restent intacts ; chaque nouvelle pièce est LIÉE
+          //    (creditNoteOfId + lignes sourceLineId) et NUMÉROTÉE sur la
+          //    séquence partagée. Montants HT/taxe calculés depuis les
+          //    lignes RÉELLEMENT recréditées : traitement fiscal propre à
+          //    chaque ligne, aucun taux global sur des frais non taxés.
           let creditNoteInvoiceId: string | null = null;
           if (input.issueCreditNote) {
             if (!origin) {
@@ -266,67 +344,82 @@ export class RefundService {
                 "Aucune facture liée à ce paiement : émission d'avoir impossible.",
               );
             }
-            const rate = Number(origin.taxRatePercent);
-            const split = creditNoteSplit(input.amountCents, rate);
-            const existingNote = await tx.invoice.findFirst({
-              where: { creditNoteOfId: origin.id },
-              select: { id: true, amountTtcCents: true },
-            });
-            let noteId: string;
-            if (existingNote) {
-              // Cumul : recalcul des totaux sur le NOUVEAU TTC de l'avoir.
-              const newTtc = existingNote.amountTtcCents + input.amountCents;
-              const total = creditNoteSplit(newTtc, rate);
-              const updated = await tx.invoice.update({
-                where: { id: existingNote.id },
-                data: {
-                  amountHtCents: total.ht,
-                  taxAmountCents: total.tax,
-                  amountTtcCents: newTtc,
-                  // force la régénération du PDF (statut/rendu mis à jour)
-                  pdfRenderedStatus: null,
-                },
-              });
-              noteId = updated.id;
-            } else {
-              const claim = await claimInvoiceSequence(tx);
-              const note = await tx.invoice.create({
-                data: {
-                  number: `AV-${claim.invoiceNumber}`,
-                  customerId: origin.customerId,
-                  status: InvoiceStatus.CREDITED,
-                  currency: origin.currency,
-                  taxRatePercent: origin.taxRatePercent,
-                  amountHtCents: split.ht,
-                  taxAmountCents: split.tax,
-                  amountTtcCents: input.amountCents,
-                  paidAt: new Date(),
-                  creditNoteOfId: origin.id,
-                  legalMentionsSnapshot:
-                    origin.legalMentionsSnapshot == null
-                      ? Prisma.DbNull
-                      : (origin.legalMentionsSnapshot as Prisma.InputJsonValue),
-                },
-              });
-              noteId = note.id;
-            }
-            const lineCount = await tx.invoiceLine.count({
-              where: { invoiceId: noteId },
-            });
-            await tx.invoiceLine.create({
-              data: {
-                invoiceId: noteId,
-                kind: InvoiceLineKind.CREDIT,
-                label: `Avoir sur facture ${origin.number}`,
-                qty: 1,
-                unitPriceHtCents: split.ht,
-                taxRatePercent: origin.taxRatePercent,
-                taxAmountCents: split.tax,
-                totalTtcCents: input.amountCents,
-                sortOrder: lineCount,
+            const sourceLines = await tx.invoiceLine.findMany({
+              where: { invoiceId: origin.id, sourceLineId: null },
+              orderBy: { sortOrder: 'asc' },
+              select: {
+                id: true,
+                label: true,
+                taxRatePercent: true,
+                taxAmountCents: true,
+                totalTtcCents: true,
+                sortOrder: true,
               },
             });
-            creditNoteInvoiceId = noteId;
+            const creditedRows = sourceLines.length
+              ? await tx.invoiceLine.groupBy({
+                  by: ['sourceLineId'],
+                  where: {
+                    sourceLineId: { in: sourceLines.map((l) => l.id) },
+                  },
+                  _sum: { totalTtcCents: true, taxAmountCents: true },
+                })
+              : [];
+            const credited = new Map<string, { ttc: number; tax: number }>();
+            for (const r of creditedRows) {
+              if (r.sourceLineId === null) continue;
+              credited.set(r.sourceLineId, {
+                ttc: r._sum.totalTtcCents ?? 0,
+                tax: r._sum.taxAmountCents ?? 0,
+              });
+            }
+            const draft = allocateCreditLines(
+              sourceLines,
+              credited,
+              input.amountCents,
+            );
+            const claim = await claimInvoiceSequence(tx);
+            const note = await tx.invoice.create({
+              data: {
+                number: `AV-${claim.invoiceNumber}`,
+                customerId: origin.customerId,
+                status: InvoiceStatus.CREDITED,
+                currency: origin.currency,
+                taxRatePercent: origin.taxRatePercent,
+                amountHtCents: draft.ht,
+                taxAmountCents: draft.tax,
+                amountTtcCents: draft.ttc,
+                paidAt: new Date(),
+                creditNoteOfId: origin.id,
+                legalMentionsSnapshot:
+                  origin.legalMentionsSnapshot == null
+                    ? Prisma.DbNull
+                    : (origin.legalMentionsSnapshot as Prisma.InputJsonValue),
+                // GO P5 : coordonnées de facturation reprises sur l'avoir.
+                billingAddress:
+                  origin.billingAddress == null
+                    ? Prisma.DbNull
+                    : (origin.billingAddress as Prisma.InputJsonValue),
+                pdfRenderedStatus: null,
+              },
+            });
+            for (const l of draft.lines) {
+              await tx.invoiceLine.create({
+                data: {
+                  invoiceId: note.id,
+                  kind: InvoiceLineKind.CREDIT,
+                  sourceLineId: l.sourceLineId,
+                  label: l.label,
+                  qty: l.qty,
+                  unitPriceHtCents: l.unitPriceHtCents,
+                  taxRatePercent: l.taxRatePercent,
+                  taxAmountCents: l.taxAmountCents,
+                  totalTtcCents: l.totalTtcCents,
+                  sortOrder: l.sortOrder,
+                },
+              });
+            }
+            creditNoteInvoiceId = note.id;
           }
 
           // 7) Statuts sur cumul RÉUSSI uniquement (GO P4) : une intention

@@ -75,6 +75,7 @@ describe('InvoicePdfService (D1)', () => {
           taxAmountCents: 1_600,
           totalTtcCents: 9_600,
           sortOrder: 0,
+          sourceLineId: null,
         },
         {
           id: 'l2',
@@ -87,6 +88,7 @@ describe('InvoicePdfService (D1)', () => {
           taxAmountCents: 0,
           totalTtcCents: 2_000,
           sortOrder: 1,
+          sourceLineId: null,
         },
       ],
       order: { productName: 'Hebergement Pro' },
@@ -232,6 +234,7 @@ describe('InvoicePdfService (D1)', () => {
       taxAmountCents: 20,
       totalTtcCents: 120,
       sortOrder: i,
+      sourceLineId: null,
     }));
     const a = await service.render(inv);
     const b = await service.render(inv);

@@ -39,9 +39,14 @@ delete process.env.PAYMENT_SIMULATOR_ENABLED;
  *  F. externe (carte réelle désactivée) : reste PENDING, confirmation
  *     prestataire = refus 409 tracé, AUCUN succès externe déclaré, et
  *     l'opération INTERNE reste disponible malgré l'adaptateur bloqué ;
- *  G. avoirs : AV- liés (creditNoteOfId), statuts sur cumul complet, PDF ;
+ *  G. avoirs : UNE PIÈCE PAR REMBOURSEMENT (GO P5) — AV- liés
+ *     (creditNoteOfId + sourceLineId), 1re pièce non mutée (totaux + PDF),
+ *     somme des lignes = totaux ;
  *  H. RBAC : anonyme 401, USER 403, ADMIN 201 (routes refunds) ;
- *  I. commande non encaissée = 409 ; inconnue = 404.
+ *  I. commande non encaissée = 409 ; inconnue = 404 ;
+ *  J. GO P5 cohérence fiscale : taxe depuis les lignes réellement
+ *     remboursées (140 → taxe 20, pas 23,33), fractions successives
+ *     sans dérive, coordonnées reprises, plafond, PDF conservé.
  *
  * Coutures (AUCUN réseau réel) : MailTransportFactory + PanelTransportFactory
  * stubbés. PrismaService RÉEL — base dédiée du chantier.
@@ -105,7 +110,7 @@ describe('Remboursements et avoirs (e2e, GO Q9)', () => {
   async function seedPaidOrder(
     tag: string,
     opts: { rate?: number } = {},
-  ): Promise<{ orderId: string; invoiceId: string }> {
+  ): Promise<{ orderId: string; invoiceId: string; lineId: string }> {
     const rate = opts.rate ?? 15;
     const order = await prisma.order.create({
       data: {
@@ -139,10 +144,119 @@ describe('Remboursements et avoirs (e2e, GO Q9)', () => {
         taxAmountCents: 196,
         amountTtcCents: 1500,
         paidAt: new Date(),
+        // GO P5 : coordonnées de facturation reprises sur les avoirs émis.
+        billingAddress: {
+          name: 'Membre Q9',
+          email: memberEmail,
+          phone: '555-0142',
+        },
+        // Ligne source RÉELLE (le calcul de l'avoir s'appuie dessus, GO P5).
+        lines: {
+          create: [
+            {
+              kind: 'PRODUCT',
+              label: `q9-${tag}-licence`,
+              qty: 1,
+              unitPriceHtCents: 1304,
+              taxRatePercent: rate,
+              taxAmountCents: 196,
+              totalTtcCents: 1500,
+              sortOrder: 0,
+            },
+          ],
+        },
       },
+      include: { lines: true },
     });
     allSeededInvoiceIds.push(invoice.id);
-    return { orderId: order.id, invoiceId: invoice.id };
+    return {
+      orderId: order.id,
+      invoiceId: invoice.id,
+      lineId: invoice.lines[0].id,
+    };
+  }
+
+  /**
+   * GO P5 — facture MIXTE : produit HT 100 + taxe 20 + frais non taxés 20
+   * = TTC 140 (base de l'exemple « taxe 20, pas 23,33 »).
+   */
+  async function seedMixedOrder(
+    tag: string,
+  ): Promise<{ orderId: string; invoiceId: string; prodLineId: string; fraisLineId: string }> {
+    const order = await prisma.order.create({
+      data: {
+        customerId: memberCustomerId,
+        customerName: 'Membre Q9',
+        customerEmail: memberEmail,
+        productId,
+        productName: `q9-${tag}-${stamp}`,
+        status: OrderStatus.PAID,
+        paidAt: new Date(),
+        amountHtCents: 120,
+        taxAmountCents: 20,
+        amountTtcCents: 140,
+        taxRatePercent: 20,
+        paymentMethodId: virId,
+        paymentMethodName: `VIR-${stamp}`,
+        idempotencyKey: `q9-seed-${tag}-${stamp}`,
+        idempotencyBase: `q9-seed-${tag}-${stamp}`,
+      },
+    });
+    allOrderIds.push(order.id);
+    const invoice = await prisma.invoice.create({
+      data: {
+        number: `Q9M-${stamp}-${allSeededInvoiceIds.length + 1}`,
+        orderId: order.id,
+        customerId: memberCustomerId,
+        status: InvoiceStatus.PAID,
+        currency: 'USD',
+        taxRatePercent: 20,
+        amountHtCents: 120,
+        taxAmountCents: 20,
+        amountTtcCents: 140,
+        paidAt: new Date(),
+        billingAddress: {
+          name: 'Membre Q9',
+          email: memberEmail,
+          city: 'Rabat',
+        },
+        lines: {
+          create: [
+            {
+              kind: 'PRODUCT',
+              label: 'Produit HT 100',
+              qty: 1,
+              unitPriceHtCents: 100,
+              taxRatePercent: 20,
+              taxAmountCents: 20,
+              totalTtcCents: 120,
+              sortOrder: 0,
+            },
+            {
+              kind: 'ADJUSTMENT',
+              label: 'Frais non taxés',
+              qty: 1,
+              unitPriceHtCents: 20,
+              taxRatePercent: 0,
+              taxAmountCents: 0,
+              totalTtcCents: 20,
+              sortOrder: 1,
+            },
+          ],
+        },
+      },
+      include: { lines: true },
+    });
+    allSeededInvoiceIds.push(invoice.id);
+    const prod = invoice.lines.find((l) => l.totalTtcCents === 120);
+    const frais = invoice.lines.find((l) => l.totalTtcCents === 20);
+    if (!prod || !frais) throw new Error('seedMixedOrder: lignes absentes');
+    return {
+      orderId: order.id,
+      invoiceId: invoice.id,
+      prodLineId: prod.id,
+      fraisLineId: frais.id,
+    };
   }
 
   /** Commande JAMAIS encaissée (paidAt null) pour le refus d'accès. */
@@ -658,12 +772,19 @@ describe('Remboursements et avoirs (e2e, GO Q9)', () => {
   describe('G — avoirs', () => {
     let gOrderId = '';
     let gInvoiceId = '';
+    let gLineId = '';
     let note1Id = '';
+    let note1Snapshot: {
+      number: string;
+      pdfPath: string | null;
+      pdfRenderedStatus: string | null;
+    } | null = null;
 
     it('G1 — avoir partiel 1000 : AV- lié (creditNoteOfId), origine PAID, wallet +1000', async () => {
       const seeded = await seedPaidOrder('g');
       gOrderId = seeded.orderId;
       gInvoiceId = seeded.invoiceId;
+      gLineId = seeded.lineId;
       const balanceBefore = await balanceOf();
 
       const res = await postRefund(
@@ -688,14 +809,20 @@ describe('Remboursements et avoirs (e2e, GO Q9)', () => {
       expect(note.orderId).toBeNull(); // avoir standalone, jamais une commande
       expect(note.creditNoteOfId).toBe(gInvoiceId);
       expect(note.amountTtcCents).toBe(1000);
-      expect(note.amountHtCents).toBe(870); // 15 % : taxe 130 arrondie
-      expect(note.taxAmountCents).toBe(130);
+      // fraction 1000/1500 de la ligne source (taxe 196) : arrondi → 131
+      expect(note.amountHtCents).toBe(869);
+      expect(note.taxAmountCents).toBe(131);
+      expect(note.taxAmountCents + note.amountHtCents).toBe(note.amountTtcCents);
+      // GO P5 : coordonnées de facturation reprises sur l'avoir.
+      expect(note.billingAddress).toMatchObject({ name: 'Membre Q9' });
 
       const line = await prisma.invoiceLine.findFirstOrThrow({
         where: { invoiceId: note1Id },
       });
       expect(line.kind).toBe('CREDIT');
       expect(line.totalTtcCents).toBe(1000);
+      expect(line.taxAmountCents).toBe(131);
+      expect(line.sourceLineId).toBe(gLineId); // pièce LIÉE à sa ligne source
 
       // Partiel : l'origine et la commande restent réglées.
       const origin = await prisma.invoice.findUniqueOrThrow({
@@ -720,9 +847,18 @@ describe('Remboursements et avoirs (e2e, GO Q9)', () => {
         .set('Authorization', `Bearer ${memberToken}`)
         .expect(200);
       expect(clientPdf.headers['content-type']).toContain('application/pdf');
+
+      // GO P5 : état du PDF du 1er avoir figé pour vérifier sa CONSERVATION
+      // après émission d'une pièce suivante (G3).
+      note1Snapshot = await prisma.invoice.findUniqueOrThrow({
+        where: { id: note1Id },
+        select: { number: true, pdfPath: true, pdfRenderedStatus: true },
+      });
+      expect(note1Snapshot.pdfPath).toBeTruthy();
+      expect(note1Snapshot.pdfRenderedStatus).toBeTruthy();
     });
 
-    it('G3 — avoir final 500 (cumul EXACT) : MÊME avoir cumulé, origine CREDITED, commande REFUNDED', async () => {
+    it('G3 — avoir solde 500 : PIÈCE DISTINCTE, 1re pièce (totaux + PDF) INTACTE, origine CREDITED', async () => {
       const balanceBefore = await balanceOf();
       const res = await postRefund(
         gOrderId,
@@ -736,24 +872,45 @@ describe('Remboursements et avoirs (e2e, GO Q9)', () => {
       expect(res.body.status).toBe(RefundStatus.SUCCEEDED);
       expect(await balanceOf()).toBe(balanceBefore + 500);
 
-      // Un seul avoir par facture (invariant) : le 2e remboursement CUMULE.
-      expect(res.body.creditNoteInvoiceId).toBe(note1Id);
-      const note = await prisma.invoice.findUniqueOrThrow({
+      // GO P5 : UNE PIÈCE PAR REMBOURSEMENT — jamais de cumul sur un avoir
+      // déjà émis (le document émis et son PDF restent intacts).
+      const note2Id = res.body.creditNoteInvoiceId as string;
+      expect(note2Id).toBeTruthy();
+      expect(note2Id).not.toBe(note1Id);
+      expect(note1Snapshot).toBeTruthy();
+      const note2 = await prisma.invoice.findUniqueOrThrow({
+        where: { id: note2Id },
+      });
+      expect(note2.number).toMatch(/^AV-/);
+      expect(note2.number).not.toBe(note1Snapshot!.number); // numérotation sûre
+      expect(note2.creditNoteOfId).toBe(gInvoiceId);
+      expect(note2.status).toBe(InvoiceStatus.CREDITED);
+      // restes EXACTS de la ligne source : TTC 1500−1000, taxe 196−131
+      expect(note2.amountTtcCents).toBe(500);
+      expect(note2.amountHtCents).toBe(435);
+      expect(note2.taxAmountCents).toBe(65);
+
+      const note2Lines = await prisma.invoiceLine.findMany({
+        where: { invoiceId: note2Id },
+      });
+      expect(note2Lines).toHaveLength(1);
+      expect(note2Lines[0]).toMatchObject({
+        kind: 'CREDIT',
+        sourceLineId: gLineId,
+        totalTtcCents: 500,
+        taxAmountCents: 65,
+      });
+
+      // 1re pièce NON MUTÉE : montants + PDF conservés tels qu'émis.
+      const note1 = await prisma.invoice.findUniqueOrThrow({
         where: { id: note1Id },
       });
-      expect(note.amountTtcCents).toBe(1500); // 1000 + 500
-      expect(note.amountHtCents).toBe(1304); // 15 % : taxe 196 arrondie
-      expect(note.taxAmountCents).toBe(196);
-      expect(note.status).toBe(InvoiceStatus.CREDITED);
-      expect(note.pdfRenderedStatus).toBeNull(); // PDF à régénérer (Q8)
-
-      // Une ligne CREDIT par remboursement (traçabilité de chaque écriture).
-      const lines = await prisma.invoiceLine.findMany({
-        where: { invoiceId: note1Id },
-        orderBy: { sortOrder: 'asc' },
-      });
-      expect(lines).toHaveLength(2);
-      expect(lines[1].totalTtcCents).toBe(500);
+      expect(note1.amountTtcCents).toBe(1000);
+      expect(note1.amountHtCents).toBe(869);
+      expect(note1.taxAmountCents).toBe(131);
+      expect(note1.pdfPath).toBe(note1Snapshot!.pdfPath);
+      expect(note1.pdfPath).toBeTruthy();
+      expect(note1.pdfRenderedStatus).toBe(note1Snapshot!.pdfRenderedStatus);
 
       const origin = await prisma.invoice.findUniqueOrThrow({
         where: { id: gInvoiceId },
@@ -763,9 +920,22 @@ describe('Remboursements et avoirs (e2e, GO Q9)', () => {
         where: { id: gOrderId },
       });
       expect(order.status).toBe(OrderStatus.REFUNDED);
-      expect(
-        await prisma.invoice.count({ where: { creditNoteOfId: gInvoiceId } }),
-      ).toBe(1); // TOUJOURS un seul avoir par facture
+
+      // GO P5 : pièces DISTINCTES liées à la même facture + somme des
+      // lignes = totaux des pièces = encaissé (aucun écart d'arrondi).
+      const notes = await prisma.invoice.findMany({
+        where: { creditNoteOfId: gInvoiceId },
+      });
+      expect(notes).toHaveLength(2);
+      const allLines = await prisma.invoiceLine.findMany({
+        where: { invoiceId: { in: notes.map((n) => n.id) } },
+      });
+      expect(allLines).toHaveLength(2);
+      expect(allLines.reduce((s, l) => s + l.totalTtcCents, 0)).toBe(1500);
+      expect(allLines.reduce((s, l) => s + l.taxAmountCents, 0)).toBe(196);
+      expect(allLines.reduce((s, l) => s + l.unitPriceHtCents, 0)).toBe(1304);
+      expect(notes.reduce((s, n) => s + n.amountTtcCents, 0)).toBe(1500);
+      expect(notes.reduce((s, n) => s + n.taxAmountCents, 0)).toBe(196);
     });
 
     it('G4 — plafond aussi épuisé après les avoirs : 409', async () => {
@@ -776,6 +946,173 @@ describe('Remboursements et avoirs (e2e, GO Q9)', () => {
       );
       expect(res.status).toBe(409);
       expect(res.body.message).toContain('Plafond');
+    });
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // J — GO P5 : cohérence fiscale interne (taxe depuis les lignes
+  //     réellement remboursées, pièces distinctes, plafonds, PDF)
+  // ═══════════════════════════════════════════════════════════════════════
+  describe('J — GO P5 : avoirs et cohérence fiscale', () => {
+    it('J1 — intégral 140 (HT 100 + taxe 20 + frais 20) : taxe EXACTE 20, pas 23,33', async () => {
+      const seeded = await seedMixedOrder('jmix');
+      const balanceBefore = await balanceOf();
+
+      const res = await postRefund(
+        seeded.orderId,
+        refundBody({
+          amountCents: 140,
+          issueCreditNote: true,
+          reason: 'Remboursement intégral mixte',
+        }),
+        `q9-j1-${stamp}`,
+      ).expect(201);
+      expect(res.body.status).toBe(RefundStatus.SUCCEEDED);
+      expect(await balanceOf()).toBe(balanceBefore + 140);
+
+      const noteId = res.body.creditNoteInvoiceId as string;
+      const note = await prisma.invoice.findUniqueOrThrow({
+        where: { id: noteId },
+      });
+      expect(note.creditNoteOfId).toBe(seeded.invoiceId);
+      expect(note.amountTtcCents).toBe(140);
+      expect(note.amountHtCents).toBe(120);
+      // Le taux global (20 % de 140 TTC = 23,33) serait FAUSSE : la taxe
+      // vient des LIGNES recréditées (20 sur la ligne produit, 0 sur les
+      // frais non taxés).
+      expect(note.taxAmountCents).toBe(20);
+      expect(note.taxAmountCents).not.toBe(23);
+      // coordonnées de facturation reprises sur l'avoir (GO P5)
+      expect(note.billingAddress).toMatchObject({
+        name: 'Membre Q9',
+        email: memberEmail,
+        city: 'Rabat',
+      });
+
+      const lines = await prisma.invoiceLine.findMany({
+        where: { invoiceId: noteId },
+        orderBy: { sortOrder: 'asc' },
+      });
+      expect(lines).toHaveLength(2);
+      expect(lines[0]).toMatchObject({
+        kind: 'CREDIT',
+        sourceLineId: seeded.prodLineId,
+        unitPriceHtCents: 100,
+        taxAmountCents: 20,
+        totalTtcCents: 120,
+      });
+      expect(Number(lines[0].taxRatePercent)).toBe(20);
+      expect(lines[1]).toMatchObject({
+        kind: 'CREDIT',
+        sourceLineId: seeded.fraisLineId,
+        unitPriceHtCents: 20,
+        taxAmountCents: 0,
+        totalTtcCents: 20,
+      });
+      expect(Number(lines[1].taxRatePercent)).toBe(0); // frais NON taxés
+      // somme des lignes = totaux de la pièce
+      expect(lines.reduce((s, l) => s + l.unitPriceHtCents, 0)).toBe(
+        note.amountHtCents,
+      );
+      expect(lines.reduce((s, l) => s + l.taxAmountCents, 0)).toBe(
+        note.taxAmountCents,
+      );
+      expect(lines.reduce((s, l) => s + l.totalTtcCents, 0)).toBe(
+        note.amountTtcCents,
+      );
+
+      // cumul RÉUSSI = encaissé → bascules
+      const order = await prisma.order.findUniqueOrThrow({
+        where: { id: seeded.orderId },
+      });
+      expect(order.status).toBe(OrderStatus.REFUNDED);
+      const origin = await prisma.invoice.findUniqueOrThrow({
+        where: { id: seeded.invoiceId },
+      });
+      expect(origin.status).toBe(InvoiceStatus.CREDITED);
+    });
+
+    it('J2 — remboursements partiels successifs : 2 pièces, sommes exactes, PDF du 1er conservé, plafond', async () => {
+      const seeded = await seedMixedOrder('jpart');
+      const balanceBefore = await balanceOf();
+
+      // Pièce A — 70 : fraction de la ligne produit (taxe 12, HT 58)
+      const resA = await postRefund(
+        seeded.orderId,
+        refundBody({ amountCents: 70, issueCreditNote: true, reason: 'Partiel 1' }),
+        `q9-j2a-${stamp}`,
+      ).expect(201);
+      const noteAId = resA.body.creditNoteInvoiceId as string;
+      const noteA = await prisma.invoice.findUniqueOrThrow({
+        where: { id: noteAId },
+      });
+      expect(noteA.amountTtcCents).toBe(70);
+      expect(noteA.amountHtCents).toBe(58);
+      expect(noteA.taxAmountCents).toBe(12);
+      expect(noteA.status).toBe(InvoiceStatus.CREDITED);
+
+      // PDF de la pièce A émis (admin) — référence de conservation.
+      const pdfA = await request(app.getHttpServer())
+        .get(`/${GlobalPrefix}/store/admin/invoices/${noteAId}/pdf`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .expect(200);
+      expect(pdfA.headers['content-type']).toContain('application/pdf');
+      const aSnapshot = await prisma.invoice.findUniqueOrThrow({
+        where: { id: noteAId },
+        select: { pdfPath: true, pdfRenderedStatus: true },
+      });
+      expect(aSnapshot.pdfPath).toBeTruthy();
+
+      // Pièce B — 70 : restes EXACTS (produit 50/8 + frais 20/0)
+      const resB = await postRefund(
+        seeded.orderId,
+        refundBody({ amountCents: 70, issueCreditNote: true, reason: 'Partiel 2' }),
+        `q9-j2b-${stamp}`,
+      ).expect(201);
+      expect(resB.body.creditNoteInvoiceId).not.toBe(noteAId); // pièces distinctes
+      const noteB = await prisma.invoice.findUniqueOrThrow({
+        where: { id: resB.body.creditNoteInvoiceId as string },
+      });
+      expect(noteB.amountTtcCents).toBe(70);
+      expect(noteB.amountHtCents).toBe(62);
+      expect(noteB.taxAmountCents).toBe(8);
+
+      // La pièce A n'a SUBI AUCUNE mutation : totaux + PDF conservés.
+      const noteAAfter = await prisma.invoice.findUniqueOrThrow({
+        where: { id: noteAId },
+      });
+      expect(noteAAfter.amountTtcCents).toBe(70);
+      expect(noteAAfter.amountHtCents).toBe(58);
+      expect(noteAAfter.taxAmountCents).toBe(12);
+      expect(noteAAfter.pdfPath).toBe(aSnapshot.pdfPath);
+      expect(noteAAfter.pdfRenderedStatus).toBe(aSnapshot.pdfRenderedStatus);
+
+      // Somme des lignes des 2 pièces = totaux = encaissé (zéro dérive).
+      const notes = await prisma.invoice.findMany({
+        where: { creditNoteOfId: seeded.invoiceId },
+      });
+      expect(notes).toHaveLength(2);
+      const lines = await prisma.invoiceLine.findMany({
+        where: { invoiceId: { in: notes.map((n) => n.id) } },
+      });
+      expect(lines).toHaveLength(3); // 1 ligne (pièce A) + 2 lignes (pièce B)
+      expect(lines.reduce((s, l) => s + l.totalTtcCents, 0)).toBe(140);
+      expect(lines.reduce((s, l) => s + l.taxAmountCents, 0)).toBe(20);
+      expect(lines.reduce((s, l) => s + l.unitPriceHtCents, 0)).toBe(120);
+      expect(notes.reduce((s, n) => s + n.amountTtcCents, 0)).toBe(140);
+      expect(await balanceOf()).toBe(balanceBefore + 140);
+
+      // Plafond (par pièce émise comme au global) : tout dépassement = 409.
+      const over = await postRefund(
+        seeded.orderId,
+        refundBody({ amountCents: 1, issueCreditNote: true }),
+        `q9-j2c-${stamp}`,
+      );
+      expect(over.status).toBe(409);
+      expect(over.body.message).toContain('Plafond');
+      expect(
+        await prisma.invoice.count({ where: { creditNoteOfId: seeded.invoiceId } }),
+      ).toBe(2); // zéro pièce créée sur refus
     });
   });
 

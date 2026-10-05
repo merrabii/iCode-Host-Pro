@@ -8,19 +8,21 @@ import {
 import { JwtPayload } from '../auth/types';
 import {
   RefundService,
+  allocateCreditLines,
   assertRefundIdempotencyKey,
-  creditNoteSplit,
   refundCapExceeded,
   refundIdentityMatches,
 } from './refund.service';
 
 // GO Q9 — unitaires des fondations remboursements/avoirs :
-// A. identité d'idempotence, B. plafond, C. découpage d'avoir,
-// D. contrat du header Idempotency-Key, E. interne (wallet + avoir) sous mocks,
-// F. rejeu sans second effet, G. externe = PENDING sans wallet (jamais de
+// A. identité d'idempotence, B. plafond, C. allocation d'une pièce d'avoir
+//    sur les lignes source (GO P5 : taxe par ligne, restes exacts), D. contrat
+//    du header Idempotency-Key, E. interne (wallet + avoir) sous mocks,
+//    F. rejeu sans second effet, G. externe = PENDING sans wallet (jamais de
 //    succès sans confirmation réelle), H. machine d'état de confirmation
 //    prestataire = SIMULATION étiquetée (preuve de simulation, distincte
-//    d'une validation prestataire réelle).
+//    d'une validation prestataire réelle), E2. GO P4/P5 : statuts sur le
+//    cumul RÉUSSI, une PIÈCE par remboursement (aucun cumul sur pièce émise).
 describe('RefundService (GO Q9 — remboursements et avoirs)', () => {
   const actor: JwtPayload = {
     sub: 'admin-1',
@@ -47,13 +49,15 @@ describe('RefundService (GO Q9 — remboursements et avoirs)', () => {
         updateMany: jest.fn(),
       },
       invoice: {
-        findFirst: jest.fn(),
         findUnique: jest.fn(),
         create: jest.fn(),
-        update: jest.fn(),
         updateMany: jest.fn(),
       },
-      invoiceLine: { create: jest.fn(), count: jest.fn().mockResolvedValue(0) },
+      invoiceLine: {
+        create: jest.fn(),
+        findMany: jest.fn(),
+        groupBy: jest.fn(),
+      },
       order: { updateMany: jest.fn() },
       walletTransaction: { findUnique: jest.fn() },
       billingSetting: { findFirst: jest.fn() },
@@ -99,6 +103,7 @@ describe('RefundService (GO Q9 — remboursements et avoirs)', () => {
       taxRatePercent: 15,
       customerId: 'cust-1',
       legalMentionsSnapshot: { legalName: 'ACME' },
+      billingAddress: { name: 'Membre Q9', email: 'member@test.local' },
     };
   }
 
@@ -154,24 +159,124 @@ describe('RefundService (GO Q9 — remboursements et avoirs)', () => {
     });
   });
 
-  // ── C. découpage HT/taxe d’un avoir ────────────────────────────────────
-  describe('creditNoteSplit (C)', () => {
-    it('sans taxe : HT = TTC', () => {
-      expect(creditNoteSplit(1000, 0)).toEqual({ ht: 1000, tax: 0 });
+  // ── C. GO P5 : allocation d’une pièce sur les lignes source ────────────
+  describe('allocateCreditLines (C — GO P5)', () => {
+    const mixedLines = [
+      {
+        id: 'src-prod',
+        label: 'Produit',
+        taxRatePercent: 20,
+        taxAmountCents: 20,
+        totalTtcCents: 120,
+        sortOrder: 0,
+      },
+      {
+        id: 'src-frais',
+        label: 'Frais de dossier',
+        taxRatePercent: 0,
+        taxAmountCents: 0,
+        totalTtcCents: 20,
+        sortOrder: 1,
+      },
+    ];
+    const none = new Map<string, { ttc: number; tax: number }>();
+
+    it('GO P5 : intégral 140 (HT 100 + taxe 20 + frais 20) → taxe 20, PAS 23,33', () => {
+      const out = allocateCreditLines(mixedLines, none, 140);
+      expect(out.ttc).toBe(140);
+      expect(out.tax).toBe(20);
+      expect(out.ht).toBe(120);
+      expect(out.ht + out.tax).toBe(out.ttc);
+      expect(out.lines).toHaveLength(2);
+      expect(out.lines[0]).toMatchObject({
+        sourceLineId: 'src-prod',
+        taxRatePercent: 20,
+        unitPriceHtCents: 100,
+        taxAmountCents: 20,
+        totalTtcCents: 120,
+      });
+      expect(out.lines[1]).toMatchObject({
+        sourceLineId: 'src-frais',
+        taxRatePercent: 0,
+        unitPriceHtCents: 20,
+        taxAmountCents: 0,
+        totalTtcCents: 20,
+      });
+      // Un taux global (20 % de 140 TTC = 23,33) serait FAUSSE : les frais
+      // ne sont pas taxés. Plus aucun découpage par taux global (GO P5).
+      expect(out.tax).not.toBe(23);
     });
 
-    it('taxe 15 % : arrondi au centime, HT + taxe = TTC', () => {
-      expect(creditNoteSplit(1000, 15)).toEqual({ ht: 870, tax: 130 });
-      expect(creditNoteSplit(10000, 15)).toEqual({ ht: 8696, tax: 1304 });
-      const s = creditNoteSplit(999, 15);
-      expect(s.ht + s.tax).toBe(999);
+    it('fractions successives : somme des pièces = totaux source (zéro dérive)', () => {
+      const first = allocateCreditLines(mixedLines, none, 70);
+      expect(first.ttc).toBe(70);
+      expect(first.lines[0]).toMatchObject({
+        totalTtcCents: 70,
+        taxAmountCents: 12, // round(20 × 70 / 120)
+        unitPriceHtCents: 58,
+      });
+      // 2e pièce : restes (ligne 1 = 50 TTC / 8 taxe, puis frais 20)
+      const credited = new Map([['src-prod', { ttc: 70, tax: 12 }]]);
+      const second = allocateCreditLines(mixedLines, credited, 70);
+      expect(second.ttc).toBe(70);
+      expect(second.ht + second.tax).toBe(70);
+      expect(first.ht + second.ht).toBe(120);
+      expect(first.tax + second.tax).toBe(20);
+      expect(first.ttc + second.ttc).toBe(140);
     });
 
-    it('taxe 19 % : arrondi au centime, HT + taxe = TTC', () => {
-      const s = creditNoteSplit(1000, 19);
-      expect(s.tax).toBe(160);
-      expect(s.ht).toBe(840);
-      expect(s.ht + s.tax).toBe(1000);
+    it('couverture totale après arrondi partiel : reste EXACT (taxe 196)', () => {
+      const line = [
+        {
+          id: 'src-15',
+          label: 'Licence',
+          taxRatePercent: 15,
+          taxAmountCents: 196,
+          totalTtcCents: 1500,
+          sortOrder: 0,
+        },
+      ];
+      const first = allocateCreditLines(line, none, 1000);
+      expect(first.tax).toBe(131); // round(196 × 1000 / 1500)
+      expect(first.ht).toBe(869);
+      const credited = new Map([['src-15', { ttc: 1000, tax: 131 }]]);
+      const second = allocateCreditLines(line, credited, 500);
+      expect(second.ttc).toBe(500);
+      expect(second.tax).toBe(65); // reste EXACT 196 − 131
+      expect(second.ht).toBe(435);
+      expect(first.tax + second.tax).toBe(196);
+      expect(first.ht + second.ht).toBe(1304);
+    });
+
+    it('montant supérieur aux lignes restantes : ConflictException', () => {
+      expect(() => allocateCreditLines(mixedLines, none, 141)).toThrow(
+        ConflictException,
+      );
+      const creditedAll = new Map([
+        ['src-prod', { ttc: 120, tax: 20 }],
+        ['src-frais', { ttc: 20, tax: 0 }],
+      ]);
+      expect(() => allocateCreditLines(mixedLines, creditedAll, 1)).toThrow(
+        ConflictException,
+      );
+    });
+
+    it('lignes intégralement recréditées sautées, tri sortOrder respecté', () => {
+      const credited = new Map([['src-prod', { ttc: 120, tax: 20 }]]);
+      const out = allocateCreditLines(mixedLines, credited, 20);
+      expect(out.lines).toHaveLength(1);
+      expect(out.lines[0]).toMatchObject({
+        sourceLineId: 'src-frais',
+        totalTtcCents: 20,
+        taxAmountCents: 0,
+        sortOrder: 0,
+      });
+      const shuffled = [mixedLines[1], mixedLines[0]];
+      const out2 = allocateCreditLines(shuffled, none, 140);
+      expect(out2.lines.map((l) => l.sourceLineId)).toEqual([
+        'src-prod',
+        'src-frais',
+      ]);
     });
   });
 
@@ -209,6 +314,17 @@ describe('RefundService (GO Q9 — remboursements et avoirs)', () => {
       tx.refund.findUnique.mockResolvedValue(null);
       tx.refund.aggregate.mockResolvedValue({ _sum: { amountCents: 500 } });
       tx.invoice.findUnique.mockResolvedValue(originInvoice());
+      tx.invoiceLine.findMany.mockResolvedValue([
+        {
+          id: 'il-1',
+          label: 'Licence Q9',
+          taxRatePercent: 15,
+          taxAmountCents: 196,
+          totalTtcCents: 1500,
+          sortOrder: 0,
+        },
+      ]);
+      tx.invoiceLine.groupBy.mockResolvedValue([]); // rien de recrédité encore
       tx.refund.create.mockResolvedValue({ id: 'rf-1' });
       tx.invoice.create.mockResolvedValue({ id: 'inv-av-1' });
       tx.walletTransaction.findUnique.mockResolvedValue({ id: 'wt-1' });
@@ -245,15 +361,17 @@ describe('RefundService (GO Q9 — remboursements et avoirs)', () => {
         type: WalletTransactionType.REFUND,
       });
 
-      // avoir : facture AV- liée, statut CREDITED, ligne CREDIT
+      // avoir : UNE PIÈCE AV- liée (GO P5), montants depuis la ligne source
       expect(tx.invoice.create).toHaveBeenCalledTimes(1);
       expect(tx.invoice.create.mock.calls[0][0].data).toMatchObject({
         number: expect.stringMatching(/^AV-/),
         status: 'CREDITED',
         creditNoteOfId: 'inv-1',
         amountTtcCents: 1000,
-        amountHtCents: 870,
-        taxAmountCents: 130,
+        // fraction 1000/1500 de la ligne (taxe 196) : round → 131, HT = 869
+        amountHtCents: 869,
+        taxAmountCents: 131,
+        billingAddress: { name: 'Membre Q9', email: 'member@test.local' },
       });
       // l'avoir n'est rattaché à AUCUNE commande (facture de crédit standalone)
       expect(tx.invoice.create.mock.calls[0][0].data).not.toHaveProperty(
@@ -262,6 +380,8 @@ describe('RefundService (GO Q9 — remboursements et avoirs)', () => {
       expect(tx.invoiceLine.create.mock.calls[0][0].data).toMatchObject({
         kind: 'CREDIT',
         totalTtcCents: 1000,
+        sourceLineId: 'il-1', // pièce LIÉE à sa ligne source (GO P5)
+        taxRatePercent: 15,
       });
 
       // cumul complet → origine CREDITED (CAS PAID uniquement), commande REFUNDED
@@ -390,6 +510,127 @@ describe('RefundService (GO Q9 — remboursements et avoirs)', () => {
         expect.objectContaining({
           where: { id: 'ord-1', status: OrderStatus.PAID },
           data: { status: OrderStatus.REFUNDED },
+        }),
+      );
+    });
+  });
+
+  // ── E3. GO P5 : UNE PIÈCE par remboursement, pièce émise intacte ───────
+  describe('createRefund — pièces d’avoir distinctes (P5)', () => {
+    function setupSecondRefund() {
+      const { service, tx, audit } = makeService();
+      tx.$queryRaw
+        .mockResolvedValueOnce(paidOrderRow()) // verrou commande FOR UPDATE
+        .mockResolvedValueOnce([{ next: 51 }]); // UPDATE … RETURNING (séquence)
+      tx.billingSetting.findFirst.mockResolvedValue({
+        id: 'billing-settings',
+        currency: 'USD',
+        invoiceSequence: 50,
+      });
+      tx.refund.findUnique.mockResolvedValue(null);
+      tx.refund.aggregate
+        .mockResolvedValueOnce({ _sum: { amountCents: 1000 } }) // engagé
+        .mockResolvedValueOnce({ _sum: { amountCents: 1000 } }); // réussi
+      tx.invoice.findUnique.mockResolvedValue(originInvoice());
+      tx.invoiceLine.findMany.mockResolvedValue([
+        {
+          id: 'il-1',
+          label: 'Licence Q9',
+          taxRatePercent: 15,
+          taxAmountCents: 196,
+          totalTtcCents: 1500,
+          sortOrder: 0,
+        },
+      ]);
+      // 1re pièce (1000 TTC, taxe 131) déjà émise sur la ligne source.
+      tx.invoiceLine.groupBy.mockResolvedValue([
+        {
+          sourceLineId: 'il-1',
+          _sum: { totalTtcCents: 1000, taxAmountCents: 131 },
+        },
+      ]);
+      tx.refund.create.mockResolvedValue({ id: 'rf-p5-2' });
+      tx.invoice.create.mockResolvedValue({ id: 'inv-av-p5-2' });
+      tx.walletTransaction.findUnique.mockResolvedValue({ id: 'wt-p5-2' });
+      tx.order.updateMany.mockResolvedValue({ count: 1 });
+      tx.invoice.updateMany.mockResolvedValue({ count: 1 });
+      tx.refund.update.mockImplementation(
+        async ({ data }: { data: Record<string, unknown> }) => ({
+          id: 'rf-p5-2',
+          ...data,
+        }),
+      );
+      return { service, tx, audit };
+    }
+
+    it('2e remboursement : NOUVELLE pièce AV- liée, montants = restes EXACTS', async () => {
+      const { service, tx } = setupSecondRefund();
+
+      const view = await service.createRefund(
+        'ord-1',
+        {
+          amountCents: 500,
+          kind: RefundKind.WALLET_CREDIT,
+          issueCreditNote: true,
+          reason: 'Solde',
+        },
+        'refund-key-p5-0001',
+        actor,
+      );
+
+      expect(view.creditNoteInvoiceId).toBe('inv-av-p5-2');
+      expect(view.creditNoteInvoiceId).not.toBe('inv-av-1'); // pièce DISTINCTE
+      expect(tx.invoice.create).toHaveBeenCalledTimes(1);
+      expect(tx.invoice.create.mock.calls[0][0].data).toMatchObject({
+        number: expect.stringMatching(/^AV-/),
+        creditNoteOfId: 'inv-1',
+        // restes : TTC 1500−1000 = 500, taxe 196−131 = 65, HT 1304−869 = 435
+        amountTtcCents: 500,
+        amountHtCents: 435,
+        taxAmountCents: 65,
+        billingAddress: { name: 'Membre Q9', email: 'member@test.local' },
+      });
+      // AUCUNE mutation d'un avoir déjà émis : makeTx n'expose même plus
+      // invoice.update/invoice.updateMany de PIÈCE — un appel = crash.
+      expect(tx.invoiceLine.create.mock.calls[0][0].data).toMatchObject({
+        kind: 'CREDIT',
+        sourceLineId: 'il-1',
+        totalTtcCents: 500,
+        taxAmountCents: 65,
+      });
+      // cumul RÉUSSI = encaissé → origine CREDITED + commande REFUNDED
+      expect(tx.invoice.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 'inv-1', status: 'PAID' },
+          data: { status: 'CREDITED' },
+        }),
+      );
+      expect(tx.order.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: { status: OrderStatus.REFUNDED },
+        }),
+      );
+    });
+
+    it('groupBy cible les lignes SOURCE de la facture (restes recalculés)', async () => {
+      const { service, tx } = setupSecondRefund();
+
+      await service.createRefund(
+        'ord-1',
+        { amountCents: 500, kind: RefundKind.WALLET_CREDIT, issueCreditNote: true },
+        'refund-key-p5-0002',
+        actor,
+      );
+
+      expect(tx.invoiceLine.groupBy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          by: ['sourceLineId'],
+          where: { sourceLineId: { in: ['il-1'] } },
+        }),
+      );
+      expect(tx.invoiceLine.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { invoiceId: 'inv-1', sourceLineId: null },
         }),
       );
     });

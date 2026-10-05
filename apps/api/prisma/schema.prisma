@@ -1414,7 +1414,7 @@ model Refund {
   idempotencyKey      String           @unique // clé fournie par l'admin (header Idempotency-Key)
   walletTransactionId String?          @unique // trace du crédit wallet (interne)
   walletTransaction   WalletTransaction? @relation(fields: [walletTransactionId], references: [id], onDelete: SetNull)
-  creditNoteInvoiceId String?          // avoir visé (NON unique : plusieurs remboursements cumulent le MÊME avoir ; un seul avoir/facture via creditNoteOfId)
+  creditNoteInvoiceId String?          // pièce d'avoir émise pour CE remboursement (GO P5 : une pièce par remboursement, liée via creditNoteOfId)
   creditNoteInvoice   Invoice?         @relation("RefundCreditNote", fields: [creditNoteInvoiceId], references: [id], onDelete: SetNull)
   providerRef         String? // référence prestataire — null tant que non confirmé RÉELLEMENT
   createdByUserId     String?
@@ -1588,7 +1588,7 @@ model Invoice {
   // courant est rendu avec le statut ACTUEL de la facture ; il est re-généré
   // dès que `status` change (les données d'émission, elles, restent figées).
   pdfRenderedStatus         String?
-  creditNoteOfId            String?       @unique // avoir émis sur cette facture
+  creditNoteOfId            String? // GO P5 : PLUSIEURS avoirs possibles sur cette facture (pièces distinctes, jamais augmentées)
   creditNoteOf              Invoice?      @relation("CreditNote", fields: [creditNoteOfId], references: [id], onDelete: SetNull)
   legalMentionsSnapshot     Json? // mentions légales au moment de l'émission
   billingAddress            Json? // adresse facturation (snapshot)
@@ -1604,6 +1604,7 @@ model Invoice {
   @@index([customerId])
   @@index([status])
   @@index([subscriptionId])
+  @@index([creditNoteOfId])
 }
 
 model InvoiceLine {
@@ -1618,8 +1619,12 @@ model InvoiceLine {
   taxAmountCents  Int
   totalTtcCents   Int
   sortOrder       Int             @default(0)
+  // GO P5 — ligne source recréditée par cette pièce de crédit : le lien
+  // direct permet de calculer les restes fiscaux EXACTS par ligne.
+  sourceLineId    String?
 
   @@index([invoiceId])
+  @@index([sourceLineId])
 }
 
 // ── Logs de provisioning d'une commande ────────────────────────────────────
