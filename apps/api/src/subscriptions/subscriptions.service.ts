@@ -411,12 +411,13 @@ export class SubscriptionsService {
       // Seules les VRAIES paires (SUSPENDRE / RÉACTIVER) basculent les
       // services : PENDING→ACTIVE (approbation) ne touche aucune app.
       if (cur.status === SubscriptionStatus.ACTIVE && transition.to === SubscriptionStatus.SUSPENDED) {
-        await applyHostingStatusInTx(tx, id, 'ACTIVE', 'SUSPENDED');
+        // Q12-P3 : repli orderId (service legacy sans subscriptionId).
+        await applyHostingStatusInTx(tx, id, 'ACTIVE', 'SUSPENDED', [cur.orderId]);
       } else if (
         cur.status === SubscriptionStatus.SUSPENDED &&
         transition.to === SubscriptionStatus.ACTIVE
       ) {
-        await applyHostingStatusInTx(tx, id, 'SUSPENDED', 'ACTIVE');
+        await applyHostingStatusInTx(tx, id, 'SUSPENDED', 'ACTIVE', [cur.orderId]);
       }
       return {
         raced: false as const,

@@ -322,7 +322,10 @@ describe('SubscriptionsService', () => {
         data: { status: 'SUSPENDED' },
       });
       expect(tx.hostingService.updateMany).toHaveBeenCalledWith({
-        where: { subscriptionId: 's1', status: 'ACTIVE' },
+        where: {
+          status: 'ACTIVE',
+          OR: [{ subscriptionId: 's1' }, { orderId: { in: ['ord-1'] } }],
+        },
         data: { status: 'SUSPENDED' },
       });
       expect(mockPrisma.subscription.updateMany).not.toHaveBeenCalled(); // jamais hors TX
@@ -359,7 +362,10 @@ describe('SubscriptionsService', () => {
       const out = await service.updateSubscription('s1', { status: 'ACTIVE' }, admin);
 
       expect(tx.hostingService.updateMany).toHaveBeenCalledWith({
-        where: { subscriptionId: 's1', status: 'SUSPENDED' },
+        where: {
+          status: 'SUSPENDED',
+          OR: [{ subscriptionId: 's1' }, { orderId: { in: ['ord-1'] } }],
+        },
         data: { status: 'ACTIVE' },
       });
       expect(mockEffects.resumeApps).toHaveBeenCalledWith({

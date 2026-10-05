@@ -20,12 +20,20 @@ import {
  * d'erreur. Utilisé par la suspension automatique (RenewalService) ET par les
  * transitions admin (SubscriptionsService) pour que statut abonnement et statut
  * service ne divergent JAMAIS.
+ *
+ * Q12-P3 — résolution abonnement → service « réelle » : `subscriptionId` POSÉ
+ * à la création C3 (checkout) MAIS nullable sur les lignes legacy (créées avant
+ * le lien) — on match donc `subscriptionId = X` OU `orderId ∈ (ordres de
+ * l'abonnement)`. Un service n'appartient qu'à SON abonnement (orderId est
+ * unique 1:1, renouvellements/upgrade de la MÊME chaîne) : aucun service d'un
+ * autre abonnement n'est touché.
  */
 export async function applyHostingStatusInTx(
   tx: Prisma.TransactionClient,
   subscriptionId: string,
   from: HostingServiceStatus,
   to: HostingServiceStatus,
+  orderIds: Array<string | null> = [],
 ): Promise<number> {
   const tables = await tx.$queryRaw<Array<{ exists: boolean }>>`
     SELECT EXISTS (
@@ -33,8 +41,12 @@ export async function applyHostingStatusInTx(
       WHERE table_schema = current_schema() AND table_name = 'HostingService'
     ) AS "exists"`;
   if (!tables[0]?.exists) return 0;
+  const ownOrders = [...new Set(orderIds.filter((v): v is string => !!v))];
   const cas = await tx.hostingService.updateMany({
-    where: { subscriptionId, status: from },
+    where: {
+      status: from,
+      OR: [{ subscriptionId }, ...(ownOrders.length > 0 ? [{ orderId: { in: ownOrders } }] : [])],
+    },
     data: { status: to },
   });
   return cas.count;
@@ -50,15 +62,27 @@ export async function applyHostingStatusInTx(
  *    suppression de ressources ni de données** (jamais `deleteApplication`) ;
  *  - **Réactivation contrôlée** = relance (`startApplication`), sans double
  *    facturation (aucune écriture de facture ici) ;
+ *  - **Résolution réelle (Q12-P3)** : abonnement → service via
+ *    `subscriptionId`/`orderId` réels (lignes legacy sans lien comprises) ;
+ *    service → apps via les **allocations persistantes** (modèle C2, `Deployment
+ *    .hostingServiceId` NULL) en plus des liens directs — jamais « le dernier
+ *    abonnement actif » du compte ;
  *  - **Respect du protocole C4** : sous `HOSTING_C4_ENABLED=true`, chaque
- *    dispatch est une tentative durable `CONFIGURE` (`beginDispatch` refuse si
- *    un arrêt/C4 est opposable, la consignation `settle` trace l'issue) ;
- *    sous OFF : appel direct + catch best-effort (contrat historique) ;
+ *    dispatch est une tentative durable `CONFIGURE` (avec allocation de l'app :
+ *    au plus un dispatch créatif ouvert par app — arrêt/reprise concurrents
+ *    sur provider lent → second refusé explicitement) ; `beginDispatch`
+ *    refuse si un arrêt est opposable ou un créateur non résolu ; la
+ *    consignation `settle` trace l'issue — **timeout/échec réseau = outcome
+ *    `UNKNOWN`** (ambiguïté durable, modèle C4) ; **succès provider non
+ *    consigné = JAMAIS `done`** (tentative laissée DISPATCHED) ; sous OFF :
+ *    appel direct + catch best-effort (contrat historique, AUCUNE table C4) ;
  *  - **Capacité provider manquante** (panneau non Coolify, jeton illisible…) →
  *    blocage EXPLICITE comptabilisé (`blocked`) + audit, jamais de faux succès ;
  *  - **Échecs visibles et récupérables** : chaque échec/blocage est audité
  *    (`suspension.app_*`), le recompte est renvoyé à l'appelant (admin), et une
- *    nouvelle action (suspendre/réactiver à nouveau) rejoue l'effet ;
+ *    nouvelle action rejoue l'effet — sauf sous C4 où une tentative encore
+ *    ouverte/`UNKNOWN` bloque le re-dispatch (incertitude conservée, résolution
+ *    par le support) ;
  *  - Jamais d'appel réseau dans la transaction métier (post-commit uniquement).
  */
 
@@ -109,27 +133,63 @@ export class SuspensionEffectsService {
 
   // ──────────────────────────── moteur ──────────────────────────────────────
 
+  /**
+   * Q12-P3 — résolution « réelle » :
+   *  - abonnement → service : `subscriptionId` (posé à la création C3) OU
+   *    `orderId` des ordres de l'abonnement (lignes legacy sans lien) ;
+   *  - service → apps : allocations persistantes `HostingServiceAllocation`
+   *    (modèle C2 : `Deployment.hostingServiceId` reste NULL « transition »),
+   *    puis les liens directs (`hostingServiceId` / `orderId`) en complément.
+   *    Aucun réseau dans le scan — seuls les déploiements à `coolifyUuid`
+   *    non null rattachés au SEUL abonnement demandé sont considérés.
+   */
   private async run(
     op: Op,
     params: { subscriptionId: string; holder: string; orderId?: string | null },
   ): Promise<SuspensionEffectsSummary> {
+    const sub = await this.prisma.subscription.findUnique({
+      where: { id: params.subscriptionId },
+      select: { orderId: true },
+    });
+    const subOrderIds = [
+      ...new Set(
+        [sub?.orderId ?? null, params.orderId ?? null].filter(
+          (v): v is string => !!v,
+        ),
+      ),
+    ];
     const services = await this.prisma.hostingService.findMany({
-      where: { subscriptionId: params.subscriptionId },
+      where: {
+        OR: [
+          { subscriptionId: params.subscriptionId },
+          ...(subOrderIds.length > 0 ? [{ orderId: { in: subOrderIds } }] : []),
+        ],
+      },
       select: { id: true, orderId: true },
     });
     if (services.length === 0) return { ...EMPTY };
     const serviceIds = services.map((s) => s.id);
     const orderIds = [
       ...new Set(
-        [...services.map((s) => s.orderId), params.orderId ?? null].filter(
+        [...services.map((s) => s.orderId), ...subOrderIds].filter(
           (v): v is string => !!v,
         ),
+      ),
+    ];
+    const allocations = await this.prisma.hostingServiceAllocation.findMany({
+      where: { hostingServiceId: { in: serviceIds }, deploymentId: { not: null } },
+      select: { deploymentId: true },
+    });
+    const allocatedDepIds = [
+      ...new Set(
+        allocations.map((a) => a.deploymentId).filter((v): v is string => !!v),
       ),
     ];
     const deps = await this.prisma.deployment.findMany({
       where: {
         coolifyUuid: { not: null },
         OR: [
+          ...(allocatedDepIds.length > 0 ? [{ id: { in: allocatedDepIds } }] : []),
           { hostingServiceId: { in: serviceIds } },
           ...(orderIds.length > 0 ? [{ orderId: { in: orderIds } }] : []),
         ],
@@ -200,21 +260,31 @@ export class SuspensionEffectsService {
     }
 
     // ── C4 (sous ON) : tentative durable AVANT le dispatch ──────────────────
+    // Q12-P3 : la tentative porte l'allocation de l'app (modèle C2) — la garde
+    // « au plus une tentative de création ouverte par allocation » serialize
+    // alors un arrêt et une reprise CONCURRENTS sur un provider lent (le
+    // second dispatch est refusé explicitement, jamais de course provider).
     const c4Enabled = isHostingC4Enabled();
     let attemptId: string | null = null;
     if (c4Enabled) {
       try {
+        const allocation = await this.prisma.hostingServiceAllocation.findFirst({
+          where: { deploymentId: p.deploymentId },
+          select: { id: true },
+        });
         const ticket = await this.c4.beginDispatchStandalone({
           nature: 'CONFIGURE',
           scope: { type: 'DEPLOYMENT', id: p.deploymentId },
+          allocationId: allocation?.id ?? null,
           holder: p.holder,
           orderId: p.orderId,
           targetIntent: { type: 'application', op, uuid: p.uuid },
         });
         attemptId = ticket.attemptId;
       } catch (err) {
-        // Refus C4 (arrêt opposable, tentative déjà ouverte…) → blocage
-        // explicite de CET action, les autres corrections continuent.
+        // Refus C4 (arrêt opposable, tentative déjà ouverte, créateur non
+        // résolu…) → blocage explicite de CET action, les autres corrections
+        // continuent.
         const msg = err instanceof Error ? err.message : String(err);
         const conflict = err instanceof ConflictException;
         if (conflict) return this.recordBlock(op, p, 'c4_refuse', msg);
@@ -229,7 +299,20 @@ export class SuspensionEffectsService {
       if (op === 'stop') await transport.stopApplication(target, p.uuid);
       else await transport.startApplication(target, p.uuid);
       if (attemptId) {
-        await this.c4.settleStandalone({ attemptId, holder: p.holder, outcome: 'SUCCESS' });
+        try {
+          await this.c4.settleStandalone({ attemptId, holder: p.holder, outcome: 'SUCCESS' });
+        } catch (e) {
+          // Succès provider NON consigné (TX de settle annulée) : la tentative
+          // reste DISPATCHED (incertitude conservée par contrat C4) et JAMAIS
+          // ce succès n'est requalifié `done` — échec visible + audité.
+          this.log.warn(`settle SUCCESS ${op} dep=${p.deploymentId} failed: ${String(e)}`);
+          return this.recordFail(
+            op,
+            p,
+            'Succès provider non consigné (consignation en échec) — tentative laissée ouverte.',
+            'failed',
+          );
+        }
       }
       return 'done';
     } catch (err) {
@@ -240,11 +323,16 @@ export class SuspensionEffectsService {
         /non disponible pour ce fournisseur|Coolify uniquement/i.test(msg) ||
         /indéchiffrable|ENCRYPTION_KEY/i.test(msg);
       if (attemptId) {
+        // Q12-P3 : timeout/échec réseau = RÉSULTAT AMBIGU (pas de preuve
+        // d'échec définitif) → outcome `UNKNOWN` durable (modèle C4 des
+        // dispatchs deployments/provisioning) ; capacité absente = échec
+        // connu → `PERMANENT_FAILURE`. Si la settle échoue elle-même, la
+        // tentative reste DISPATCHED (incertitude toujours conservée).
         await this.c4
           .settleStandalone({
             attemptId,
             holder: p.holder,
-            outcome: capability ? 'PERMANENT_FAILURE' : 'FAILED_RETRYABLE',
+            outcome: capability ? 'PERMANENT_FAILURE' : 'UNKNOWN',
           })
           .catch((e) =>
             this.log.warn(`settle ${op} dep=${p.deploymentId} failed: ${String(e)}`),

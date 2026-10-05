@@ -868,11 +868,14 @@ export class RenewalService implements OnModuleInit, OnModuleDestroy {
 
         // 5. Services hébergement de CET abonnement, MÊME transaction
         //    (probe schéma : base pré-C1 sans table → skip, jamais d'erreur).
+        //    Q12-P3 : `subscriptionId` legacy NULL → repli sur les ORDRES de
+        //    l'abonnement (facture + abonnement), jamais un autre abonnement.
         await applyHostingStatusInTx(
           tx,
           subId,
           'ACTIVE',
           'SUSPENDED',
+          [row.orderId, sub.orderId],
         );
 
         return { subId, orderId: row.orderId ?? sub.orderId };

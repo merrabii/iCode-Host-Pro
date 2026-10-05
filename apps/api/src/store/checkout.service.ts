@@ -1007,6 +1007,11 @@ export class CheckoutService {
             data: {
               userId,
               orderId: order.id,
+              // Q12-P3 : le lien ABBONEMENT → service est posé DÈS la création
+              // C3 (même transaction que la confirmation). Sans lui, tout
+              // basculement de suspension résolvait « subscriptionId » null :
+              // le service hébergement ne suivait JAMAIS l'abonnement.
+              subscriptionId: subId,
               productId: order.productId,
               packId: order.packId,
               deploymentModuleId: catalog.pack.deploymentModuleId ?? null,

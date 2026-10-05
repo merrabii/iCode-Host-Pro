@@ -470,7 +470,10 @@ describe('checkout C3 (17B.4F-C3) + confirmation de paiement', () => {
       data: expect.objectContaining({ userId: 'u1', orderId: 'ord-new' }),
     });
     expect(tx.hostingService.create).toHaveBeenCalledWith({
-      data: expect.objectContaining({ userId: 'u1' }),
+      data: expect.objectContaining({ userId: 'u1', subscriptionId: expect.any(String) }),
+    });
+    expect(tx.hostingService.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({ userId: 'u1', orderId: 'ord-new' }),
     });
   });
 

@@ -553,6 +553,9 @@ describe('RenewalService (D2 — échéances, renouvellement, dunning)', () => {
         .mockResolvedValue([{ exists: opts.probe ?? false }]), // sonde HostingService
       subscription: {
         findFirst: jest.fn(async () => opts.subResolve ?? null),
+        findUnique: jest.fn(async () =>
+          opts.subRow ? { orderId: (opts.subRow as { orderId?: string | null }).orderId ?? null } : null,
+        ),
         updateMany: jest.fn(async () => ({ count: opts.casCount ?? 1 })),
       },
       hostingService: { updateMany: jest.fn(async () => ({ count: 1 })) },
@@ -587,8 +590,13 @@ describe('RenewalService (D2 — échéances, renouvellement, dunning)', () => {
       data: { status: SubscriptionStatus.SUSPENDED },
     });
     // Services hébergement du SEUL abonnement concerné, MÊME transaction.
+    // Q12-P3 : résolution réelle `subscriptionId` OU `orderId` de l'abonnement
+    // (lignes legacy sans lien comprises) — jamais un autre abonnement.
     expect(tx.hostingService.updateMany).toHaveBeenCalledWith({
-      where: { subscriptionId: 'sub-1', status: 'ACTIVE' },
+      where: {
+        status: 'ACTIVE',
+        OR: [{ subscriptionId: 'sub-1' }, { orderId: { in: ['ord-1'] } }],
+      },
       data: { status: 'SUSPENDED' },
     });
     // Effets provider post-commit via SuspensionEffectsService (aucune suppression).

@@ -13,15 +13,24 @@ import { SuspensionEffectsService } from './suspension-effects.service';
  *  - capacité provider manquante / jeton illisible / sans cible → blocage
  *    EXPLICITE (`blocked` + audit `suspension.app_*_blocked`), jamais de faux
  *    succès ; échec réseau → `failed` visible ;
- *  - C4 (flag relu à l'appel) : `beginDispatchStandalone(CONFIGURE)` avant le
- *    dispatch (refus → blocage, transport JAMAIS appelé), `settleStandalone`
- *    après (SUCCESS / PERMANENT_FAILURE capacité / FAILED_RETRYABLE réseau) ;
+ *  - résolution réelle (Q12-P3) : service via `subscriptionId` OU `orderId`
+ *    de l'abonnement (lignes legacy sans lien) ; apps via ALLOCATIONS (C2)
+ *    en plus des liens directs ;
+ *  - C4 (flag relu à l'appel) : `beginDispatchStandalone(CONFIGURE)` avec
+ *    allocation de l'app avant le dispatch (refus → blocage, transport JAMAIS
+ *    appelé), `settleStandalone` après (SUCCESS / PERMANENT_FAILURE capacité /
+ *    UNKNOWN réseau ambigu) ; **succès provider non consigné → JAMAIS done** ;
  *  - aucun réseau dans le scan : seuls les déploiements à `coolifyUuid` non
  *    null et rattachés au SEUL abonnement demandé sont considérés.
  */
 describe('SuspensionEffectsService (Q5)', () => {
   let svc: SuspensionEffectsService;
-  let prisma: { hostingService: { findMany: jest.Mock }; deployment: { findMany: jest.Mock } };
+  let prisma: {
+    subscription: { findUnique: jest.Mock };
+    hostingService: { findMany: jest.Mock };
+    hostingServiceAllocation: { findMany: jest.Mock; findFirst: jest.Mock };
+    deployment: { findMany: jest.Mock };
+  };
   let audit: { record: jest.Mock };
   let crypto: { decrypt: jest.Mock };
   let transport: { stopApplication: jest.Mock; startApplication: jest.Mock; deleteApplication: jest.Mock };
@@ -39,7 +48,12 @@ describe('SuspensionEffectsService (Q5)', () => {
     jest.clearAllMocks();
     delete process.env.HOSTING_C4_ENABLED; // OFF par défaut (fail-closed)
     prisma = {
+      subscription: { findUnique: jest.fn(async () => null) },
       hostingService: { findMany: jest.fn(async () => [{ id: 'hs-1', orderId: 'ord-1' }]) },
+      hostingServiceAllocation: {
+        findMany: jest.fn(async () => []),
+        findFirst: jest.fn(async () => ({ id: 'alloc-1' })),
+      },
       deployment: {
         findMany: jest.fn(async () => [
           { id: 'dep-1', orderId: 'ord-1', coolifyUuid: 'uuid-1', server },
@@ -169,17 +183,82 @@ describe('SuspensionEffectsService (Q5)', () => {
     );
   });
 
+  describe('Q12-P3 — r\u00e9solution r\u00e9elle (services legacy, apps via allocations)', () => {
+    it('service legacy SANS subscriptionId \u2192 r\u00e9solu par l\u2019orderId de l\u2019abonnement', async () => {
+      prisma.subscription.findUnique.mockResolvedValue({ orderId: 'ord-legacy' });
+      prisma.hostingService.findMany.mockResolvedValue([
+        { id: 'hs-legacy', orderId: 'ord-legacy' },
+      ]);
+      const out = await svc.suspendApps({
+        subscriptionId: 'sub-1',
+        holder: 'system:renewal-sweep',
+        orderId: null,
+      });
+      expect(out).toEqual({ apps: 1, done: 1, blocked: 0, failed: 0 });
+      // O\u00f9 que le service a \u00e9t\u00e9 cherch\u00e9 : subscriptionId OU orderId abonnement.
+      expect(prisma.hostingService.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: {
+            OR: [{ subscriptionId: 'sub-1' }, { orderId: { in: ['ord-legacy'] } }],
+          },
+        }),
+      );
+    });
+
+    it('app reli\u00e9e UNIQUEMENT par son allocation (C2, hostingServiceId/orderId null) \u2192 dispatch\u00e9e', async () => {
+      prisma.hostingServiceAllocation.findMany.mockResolvedValue([
+        { deploymentId: 'dep-legacy' },
+      ]);
+      prisma.deployment.findMany.mockResolvedValue([
+        { id: 'dep-legacy', orderId: null, coolifyUuid: 'uuid-legacy', server },
+      ]);
+      const out = await svc.suspendApps(params);
+      expect(out).toEqual({ apps: 1, done: 1, blocked: 0, failed: 0 });
+      // Le scan demande BIEN les ids issus des allocations.
+      expect(prisma.deployment.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            OR: expect.arrayContaining([{ id: { in: ['dep-legacy'] } }]),
+          }),
+        }),
+      );
+      expect(transport.stopApplication).toHaveBeenCalledWith(expect.anything(), 'uuid-legacy');
+    });
+
+    it('apps d\u2019un AUTRE abonnement (autre service/allocation) jamais touch\u00e9es', async () => {
+      prisma.hostingService.findMany.mockResolvedValue([{ id: 'hs-1', orderId: 'ord-1' }]);
+      prisma.hostingServiceAllocation.findMany.mockResolvedValue([{ deploymentId: 'dep-1' }]);
+      prisma.deployment.findMany.mockResolvedValue([
+        { id: 'dep-1', orderId: 'ord-1', coolifyUuid: 'uuid-1', server },
+      ]);
+      const out = await svc.suspendApps(params);
+      expect(out).toEqual({ apps: 1, done: 1, blocked: 0, failed: 0 });
+      // Le scan n'interroge QUE les allocations des services de CET abonnement.
+      expect(prisma.hostingServiceAllocation.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { hostingServiceId: { in: ['hs-1'] }, deploymentId: { not: null } },
+        }),
+      );
+      // Aucun id d\u2019app \u00e9tranger (dep-other) n'entre dans le filtre.
+      const depWhere = prisma.deployment.findMany.mock.calls[0][0].where as unknown;
+      expect(JSON.stringify(depWhere)).not.toContain('dep-other');
+      expect(transport.stopApplication).toHaveBeenCalledTimes(1);
+      expect(transport.stopApplication).toHaveBeenCalledWith(expect.anything(), 'uuid-1');
+    });
+  });
+
   describe('C4 (flag relu \u00e0 l\u2019appel)', () => {
     beforeEach(() => {
       process.env.HOSTING_C4_ENABLED = 'true';
     });
 
-    it('dispatch r\u00e9ussi \u2192 begin CONFIGURE puis settle SUCCESS', async () => {
+    it('dispatch r\u00e9ussi \u2192 begin CONFIGURE (allocation de l\u2019app) puis settle SUCCESS', async () => {
       const out = await svc.suspendApps(params);
       expect(out).toEqual({ apps: 1, done: 1, blocked: 0, failed: 0 });
       expect(c4.beginDispatchStandalone).toHaveBeenCalledWith({
         nature: 'CONFIGURE',
         scope: { type: 'DEPLOYMENT', id: 'dep-1' },
+        allocationId: 'alloc-1',
         holder: 'system:renewal-sweep',
         orderId: 'ord-1',
         targetIntent: { type: 'application', op: 'stop', uuid: 'uuid-1' },
@@ -224,12 +303,30 @@ describe('SuspensionEffectsService (Q5)', () => {
       );
     });
 
-    it('\u00e9chec r\u00e9seau sous C4 \u2192 settle FAILED_RETRYABLE + failed visible', async () => {
+    it('timeout ambigu sous C4 \u2192 settle UNKNOWN (incertitude durable) + failed visible', async () => {
       transport.stopApplication.mockRejectedValue(new Error('ETIMEDOUT'));
       const out = await svc.suspendApps(params);
       expect(out).toEqual({ apps: 1, done: 0, blocked: 0, failed: 1 });
       expect(c4.settleStandalone).toHaveBeenCalledWith(
-        expect.objectContaining({ attemptId: 'att-1', outcome: 'FAILED_RETRYABLE' }),
+        expect.objectContaining({ attemptId: 'att-1', outcome: 'UNKNOWN' }),
+      );
+      expect(c4.settleStandalone).not.toHaveBeenCalledWith(
+        expect.objectContaining({ outcome: 'FAILED_RETRYABLE' }),
+      );
+    });
+
+    it('succ\u00e8s provider puis \u00e9chec de consignation \u2192 JAMAIS done (tentative ouverte)', async () => {
+      c4.settleStandalone.mockRejectedValueOnce(new Error('pg down'));
+      const out = await svc.suspendApps(params);
+      // Le transport a R\u00e9USSI mais la consignation a \u00e9chou\u00e9 : aucun
+      // requalification `done`, \u00e9chec visible + audit\u00e9.
+      expect(transport.stopApplication).toHaveBeenCalledTimes(1);
+      expect(out).toEqual({ apps: 1, done: 0, blocked: 0, failed: 1 });
+      expect(audit.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'suspension.app_stop_failed',
+          details: expect.objectContaining({ detail: expect.stringContaining('non consign\u00e9') }),
+        }),
       );
     });
 
