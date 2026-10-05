@@ -738,6 +738,47 @@ export const adminResyncLimits = (t: string, id: string) =>
     method: 'POST',
   });
 
+// GO Q9 — remboursements internes (ADMIN) : header `Idempotency-Key` REQUIS
+// (8..128, même contrat que le checkout) ; `WALLET_CREDIT` s'exécute
+// immédiatement dans la même transaction (plafond = montant encaissé). La
+// carte réelle reste désactivée : aucun succès externe sans confirmation
+// réelle du prestataire (adaptateur non configuré).
+export interface AdminRefund {
+  id: string;
+  orderId: string;
+  kind: 'WALLET_CREDIT' | 'EXTERNAL_CARD';
+  status: 'PENDING' | 'SUCCEEDED' | 'FAILED';
+  amountCents: number;
+  currency: string;
+  reason: string | null;
+  issueCreditNote: boolean;
+  creditNoteInvoiceId: string | null;
+  providerRef: string | null;
+  processedAt: string | null;
+  createdAt: string;
+  replayed: boolean;
+}
+export const createAdminRefund = (
+  t: string,
+  orderId: string,
+  body: {
+    amountCents: number;
+    reason?: string;
+    issueCreditNote?: boolean;
+  },
+  idempotencyKey: string,
+) =>
+  apiJson(`/api/store/admin/orders/${encodeURIComponent(orderId)}/refunds`, t, {
+    method: 'POST',
+    headers: { 'Idempotency-Key': idempotencyKey },
+    body: JSON.stringify({ kind: 'WALLET_CREDIT', ...body }),
+  }) as Promise<ApiResult<AdminRefund>>;
+export const listAdminRefunds = (t: string, orderId: string) =>
+  apiJson(
+    `/api/store/admin/orders/${encodeURIComponent(orderId)}/refunds`,
+    t,
+  ) as Promise<ApiResult<AdminRefund[]>>;
+
 // GO P9 (lot E1 / M-06) — écran « moyens de paiement » : la gestion admin
 // (activation, ordre, config d'affichage, frais) n'avait AUCUNE interface.
 // `configEnc` (secrets carte) n'est jamais exposé : seul `hasConfigEnc`.

@@ -1368,11 +1368,68 @@ model WalletTransaction {
   adminActorId    String? // qui a validé/rejeté une recharge (audit)
   adminActorEmail String? // snapshot (survit à la suppression de l'acteur)
   note            String?
-  createdAt       DateTime            @default(now())
-  processedAt     DateTime?
+  createdAt             DateTime            @default(now())
+  processedAt           DateTime?
+
+  refund                Refund? // GO Q9 — traçabilité du remboursement que ce crédit sert
 
   @@index([customerId])
   @@index([status])
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// GO Q9 — Remboursements & avoirs : fondations internes.
+//
+// `Refund` = journal des intentions de remboursement, LIÉS au paiement
+// d'origine (orderId + invoiceId) :
+//  • plafond cumulé : PENDING + SUCCEEDED ≤ montant encaissé (Order.amountTtcCents
+//    sous verrou FOR UPDATE — la commande sérialise ses propres remboursements) ;
+//  • idempotence : `idempotencyKey` unique — même clé + même intention = rejeu
+//    sans effet, même clé + intention différente = 409 ;
+//  • concurrence : verrou commande d'ABORD (ordre canonique commande → facture →
+//    client, identique au paiement) ;
+//  • interne (WALLET_CREDIT) : exécuté dans la même TX que la création —
+//    opération indépendante du prestataire ;
+//  • externe (EXTERNAL_CARD) : reste PENDING tant que le prestataire n'a pas
+//    CONFIRMÉ réellement (providerRef null) — jamais de succès déclaré sans
+//    confirmation réelle (adaptateur carte volontairement non configuré) ;
+//  • avoirs : `issueCreditNote` émet un Invoice lié par `creditNoteOfId`.
+model Refund {
+  id                  String           @id @default(cuid())
+  orderId             String
+  order               Order            @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  invoiceId           String? // facture d'origine (paiement encaissé visé)
+  invoice             Invoice?         @relation("RefundOrigin", fields: [invoiceId], references: [id], onDelete: SetNull)
+  kind                RefundKind
+  status              RefundStatus     @default(PENDING)
+  amountCents         Int // strictement positif
+  currency            String           @default("USD")
+  reason              String?
+  issueCreditNote     Boolean          @default(false)
+  idempotencyKey      String           @unique // clé fournie par l'admin (header Idempotency-Key)
+  walletTransactionId String?          @unique // trace du crédit wallet (interne)
+  walletTransaction   WalletTransaction? @relation(fields: [walletTransactionId], references: [id], onDelete: SetNull)
+  creditNoteInvoiceId String?          // avoir visé (NON unique : plusieurs remboursements cumulent le MÊME avoir ; un seul avoir/facture via creditNoteOfId)
+  creditNoteInvoice   Invoice?         @relation("RefundCreditNote", fields: [creditNoteInvoiceId], references: [id], onDelete: SetNull)
+  providerRef         String? // référence prestataire — null tant que non confirmé RÉELLEMENT
+  createdByUserId     String?
+  createdByEmail      String? // snapshot acteur (survit à la suppression)
+  failureReason       String?
+  processedAt         DateTime?
+  createdAt           DateTime         @default(now())
+
+  @@index([orderId])
+}
+
+enum RefundStatus {
+  PENDING // créé — effets non appliqués (externe : attente confirmation réelle)
+  SUCCEEDED // interne appliqué (wallet crédité) ou externe confirmé réellement
+  FAILED // échec explicite (failureReason porté)
+}
+
+enum RefundKind {
+  WALLET_CREDIT // interne — recrédite le wallet (indépendant du prestataire)
+  EXTERNAL_CARD // externe — prestataire carte (bloqué sans adaptateur configuré)
 }
 
 // ── Commande (Order) ───────────────────────────────────────────────────────
@@ -1405,6 +1462,7 @@ model Order {
   product           Product           @relation(fields: [productId], references: [id], onDelete: Restrict)
   productName       String // snapshot
   packId            String? // pack provisionné (ressources/apps)
+  refunds           Refund[] // GO Q9 — remboursements liés à ce paiement
   status            OrderStatus       @default(PENDING_PAYMENT)
   billingCycle      BillingCycle      @default(ONETIME)
   currency          String            @default("USD")
@@ -1532,6 +1590,11 @@ model Invoice {
 
   lines        InvoiceLine[]
   creditNotes  Invoice[] @relation("CreditNote")
+  // GO Q9 — remboursements : cette facture est le paiement d'origine qu'un
+  // remboursement vise (refundsAsOrigin) / l'avoir émis porte le lien sortant
+  // (refundsAsCreditNote). Le lien strict reste `creditNoteOfId`.
+  refundsAsOrigin     Refund[] @relation("RefundOrigin")
+  refundsAsCreditNote Refund[] @relation("RefundCreditNote")
 
   @@index([customerId])
   @@index([status])

@@ -16,8 +16,12 @@ import { JwtPayload } from '../auth/types';
 export interface ApplyWalletInput {
   amountCents: number;
   idempotencyKey: string;
-  /** Devise de l'opération (défaut USD) — partie de l'identité opérationnelle. */
+  /** Devise de l'opǸration (dǸfaut USD) �?" partie de l'identitǸ opǸrationnelle. */
   currency?: string;
+  /** GO Q9 : type EXPLICITE pour un crédit de remboursement (REFUND). Jamais
+   *  fourni = comportement historique (CREDIT/débit DEBIT) strictement inchangé,
+   *  y compris pour le contrôle d'identité d'un rejeu. */
+  type?: WalletTransactionType;
   note?: string | null;
   reference?: string | null;
   orderId?: string | null;
@@ -216,9 +220,10 @@ export class WalletService {
     return (
       row.customerId === customerId &&
       row.type ===
-        (direction === 'credit'
-          ? WalletTransactionType.CREDIT
-          : WalletTransactionType.DEBIT) &&
+        (input.type ??
+          (direction === 'credit'
+            ? WalletTransactionType.CREDIT
+            : WalletTransactionType.DEBIT)) &&
       row.amountCents === input.amountCents &&
       row.currency === (input.currency ?? 'USD') &&
       row.status === WalletTxStatus.SUCCEEDED &&
@@ -283,9 +288,10 @@ export class WalletService {
       data: {
         customerId,
         type:
-          direction === 'credit'
+          input.type ??
+          (direction === 'credit'
             ? WalletTransactionType.CREDIT
-            : WalletTransactionType.DEBIT,
+            : WalletTransactionType.DEBIT),
         amountCents: input.amountCents,
         currency: input.currency ?? 'USD',
         status: WalletTxStatus.SUCCEEDED,

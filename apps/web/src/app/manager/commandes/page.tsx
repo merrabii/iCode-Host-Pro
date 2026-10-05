@@ -9,6 +9,7 @@ import {
   adminTerminateOrder,
   apiError,
   confirmAdminOrderPayment,
+  createAdminRefund,
   formatCents,
   getAdminOrder,
   listAdminOrders,
@@ -71,6 +72,10 @@ export default function ManagerOrdersPage() {
   const [pendingAction, setPendingAction] = useState<OrderActionDef | null>(null);
   const [actionReason, setActionReason] = useState('');
   const [actionBusy, setActionBusy] = useState(false);
+  // GO Q9 — remboursement wallet : montant en unités (converti en cents) +
+  // émission optionnelle d'un avoir (facture de crédit AV-).
+  const [refundAmount, setRefundAmount] = useState('');
+  const [refundCreditNote, setRefundCreditNote] = useState(false);
 
   /** Les 5 actions admin (M-06) exposées selon l'état réel de la commande. */
   const actionsFor = (o: OrderDetail): OrderActionDef[] => {
@@ -86,6 +91,12 @@ export default function ManagerOrdersPage() {
         key: 'finalize',
         label: 'Finaliser (C4)',
         hint: 'Finalisation d’une commande C3 prête : la preuve provider est relue côté serveur.',
+        needsReason: true,
+      });
+      list.push({
+        key: 'refund',
+        label: 'Rembourser (wallet)',
+        hint: 'Crédite le portefeuille du client dans la même transaction — plafond = montant encaissé, idempotent (clé unique). La carte réelle reste désactivée (aucun remboursement bancaire externe).',
         needsReason: true,
       });
     }
@@ -135,6 +146,23 @@ export default function ManagerOrdersPage() {
       toast.error('Le motif doit faire au moins 8 caractères.');
       return;
     }
+    // GO Q9 — validation du remboursement AVANT toute écriture.
+    let refundCents = 0;
+    if (a.key === 'refund') {
+      refundCents = Math.round(
+        Number.parseFloat(refundAmount.replace(',', '.')) * 100,
+      );
+      if (!Number.isFinite(refundCents) || refundCents <= 0) {
+        toast.error('Montant de remboursement invalide.');
+        return;
+      }
+      if (refundCents > detail.amountTtcCents) {
+        toast.error(
+          `Le montant dépasse le total encaissé (${formatCents(detail.amountTtcCents)}).`,
+        );
+        return;
+      }
+    }
     setActionBusy(true);
     let res: ApiResult;
     switch (a.key) {
@@ -156,6 +184,20 @@ export default function ManagerOrdersPage() {
       case 'resync-limits':
         res = await adminResyncLimits(token, detail.id);
         break;
+      case 'refund':
+        res = await createAdminRefund(
+          token,
+          detail.id,
+          {
+            amountCents: refundCents,
+            reason,
+            issueCreditNote: refundCreditNote,
+          },
+          // clé unique par action : un double-clic = rejeu idempotent, jamais
+          // un double crédit.
+          `mgr-${crypto.randomUUID()}`,
+        );
+        break;
       default:
         res = { ok: false, status: 0, data: null };
     }
@@ -164,9 +206,24 @@ export default function ManagerOrdersPage() {
       toast.error(apiError(res, `L’action « ${a.label} » a échoué.`));
       return;
     }
-    toast.ok(`« ${a.label} » exécutée.`);
+    if (a.key === 'refund') {
+      const rf = res.data as { status?: string; replayed?: boolean } | null;
+      if (rf?.replayed) {
+        toast.info('Remboursement déjà enregistré (rejeu idempotent, aucun double crédit).');
+      } else if (rf?.status === 'SUCCEEDED') {
+        toast.ok(
+          `Remboursement exécuté — ${formatCents(refundCents)} crédités au portefeuille${refundCreditNote ? ' + avoir émis' : ''}.`,
+        );
+      } else {
+        toast.ok('Remboursement enregistré (en attente de traitement).');
+      }
+    } else {
+      toast.ok(`« ${a.label} » exécutée.`);
+    }
     setPendingAction(null);
     setActionReason('');
+    setRefundAmount('');
+    setRefundCreditNote(false);
     await load(token, page, status, q);
     await openDetail(detail.id);
   };
@@ -175,6 +232,10 @@ export default function ManagerOrdersPage() {
     if (a.needsReason) {
       setPendingAction(a);
       setActionReason('');
+      if (a.key === 'refund') {
+        setRefundAmount('');
+        setRefundCreditNote(false);
+      }
       return;
     }
     void runAction(a);
@@ -495,6 +556,26 @@ export default function ManagerOrdersPage() {
                 </p>
                 {pendingAction && (
                   <div className="mt">
+                    {pendingAction.key === 'refund' && (
+                      <>
+                        <Field label="Montant à rembourser (devise)">
+                          <Input
+                            value={refundAmount}
+                            placeholder="ex. 10.50"
+                            inputMode="decimal"
+                            onChange={(e) => setRefundAmount(e.target.value)}
+                          />
+                        </Field>
+                        <label className="row cell-sub" style={{ gap: 6, marginBottom: 8, cursor: 'pointer' }}>
+                          <input
+                            type="checkbox"
+                            checked={refundCreditNote}
+                            onChange={(e) => setRefundCreditNote(e.target.checked)}
+                          />
+                          Émettre un avoir (facture de crédit liée à la facture d’origine)
+                        </label>
+                      </>
+                    )}
                     <Field label={`Motif — ${pendingAction.label}`}>
                       <Input
                         value={actionReason}
@@ -506,7 +587,13 @@ export default function ManagerOrdersPage() {
                     <div className="row">
                       <Button
                         size="sm"
-                        disabled={actionBusy || actionReason.trim().length < 8}
+                        disabled={
+                          actionBusy ||
+                          actionReason.trim().length < 8 ||
+                          (pendingAction.key === 'refund' &&
+                            !(/^\d+([.,]\d{1,2})?$/.test(refundAmount.replace(',', '.')) &&
+                              Number.parseFloat(refundAmount.replace(',', '.')) > 0))
+                        }
                         onClick={() => void runAction(pendingAction)}
                       >
                         {actionBusy ? 'Exécution…' : 'Valider'}

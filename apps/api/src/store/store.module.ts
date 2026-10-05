@@ -11,6 +11,7 @@ import { PanelTransportFactory } from '../servers/panel-transport.factory';
 import { BillingPaymentAdminController } from './billing-payment.admin.controller';
 import { AdminBillingController } from './admin-billing.controller';
 import { AdminOrdersController } from './admin-orders.controller';
+import { AdminRefundsController } from './admin-refunds.controller';
 import { CheckoutController } from './checkout.controller';
 import { CheckoutService } from './checkout.service';
 import { ClientStoreController } from './client-store.controller';
@@ -22,6 +23,7 @@ import { OrderLifecycleService } from './order-lifecycle.service';
 import { PaymentMethodsController } from './payment-methods.controller';
 import { ProvisioningService } from './provisioning.service';
 import { ReconcileRunnerService } from './reconcile.runner.service';
+import { RefundService } from './refund.service';
 import { ReconcileService } from './reconcile.service';
 import { ReconcileSettingAdminController } from './reconcile-setting.admin.controller';
 import { ReconcileSettingsService } from './reconcile-settings.service';
@@ -58,6 +60,7 @@ import { RenewalService } from './renewal.service';
     PaymentMethodsController,
     BillingPaymentAdminController,
     AdminOrdersController,
+    AdminRefundsController,
     AdminBillingController,
     ClientStoreController,
     CheckoutController,
@@ -84,6 +87,7 @@ import { RenewalService } from './renewal.service';
     },
     ReconcileService,
     ReconcileRunnerService,
+    RefundService,
     RenewalService,
     SuspensionEffectsService,
   ],
