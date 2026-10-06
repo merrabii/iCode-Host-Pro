@@ -11,6 +11,15 @@
 #    défensif et explicite — les specs pilotent les sweeps à la main ;
 #  - PAYMENT_SIMULATOR_ENABLED n'est PAS défini : les specs le pilotent elles-
 #    mêmes (activation/refus) ;
+#  - PAYMENT_SIMULATOR_ENABLED n'est PAS defini : les specs le pilotent elles-
+#    memes (activation/refus) ;
+#  - ENCRYPTION_KEY n'est PAS une cle live : elle est GENÉRÉE pour chaque job
+#    (node crypto.randomBytes(32)) puis ecrite dans $GITHUB_ENV - CryptoService accepte
+#    une chaine de n'importe quelle longueur (sha256 -> 32 octets). Aucune copie
+#    d'un .env local, la valeur n'est jamais affichee ;
+#  - les pre-requis d'environnement des tests sont verifies par une etape fail-fast
+#    dediee (DATABASE_URL / PORT / JWT_SECRET / ENCRYPTION_KEY) - cela ne remplace
+#    pas les controles applicatifs, il les precise seulement.
 #  - `next build` est exécuté avec `--max-old-space-size=6144` (Q10 : exit 134
 #    = OOM du HEAP V8 par défaut, pas de la RAM machine — même fix local).
 name: CI
@@ -63,6 +72,30 @@ jobs:
           node-version: 22
           cache: pnpm
 
+      # Cle de chiffrement SYNTHETIQUE, generee pour CE job (jamais une cle live,
+      # jamais copiee d'un .env local). Ecrite dans $GITHUB_ENV => disponible
+      # dans TOUTES les etapes suivantes (migrations, unit, e2e, legacy) ; la
+      # valeur n'est jamais affichee dans les logs.
+      - name: Generate synthetic ENCRYPTION_KEY (tests only)
+        run: |
+          set -euo pipefail
+          KEY=$(node -e "process.stdout.write(require('crypto').randomBytes(32).toString('hex'))")
+          if [ "${#KEY}" -ne 64 ]; then echo "::error::ENCRYPTION_KEY generation invalide"; exit 1; fi
+          echo "ENCRYPTION_KEY=$KEY" >> "$GITHUB_ENV"
+          echo "ENCRYPTION_KEY generee pour ce job (64 hex, valeur non affichee)."
+
+      # Pre-requis explicites des tests : echec immediat si une variable
+      # indispensable manque - ne remplace PAS les controles applicatifs,
+      # il les rend visibles dans le workflow.
+      - name: Verify test env prerequisites (fail fast)
+        run: |
+          set -euo pipefail
+          missing=0
+          for v in DATABASE_URL PORT JWT_SECRET ENCRYPTION_KEY; do
+            if [ -z "${!v:-}" ]; then echo "::error::variable $v absente du job"; missing=1; fi
+          done
+          if [ "$missing" -ne 0 ]; then exit 1; fi
+          echo "Pre-requis OK (valeurs non affichees) : DATABASE_URL PORT JWT_SECRET ENCRYPTION_KEY"
       - name: Install (lockfile figé)
         run: pnpm install --frozen-lockfile
 
