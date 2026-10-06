@@ -465,46 +465,52 @@ export class RefundService {
               processedAt: new Date(),
             },
           });
-          await this.audit.record({
-            actorId: actor.sub,
-            actorEmail: actor.email,
-            action: 'refund.succeeded',
-            resourceType: 'refund',
-            resourceId: done.id,
-            details: {
-              orderId,
-              amountCents: input.amountCents,
-              currency: order.currency,
-              kind: input.kind,
-              creditNoteInvoiceId,
-              usedAfter: total,
-              succeededAfter: succeededTotal,
-              captured: order.amountTtcCents,
-              fullyRefunded,
-              orderStatusChanged,
+          await this.audit.record(
+            {
+              actorId: actor.sub,
+              actorEmail: actor.email,
+              action: 'refund.succeeded',
+              resourceType: 'refund',
+              resourceId: done.id,
+              details: {
+                orderId,
+                amountCents: input.amountCents,
+                currency: order.currency,
+                kind: input.kind,
+                creditNoteInvoiceId,
+                usedAfter: total,
+                succeededAfter: succeededTotal,
+                captured: order.amountTtcCents,
+                fullyRefunded,
+                orderStatusChanged,
+              },
             },
-          });
+            tx,
+          );
           return this.toView(done, false);
         }
 
         // 8) Externe : PENDING, aucun effet, providerRef null — jamais de
         //    succès déclaré sans confirmation RÉELLE (adaptateur non configuré).
-        await this.audit.record({
-          actorId: actor.sub,
-          actorEmail: actor.email,
-          action: 'refund.created',
-          resourceType: 'refund',
-          resourceId: refund.id,
-          details: {
-            orderId,
-            amountCents: input.amountCents,
-            currency: order.currency,
-            kind: input.kind,
-            provider: 'disabled',
+        await this.audit.record(
+          {
+            actorId: actor.sub,
+            actorEmail: actor.email,
+            action: 'refund.created',
+            resourceType: 'refund',
+            resourceId: refund.id,
+            details: {
+              orderId,
+              amountCents: input.amountCents,
+              currency: order.currency,
+              kind: input.kind,
+              provider: 'disabled',
+            },
           },
-        });
+          tx,
+        );
         return this.toView(refund, false);
-      });
+      }, { maxWait: 10000, timeout: 30000 });
     } catch (e) {
       // P2002 UNIQUEMENT sur la clé d'idempotence (course sur une autre
       // commande) : les autres collisions (numéro de facture…) ne sont PAS

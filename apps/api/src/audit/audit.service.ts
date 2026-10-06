@@ -27,9 +27,12 @@ export interface AuditPage {
 export class AuditService {
   constructor(private readonly prisma: PrismaService) {}
 
-  async record(input: AuditRecord): Promise<void> {
+  async record(
+    input: AuditRecord,
+    client: Prisma.TransactionClient | PrismaService = this.prisma,
+  ): Promise<void> {
     try {
-      await this.prisma.auditLog.create({
+      await client.auditLog.create({
         data: {
           actorId: input.actorId ?? null,
           actorEmail: input.actorEmail ?? null,

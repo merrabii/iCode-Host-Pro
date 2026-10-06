@@ -404,6 +404,7 @@ describe('RefundService (GO Q9 — remboursements et avoirs)', () => {
       expect(view.replayed).toBe(false);
       expect(audit.record).toHaveBeenCalledWith(
         expect.objectContaining({ action: 'refund.succeeded' }),
+        tx,
       );
     });
 
@@ -757,6 +758,7 @@ describe('RefundService (GO Q9 — remboursements et avoirs)', () => {
           action: 'refund.created',
           details: expect.objectContaining({ provider: 'disabled' }),
         }),
+        tx,
       );
     });
 
