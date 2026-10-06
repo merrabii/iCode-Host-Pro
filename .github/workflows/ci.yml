@@ -14,9 +14,12 @@
 #  - PAYMENT_SIMULATOR_ENABLED n'est PAS defini : les specs le pilotent elles-
 #    memes (activation/refus) ;
 #  - ENCRYPTION_KEY n'est PAS une cle live : elle est GENÉRÉE pour chaque job
-#    (node crypto.randomBytes(32)) puis ecrite dans $GITHUB_ENV - CryptoService accepte
-#    une chaine de n'importe quelle longueur (sha256 -> 32 octets). Aucune copie
-#    d'un .env local, la valeur n'est jamais affichee ;
+#    (node crypto.randomBytes(32)) puis ecrite dans un fichier prive
+#    $RUNNER_TEMP/encryption.key et exportee UNIQUEMENT dans les etapes de
+#    tests (jamais dans l'env du job : le runner journalise l'env de chaque
+#    etape, la valeur ne doit donc jamais y figurer) - CryptoService accepte
+#    une chaine de n'importe quelle longueur (sha256 -> 32 octets). Aucune
+#    copie d'un .env local, la valeur n'est jamais affichee ;
 #  - les pre-requis d'environnement des tests sont verifies par une etape fail-fast
 #    dediee (DATABASE_URL / PORT / JWT_SECRET / ENCRYPTION_KEY) - cela ne remplace
 #    pas les controles applicatifs, il les precise seulement.
@@ -73,15 +76,16 @@ jobs:
           cache: pnpm
 
       # Cle de chiffrement SYNTHETIQUE, generee pour CE job (jamais une cle live,
-      # jamais copiee d'un .env local). Ecrite dans $GITHUB_ENV => disponible
-      # dans TOUTES les etapes suivantes (migrations, unit, e2e, legacy) ; la
-      # valeur n'est jamais affichee dans les logs.
+      # jamais copiee d'un .env local). Ecrite dans un fichier prive du runner
+      # (pas dans $GITHUB_ENV => jamais dans l'env journalise des etapes) puis
+      # exportee dans chaque etape de tests ; la valeur n'est jamais affichee.
       - name: Generate synthetic ENCRYPTION_KEY (tests only)
         run: |
           set -euo pipefail
           KEY=$(node -e "process.stdout.write(require('crypto').randomBytes(32).toString('hex'))")
           if [ "${#KEY}" -ne 64 ]; then echo "::error::ENCRYPTION_KEY generation invalide"; exit 1; fi
-          echo "ENCRYPTION_KEY=$KEY" >> "$GITHUB_ENV"
+          umask 077
+          printf '%s' "$KEY" > "$RUNNER_TEMP/encryption.key"
           echo "ENCRYPTION_KEY generee pour ce job (64 hex, valeur non affichee)."
 
       # Pre-requis explicites des tests : echec immediat si une variable
@@ -91,9 +95,13 @@ jobs:
         run: |
           set -euo pipefail
           missing=0
-          for v in DATABASE_URL PORT JWT_SECRET ENCRYPTION_KEY; do
+          for v in DATABASE_URL PORT JWT_SECRET; do
             if [ -z "${!v:-}" ]; then echo "::error::variable $v absente du job"; missing=1; fi
           done
+          if [ ! -s "$RUNNER_TEMP/encryption.key" ] || ! grep -Eqx '[0-9a-f]{64}' "$RUNNER_TEMP/encryption.key"; then
+            echo "::error::ENCRYPTION_KEY absente ou invalide (fichier de job)"
+            missing=1
+          fi
           if [ "$missing" -ne 0 ]; then exit 1; fi
           echo "Pre-requis OK (valeurs non affichees) : DATABASE_URL PORT JWT_SECRET ENCRYPTION_KEY"
       - name: Install (lockfile figé)
@@ -117,7 +125,10 @@ jobs:
         run: pnpm -C apps/web exec next build
 
       - name: Tests unitaires (API)
-        run: pnpm -C apps/api exec jest src --maxWorkers=4
+        run: |
+          set -euo pipefail
+          export ENCRYPTION_KEY="$(cat "$RUNNER_TEMP/encryption.key")"
+          pnpm -C apps/api exec jest src --maxWorkers=4
 
       - name: Tests e2e (API, base CI isolée)
         # Les 4 suites legacy 17B (c3-premig / c4-premig / c4-release /
@@ -126,9 +137,11 @@ jobs:
         # de les mixter avec la base CI principale. Leurs bases sont refabriquées
         # à l'étape « bases dédiées » (migrate complet, 60 migrations, puis
         # retrait des tables C1/C3/C4 pour l'état pré-migratoire).
-        run: >-
-          pnpm -C apps/api exec jest --config ./test/jest-e2e.json --runInBand
-          --testPathIgnorePatterns c3-premig c4-premig c4-release c4-rollback
+        run: |
+          set -euo pipefail
+          export ENCRYPTION_KEY="$(cat "$RUNNER_TEMP/encryption.key")"
+          pnpm -C apps/api exec jest --config ./test/jest-e2e.json --runInBand \
+            --testPathIgnorePatterns c3-premig c4-premig c4-release c4-rollback
 
       - name: Bases dédiées des suites legacy 17B (refabrique Q10)
         # Recette reproductible (identique à la refabrique locale Q10) :
@@ -246,6 +259,7 @@ jobs:
           PGPASSWORD: icode
         run: |
           set -euo pipefail
+          export ENCRYPTION_KEY="$(cat "$RUNNER_TEMP/encryption.key")"
           DATABASE_URL="postgresql://icode:icode@localhost:5432/icode_host_pro_c3premig" \
             pnpm -C apps/api exec jest --config ./test/jest-e2e.json --runInBand c3-premig
           DATABASE_URL="postgresql://icode:icode@localhost:5432/icode_host_pro_c4premig" \
