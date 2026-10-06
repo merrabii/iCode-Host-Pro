@@ -24,8 +24,12 @@ import {
  * P8 (lot D2) + Q-A (GO items 1/4) + Q5/Q6 — matrice de décision du scheduler :
  *   - arrêt de chaîne (aucune souscription liée / produit changé) CAS idempotent ;
  *   - suspension admin = on n'arrête JAMAIS la chaîne (résumable) ;
- *   - création + paiement ATOMIQUE (`checkout.payOrderWithWallet` = débit +
+ *   - créations + paiement ATOMIQUE (`checkout.payOrderWithWallet` = débit +
  *     confirmation dans UNE tx, clé `wallet-pay:<orderId>`) ;
+ *   - P2 (corrections finales) : consentement + éligibilité revérifiés DANS la
+ *     tx de débit/confirmation sous verrou `FOR UPDATE` (CAS autonome
+ *     supprimé), voie GRATUITE soumise à la même garde, règlement MANUEL
+ *     jamais bloqué ;
  *   - solde insuffisant → facture reste impayée, AUCUN crédit compensatoire ;
  *   - reprise : garde RE-VALIDÉE avant tout débit (jamais de prélèvement sur
  *     une chaîne close/suspendue/produit changé depuis la création) ;
@@ -216,11 +220,22 @@ describe('RenewalService (D2 — échéances, renouvellement, dunning)', () => {
     });
     // Q-A (item 1) : paiement ATOMIQUE — plus de débit séparé + confirmation.
     expect(checkout.payOrderWithWallet).toHaveBeenCalledTimes(1);
-    expect(checkout.payOrderWithWallet).toHaveBeenCalledWith('renewal-1', {
-      sub: 'user-1',
-      email: 'alice@test.local',
-      role: Role.USER,
-    });
+    expect(checkout.payOrderWithWallet).toHaveBeenCalledWith(
+      'renewal-1',
+      {
+        sub: 'user-1',
+        email: 'alice@test.local',
+        role: Role.USER,
+      },
+      // P2 : la voie AUTOMATIQUE porte la garde transactionnelle — le
+      // consentement + l'éligibilité sont revérifiés SOUS VERROU dans la
+      // transaction de débit, jamais par un CAS autonome committé séparément.
+      { requireRenewalConsent: true },
+    );
+    // P2 : le CAS de consentement autonome (updateMany no-op hors tx) est
+    // SUPPRIMÉ — la seule écriture `autoRenew` est le flip de création dans
+    // LA transaction (lastTx).
+    expect(prisma.order.updateMany).not.toHaveBeenCalled();
     expect(wallet.debit).not.toHaveBeenCalled();
     expect(checkout.confirmOrderPaid).not.toHaveBeenCalled();
     expect(audit.record).toHaveBeenCalledWith(expect.objectContaining({
@@ -245,6 +260,58 @@ describe('RenewalService (D2 — échéances, renouvellement, dunning)', () => {
     expect(checkout.confirmOrderPaid).not.toHaveBeenCalled();
     expect(wallet.credit).not.toHaveBeenCalled();
     expect(wallet.debit).not.toHaveBeenCalled();
+  });
+
+  it('P2 : renouvellement GRATUIT (amount <= 0) → confirmation free SOUS GARDE transactionnelle', async () => {
+    prisma.order.findMany
+      .mockResolvedValueOnce([
+        head({ amountHtCents: 0, taxAmountCents: 0, amountTtcCents: 0 }),
+      ])
+      .mockResolvedValueOnce([]);
+    prisma.subscription.findFirst.mockResolvedValue({
+      id: 'sub-1',
+      productId: 'prod-1',
+      status: SubscriptionStatus.ACTIVE,
+    });
+
+    const res = await svc.sweep();
+
+    expect(res).toMatchObject({ created: 1, paid: 1, pending: 0 });
+    // La voie GRATUITE est soumise à la MÊME règle que le débit : le flag de
+    // garde est posé, la confirmation tranche dans SA transaction.
+    expect(checkout.confirmOrderPaid).toHaveBeenCalledTimes(1);
+    expect(checkout.confirmOrderPaid).toHaveBeenCalledWith(
+      'renewal-1',
+      { source: 'free' },
+      { requireRenewalConsent: true },
+    );
+    expect(checkout.payOrderWithWallet).not.toHaveBeenCalled();
+    expect(wallet.debit).not.toHaveBeenCalled();
+  });
+
+  it('P2 : renouvellement GRATUIT révoqué → la confirmation free refuse (409) → pending, zéro effet', async () => {
+    prisma.order.findMany
+      .mockResolvedValueOnce([head({ amountTtcCents: 0 })])
+      .mockResolvedValueOnce([]);
+    prisma.subscription.findFirst.mockResolvedValue({
+      id: 'sub-1',
+      productId: 'prod-1',
+      status: SubscriptionStatus.ACTIVE,
+    });
+    checkout.confirmOrderPaid.mockRejectedValueOnce(
+      new ConflictException('Renouvellement révoqué : confirmation automatique refusée.'),
+    );
+
+    const res = await svc.sweep();
+
+    expect(res).toMatchObject({ created: 1, paid: 0, pending: 1 });
+    expect(checkout.confirmOrderPaid).toHaveBeenCalledWith(
+      'renewal-1',
+      { source: 'free' },
+      { requireRenewalConsent: true },
+    );
+    expect(wallet.debit).not.toHaveBeenCalled();
+    expect(wallet.credit).not.toHaveBeenCalled();
   });
 
   // ── 1b. Gardes d'éligibilité ───────────────────────────────────────────────
@@ -424,7 +491,7 @@ describe('RenewalService (D2 — échéances, renouvellement, dunning)', () => {
     expect(wallet.debit).not.toHaveBeenCalled();
   });
 
-  it('Q12-P2 : course révocation/débit — révocation committée entre la lecture et le CAS → AUCUN débit', async () => {
+  it('P2 : course révocation/débit — révocation committée avant la décision → la TX de débit tranche (zéro débit)', async () => {
     prisma.order.findMany
       .mockResolvedValueOnce([]) // aucune échéance
       .mockResolvedValueOnce([{
@@ -432,7 +499,7 @@ describe('RenewalService (D2 — échéances, renouvellement, dunning)', () => {
         renewsOrderId: 'mother-1',
         productId: 'prod-1',
         amountTtcCents: 1200,
-        autoRenew: true, // lu AVANT que la révocation ne commite
+        autoRenew: true, // lu AVANT que la révocation ne commite (passe rapide)
         customerEmail: 'alice@test.local',
         customer: { userId: 'user-1' },
         invoice: { number: '2026-0041' },
@@ -442,14 +509,25 @@ describe('RenewalService (D2 — échéances, renouvellement, dunning)', () => {
       productId: 'prod-1',
       status: SubscriptionStatus.ACTIVE,
     });
-    // CAS de consentement juste avant le débit : la révocation a committé
-    // entre la lecture de la passe et ce CAS → count 0.
-    prisma.order.updateMany.mockResolvedValueOnce({ count: 0 });
+    // L'AUTORITÉ vit dans LA transaction de débit (P2) : sous verrou
+    // `FOR UPDATE`, la révocation committée est vue → ConflictException →
+    // rollback total (zéro débit, zéro confirmation). Un CAS autonome
+    // committé séparément ne serait PAS une réservation durable.
+    checkout.payOrderWithWallet.mockRejectedValueOnce(
+      new ConflictException('Renouvellement révoqué : prélèvement automatique refusé.'),
+    );
 
     const res = await svc.sweep();
 
     expect(res).toMatchObject({ paid: 0, pending: 1 });
-    expect(checkout.payOrderWithWallet).not.toHaveBeenCalled();
+    // La voie automatique passe TOUJOURS par la garde transactionnelle…
+    expect(checkout.payOrderWithWallet).toHaveBeenCalledWith(
+      'renewal-1',
+      expect.objectContaining({ sub: 'user-1' }),
+      { requireRenewalConsent: true },
+    );
+    // …et plus JAMAIS par un CAS de consentement autonome hors transaction.
+    expect(prisma.order.updateMany).not.toHaveBeenCalled();
     expect(checkout.confirmOrderPaid).not.toHaveBeenCalled();
     expect(wallet.debit).not.toHaveBeenCalled();
   });

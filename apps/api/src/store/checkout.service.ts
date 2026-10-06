@@ -823,11 +823,15 @@ export class CheckoutService {
    * commande reste PENDING_PAYMENT, l'échec est audible (jamais un succès
    * annoncé à tort) et l'admin peut résoudre puis relancer.
    */
-  async confirmOrderPaid(orderId: string, ctx: ConfirmPaidContext): Promise<ConfirmPaidResult> {
+  async confirmOrderPaid(
+    orderId: string,
+    ctx: ConfirmPaidContext,
+    opts?: { requireRenewalConsent?: boolean },
+  ): Promise<ConfirmPaidResult> {
     let outcome: ConfirmTxOutcome;
     try {
       outcome = await this.prisma.$transaction((tx) =>
-        this.confirmOrderInTx(tx, orderId, ctx),
+        this.confirmOrderInTx(tx, orderId, ctx, opts),
       );
     } catch (e) {
       await this.audit
@@ -867,15 +871,38 @@ export class CheckoutService {
 
   /**
    * Corps TRANSACTIONNEL de la confirmation (Q-A) — réutilisé par le règlement
-   * portefeuille atomique `payOrderWithWallet` : même verrous, mêmes états,
+   * portefeuille atomique `payOrderWithWallet` : mêmes verrous, mêmes états,
    * mêmes droits que tout autre règlement.
+   *
+   * Corrections finales ciblées (P2) — `opts.requireRenewalConsent` = décision
+   * de PRÉLÈVEMENT/CONFIRMATION AUTOMATIQUE : le consentement courant et
+   * l'éligibilité de la chaîne sont revérifiés SOUS VERROU `FOR UPDATE`, dans
+   * LA transaction qui ouvre les droits (jamais par un CAS autonome committé
+   * séparément). Toute réfutation → `ConflictException` → rollback complet
+   * (zéro droit ouvert, zéro mouvement). Les confirmations MANUELES (admin,
+   * simulateur, client) ne passent jamais par cette garde.
    */
   private async confirmOrderInTx(
     tx: Prisma.TransactionClient,
     orderId: string,
     ctx: ConfirmPaidContext,
+    opts?: { requireRenewalConsent?: boolean },
   ): Promise<ConfirmTxOutcome> {
     {
+        if (opts?.requireRenewalConsent) {
+          const gate = await tx.$queryRaw<
+            { id: string; autoRenew: boolean; productId: string; renewsOrderId: string | null }[]
+          >`
+            SELECT id, "autoRenew", "productId", "renewsOrderId" FROM "Order"
+            WHERE id = ${orderId} FOR UPDATE`;
+          if (!gate[0]) throw new NotFoundException('Commande introuvable.');
+          if (!gate[0].autoRenew) {
+            throw new ConflictException(
+              'Renouvellement révoqué : confirmation automatique refusée.',
+            );
+          }
+          await this.renewalChargeGateInTx(tx, gate[0]);
+        }
         const order = await tx.order.findUnique({
           where: { id: orderId },
           include: { customer: { select: { userId: true } } },
@@ -1094,6 +1121,49 @@ export class CheckoutService {
   }
 
   /**
+   * Corrections finales ciblées (P2) — garde AUTORITAIRE d'un prélèvement
+   * automatique, exécutée DANS la transaction de débit/confirmation :
+   *  - le consentement courant (`autoRenew`) est lu par l'appelant SOUS VERROU
+   *    `FOR UPDATE` sur la commande (ligne ci-dessus / dans
+   *    `payOrderWithWallet`) ;
+   *  - l'ÉLIGIBILITÉ de la chaîne est re-revérifiée ici : facture de la
+   *    commande verrouillée PUIS abonnement de la chaîne verrouillé (même
+   *    hiérarchie que la suspension — jamais d'ordre inverse, donc aucun
+   *    cycle de verrous), état ACTIVE et produit inchangés relevés SOUS
+   *    verrou. Un CAS autonome committé séparément n'est PAS une
+   *    réservation durable du droit à prélever.
+   * Retour silencieux = autorisé ; sinon `ConflictException` → rollback
+   * intégral de la transaction (zéro débit, zéro confirmation, zéro droit).
+   */
+  private async renewalChargeGateInTx(
+    tx: Prisma.TransactionClient,
+    order: { id: string; productId: string; renewsOrderId: string | null },
+  ): Promise<void> {
+    if (!order.renewsOrderId) {
+      throw new ConflictException(
+        'Commande hors chaîne de renouvellement : prélèvement automatique refusé.',
+      );
+    }
+    // Verrou facture AVANT abonnement (hiérarchie identique à la suspension).
+    await tx.$queryRaw`SELECT id FROM "Invoice" WHERE "orderId" = ${order.id} FOR UPDATE`;
+    const subId = await this.resolveSubscriptionIdForOrder(tx, order);
+    if (!subId) {
+      throw new ConflictException('Aucun abonnement lié à la chaîne : renouvellement refusé.');
+    }
+    const subs = await tx.$queryRaw<{ id: string; status: string; productId: string }[]>`
+      SELECT id, status, "productId" FROM "Subscription" WHERE id = ${subId} FOR UPDATE`;
+    const sub = subs[0];
+    if (!sub || sub.status !== SubscriptionStatus.ACTIVE) {
+      throw new ConflictException(
+        `Abonnement ${sub ? sub.status : 'introuvable'} : prélèvement automatique refusé.`,
+      );
+    }
+    if (sub.productId !== order.productId) {
+      throw new ConflictException('Produit de la chaîne changé : renouvellement refusé.');
+    }
+  }
+
+  /**
    * Q-A (item 4) — abonnement facturé par une commande : résolution par la
    * CHAÎNE de renouvellements (`renewsOrderId`, garde 50 maillons). Jamais de
    * sélection « dernier abonnement actif » du compte.
@@ -1235,8 +1305,20 @@ export class CheckoutService {
    * stricte (`wallet.service`). Propriétaire : `customer.userId === user.sub`
    * STRICT (aucun dossier invité non lié, aucun autre compte) — sinon 404
    * (jamais de fuite d'existence). Devise : USD uniquement.
+   *
+   * Corrections finales ciblées (P2) — `opts.requireRenewalConsent` = voie
+   * PRÉLÈVEMENT AUTOMATIQUE (renouvellement) : consentement + éligibilité
+   * revérifiés SOUS VERROU dans CETTE transaction, AVANT tout débit (garde
+   * `renewalChargeGateInTx`) ; réfutation → rollback total (zéro débit,
+   * zéro confirmation). Le règlement MANUEL du client/admin (sans option) n'est
+   * jamais soumis à cette garde : révoquer le renouvellement n'empêche pas de
+   * régler volontairement une facture existante.
    */
-  async payOrderWithWallet(orderId: string, user: JwtPayload): Promise<PayWithWalletResult> {
+  async payOrderWithWallet(
+    orderId: string,
+    user: JwtPayload,
+    opts?: { requireRenewalConsent?: boolean },
+  ): Promise<PayWithWalletResult> {
     const key = `wallet-pay:${orderId}`;
     const preview = await this.prisma.order.findUnique({
       where: { id: orderId },
@@ -1306,10 +1388,18 @@ export class CheckoutService {
       out = await this.prisma.$transaction(async (tx): Promise<WalletTxOutcome> => {
         // 1) verrou COMMANDE : sérialise double-clic / courses concurrentes.
         const rows = await tx.$queryRaw<
-          { id: string; status: OrderStatus; amountTtcCents: number; currency: string }[]
+          {
+            id: string;
+            status: OrderStatus;
+            amountTtcCents: number;
+            currency: string;
+            autoRenew: boolean;
+            productId: string;
+            renewsOrderId: string | null;
+          }[]
         >`
-          SELECT id, status, "amountTtcCents", currency FROM "Order"
-          WHERE id = ${orderId} FOR UPDATE`;
+          SELECT id, status, "amountTtcCents", currency, "autoRenew", "productId", "renewsOrderId"
+          FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
         if (rows.length === 0) throw new NotFoundException('Commande introuvable.');
         if (rows[0].status !== OrderStatus.PENDING_PAYMENT) {
           // Le concurrent a gagné entre le preview et le verrou : si SON débit
@@ -1342,6 +1432,18 @@ export class CheckoutService {
           );
         }
         const amountTtcCents = rows[0].amountTtcCents;
+
+        // P2 — prélèvement AUTOMATIQUE : consentement + éligibilité revérifiés
+        // SOUS VERROU (ci-dessus : commande déjà verrouillée `FOR UPDATE`),
+        // AVANT tout débit. La révocation committée avant ce verrou → 409 →
+        // rollback total ; elle qui arrive après attend notre commit (la
+        // course est sérialisée sur la même ligne).
+        if (opts?.requireRenewalConsent) {
+          if (!rows[0].autoRenew) {
+            throw new ConflictException('Renouvellement révoqué : prélèvement automatique refusé.');
+          }
+          await this.renewalChargeGateInTx(tx, rows[0]);
+        }
 
         // 2) récupération split legacy (débit fait SANS confirmation atomique,
         //    bug ancien) : net = débits aboutis − crédits pour CETTE commande.
