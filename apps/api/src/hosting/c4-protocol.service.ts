@@ -28,6 +28,8 @@ export interface C4BeginDispatchParams {
   holder: string;
   allocationId?: string | null;
   orderId?: string | null;
+  /** Service porteur (couvre les arrêts sur le scope SERVICE même hors scope de dispatch). */
+  serviceId?: string | null;
   /** Cible exacte figée avant appel (uuid connu pour DELETE ; non connu pour CREATE). */
   targetIntent?: Record<string, unknown> | null;
 }
@@ -243,7 +245,7 @@ export class C4ProtocolService {
     const scopes = C4ProtocolService.scopesFor({
       order: params.orderId ?? (params.scope.type === 'ORDER' ? params.scope.id : null),
       allocation: params.allocationId,
-      service: params.scope.type === 'SERVICE' ? params.scope.id : null,
+      service: params.serviceId ?? (params.scope.type === 'SERVICE' ? params.scope.id : null),
       deployment: params.scope.type === 'DEPLOYMENT' ? params.scope.id : null,
     });
     if (!scopes.some((s) => s.type === params.scope.type && s.id === params.scope.id)) {

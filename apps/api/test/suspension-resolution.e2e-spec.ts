@@ -41,13 +41,14 @@ import { acceptanceFor, preloadAcceptance } from './pricing-acceptance.fixture';
  *     service de l'autre abonnement.
  *
  * Aucun réseau : PanelTransportFactory + MailTransportFactory stubbés,
- * C4 OFF (`HOSTING_C4_ENABLED` absent), C3 ON.
+ * C4 ON (les dispatches stop/start et le provisioning passent par le
+ * protocole — tentatives durablement consignées), C3 ON.
  */
 describe('Résolution abonnement → service réelle (e2e, Q12-P3)', () => {
   process.env.HOSTING_C3_ENABLED = 'true';
   process.env.ORDER_SWEEP_ENABLED = 'false';
   process.env.RENEWAL_SWEEP_ENABLED = 'false';
-  delete process.env.HOSTING_C4_ENABLED;
+  process.env.HOSTING_C4_ENABLED = 'true';
   installFingerprintEnv();
 
   let app: INestApplication;
@@ -313,6 +314,38 @@ describe('Résolution abonnement → service réelle (e2e, Q12-P3)', () => {
     try {
       if (prisma) {
         const orderIds = [...allOrderIds];
+        // Protocole C4 (ON ici) : tentatives/takeovers/évidences des
+        // ordres, allocations et déploiements du membre — AVANT les entités.
+        const c4Deps = await prisma.deployment
+          .findMany({ where: { userId: memberUserId }, select: { id: true } })
+          .catch(() => []);
+        const c4Allocs = await prisma.hostingServiceAllocation
+          .findMany({ where: { hostingService: { userId: memberUserId } }, select: { id: true } })
+          .catch(() => []);
+        const c4DepIds = c4Deps.map((d) => d.id);
+        const c4AllocIds = c4Allocs.map((a) => a.id);
+        await prisma.c4ProviderAttempt
+          .deleteMany({
+            where: {
+              OR: [
+                { orderId: { in: orderIds } },
+                { allocationId: { in: c4AllocIds } },
+                { scopeId: { in: [...orderIds, ...c4DepIds, ...c4AllocIds] } },
+              ],
+            },
+          })
+          .catch(() => undefined);
+        await prisma.c4Takeover
+          .deleteMany({ where: { scopeId: { in: [...orderIds, ...c4DepIds, ...c4AllocIds] } } })
+          .catch(() => undefined);
+        await prisma.c4StopRequest
+          .deleteMany({ where: { scopeId: { in: [...orderIds, ...c4DepIds] } } })
+          .catch(() => undefined);
+        await prisma.c4ReleaseEvidence
+          .deleteMany({ where: { OR: [{ orderId: { in: orderIds } }, { allocationId: { in: c4AllocIds } }] } })
+          .catch(() => undefined);
+        await prisma.c4ReadinessProof.deleteMany({ where: { orderId: { in: orderIds } } }).catch(() => undefined);
+
         await prisma.hostingServiceAllocation
           .deleteMany({ where: { hostingService: { orderId: { in: orderIds } } } })
           .catch(() => undefined);
@@ -339,6 +372,7 @@ describe('Résolution abonnement → service réelle (e2e, Q12-P3)', () => {
       // meilleur effort
     }
     delete process.env.HOSTING_C3_ENABLED;
+    delete process.env.HOSTING_C4_ENABLED;
     if (app) await app.close();
   });
 
@@ -349,6 +383,7 @@ describe('Résolution abonnement → service réelle (e2e, Q12-P3)', () => {
   let realServiceId = '';
   let realSubId = '';
   let realUuid = '';
+  let realDepId = '';
 
   it('confirmation C3 : HostingService créé AVEC subscriptionId (lien abonnement réel)', async () => {
     const res = await placeOrder(checkoutBody({ productSlug: prodSlug })).expect(201);
@@ -376,6 +411,7 @@ describe('Résolution abonnement → service réelle (e2e, Q12-P3)', () => {
     await waitOrderActive(realOrderId);
     const dep = await prisma.deployment.findUniqueOrThrow({ where: { orderId: realOrderId } });
     realUuid = dep.coolifyUuid!;
+    realDepId = dep.id;
     expect(dep.status).toBe(DeploymentStatus.ACTIVE);
     const svcFinal = await prisma.hostingService.findUniqueOrThrow({
       where: { id: realServiceId },
@@ -400,10 +436,24 @@ describe('Résolution abonnement → service réelle (e2e, Q12-P3)', () => {
     expect(stopCalls).toContainEqual({ provider: 'COOLIFY', uuid: realUuid });
     expect(startCalls.some((c) => c.uuid === realUuid)).toBe(false);
     expect(deleteCalls).toHaveLength(0);
+    // Sous C4 ON : l'arrêt est une tentative CONFIGURE durable consignée.
+    const stopAttempts = await prisma.c4ProviderAttempt.findMany({
+      where: { scopeId: realDepId, nature: 'CONFIGURE' },
+      orderBy: { dispatchedAt: 'asc' },
+    });
+    expect(stopAttempts).toHaveLength(1);
+    expect(stopAttempts[0].phase).toBe('RETURNED');
+    expect(stopAttempts[0].outcome).toBe('SUCCESS');
 
     const r2 = await patchSubscription(realSubId, 'ACTIVE').expect(200);
-    expect(r2.body.effects).toMatchObject({ apps: 1, done: 1, blocked: 0, failed: 0 });
+    expect(r2.body.effects).toMatchObject({ apps: 1, done: 1, blocked: 0, failed: 0, mode: 'c4' });
     expect(startCalls).toContainEqual({ provider: 'COOLIFY', uuid: realUuid });
+    const startAttempts = await prisma.c4ProviderAttempt.findMany({
+      where: { scopeId: realDepId, nature: 'CONFIGURE' },
+      orderBy: { dispatchedAt: 'asc' },
+    });
+    expect(startAttempts).toHaveLength(2);
+    expect(startAttempts[1].outcome).toBe('SUCCESS');
     const svc2 = await prisma.hostingService.findUniqueOrThrow({
       where: { id: realServiceId },
       select: { status: true },

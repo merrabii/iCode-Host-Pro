@@ -25,8 +25,9 @@ import {
 // Sweeps (timers) OFF : déclenchement à la demande (horloge accélérée en base).
 process.env.ORDER_SWEEP_ENABLED = 'false';
 process.env.RENEWAL_SWEEP_ENABLED = 'false';
-// Q5 : C4 OFF ici (protocole C4 du moteur d'effets = unit suspension-effects).
-delete process.env.HOSTING_C4_ENABLED;
+// Q12-P3 : C4 ON ici — les dispatches stop/start du moteur d'effets passent
+// par le protocole (tentatives CONFIGURE durablement consignées).
+process.env.HOSTING_C4_ENABLED = 'true';
 
 /**
  * Q5 (GO item 5) — suspension / réactivation réversibles (e2e, socle) :
@@ -394,6 +395,19 @@ describe('Suspension / réactivation réversibles (e2e, Q5)', () => {
     // pas touché.
     try {
       if (prisma) {
+        // Protocole C4 (ON ici) : tentatives/takeovers des déploiements de la
+        // recette — AVANT la suppression des déploiements.
+        const c4Deps = await prisma.deployment
+          .findMany({
+            where: { repoFullName: { in: ['dan/app-a', 'dan/app-b', 'emma/app-e'] } },
+            select: { id: true },
+          })
+          .catch(() => []);
+        const c4DepIds = c4Deps.map((d) => d.id);
+        await prisma.c4ProviderAttempt.deleteMany({ where: { scopeId: { in: c4DepIds } } }).catch(() => undefined);
+        await prisma.c4Takeover.deleteMany({ where: { scopeId: { in: c4DepIds } } }).catch(() => undefined);
+        await prisma.c4StopRequest.deleteMany({ where: { scopeId: { in: c4DepIds } } }).catch(() => undefined);
+
         if (numbers.length) {
           await prisma.invoice.deleteMany({ where: { number: { in: numbers } } });
         }
@@ -421,6 +435,7 @@ describe('Suspension / réactivation réversibles (e2e, Q5)', () => {
     } catch {
       // Meilleur effort : jamais d'échec de nettoyage masquant un vrai test.
     }
+    delete process.env.HOSTING_C4_ENABLED;
     if (app) await app.close();
   });
 
@@ -456,6 +471,21 @@ describe('Suspension / réactivation réversibles (e2e, Q5)', () => {
     expect(stopCalls.some((c) => c.uuid === 'uuid-dan-b')).toBe(false);
     expect(startCalls).toHaveLength(0);
     expect(deleteCalls).toHaveLength(0); // AUCUNE suppression
+
+    // Sous C4 ON : chaque arrêt est une tentative CONFIGURE durable consignée.
+    const stoppedDeps = await prisma.deployment.findMany({
+      where: { coolifyUuid: { in: ['uuid-dan-a', 'uuid-emma-e'] } },
+      select: { id: true },
+    });
+    const stopAttempts = await prisma.c4ProviderAttempt.findMany({
+      where: { scopeId: { in: stoppedDeps.map((d) => d.id) } },
+    });
+    expect(stopAttempts).toHaveLength(2);
+    expect(
+      stopAttempts.every(
+        (a) => a.nature === 'CONFIGURE' && a.phase === 'RETURNED' && a.outcome === 'SUCCESS',
+      ),
+    ).toBe(true);
 
     // Audits : suspension + effets ; jamais sur l'abonnement non concerné.
     for (const subId of [danSubA, emmaSub]) {

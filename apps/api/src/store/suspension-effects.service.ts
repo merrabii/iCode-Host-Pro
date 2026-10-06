@@ -67,15 +67,25 @@ export async function applyHostingStatusInTx(
  *    service → apps via les **allocations persistantes** (modèle C2, `Deployment
  *    .hostingServiceId` NULL) en plus des liens directs — jamais « le dernier
  *    abonnement actif » du compte ;
- *  - **Respect du protocole C4** : sous `HOSTING_C4_ENABLED=true`, chaque
- *    dispatch est une tentative durable `CONFIGURE` (avec allocation de l'app :
- *    au plus un dispatch créatif ouvert par app — arrêt/reprise concurrents
- *    sur provider lent → second refusé explicitement) ; `beginDispatch`
- *    refuse si un arrêt est opposable ou un créateur non résolu ; la
- *    consignation `settle` trace l'issue — **timeout/échec réseau = outcome
- *    `UNKNOWN`** (ambiguïté durable, modèle C4) ; **succès provider non
- *    consigné = JAMAIS `done`** (tentative laissée DISPATCHED) ; sous OFF :
- *    appel direct + catch best-effort (contrat historique, AUCUNE table C4) ;
+ *  - **Respect du protocole C4 (Q12-P3)** : chaque dispatch est une tentative
+ *    durable `CONFIGURE` sous ON (avec allocation de l'app : au plus un
+ *    dispatch créatif ouvert par app — arrêt/reprise concurrents sur provider
+ *    lent → second refusé explicitement) ; `beginDispatch` refuse si un arrêt
+ *    est opposable (scopes ORDER/SERVICE/ALLOCATION/**DEPLOYMENT**) ou un
+ *    créateur non résolu ; la consignation `settle` trace l'issue —
+ *    **timeout/échec réseau = outcome `UNKNOWN`** (ambiguïté durable) ;
+ *    **succès provider non consigné = JAMAIS `done`** (tentative laissée
+ *    DISPATCHED) ; **sous OFF : AUCUN repli direct** pour les opérations
+ *    couvertes (blocage `protocole_off` comptabilisé + audité, zéro appel
+ *    réseau, aucune table C4 lue ni écrite) — le direct legacy est réservé aux
+ *    opérations HORS protocole (jamais celles-ci) ;
+ *  - **Barrières de décision (Q12-P3)** : la décision la PLUS RÉCENTE gagne —
+ *    l'état de l'abonnement est revérifié LIVE avant toute préparation (aucune
+ *    action préparée/émise après une suspension/réactivation concurrente,
+ *    blocage `decision_perimee`) ; un passage ON→OFF pendant la préparation ne
+ *    contourne rien (tentative consignée `REFUSED`, zéro appel suivant) ; une
+ *    réponse reçue après un passage OFF reste consignée (`settle`
+ *    inconditionnel) sans aucun appel suivant ;
  *  - **Capacité provider manquante** (panneau non Coolify, jeton illisible…) →
  *    blocage EXPLICITE comptabilisé (`blocked`) + audit, jamais de faux succès ;
  *  - **Échecs visibles et récupérables** : chaque échec/blocage est audité
@@ -95,9 +105,13 @@ export interface SuspensionEffectsSummary {
   blocked: number;
   /** Échecs visibles (réseau/HTTP) — récupérables par une nouvelle action. */
   failed: number;
+  /** Classification de l'effet infra : protocole actif au DÉMARRAGE du passage. */
+  mode: 'c4' | 'off';
 }
 
-const EMPTY: SuspensionEffectsSummary = { apps: 0, done: 0, blocked: 0, failed: 0 };
+function emptySummary(mode: 'c4' | 'off'): SuspensionEffectsSummary {
+  return { apps: 0, done: 0, blocked: 0, failed: 0, mode };
+}
 
 type Op = 'stop' | 'start';
 
@@ -147,6 +161,7 @@ export class SuspensionEffectsService {
     op: Op,
     params: { subscriptionId: string; holder: string; orderId?: string | null },
   ): Promise<SuspensionEffectsSummary> {
+    const mode: 'c4' | 'off' = isHostingC4Enabled() ? 'c4' : 'off';
     const sub = await this.prisma.subscription.findUnique({
       where: { id: params.subscriptionId },
       select: { orderId: true },
@@ -167,7 +182,7 @@ export class SuspensionEffectsService {
       },
       select: { id: true, orderId: true },
     });
-    if (services.length === 0) return { ...EMPTY };
+    if (services.length === 0) return emptySummary(mode);
     const serviceIds = services.map((s) => s.id);
     const orderIds = [
       ...new Set(
@@ -199,18 +214,27 @@ export class SuspensionEffectsService {
         orderId: true,
         coolifyUuid: true,
         server: true,
+        hostingServiceId: true,
       },
       orderBy: { createdAt: 'asc' },
     });
 
-    const summary: SuspensionEffectsSummary = { apps: deps.length, done: 0, blocked: 0, failed: 0 };
+    const summary: SuspensionEffectsSummary = {
+      apps: deps.length,
+      done: 0,
+      blocked: 0,
+      failed: 0,
+      mode,
+    };
     for (const dep of deps) {
       const outcome = await this.dispatchOne(op, {
         deploymentId: dep.id,
-        orderId: dep.orderId ?? params.orderId ?? null,
+        orderId: dep.orderId ?? params.orderId ?? subOrderIds[0] ?? null,
         uuid: dep.coolifyUuid!,
         server: dep.server,
         holder: params.holder,
+        subscriptionId: params.subscriptionId,
+        hostingServiceId: dep.hostingServiceId,
       });
       if (outcome === 'done') summary.done += 1;
       else if (outcome === 'blocked') summary.blocked += 1;
@@ -240,8 +264,27 @@ export class SuspensionEffectsService {
         strictTls: boolean;
       } | null;
       holder: string;
+      subscriptionId: string;
+      hostingServiceId: string | null;
     },
   ): Promise<'done' | 'blocked' | 'failed'> {
+    // ── Décision la PLUS RÉCENTE gagne (Q12-P3) : revérification LIVE ──────
+    // Une suspension/réactivation concurrente committée pendant la boucle
+    // rend l'effet périmé : aucune préparation, aucun appel, blocage visible.
+    const fresh = await this.prisma.subscription.findUnique({
+      where: { id: p.subscriptionId },
+      select: { status: true },
+    });
+    const expected = op === 'stop' ? 'SUSPENDED' : 'ACTIVE';
+    if (fresh?.status !== expected) {
+      return this.recordBlock(
+        op,
+        p,
+        'decision_perimee',
+        `Abonnement ${fresh?.status ?? 'introuvable'} (décision plus récente) ≠ ${expected} : aucun appel émis.`,
+      );
+    }
+
     // ── Cible provider : capacité préalable, sinon blocage explicite ────────
     if (!p.server || !p.server.apiBaseUrl || !p.server.apiTokenEnc) {
       return this.recordBlock(op, p, 'sans_cible', 'Serveur panneau non configuré pour cette application.');
@@ -259,39 +302,77 @@ export class SuspensionEffectsService {
       return this.recordBlock(op, p, 'jeton_indefin', 'Jeton API panneau indéchiffrable (ENCRYPTION_KEY ?).');
     }
 
-    // ── C4 (sous ON) : tentative durable AVANT le dispatch ──────────────────
+    // ── OFF : AUCUN repli direct (opération couverte par le protocole) ──────
+    // Q12-P3 : le contrat historique « appel direct sous OFF » est aboli pour
+    // stop/start de suspension : zéro appel réseau, zéro table C4, blocage
+    // `protocole_off` comptabilisé + audité (le direct reste réservé aux
+    // opérations HORS protocole).
+    if (!isHostingC4Enabled()) {
+      return this.recordBlock(
+        op,
+        p,
+        'protocole_off',
+        'Protocole C4 désactivé : appel provider non émis (aucun repli direct).',
+      );
+    }
+
+    // ── C4 : tentative durable AVANT le dispatch ────────────────────────────
     // Q12-P3 : la tentative porte l'allocation de l'app (modèle C2) — la garde
     // « au plus une tentative de création ouverte par allocation » serialize
     // alors un arrêt et une reprise CONCURRENTS sur un provider lent (le
     // second dispatch est refusé explicitement, jamais de course provider).
-    const c4Enabled = isHostingC4Enabled();
+    // Le scope SERVICE porteur est ajouté aux scopes opposables : un arrêt sur
+    // le service (au-delà du scope DEPLOYMENT) refuse le dispatch.
     let attemptId: string | null = null;
-    if (c4Enabled) {
-      try {
-        const allocation = await this.prisma.hostingServiceAllocation.findFirst({
-          where: { deploymentId: p.deploymentId },
-          select: { id: true },
-        });
-        const ticket = await this.c4.beginDispatchStandalone({
-          nature: 'CONFIGURE',
-          scope: { type: 'DEPLOYMENT', id: p.deploymentId },
-          allocationId: allocation?.id ?? null,
-          holder: p.holder,
-          orderId: p.orderId,
-          targetIntent: { type: 'application', op, uuid: p.uuid },
-        });
-        attemptId = ticket.attemptId;
-      } catch (err) {
-        // Refus C4 (arrêt opposable, tentative déjà ouverte, créateur non
-        // résolu…) → blocage explicite de CET action, les autres corrections
-        // continuent.
-        const msg = err instanceof Error ? err.message : String(err);
-        const conflict = err instanceof ConflictException;
-        if (conflict) return this.recordBlock(op, p, 'c4_refuse', msg);
-        // Erreur inattendue (schéma, DB) : pas de faux succès, échec visible.
-        return this.recordFail(op, p, msg, 'failed');
-      }
+    try {
+      const allocation = await this.prisma.hostingServiceAllocation.findFirst({
+        where: { deploymentId: p.deploymentId },
+        select: { id: true, hostingServiceId: true },
+      });
+      const ticket = await this.c4.beginDispatchStandalone({
+        nature: 'CONFIGURE',
+        scope: { type: 'DEPLOYMENT', id: p.deploymentId },
+        allocationId: allocation?.id ?? null,
+        holder: p.holder,
+        orderId: p.orderId,
+        serviceId: allocation?.hostingServiceId ?? p.hostingServiceId,
+        targetIntent: { type: 'application', op, uuid: p.uuid },
+      });
+      attemptId = ticket.attemptId;
+    } catch (err) {
+      // Refus C4 (arrêt opposable, tentative déjà ouverte, créateur non
+      // résolu…) → blocage explicite de CET action, les autres corrections
+      // continuent.
+      const msg = err instanceof Error ? err.message : String(err);
+      const conflict = err instanceof ConflictException;
+      if (conflict) return this.recordBlock(op, p, 'c4_refuse', msg);
+      // Erreur inattendue (schéma, DB) : pas de faux succès, échec visible.
+      return this.recordFail(op, p, msg, 'failed');
     }
+
+    // ── ON→OFF pendant la préparation : AUCUN contournement ────────────────
+    // La tentative émise sous ON est consignée `REFUSED` (terminale sûre) et
+    // l'appel réseau n'a JAMAIS lieu — aucun dispatch direct de repli.
+    if (!isHostingC4Enabled()) {
+      if (attemptId) {
+        await this.c4
+          .settleStandalone({ attemptId, holder: p.holder, outcome: 'REFUSED' })
+          .catch((e) =>
+            this.log.warn(`settle REFUSED ${op} dep=${p.deploymentId} failed: ${String(e)}`),
+          );
+      }
+      return this.recordBlock(
+        op,
+        p,
+        'protocole_off',
+        'Protocole C4 désactivé pendant la préparation : tentative consignée REFUSED, aucun appel émis.',
+      );
+    }
+
+    // ── Dispatch transport (post-commit, jamais dans la TX métier) ──────────
+    // Une réponse reçue APRÈS un passage OFF reste consignée ci-dessous
+    // (consignation limitée) ; le PROCHAIN dispatch est alors bloqué par la
+    // garde `protocole_off` ci-dessus — aucun appel suivant.
 
     // ── Dispatch transport (post-commit, jamais dans la TX métier) ──────────
     try {

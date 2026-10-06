@@ -28,11 +28,13 @@ import {
  * Q12-P3 — effets de suspension sous PROTOCOLE C4 (e2e, PostgreSQL réel,
  * `HOSTING_C4_ENABLED=true` — les 5 tables C4 vivent dans la base) :
  *
- *  1. **Arrêt opposable** : un `C4StopRequest` couvre la cible →
- *     `beginDispatch` REFUSE, transport JAMAIS appelé, aucune tentative
+ *  1. **Arrêt opposable** (scope DEPLOYMENT) : un `C4StopRequest` couvre la
+ *     cible → `beginDispatch` REFUSE, transport JAMAIS appelé, aucune tentative
  *     créée, blocage audité (`c4_refuse`) — le statut bascule quand même ;
- *  2. **Bascule OFF avant dispatch** : flag relu à l'appel → AUCUNE table C4
- *     lue ni écrite (0 tentative), appel direct (contrat historique) ;
+ *  2. **OFF avant dispatch** : AUCUN appel réseau (le contrat historique « appel
+ *     direct sous OFF » est aboli — aucun repli direct), zéro table C4, blocage
+ *     `protocole_off` ; la RÉPONSE distingue le statut métier (committé) des
+ *     effets infra (`effects.mode='off'`, blocked) ;
  *  3. **Arrêt/reprise concurrents sur provider lent** : la tentative ouverte
  *     (avec allocation de l'app) RÉFUSE le second dispatch — jamais deux
  *     arrêts/relances concurrents chez le provider ; après settle, une
@@ -41,7 +43,18 @@ import {
  *     requalification) → toute re-dispatch est REFUSÉE jusqu'à résolution
  *     (aucun contournement de l'incertitude) ;
  *  5. **Succès provider puis échec de consignation** : la tentative reste
- *     DISPATCHED, l'effet n'est JAMAIS compté `done`, échec visible audité.
+ *     DISPATCHED, l'effet n'est JAMAIS compté `done`, échec visible audité ;
+ *  6. **ON→OFF pendant la préparation** : tentative émise sous ON consignée
+ *     `REFUSED`, AUCUN appel transport (aucun contournement) ;
+ *  7. **Réponse reçue après passage OFF** : consignation limitée (la réponse
+ *     de l'appel en vol est consignée SUCCESS) puis AUCUN appel suivant ;
+ *  8. **Arrêt opposable au-delà de DEPLOYMENT** (scope SERVICE) : le dispatch
+ *     sur le déploiement est REFUSÉ (portée des arrêts sur le service), zéro
+ *     tentative, zéro appel ;
+ *  9. **Décision la plus récente gagne** : une réactivation en vol suivie
+ *     d'une suspension concurrente → aucune action préparée émise après la
+ *     décision la plus récente (`decision_perimee`), puis récupération
+ *     ACTIVE + relance complète.
  *
  * Aucun réseau : PanelTransportFactory + MailTransportFactory stubbés.
  */
@@ -98,12 +111,23 @@ describe('Suspension sous C4 — e2e PostgreSQL réel (Q12-P3)', () => {
     uuid: string;
     userId: string;
   }
+  interface Pair {
+    subId: string;
+    svcId: string;
+    userId: string;
+    deps: Array<{ depId: string; uuid: string }>;
+  }
   const nodes: Record<'A' | 'B' | 'C' | 'D' | 'E', Node> = {
     A: { subId: '', svcId: '', depId: '', uuid: 'uuid-a', userId: '' },
     B: { subId: '', svcId: '', depId: '', uuid: 'uuid-b', userId: '' },
     C: { subId: '', svcId: '', depId: '', uuid: 'uuid-c', userId: '' },
     D: { subId: '', svcId: '', depId: '', uuid: 'uuid-d', userId: '' },
     E: { subId: '', svcId: '', depId: '', uuid: 'uuid-e', userId: '' },
+  };
+  /** Abonnements DEUX apps (scénarios 6, 7 et 9). */
+  const pairs: Record<'F' | 'G', Pair> = {
+    F: { subId: '', svcId: '', userId: '', deps: [] },
+    G: { subId: '', svcId: '', userId: '', deps: [] },
   };
 
   async function waitFor<T>(
@@ -146,6 +170,15 @@ describe('Suspension sous C4 — e2e PostgreSQL réel (Q12-P3)', () => {
       where: { scopeId: depId },
       orderBy: { dispatchedAt: 'asc' },
     });
+
+  /** Dernière raison auditable d'un blocage/échec sur une ressource. */
+  const lastAuditReason = async (action: string, resourceId: string): Promise<string | undefined> => {
+    const row = await prisma.auditLog.findFirst({
+      where: { action, resourceId },
+      orderBy: { createdAt: 'desc' },
+    });
+    return (row?.details as { reason?: string } | undefined)?.reason;
+  };
 
   // ── Boot + fixtures ───────────────────────────────────────────────────────
   beforeAll(async () => {
@@ -233,18 +266,82 @@ describe('Suspension sous C4 — e2e PostgreSQL réel (Q12-P3)', () => {
         },
       });
     }
+
+    // Abonnements à DEUX applications (F : scénario 7 ; G : scénarios 6 et 9).
+    for (const k of ['F', 'G'] as const) {
+      const p = pairs[k];
+      const user = await prisma.user.create({
+        data: {
+          email: `p3c4-${k.toLowerCase()}_${stamp}@example.com`,
+          passwordHash: await bcrypt.hash(password, 10),
+          role: Role.USER,
+        },
+      });
+      p.userId = user.id;
+      const sub = await prisma.subscription.create({
+        data: { userId: user.id, productId, status: SubscriptionStatus.ACTIVE },
+      });
+      p.subId = sub.id;
+      const svc = await prisma.hostingService.create({
+        data: {
+          userId: user.id,
+          subscriptionId: sub.id,
+          productId,
+          status: HostingServiceStatus.ACTIVE,
+          ramMbSnapshot: 512,
+          cpuCoresSnapshot: 1,
+        },
+      });
+      p.svcId = svc.id;
+      for (const i of [1, 2]) {
+        const uuid = `uuid-${k.toLowerCase()}${i}`;
+        const dep = await prisma.deployment.create({
+          data: {
+            userId: user.id,
+            serverId: srvId,
+            repoFullName: `p3c4-${k.toLowerCase()}/app${i}`,
+            coolifyUuid: uuid,
+            status: DeploymentStatus.ACTIVE,
+          },
+        });
+        p.deps.push({ depId: dep.id, uuid });
+        await prisma.hostingServiceAllocation.create({
+          data: {
+            hostingServiceId: svc.id,
+            deploymentId: dep.id,
+            idempotencyKey: `p3c4-${k}${i}-${stamp}`,
+            status: HostingServiceAllocationStatus.BOUND,
+          },
+        });
+      }
+    }
   });
 
   afterAll(async () => {
     try {
       if (prisma) {
-        const depIds = Object.values(nodes).map((n) => n.depId);
-        const svcIds = Object.values(nodes).map((n) => n.svcId);
-        const subIds = Object.values(nodes).map((n) => n.subId);
-        const userIds = Object.values(nodes).map((n) => n.userId);
+        const depIds = [
+          ...Object.values(nodes).map((n) => n.depId),
+          ...Object.values(pairs).flatMap((p) => p.deps.map((d) => d.depId)),
+        ];
+        const svcIds = [
+          ...Object.values(nodes).map((n) => n.svcId),
+          ...Object.values(pairs).map((p) => p.svcId),
+        ];
+        const subIds = [
+          ...Object.values(nodes).map((n) => n.subId),
+          ...Object.values(pairs).map((p) => p.subId),
+        ];
+        const userIds = [
+          ...Object.values(nodes).map((n) => n.userId),
+          ...Object.values(pairs).map((p) => p.userId),
+        ];
         await prisma.c4ProviderAttempt.deleteMany({ where: { scopeId: { in: depIds } } }).catch(() => undefined);
         await prisma.c4Takeover.deleteMany({ where: { scopeId: { in: depIds } } }).catch(() => undefined);
-        await prisma.c4StopRequest.deleteMany({ where: { scopeId: { in: depIds } } }).catch(() => undefined);
+        // Les arrêts opposables peuvent viser un service (scénario 8).
+        await prisma.c4StopRequest
+          .deleteMany({ where: { scopeId: { in: [...depIds, ...svcIds] } } })
+          .catch(() => undefined);
         await prisma.hostingServiceAllocation.deleteMany({ where: { hostingServiceId: { in: svcIds } } }).catch(() => undefined);
         await prisma.deployment.deleteMany({ where: { id: { in: depIds } } }).catch(() => undefined);
         await prisma.hostingService.deleteMany({ where: { id: { in: svcIds } } }).catch(() => undefined);
@@ -262,7 +359,7 @@ describe('Suspension sous C4 — e2e PostgreSQL réel (Q12-P3)', () => {
   });
 
   // ═══════════════════════════════════════════════════════════════════════
-  // 1 — arrêt opposable
+  // 1 — arrêt opposable (scope DEPLOYMENT)
   // ═══════════════════════════════════════════════════════════════════════
   it('arrêt opposable sur la cible → dispatch REFUSÉ, zéro transport, zéro tentative, statut basculé', async () => {
     await c4.requestStop({
@@ -271,18 +368,14 @@ describe('Suspension sous C4 — e2e PostgreSQL réel (Q12-P3)', () => {
     });
 
     const r = await patchSubscription(nodes.A.subId, 'SUSPENDED').expect(200);
-    expect(r.body.effects).toMatchObject({ apps: 1, done: 0, blocked: 1, failed: 0 });
+    expect(r.body.effects).toMatchObject({ apps: 1, done: 0, blocked: 1, failed: 0, mode: 'c4' });
 
     // Jamais de dispatch : transport intact, AUCUNE tentative créée (refus
     // AVANT l'émission), blocage audité.
     expect(stopCalls).not.toContainEqual(nodes.A.uuid);
     expect(deleteCalls).toHaveLength(0);
     expect(await attemptsOf(nodes.A.depId)).toHaveLength(0);
-    const blocked = await prisma.auditLog.findFirst({
-      where: { action: 'suspension.app_stop_blocked', resourceId: nodes.A.depId },
-    });
-    expect(blocked).not.toBeNull();
-    expect((blocked!.details as { reason?: string }).reason).toBe('c4_refuse');
+    expect(await lastAuditReason('suspension.app_stop_blocked', nodes.A.depId)).toBe('c4_refuse');
 
     // Le statut métier bascule malgré tout (effets = best-effort post-commit).
     const sub = await prisma.subscription.findUniqueOrThrow({
@@ -293,26 +386,31 @@ describe('Suspension sous C4 — e2e PostgreSQL réel (Q12-P3)', () => {
   });
 
   // ═══════════════════════════════════════════════════════════════════════
-  // 2 — bascule OFF avant dispatch
+  // 2 — OFF avant dispatch → AUCUN appel (aucun repli direct)
   // ═══════════════════════════════════════════════════════════════════════
-  it('bascule OFF pendant l\u2019exécution → dispatch direct, AUCUNE table C4 écrite', async () => {
-    const prior = process.env.HOSTING_C4_ENABLED;
+  it('OFF avant dispatch → AUCUN appel réseau (aucun repli direct), zéro table C4, réponse = métier + infra', async () => {
     process.env.HOSTING_C4_ENABLED = 'false';
+    const stopBefore = stopCalls.length;
+    const startBefore = startCalls.length;
     try {
+      // Suspension : le métier bascule, l'infra n'émet RIEN (protocole off).
       const r = await patchSubscription(nodes.B.subId, 'SUSPENDED').expect(200);
-      expect(r.body.effects).toMatchObject({ apps: 1, done: 1, blocked: 0, failed: 0 });
-      expect(stopCalls).toContainEqual(nodes.B.uuid);
-      // Aucune tentative C4 : le OFF ne lit ni n'écrit les tables du protocole.
+      expect(r.body.status).toBe(SubscriptionStatus.SUSPENDED);
+      expect(r.body.effects).toMatchObject({ apps: 1, done: 0, blocked: 1, failed: 0, mode: 'off' });
+      expect(stopCalls.length).toBe(stopBefore);
       expect(await attemptsOf(nodes.B.depId)).toHaveLength(0);
       expect(await prisma.c4Takeover.count({ where: { scopeId: nodes.B.depId } })).toBe(0);
-      // Reprise DANS la même fenêtre OFF : toujours aucune écriture C4.
+      expect(await lastAuditReason('suspension.app_stop_blocked', nodes.B.depId)).toBe('protocole_off');
+
+      // Reprise DANS la même fenêtre OFF : idem, zéro appel, zéro écriture C4.
       const r2 = await patchSubscription(nodes.B.subId, 'ACTIVE').expect(200);
-      expect(r2.body.effects).toMatchObject({ apps: 1, done: 1, blocked: 0, failed: 0 });
-      expect(startCalls).toContainEqual(nodes.B.uuid);
+      expect(r2.body.status).toBe(SubscriptionStatus.ACTIVE);
+      expect(r2.body.effects).toMatchObject({ apps: 1, done: 0, blocked: 1, failed: 0, mode: 'off' });
+      expect(startCalls.length).toBe(startBefore);
       expect(await attemptsOf(nodes.B.depId)).toHaveLength(0);
-      expect(await prisma.c4Takeover.count({ where: { scopeId: nodes.B.depId } })).toBe(0);
+      expect(await lastAuditReason('suspension.app_start_blocked', nodes.B.depId)).toBe('protocole_off');
     } finally {
-      process.env.HOSTING_C4_ENABLED = prior;
+      process.env.HOSTING_C4_ENABLED = 'true';
     }
   });
 
@@ -427,6 +525,180 @@ describe('Suspension sous C4 — e2e PostgreSQL réel (Q12-P3)', () => {
       expect(deleteCalls).toHaveLength(0);
     } finally {
       spy.mockRestore();
+    }
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // 6 — ON→OFF pendant la préparation → aucun contournement
+  // ═══════════════════════════════════════════════════════════════════════
+  it('ON→OFF pendant la préparation → tentative consignée REFUSED, AUCUN appel transport', async () => {
+    const original = c4.beginDispatchStandalone.bind(c4);
+    const spy = jest.spyOn(c4, 'beginDispatchStandalone').mockImplementationOnce(async (p) => {
+      const ticket = await original(p);
+      // Bascule OFF APRÈS l'émission du ticket, AVANT l'appel réseau.
+      process.env.HOSTING_C4_ENABLED = 'false';
+      return ticket;
+    });
+    const stopBefore = stopCalls.length;
+    try {
+      const r = await patchSubscription(pairs.G.subId, 'SUSPENDED').expect(200);
+      expect(r.body.status).toBe(SubscriptionStatus.SUSPENDED);
+      expect(r.body.effects).toMatchObject({ apps: 2, done: 0, blocked: 2, failed: 0 });
+
+      // AUCUN contournement : zéro appel réseau malgré le passage OFF.
+      expect(stopCalls.length).toBe(stopBefore);
+      // App 1 : tentative émise sous ON → consignée REFUSED (terminale sûre).
+      const a1 = await attemptsOf(pairs.G.deps[0].depId);
+      expect(a1).toHaveLength(1);
+      expect(a1[0].phase).toBe('RETURNED');
+      expect(a1[0].outcome).toBe('REFUSED');
+      // App 2 : OFF déjà actif à l'entrée → AUCUNE tentative, AUCUN appel.
+      expect(await attemptsOf(pairs.G.deps[1].depId)).toHaveLength(0);
+      for (const d of pairs.G.deps) {
+        expect(await lastAuditReason('suspension.app_stop_blocked', d.depId)).toBe('protocole_off');
+      }
+      expect(deleteCalls).toHaveLength(0);
+    } finally {
+      spy.mockRestore();
+      process.env.HOSTING_C4_ENABLED = 'true';
+      stopImpl = async () => undefined;
+    }
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // 7 — réponse reçue après passage OFF → consignation limitée, zéro appel suivant
+  // ═══════════════════════════════════════════════════════════════════════
+  it('réponse reçue après passage OFF → consignation limitée de l\u2019appel en vol, AUCUN appel suivant', async () => {
+    let releaseStop: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      releaseStop = resolve;
+    });
+    const [f1, f2] = pairs.F.deps;
+    stopImpl = async (uuid) => {
+      if (uuid === f1.uuid) await gate;
+    };
+    try {
+      const p1 = new Promise<request.Response>((resolve, reject) => {
+        patchSubscription(pairs.F.subId, 'SUSPENDED')
+          .expect(200)
+          .end((err, res) => (err ? reject(err) : resolve(res)));
+      });
+      await waitFor(
+        'F1 stop in flight',
+        async () => ({
+          open: await prisma.c4ProviderAttempt.count({
+            where: { scopeId: f1.depId, phase: 'DISPATCHED' },
+          }),
+          called: stopCalls.filter((u) => u === f1.uuid).length,
+        }),
+        (s) => s.open >= 1 && s.called >= 1,
+      );
+
+      // L'OFF arrive PENDANT le vol — la réponse reste consignée (limitée).
+      process.env.HOSTING_C4_ENABLED = 'false';
+      releaseStop();
+      const r1 = await p1;
+
+      expect(r1.body.status).toBe(SubscriptionStatus.SUSPENDED);
+      expect(r1.body.effects).toMatchObject({ apps: 2, done: 1, blocked: 1, failed: 0 });
+      const a1 = await attemptsOf(f1.depId);
+      expect(a1).toHaveLength(1);
+      expect(a1[0].phase).toBe('RETURNED');
+      expect(a1[0].outcome).toBe('SUCCESS'); // consignation malgré l'OFF
+
+      // AUCUN appel suivant : la seconde app est bloquée, jamais appelée.
+      expect(stopCalls.filter((u) => u === f2.uuid)).toHaveLength(0);
+      expect(await attemptsOf(f2.depId)).toHaveLength(0);
+      expect(await lastAuditReason('suspension.app_stop_blocked', f2.depId)).toBe('protocole_off');
+      expect(deleteCalls).toHaveLength(0);
+    } finally {
+      process.env.HOSTING_C4_ENABLED = 'true';
+      stopImpl = async () => undefined;
+      releaseStop();
+    }
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // 8 — arrêt opposable au-delà de DEPLOYMENT (scope SERVICE)
+  // ═══════════════════════════════════════════════════════════════════════
+  it('arrêt opposable sur le SERVICE porteur → dispatch du déploiement REFUSÉ, zéro tentative, zéro appel', async () => {
+    // B est repassé ACTIVE (fin du scénario 2) : nouvel arrêt, portée SERVICE.
+    await c4.requestStop({
+      scope: { type: 'SERVICE', id: nodes.B.svcId },
+      reason: `p3c4-svc-${stamp}`,
+    });
+    const stopBefore = stopCalls.length;
+
+    const r = await patchSubscription(nodes.B.subId, 'SUSPENDED').expect(200);
+    expect(r.body.status).toBe(SubscriptionStatus.SUSPENDED);
+    expect(r.body.effects).toMatchObject({ apps: 1, done: 0, blocked: 1, failed: 0, mode: 'c4' });
+    expect(stopCalls.length).toBe(stopBefore);
+    expect(await attemptsOf(nodes.B.depId)).toHaveLength(0);
+    expect(await lastAuditReason('suspension.app_stop_blocked', nodes.B.depId)).toBe('c4_refuse');
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // 9 — décision la plus récente gagne + récupération ACTIVE et relance
+  // ═══════════════════════════════════════════════════════════════════════
+  it('réactivation en vol puis suspension concurrente → aucune action après la décision la plus récente, puis récupération ACTIVE + relance', async () => {
+    const [g1, g2] = pairs.G.deps;
+    let releaseStart: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      releaseStart = resolve;
+    });
+    startImpl = async (uuid) => {
+      if (uuid === g1.uuid) await gate;
+    };
+    try {
+      // G est SUSPENDED (fin du scénario 6) : réactivation démarrée, en vol.
+      const p1 = new Promise<request.Response>((resolve, reject) => {
+        patchSubscription(pairs.G.subId, 'ACTIVE')
+          .expect(200)
+          .end((err, res) => (err ? reject(err) : resolve(res)));
+      });
+      await waitFor(
+        'G1 start in flight',
+        async () => ({
+          open: await prisma.c4ProviderAttempt.count({
+            where: { scopeId: g1.depId, phase: 'DISPATCHED' },
+          }),
+          called: startCalls.filter((u) => u === g1.uuid).length,
+        }),
+        (s) => s.open >= 1 && s.called >= 1,
+      );
+
+      // Décision plus récente : suspension concurrente (committée AVANT les
+      // effets). Sa propre passe : g1 refusée (tentative de reprise ouverte),
+      // g2 stoppé (conforme à la décision fraîche).
+      const r2 = await patchSubscription(pairs.G.subId, 'SUSPENDED').expect(200);
+      expect(r2.body.status).toBe(SubscriptionStatus.SUSPENDED);
+      expect(r2.body.effects).toMatchObject({ apps: 2, done: 1, blocked: 1, failed: 0 });
+      expect(await lastAuditReason('suspension.app_stop_blocked', g1.depId)).toBe('c4_refuse');
+      expect(stopCalls.filter((u) => u === g2.uuid)).toHaveLength(1);
+
+      // Le provider lent finit la reprise : g1 se consigne, mais la suite de
+      // la réactivation ne passe PAS au-delà de la décision la plus récente.
+      releaseStart();
+      const r1 = await p1;
+      expect(r1.body.effects).toMatchObject({ apps: 2, done: 1, blocked: 1, failed: 0 });
+      expect(await lastAuditReason('suspension.app_start_blocked', g2.depId)).toBe('decision_perimee');
+      // Aucune relance de g2 n'a été émise après la suspension fraîche.
+      expect(startCalls.filter((u) => u === g2.uuid)).toHaveLength(0);
+      expect(stopCalls.filter((u) => u === g1.uuid)).toHaveLength(0);
+      const a1 = await attemptsOf(g1.depId);
+      expect(a1[a1.length - 1].outcome).toBe('SUCCESS'); // reprise en vol consignée
+
+      // Récupération : décisions closes → la réactivation rejoue les DEUX
+      // relances (ACTIVE + relance attendue), aucun blocage résiduel.
+      const r3 = await patchSubscription(pairs.G.subId, 'ACTIVE').expect(200);
+      expect(r3.body.status).toBe(SubscriptionStatus.ACTIVE);
+      expect(r3.body.effects).toMatchObject({ apps: 2, done: 2, blocked: 0, failed: 0, mode: 'c4' });
+      expect(startCalls.filter((u) => u === g1.uuid)).toHaveLength(2);
+      expect(startCalls.filter((u) => u === g2.uuid)).toHaveLength(1);
+      expect(deleteCalls).toHaveLength(0);
+    } finally {
+      startImpl = async () => undefined;
+      releaseStart();
     }
   });
 });
