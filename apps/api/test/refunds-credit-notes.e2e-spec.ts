@@ -566,6 +566,24 @@ describe('Remboursements et avoirs (e2e, GO Q9)', () => {
           ),
         ),
       );
+      // Diagnostique (GO CI) : aucun test ignore, aucune assertion affaiblie -
+      // on expose les statuts/repousses REELLEMENT recus avant les memes
+      // verifications, pour prouver la cause en cas d'echec CI.
+      if (results.some((r) => r.status !== 201 && r.status !== 409)) {
+        console.error(
+          'E1 diagnostique - statuts recus:',
+          JSON.stringify(results.map((r) => r.status)),
+          'details:',
+          JSON.stringify(
+            results
+              .filter((r) => r.status !== 201 && r.status !== 409)
+              .map((r) => ({
+                status: r.status,
+                message: (r.body as { message?: string })?.message ?? null,
+              })),
+          ),
+        );
+      }
       const ok = results.filter((r) => r.status === 201);
       const conflicts = results.filter((r) => r.status === 409);
       expect(ok).toHaveLength(15);
