@@ -54,7 +54,16 @@ import {
  *  9. **Décision la plus récente gagne** : une réactivation en vol suivie
  *     d'une suspension concurrente → aucune action préparée émise après la
  *     décision la plus récente (`decision_perimee`), puis récupération
- *     ACTIVE + relance complète.
+ *     ACTIVE + relance complète ;
+ * 10. **Décision périmée sous verrou (GO fenêtres R2)** : l'arrêt lit
+ *     `expected=SUSPENDED` à l'entrée, mais la réactivation ACTIVE se
+ *     commit AVANT que `beginDispatch` n'acquière le verrou `FOR UPDATE` de
+ *     la garde de fraîcheur → conflit `decision_perimee` DANS la tx de
+ *     tentative (zéro tentative, zéro transport), la réactivation réussit ;
+ * 11. **Ordre inverse** : l'arrêt est déjà DURABLE en vol (tentative
+ *     DISPATCHED chez le provider) → la réactivation est REFUSÉE
+ *     (`c4_refuse`, tentative d'arrêt non résolue), l'arrêt se consigne
+ *     SUCCESS tardivement, puis reprise complète.
  *
  * Aucun réseau : PanelTransportFactory + MailTransportFactory stubbés.
  */
@@ -117,12 +126,14 @@ describe('Suspension sous C4 — e2e PostgreSQL réel (Q12-P3)', () => {
     userId: string;
     deps: Array<{ depId: string; uuid: string }>;
   }
-  const nodes: Record<'A' | 'B' | 'C' | 'D' | 'E', Node> = {
+  const nodes: Record<'A' | 'B' | 'C' | 'D' | 'E' | 'H' | 'I', Node> = {
     A: { subId: '', svcId: '', depId: '', uuid: 'uuid-a', userId: '' },
     B: { subId: '', svcId: '', depId: '', uuid: 'uuid-b', userId: '' },
     C: { subId: '', svcId: '', depId: '', uuid: 'uuid-c', userId: '' },
     D: { subId: '', svcId: '', depId: '', uuid: 'uuid-d', userId: '' },
     E: { subId: '', svcId: '', depId: '', uuid: 'uuid-e', userId: '' },
+    H: { subId: '', svcId: '', depId: '', uuid: 'uuid-h', userId: '' },
+    I: { subId: '', svcId: '', depId: '', uuid: 'uuid-i', userId: '' },
   };
   /** Abonnements DEUX apps (scénarios 6, 7 et 9). */
   const pairs: Record<'F' | 'G', Pair> = {
@@ -225,7 +236,7 @@ describe('Suspension sous C4 — e2e PostgreSQL réel (Q12-P3)', () => {
     });
     productId = product.id;
 
-    for (const k of ['A', 'B', 'C', 'D', 'E'] as const) {
+    for (const k of ['A', 'B', 'C', 'D', 'E', 'H', 'I'] as const) {
       const n = nodes[k];
       const email = `p3c4-${k.toLowerCase()}_${stamp}@example.com`;
       const user = await prisma.user.create({
@@ -699,6 +710,163 @@ describe('Suspension sous C4 — e2e PostgreSQL réel (Q12-P3)', () => {
     } finally {
       startImpl = async () => undefined;
       releaseStart();
+    }
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // 10 — décision périmée sous VERROU (GO fenêtres R2) : le stop lit
+  // expected=SUSPENDED à l'entrée, la réactivation ACTIVE se commit avant
+  // que la garde de fraîcheur (FOR UPDATE) n'ait lieu → decision_perimee
+  // dans la tx de tentative, ZÉRO tentative, ZÉRO transport, la
+  // réactivation (décision la plus récente) a bien réussi.
+  // ═══════════════════════════════════════════════════════════════════════
+  it('décision périmée sous verrou : réactivation commit AVANT la garde FOR UPDATE → stop refusé decision_perimee sans tentative, start réussi', async () => {
+    let gateStop!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      gateStop = resolve;
+    });
+    let markReached!: () => void;
+    const reached = new Promise<void>((resolve) => {
+      markReached = resolve;
+    });
+    const original = c4.beginDispatchStandalone.bind(c4);
+    // Le stop est arrêté AVANT l'ouverture de sa tx (donc avant toute
+    // tentative durable) : la fenêtre est tenue EXPLICITEMENT, jamais
+    // supposée par une temporisation.
+    const spy = jest
+      .spyOn(c4, 'beginDispatchStandalone')
+      .mockImplementationOnce(async (p) => {
+        markReached();
+        await gate;
+        return original(p);
+      });
+    const stopBefore = stopCalls.filter((u) => u === nodes.H.uuid).length;
+    const startBefore = startCalls.filter((u) => u === nodes.H.uuid).length;
+    try {
+      // Décision 1 : SUSPENDED — ses effets commencent, puis se figent sur
+      // la barrière ci-dessus (entrée lue : expected=SUSPENDED).
+      const pStop = new Promise<request.Response>((resolve, reject) => {
+        patchSubscription(nodes.H.subId, 'SUSPENDED')
+          .expect(200)
+          .end((err, res) => (err ? reject(err) : resolve(res)));
+      });
+      await reached;
+      // AUCUNE tentative n'existe tant que la barrière tient.
+      expect(await attemptsOf(nodes.H.depId)).toHaveLength(0);
+      expect(stopCalls.filter((u) => u === nodes.H.uuid)).toHaveLength(0);
+
+      // Décision 2 (plus récente) : ACTIVE — committée pendant que le stop
+      // est figé ; sa garde de fraîcheur passe (expected=ACTIVE) et la
+      // relance réussit réellement (seconde appelle, non bridée).
+      const rStart = await patchSubscription(nodes.H.subId, 'ACTIVE').expect(200);
+      expect(rStart.body.status).toBe(SubscriptionStatus.ACTIVE);
+      expect(rStart.body.effects).toMatchObject({ apps: 1, done: 1, blocked: 0, failed: 0 });
+      expect(startCalls.filter((u) => u === nodes.H.uuid).length).toBe(startBefore + 1);
+      expect(stopCalls.filter((u) => u === nodes.H.uuid)).toHaveLength(stopBefore);
+
+      // Libération : le stop reprend SA propre tx — la garde FOR UPDATE voit
+      // ACTIVE ≠ expected SUSPENDED → conflit decision_perimee, émission
+      // interrompue AVANT toute tentative/appel.
+      gateStop();
+      const rStop = await pStop;
+      expect(rStop.body.effects).toMatchObject({ apps: 1, done: 0, blocked: 1, failed: 0 });
+
+      // Zéro tentative du stop, zéro appel transport d'arrêt, blocage audité.
+      const attempts = await attemptsOf(nodes.H.depId);
+      expect(attempts).toHaveLength(1); // uniquement celui de la RELANCE
+      expect(stopCalls.filter((u) => u === nodes.H.uuid)).toHaveLength(0);
+      expect(await lastAuditReason('suspension.app_stop_blocked', nodes.H.depId)).toBe(
+        'decision_perimee',
+      );
+
+      // Décision la plus récente intacte en base (la relance a tenu).
+      const sub = await prisma.subscription.findUniqueOrThrow({
+        where: { id: nodes.H.subId },
+      });
+      expect(sub.status).toBe(SubscriptionStatus.ACTIVE);
+      expect(deleteCalls).toHaveLength(0);
+    } finally {
+      spy.mockRestore();
+      gateStop();
+    }
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // 11 — ordre inverse : l'arrêt est DÉJÀ durable en vol (tentative
+  // DISPATCHED chez le provider) → la réactivation la plus fraîche est
+  // REFUSÉE c4_refuse (tentative d'arrêt non résolue), l'arrêt se
+  // consigne SUCCESS tardivement, puis reprise complète.
+  // ═══════════════════════════════════════════════════════════════════════
+  it('arrêt durable en vol puis réactivation fraîche → start refusé c4_refuse, stop consigné SUCCESS tardif, puis reprise complète', async () => {
+    let gateStop!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      gateStop = resolve;
+    });
+    stopImpl = async (uuid) => {
+      if (uuid === nodes.I.uuid) await gate;
+    };
+    const startBefore = startCalls.filter((u) => u === nodes.I.uuid).length;
+    const stopBefore = stopCalls.filter((u) => u === nodes.I.uuid).length;
+    try {
+      // Décision 1 : SUSPENDED — l'appel provider se fige APRES la tentative
+      // durable (tentative DISPATCHED en vol).
+      const pStop = new Promise<request.Response>((resolve, reject) => {
+        patchSubscription(nodes.I.subId, 'SUSPENDED')
+          .expect(200)
+          .end((err, res) => (err ? reject(err) : resolve(res)));
+      });
+      await waitFor(
+        'I stop in flight',
+        async () => ({
+          open: await prisma.c4ProviderAttempt.count({
+            where: { scopeId: nodes.I.depId, phase: 'DISPATCHED' },
+          }),
+          called: stopCalls.filter((u) => u === nodes.I.uuid).length,
+        }),
+        (s) => s.open >= 1 && s.called >= 1,
+      );
+
+      // Décision 2 (plus récente) : ACTIVE — la garde de fraîcheur PASSE
+      // (expected=ACTIVE committé), mais la tentative d'arrêt non résolue
+      // rend le dispatch de relance IMPOSSIBLE : refus c4_refuse, aucun
+      // appel start émis.
+      const rStart = await patchSubscription(nodes.I.subId, 'ACTIVE').expect(200);
+      expect(rStart.body.status).toBe(SubscriptionStatus.ACTIVE);
+      expect(rStart.body.effects).toMatchObject({ apps: 1, done: 0, blocked: 1, failed: 0 });
+      expect(await lastAuditReason('suspension.app_start_blocked', nodes.I.depId)).toBe(
+        'c4_refuse',
+      );
+      expect(startCalls.filter((u) => u === nodes.I.uuid)).toHaveLength(0);
+
+      // L'arrêt en vol se termine : SUCCESS consigné TARDIVEMENT (la
+      // réponse du provider est acceptée malgré la décision fraîche).
+      gateStop();
+      const rStop = await pStop;
+      expect(rStop.body.effects).toMatchObject({ apps: 1, done: 1, blocked: 0, failed: 0 });
+      const attempts = await attemptsOf(nodes.I.depId);
+      expect(attempts[0].phase).toBe('RETURNED');
+      expect(attempts[0].outcome).toBe('SUCCESS');
+      expect(stopCalls.filter((u) => u === nodes.I.uuid)).toHaveLength(stopBefore + 1);
+
+      // Décision fraîche conservée : l'abonnement reste ACTIVE (c'est la
+      // dernière décision committée), même si l'app physiquement stoppée.
+      const sub = await prisma.subscription.findUniqueOrThrow({
+        where: { id: nodes.I.subId },
+      });
+      expect(sub.status).toBe(SubscriptionStatus.ACTIVE);
+
+      // Récupération : décisions closes → la relance rejoue (SUSPENDED puis
+      // ACTIVE), aucun blocage résiduel, aucun appel de suppression.
+      const r5a = await patchSubscription(nodes.I.subId, 'SUSPENDED').expect(200);
+      expect(r5a.body.effects).toMatchObject({ apps: 1, done: 1, blocked: 0, failed: 0 });
+      const r5b = await patchSubscription(nodes.I.subId, 'ACTIVE').expect(200);
+      expect(r5b.body.status).toBe(SubscriptionStatus.ACTIVE);
+      expect(r5b.body.effects).toMatchObject({ apps: 1, done: 1, blocked: 0, failed: 0, mode: 'c4' });
+      expect(startCalls.filter((u) => u === nodes.I.uuid).length).toBe(startBefore + 1);
+      expect(deleteCalls).toHaveLength(0);
+    } finally {
+      stopImpl = async () => undefined;
+      gateStop();
     }
   });
 });

@@ -271,6 +271,10 @@ export class SuspensionEffectsService {
     // ── Décision la PLUS RÉCENTE gagne (Q12-P3) : revérification LIVE ──────
     // Une suspension/réactivation concurrente committée pendant la boucle
     // rend l'effet périmé : aucune préparation, aucun appel, blocage visible.
+    // LECTURE D'ENTRÉE = chemin rapide seulement : entre elle et l'enregistre-
+    // ment de la tentative, des await (résolution allocation, file C4…) lais-
+    // saient une fenêtre — l'AUTORITÉ est le garde `freshnessGuard` EXÉCUTÉ
+    // SOUS VERROU dans la transaction de la tentative (GO fenêtres R2).
     const fresh = await this.prisma.subscription.findUnique({
       where: { id: p.subscriptionId },
       select: { status: true },
@@ -337,15 +341,28 @@ export class SuspensionEffectsService {
         orderId: p.orderId,
         serviceId: allocation?.hostingServiceId ?? p.hostingServiceId,
         targetIntent: { type: 'application', op, uuid: p.uuid },
+        // GO fenêtres R2 : la décision est revérifiée SOUS VERROU `FOR
+        // UPDATE` DANS la transaction qui enregistre la tentative — bloquée
+        // avant cette enregistrement, une décision périmée (réactivation
+        // concurrente committée entre la lecture d'entrée et la tentative)
+        // est refusée ici, jamais convertie en appel. La sérialisation est
+        // commune avec les transitions de l'abonnement (même verrou de
+        // ligne) ; les opérations DÉJÀ EN VOL (tentative durable) continuent
+        // et se consignent, celles non encore autorisées n'entrent jamais.
+        freshnessGuard: { subscriptionId: p.subscriptionId, expected },
       });
       attemptId = ticket.attemptId;
     } catch (err) {
       // Refus C4 (arrêt opposable, tentative déjà ouverte, créateur non
       // résolu…) → blocage explicite de CET action, les autres corrections
-      // continuent.
+      // continuent. Décision périmée détectée sous verrou dans la tx de
+      // tentative → même raison `decision_perimee` que la lecture d'entrée.
       const msg = err instanceof Error ? err.message : String(err);
       const conflict = err instanceof ConflictException;
-      if (conflict) return this.recordBlock(op, p, 'c4_refuse', msg);
+      if (conflict) {
+        const stale = msg.startsWith('decision_perimee');
+        return this.recordBlock(op, p, stale ? 'decision_perimee' : 'c4_refuse', msg);
+      }
       // Erreur inattendue (schéma, DB) : pas de faux succès, échec visible.
       return this.recordFail(op, p, msg, 'failed');
     }

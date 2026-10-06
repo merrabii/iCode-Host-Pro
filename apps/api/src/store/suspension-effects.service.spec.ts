@@ -270,6 +270,9 @@ describe('SuspensionEffectsService (Q5)', () => {
         orderId: 'ord-1',
         serviceId: 'hs-1',
         targetIntent: { type: 'application', op: 'stop', uuid: 'uuid-1' },
+        // GO fenêtres R2 : décision portée DANS la transaction de tentative
+        // (lecture `FOR UPDATE` sérialisée avec les transitions de l'abonnement).
+        freshnessGuard: { subscriptionId: 'sub-1', expected: 'SUSPENDED' },
       });
       expect(transport.stopApplication).toHaveBeenCalledTimes(1);
       expect(c4.settleStandalone).toHaveBeenCalledWith({
@@ -399,6 +402,29 @@ describe('SuspensionEffectsService (Q5)', () => {
       expect(out).toEqual({ apps: 1, done: 0, blocked: 1, failed: 0, mode: 'c4' });
       expect(factory.create).not.toHaveBeenCalled();
       expect(c4.beginDispatchStandalone).not.toHaveBeenCalled();
+      expect(audit.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'suspension.app_stop_blocked',
+          details: expect.objectContaining({ reason: 'decision_perimee' }),
+        }),
+      );
+    });
+
+    it('décision périmee détectée SOUS VERROU dans la tx de tentative → même blocage decision_perimee, zéro appel', async () => {
+      // GO fenêtres R2 : la lecture d'entrée a PASSÉ (SUSPENDED) mais la
+      // transition concurrente committée avant l'enregistrement de la
+      // tentative fait refuser `beginDispatch` sous verrou → aucune tentative
+      // n'existe, aucun transport n'est appelé, raison = decision_perimee.
+      c4.beginDispatchStandalone.mockRejectedValue(
+        new ConflictException(
+          'decision_perimee: abonnement ACTIVE ≠ SUSPENDED (transition concurrente) — tentative non enregistrée.',
+        ),
+      );
+      const out = await svc.suspendApps(params);
+      expect(out).toEqual({ apps: 1, done: 0, blocked: 1, failed: 0, mode: 'c4' });
+      expect(factory.create).not.toHaveBeenCalled();
+      expect(transport.stopApplication).not.toHaveBeenCalled();
+      expect(c4.settleStandalone).not.toHaveBeenCalled();
       expect(audit.record).toHaveBeenCalledWith(
         expect.objectContaining({
           action: 'suspension.app_stop_blocked',

@@ -32,6 +32,16 @@ export interface C4BeginDispatchParams {
   serviceId?: string | null;
   /** Cible exacte figée avant appel (uuid connu pour DELETE ; non connu pour CREATE). */
   targetIntent?: Record<string, unknown> | null;
+  /**
+   * GO fenêtres résiduelles R2 — décision (abonnement) validée SOUS VERROU
+   * `FOR UPDATE` dans LA MÊME transaction que l'enregistrement durable de la
+   * tentative : toute transition concurrente de `Subscription` (même ligne
+   * verrouillée) est sérialisée, un statut divergent lève
+   * `ConflictException('decision_perimee: …')` AVANT toute tentative/appel.
+   * Une seconde lecture HORS transaction déplacerait seulement la fenêtre ;
+   * ici la décision et l'insertion de la tentative ne font qu'un.
+   */
+  freshnessGuard?: { subscriptionId: string; expected: string };
 }
 
 /** Paramètres de consignation (retour d'une tentative émise). */
@@ -241,6 +251,27 @@ export class C4ProtocolService {
     tx: Prisma.TransactionClient,
     params: C4BeginDispatchParams,
   ): Promise<C4DispatchTicket> {
+    // ⓪ GO fenêtres R2 — décision DURABLE (décision liée à la tentative) :
+    //    lecture VERROUILLÉE de l'abonnement dans LA transaction qui va
+    //    insérer la tentative, sérialisée avec toute transition concurrente
+    //    (`updateSubscription` verrouille la même ligne `FOR UPDATE`).
+    //    Une décision périmée (statut lu avant une réactivation/suspension
+    //    concurrente) lève ici, AVANT toute tentative : la préparation non
+    //    encore autorisée ne devient jamais « en vol ». Seul un lock tenu
+    //    DANS cette transaction ferme la fenêtre ; une relecture hors tx ne
+    //    la déplacerait que. Aucun réseau dans la transaction (SQL seul).
+    if (params.freshnessGuard) {
+      const subs = await tx.$queryRaw<Array<{ status: string }>>`
+        SELECT "status" FROM "Subscription"
+        WHERE "id" = ${params.freshnessGuard.subscriptionId}
+        FOR UPDATE`;
+      if (subs[0]?.status !== params.freshnessGuard.expected) {
+        throw new ConflictException(
+          `decision_perimee: abonnement ${subs[0]?.status ?? 'introuvable'} ≠ ` +
+            `${params.freshnessGuard.expected} (transition concurrente) — tentative non enregistrée.`,
+        );
+      }
+    }
     const coversCreation = STOP_BLOCKED_NATURES.includes(params.nature);
     const scopes = C4ProtocolService.scopesFor({
       order: params.orderId ?? (params.scope.type === 'ORDER' ? params.scope.id : null),
