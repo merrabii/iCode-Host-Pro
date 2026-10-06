@@ -388,12 +388,19 @@ export class AuthService {
    *    ressusciterait une session).
    *
    * Détails de rotation :
+   *  - **Barrière commune (GO corr. finales P1)** : rotation/ré-émission/login
+   *    ET révocation (logout/changePassword/resetPassword) passent tous par le
+   *    **verrou de la ligne `User`** (identité durable, toujours présente) avant
+   *    toute écriture refresh. Sans cette barrière, le `DELETE` d'un logout en
+   *    cours ne voit pas le successeur inséré par une rotation concurrente
+   *    (snapshot READ COMMITTED) et le token survit à la révocation. Avec la
+   *    barrière, les deux ordres d'exécution convergent : soit la révocation
+   *    part en premier (rotation → CAS count 0 → 401, aucune écriture), soit la
+   *    rotation part en premier (le logout committé ensuite détruit l'intégralité
+   *    de la famille, successeur compris). Aucune survie ni résurrection.
    *  - **CAS de rotation** : la ligne n'est révoquée que si elle est encore
    *    active (`revokedAt: null`). CAS + création du successeur s'exécutent
-   *    dans **une même transaction** : un logout/reset concurrent est soit
-   *    traité AVANT (lignes déjà détruites → count 0 → relecture → 401), soit
-   *    APRÈS (il détruit aussi le successeur, même famille) — jamais « token
-   *    émis dans une famille déjà détruite ».
+   *    dans **une même transaction**, sous la barrière User.
    *  - **Course perdue (count 0)** : relecture de la ligne réelle en base.
    *    Absente (logout/reset committé entre la lecture initiale et le CAS) →
    *    401, aucun émetteur, aucune ressurrection. Présente mais pas révoquée /
@@ -403,8 +410,15 @@ export class AuthService {
    *  - **Fenêtre de rejeu 10 s** (réutilisation LÉGITIME de rotation : 2
    *    onglets / appel en double) : audit `auth.refresh.reuse`, nouveau jeton
    *    **dans la même famille**. Une ligne ABSENTE n'entre jamais dans cette
-   *    fenêtre.
+   *    fenêtre. Le double-refresh légitime reste donc servi — chaque émission
+   *    passe par la barrière User.
    *  - **Compte désactivé** (`isActive=false`) : refus avant toute rotation.
+   *  - **Access tokens résiduels (documentation séparée)** : le JWT d'accès est
+   *    stateless (signature + `exp` uniquement) — logout/reset/changePassword
+   *    ne révoquent PAS un bearer déjà émis ; il reste utilisable au plus
+   *    `jwtExpiresIn` (défaut **15 min**) après la révocation. C'est une durée
+   *    résiduelle garantie par construction, pas une révocation forte : le
+   *    point de révocation serveur fort est la ligne refresh (barrière ci-dessus).
    */
   async refresh(refreshToken: string): Promise<AuthTokens> {
     const record = await this.prisma.refreshToken.findUnique({
@@ -459,6 +473,7 @@ export class AuthService {
     //          sinon { raw, reuse } avec reuse = fenêtre de rejeu 10 s.
     const outcome = await this.prisma.$transaction(
       async (tx): Promise<{ raw: string; reuse: boolean } | null> => {
+        await this.lockAuthIdentity(tx, user.id); // barrière P1 : AVANT toute écriture
         const cas = await tx.refreshToken.updateMany({
           where: { id: record.id, revokedAt: null },
           data: { revokedAt: new Date() },
@@ -504,9 +519,13 @@ export class AuthService {
 
   /**
    * Ré-émission dans la famille d'une ligne DÉJÀ révoquée (fenêtre de rejeu).
-   * Le `updateMany` no-op est un **probe atomique sous verrou** : count 0 = la
-   * ligne a été détruite (logout/reset committé pendant la course) → null →
-   * 401, aucun token n'est émis pour une famille morte.
+   * **Barrière P1** : le verrou User est pris ici aussi — une ré-émission est
+   * une création de ligne comme la rotation, et doit s'exclure mutuellement
+   * avec logout/reset/changePassword. Le `updateMany` no-op est ensuite un
+   * **probe atomique** : count 0 = la ligne a été détruite (logout/reset
+   * committé pendant la course) → null → 401, aucun token émis pour une
+   * famille morte. (Si l'appelant détient déjà le verrou User — chemin CAS
+   * perdu en tx — le re-`FOR UPDATE` est un no-op sur la même tx.)
    */
   private async reissueInFamily(
     tx: Prisma.TransactionClient,
@@ -514,12 +533,31 @@ export class AuthService {
     row: { id: string; sessionId: string; revokedAt: Date | null },
   ): Promise<string | null> {
     if (row.revokedAt === null) return null;
+    await this.lockAuthIdentity(tx, user.id);
     const probe = await tx.refreshToken.updateMany({
       where: { id: row.id, sessionId: row.sessionId },
       data: { revokedAt: row.revokedAt }, // no-op : verrou + existence uniquement
     });
     if (probe.count !== 1) return null;
     return this.createRefreshRow(tx, user.id, row.sessionId);
+  }
+
+  /**
+   * **Barrière transactionnelle commune (GO corr. finales P1).**
+   * `SELECT … FOR UPDATE` sur la ligne `User` — identité durable présente pour
+   * tous les flux (rotation, ré-émission, login, logout, changePassword,
+   * resetPassword). Toute création ET toute destruction de lignes refresh passe
+   * par ce verrou AVANT d'écrire : les opérations sont mutuellement exclusives,
+   * l'ordre d'exécution n'a plus d'effet (les deux ordres convergent vers « aucune
+   * survivante »), et un `DELETE` ne peut plus manquer un successeur inséré pendant
+   * son propre fenêtrage (snapshot READ COMMITTED). Lock-order constant
+   * `User` → `RefreshToken` : aucune inversion possible, pas de deadlock interne.
+   */
+  private async lockAuthIdentity(
+    tx: Prisma.TransactionClient | PrismaService,
+    userId: string,
+  ): Promise<void> {
+    await tx.$queryRaw`SELECT id FROM "User" WHERE id = ${userId} FOR UPDATE`;
   }
 
   /** Crée une ligne refresh (successeur de rotation OU nouveau login). */
@@ -555,8 +593,14 @@ export class AuthService {
       where: { tokenHash: hash },
     });
     if (record) {
-      await this.prisma.refreshToken.deleteMany({
-        where: { userId: record.userId, sessionId: record.sessionId },
+      // Barrière P1 : la destruction de la famille partage le verrou User avec
+      // les rotations — un successeur inséré AVANT ce lock est détruit ici, un
+      // successeur tenté APRÈS ce lock verra la famille déjà vide (401).
+      await this.prisma.$transaction(async (tx) => {
+        await this.lockAuthIdentity(tx, record.userId);
+        await tx.refreshToken.deleteMany({
+          where: { userId: record.userId, sessionId: record.sessionId },
+        });
       });
     } else {
       // Idempotent : ligne déjà détruite → no-op défensif sur le hash.
@@ -595,17 +639,18 @@ export class AuthService {
       throw new BadRequestException('Le nouveau mot de passe doit faire au moins 8 caractères.');
     }
     const passwordHash = await bcrypt.hash(newPassword, 10);
-    await this.prisma.$transaction([
-      this.prisma.user.update({
+    await this.prisma.$transaction(async (tx) => {
+      await this.lockAuthIdentity(tx, userId); // barrière P1 : exclusivité avec rotation/login
+      await tx.user.update({
         where: { id: userId },
         data: { passwordHash },
-      }),
+      });
       // Toutes lignes, sans filtre revokedAt : pas de ligne survivante qui
       // puisse entrer dans la fenêtre de rejeu de refresh().
-      this.prisma.refreshToken.deleteMany({
+      await tx.refreshToken.deleteMany({
         where: { userId },
-      }),
-    ]);
+      });
+    });
     await this.audit.record({
       actorId: user.id,
       actorEmail: user.email,
@@ -736,6 +781,7 @@ export class AuthService {
 
     const passwordHash = await bcrypt.hash(newPassword, 10); // hors tx (bcrypt ~100 ms)
     const consumed = await this.prisma.$transaction(async (tx) => {
+      await this.lockAuthIdentity(tx, user.id); // barrière P1 : exclusivité avec rotation/login
       // CAS conditionnel : expiration + usage unique VÉRIFIÉS dans la
       // transaction. Deux appels concurrents sur le même jeton : un seul
       // obtient count === 1 ; l'autre ne modifie rien.
@@ -922,7 +968,12 @@ export class AuthService {
    */
   async issueTokens(user: User): Promise<AuthTokens> {
     const accessToken = await this.signAccess(user);
-    const refreshToken = await this.createRefreshRow(this.prisma, user.id);
+    // Barrière P1 : la création d'une famille (login) partage le verrou User
+    // avec les révocations — un reset/logout concurrent ne peut plus la manquer.
+    const refreshToken = await this.prisma.$transaction(async (tx) => {
+      await this.lockAuthIdentity(tx, user.id);
+      return this.createRefreshRow(tx, user.id);
+    });
     return { accessToken, refreshToken };
   }
 

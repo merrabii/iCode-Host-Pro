@@ -43,6 +43,8 @@ describe('AuthService (impersonation + order-time registration, ADR-027)', () =>
     subscription: { create: jest.fn() },
     auditLog: { create: jest.fn() },
     $transaction: jest.fn(),
+    // Barrière P1 (GO corr. finales) : SELECT … FOR UPDATE sur la ligne User.
+    $queryRaw: jest.fn().mockResolvedValue([]),
   };
   const mockJwt = { signAsync: jest.fn(), verifyAsync: jest.fn() };
   const mockConfig = { get: jest.fn() };
@@ -365,6 +367,7 @@ describe('AuthService (impersonation + order-time registration, ADR-027)', () =>
     /** Tx « heureuse » : CAS count 1, puis écritures. */
     const happyTx = () => {
       const tx = {
+        $queryRaw: jest.fn().mockResolvedValue([]),
         passwordResetToken: { updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
         user: { update: jest.fn().mockResolvedValue({}) },
         refreshToken: { deleteMany: jest.fn().mockResolvedValue({ count: 2 }) },
@@ -378,6 +381,7 @@ describe('AuthService (impersonation + order-time registration, ADR-027)', () =>
     /** Tx « perdante » : le CAS retourne count 0 (déjà consommé / expiré en DB). */
     const losingTx = () => {
       const tx = {
+        $queryRaw: jest.fn().mockResolvedValue([]),
         passwordResetToken: { updateMany: jest.fn().mockResolvedValue({ count: 0 }) },
         user: { update: jest.fn() },
         refreshToken: { deleteMany: jest.fn() },
@@ -490,6 +494,8 @@ describe('AuthService (impersonation + order-time registration, ADR-027)', () =>
 
       const res = await service.refresh('raw-refresh');
       expect(res.accessToken).toBe('jwt.token');
+      // Barrière P1 : verrou User pris AVANT le CAS (sérialisation avec logout/reset).
+      expect(mockPrisma.$queryRaw).toHaveBeenCalledTimes(1);
       // Seule une ligne ENCORE ACTIVE peut être révoquée (CAS).
       expect(mockPrisma.refreshToken.updateMany).toHaveBeenCalledWith({
         where: { id: 'rt1', revokedAt: null },
@@ -640,6 +646,8 @@ describe('AuthService (impersonation + order-time registration, ADR-027)', () =>
       mockPrisma.user.findUnique.mockResolvedValue(client);
 
       await service.logout('raw-refresh');
+      // Barrière P1 : la destruction partage le verrou User avec la rotation.
+      expect(mockPrisma.$queryRaw).toHaveBeenCalledTimes(1);
       expect(mockPrisma.refreshToken.deleteMany).toHaveBeenCalledWith({
         where: { userId: 'u1', sessionId: 's1' },
       });
@@ -679,11 +687,12 @@ describe('AuthService (impersonation + order-time registration, ADR-027)', () =>
 
     it('success: password updated AND every active session destroyed in one tx, audited', async () => {
       mockPrisma.user.findUnique.mockResolvedValue({ ...client, passwordHash: 'old' });
-      mockPrisma.$transaction.mockResolvedValue(undefined);
 
       await expect(service.changePassword('u1', 'current', 'new-password-1')).resolves.toEqual({
         ok: true,
       });
+      // Barrière P1 : verrou User pris en tête de la transaction interactive.
+      expect(mockPrisma.$queryRaw).toHaveBeenCalledTimes(1);
       expect(mockPrisma.user.update).toHaveBeenCalledWith({
         where: { id: 'u1' },
         data: { passwordHash: 'hashed:new-password-1' },
