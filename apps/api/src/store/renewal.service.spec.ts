@@ -112,6 +112,8 @@ describe('RenewalService (D2 — échéances, renouvellement, dunning)', () => {
     order: {
       updateMany: jest.fn(async () => ({ count: 1 })),
       create: jest.fn(async () => ({ id: 'renewal-1', ...renewalOver })),
+      // GO fenêtres R1 : remontée de racine `renewsOrderId` (barrière de chaîne).
+      findUnique: jest.fn(async () => ({ renewsOrderId: null })),
     },
     invoice: {
       findUnique: jest.fn(async () => null),

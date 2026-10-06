@@ -27,6 +27,10 @@ import { addBillingCycle } from './billing-cycle';
 import { InvoicePdfService } from './invoice-pdf.service';
 import { InvoiceListQueryDto, OrderListQueryDto } from './dto/store-lists.dto';
 import { RenewalToggleDto } from './dto/renewal-toggle.dto';
+import {
+  acquireRenewalChainBarrier,
+  renewalChainRootId,
+} from './renewal-chain-barrier';
 
 /**
  * Socle commercial (GO P4 / lot B1 - visibilité) — vues « mes commandes » et
@@ -296,36 +300,54 @@ export class ClientStoreController {
         },
       });
     } else {
+      // GO fenêtres R1 : CAS + walk de descendance + cascade dans UNE
+      // transaction, ACQUISE D'ABORD sur la barrière de chaîne commune avec
+      // la création de descendants (`acquireRenewalChainBarrier`) :
+      //  - la révocation qui attend la barrière découvre, une fois acquise,
+      //    TOUS les descendants committés (y compris une fille G préparée par
+      //    un renouvellement concurrent, invisible pendant son ouverture) ;
+      //  - un renouvellement concurrent qui attend la barrière voit ensuite
+      //    le CAS `autoRenew` déjà basculé (COUNT = 0 → aucune fille armée) ;
+      //  - un walk seul + `updateMany` séparé ne suffisait PAS : G pouvait
+      //    committer armé entre les deux, ni vu ni désarmé.
       // Cible : CAS idempotent (révocation même déjà faite = no-op sûr).
-      await this.prisma.order.updateMany({
-        where: { id: order.id, autoRenew: true },
-        data: { autoRenew: false },
-      });
-      // Cascade vers les FILLES de renouvellement (descendance `renewsOrderId`) :
-      // c'est LEUR `autoRenew` (consentement de la chaîne) que la reprise
+      // Cascade vers les FILLES de renouvellement (descendance `renewsOrderId`)
+      // : c'est LEUR `autoRenew` (consentement de la chaîne) que la reprise
       // vérifie par CAS avant tout débit — la mère est souvent déjà à false.
-      const closed = new Set<string>();
-      let frontier: string[] = [order.id];
-      for (let depth = 0; depth < 50 && frontier.length > 0; depth++) {
-        const children = await this.prisma.order.findMany({
-          where: { renewsOrderId: { in: frontier } },
-          select: { id: true },
-        });
-        frontier = [];
-        for (const child of children) {
-          if (!closed.has(child.id)) {
-            closed.add(child.id);
-            frontier.push(child.id);
+      // Le paiement manuel (sans option de consentement) reste hors barrière :
+      // révoquer n'empêche jamais de régler volontairement.
+      revokedDescendants = await this.prisma.$transaction(
+        async (tx) => {
+          const rootId = await renewalChainRootId(tx, order.id);
+          await acquireRenewalChainBarrier(tx, rootId);
+          await tx.order.updateMany({
+            where: { id: order.id, autoRenew: true },
+            data: { autoRenew: false },
+          });
+          const closed = new Set<string>();
+          let frontier: string[] = [order.id];
+          for (let depth = 0; depth < 50 && frontier.length > 0; depth++) {
+            const children = await tx.order.findMany({
+              where: { renewsOrderId: { in: frontier } },
+              select: { id: true },
+            });
+            frontier = [];
+            for (const child of children) {
+              if (!closed.has(child.id)) {
+                closed.add(child.id);
+                frontier.push(child.id);
+              }
+            }
           }
-        }
-      }
-      if (closed.size > 0) {
-        const cascade = await this.prisma.order.updateMany({
-          where: { id: { in: [...closed] }, autoRenew: true },
-          data: { autoRenew: false },
-        });
-        revokedDescendants = cascade.count;
-      }
+          if (closed.size === 0) return 0;
+          const cascade = await tx.order.updateMany({
+            where: { id: { in: [...closed] }, autoRenew: true },
+            data: { autoRenew: false },
+          });
+          return cascade.count;
+        },
+        { timeout: 30_000 },
+      );
     }
 
     await this.audit

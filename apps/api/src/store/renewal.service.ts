@@ -20,6 +20,10 @@ import { PrismaService } from '../prisma/prisma.service';
 import { MailSettingsService } from '../mail/mail-settings.service';
 import { CheckoutService } from './checkout.service';
 import { claimInvoiceSequence } from './invoice-sequence';
+import {
+  acquireRenewalChainBarrier,
+  renewalChainRootId,
+} from './renewal-chain-barrier';
 import { SuspensionEffectsService, applyHostingStatusInTx } from './suspension-effects.service';
 import {
   RENEWAL_SCHEMA,
@@ -182,18 +186,16 @@ export class RenewalService implements OnModuleInit, OnModuleDestroy {
 
   // ───────────────────── 1. Renouvellement des échéances ────────────────────
 
-  private async createDueRenewals(): Promise<{
-    created: number;
-    paid: number;
-    pending: number;
-    stopped: number;
-  }> {
-    const now = new Date();
-    // Échu + cycle récurrent + CONSENTEMENT enregistré (Q-A : sans
-    // `renewalConsentAt`, AUCUN prélèvement automatique n'est planifié — les
-    // têtes héritées sans consentement sont simplement ignorées) + famille
-    // payée (PAID/PROVISIONING/ACTIVE).
-    const heads = await this.prisma.order.findMany({
+  /**
+   * Têtes échues éligibles (Q-A) — select partagé par la passe de sweep ET
+   * par le test d'interleaving déterministe (`createRenewalOrderInTx`) :
+   * échu + cycle récurrent + CONSENTEMENT enregistré (sans
+   * `renewalConsentAt`, AUCUN prélèvement automatique n'est planifié — les
+   * têtes héritées sans consentement sont simplement ignorées) + famille
+   * payée (PAID/PROVISIONING/ACTIVE).
+   */
+  async dueRenewalHeads(now: Date) {
+    return this.prisma.order.findMany({
       where: {
         autoRenew: true,
         renewalConsentAt: { not: null },
@@ -228,6 +230,16 @@ export class RenewalService implements OnModuleInit, OnModuleDestroy {
       take: 10,
       orderBy: { nextBillingDate: 'asc' },
     });
+  }
+
+  private async createDueRenewals(): Promise<{
+    created: number;
+    paid: number;
+    pending: number;
+    stopped: number;
+  }> {
+    const now = new Date();
+    const heads = await this.dueRenewalHeads(now);
 
     let created = 0;
     let paid = 0;
@@ -354,8 +366,13 @@ export class RenewalService implements OnModuleInit, OnModuleDestroy {
    * Crée la commande de renouvellement + sa facture UNPAID, et ferme
    * `autoRenew` sur la mère, dans UNE transaction atomique.
    * `null` = la mère a déjà été traitée (concurrence) → idempotent.
+   *
+   * GO fenêtres R1 : la transaction passe PAR la barrière de chaîne
+   * (`acquireRenewalChainBarrier`, acquise EN PREMIER) — la révocation en
+   * cascade du contrôleur sérialise sur la même clé et ne peut plus manquer
+   * un descendant committé pendant son walk (ni être manquée par lui).
    */
-  private async createRenewalOrder(
+  private createRenewalOrder(
     head: {
       id: string;
       renewsOrderId: string | null;
@@ -385,12 +402,58 @@ export class RenewalService implements OnModuleInit, OnModuleDestroy {
     invoice: { id: string; amountTtcCents: number };
     invoiceNumber: string;
   } | null> {
-    return this.prisma.$transaction(async (tx) => {
-      const flipped = await tx.order.updateMany({
-        where: { id: head.id, autoRenew: true },
-        data: { autoRenew: false },
-      });
-      if (flipped.count !== 1) return null;
+    return this.prisma.$transaction(
+      (tx) => this.createRenewalOrderInTx(tx, head, now),
+      { timeout: 30_000 },
+    );
+  }
+
+  /**
+   * Corps transactionnel PUBLIC (GO fenêtres R1) : barrière de chaîne puis
+   * flip CAS + création. Exposé pour le test d'interleaving DÉTERMINISTE
+   * (les deux ordres d'exécution avec barrières explicites, jamais un
+   * `Promise.all` ni une temporisation) ; la production passe par
+   * `createRenewalOrder` ci-dessus.
+   */
+  async createRenewalOrderInTx(
+    tx: Prisma.TransactionClient,
+    head: {
+      id: string;
+      renewsOrderId: string | null;
+      customerId: string;
+      customerName: string;
+      customerEmail: string;
+      customerPhone: string | null;
+      productId: string;
+      productName: string;
+      packId: string | null;
+      billingCycle: string;
+      currency: string;
+      taxRatePercent: Prisma.Decimal;
+      amountHtCents: number;
+      taxAmountCents: number;
+      amountTtcCents: number;
+      paymentMethodId: string | null;
+      paymentMethodName: string | null;
+      optionsSnapshot: Prisma.JsonValue;
+      addonsSnapshot: Prisma.JsonValue;
+      nextBillingDate: Date | null;
+      renewalConsentAt: Date | null;
+    },
+    now: Date,
+  ): Promise<{
+    renewal: { id: string };
+    invoice: { id: string; amountTtcCents: number };
+    invoiceNumber: string;
+  } | null> {
+    // ── Barrière de la chaîne EN PREMIER (avant tout verrou de ligne) ──────
+    const rootId = await renewalChainRootId(tx, head.id);
+    await acquireRenewalChainBarrier(tx, rootId);
+    const flipped = await tx.order.updateMany({
+      where: { id: head.id, autoRenew: true },
+      data: { autoRenew: false },
+    });
+    if (flipped.count !== 1) return null;
 
       const motherInv = await tx.invoice.findUnique({
         where: { orderId: head.id },
@@ -520,7 +583,6 @@ export class RenewalService implements OnModuleInit, OnModuleDestroy {
       });
 
       return { renewal, invoice, invoiceNumber: claim.invoiceNumber };
-    });
   }
 
   // ───────────────────── 2. Paiement / reprise ──────────────────────────────
