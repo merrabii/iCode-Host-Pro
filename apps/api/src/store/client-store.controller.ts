@@ -30,6 +30,7 @@ import { RenewalToggleDto } from './dto/renewal-toggle.dto';
 import {
   acquireRenewalChainBarrier,
   renewalChainRootId,
+  RENEWAL_CHAIN_MAX_DEPTH,
 } from './renewal-chain-barrier';
 
 /**
@@ -326,17 +327,34 @@ export class ClientStoreController {
           });
           const closed = new Set<string>();
           let frontier: string[] = [order.id];
-          for (let depth = 0; depth < 50 && frontier.length > 0; depth++) {
+          // GO limite de chaîne : parcours JUSQU'AU BOUT de la descendance
+          // (l'ancienne « garde 50 » tronquait silencieusement et le CAS
+          // ci-dessous annonçait un succès PARTIEL — les maillons au-delà
+          // de 50 restaient armés). Cycle ou profondeur hors garde →
+          // ConflictException DANS la tx → rollback complet, jamais de
+          // succès partiel.
+          for (;;) {
+            if (frontier.length === 0) break;
             const children = await tx.order.findMany({
               where: { renewsOrderId: { in: frontier } },
               select: { id: true },
             });
             frontier = [];
             for (const child of children) {
-              if (!closed.has(child.id)) {
-                closed.add(child.id);
-                frontier.push(child.id);
+              if (child.id === order.id || closed.has(child.id)) {
+                throw new ConflictException(
+                  `chaine_cyclique: référence circulaire détectée en descendant la chaîne (commande ${child.id}).`,
+                );
               }
+              // Garde de profondeur (+1 = la commande de départ, alignée sur
+              // la remontée de renewalChainRootId) : refus explicite.
+              if (closed.size + 1 >= RENEWAL_CHAIN_MAX_DEPTH) {
+                throw new ConflictException(
+                  `chaine_profondeur_depassee: descendance de plus de ${RENEWAL_CHAIN_MAX_DEPTH} maillons (commande ${child.id}).`,
+                );
+              }
+              closed.add(child.id);
+              frontier.push(child.id);
             }
           }
           if (closed.size === 0) return 0;

@@ -16,6 +16,10 @@ import { GlobalPrefix } from './../src/config/constants';
 import { SaRateLimiter } from './../src/auth/rate-limiter';
 import { MailTransportFactory } from './../src/mail/mail-transport.factory';
 import { RenewalService } from '../src/store/renewal.service';
+import {
+  acquireRenewalChainBarrier,
+  renewalChainRootId,
+} from '../src/store/renewal-chain-barrier';
 import { acceptanceFor, preloadAcceptance } from './pricing-acceptance.fixture';
 import {
   PanelTransport,
@@ -53,6 +57,11 @@ process.env.RENEWAL_SWEEP_ENABLED = 'false';
  * Conservés : paiement manuel (sans option de consentement) toujours ouvert,
  * idempotence des CAS (seconde révocation = no-op), zéro réseau réel
  * (MailTransportFactory + PanelTransportFactory stubbés).
+ *
+ * GO limite de chaîne (suite) : chaînes SYNTHÉTIQUES de 49 / 50 / 51 liens
+ * (racine commune + révocation complète des descendants), preuve d'attente
+ * sur la CLÉ COMMUNE dérivée depuis la feuille à 51 liens, et chaînes
+ * INVALIDES (cycle, mère orpheline) → refus explicite + rollback complet.
  */
 describe('R1 — barrière chaîne création/révocation (e2e PG déterministe)', () => {
   let app: INestApplication;
@@ -66,13 +75,17 @@ describe('R1 — barrière chaîne création/révocation (e2e PG déterministe)'
   const adminEmail = `r1admin_${stamp}@example.com`;
   const t1Email = `r1t1_${stamp}@example.com`;
   const t2Email = `r1t2_${stamp}@example.com`;
+  const t3Email = `r1t3_${stamp}@example.com`;
   const password = 'password123';
 
   let adminToken = '';
   let t1Token = '';
   let t2Token = '';
+  let t3Token = '';
   let t1UserId = '';
   let t2UserId = '';
+  let t3UserId = '';
+  let t3CustomerId = '';
 
   let packId = '';
   let monthlyProductId = '';
@@ -148,6 +161,91 @@ describe('R1 — barrière chaîne création/révocation (e2e PG déterministe)'
       .patch(`/${GlobalPrefix}/client/orders/${orderId}/renewal`)
       .set('Authorization', `Bearer ${token}`)
       .send({ enabled });
+  }
+
+  // ── GO limite de chaîne : chaînes SYNTHÉTIQUES (49/50/51 liens) ──────────
+  let chainSeq = 0;
+
+  /**
+   * Chaîne linéaire de `edges` LIENS : ids[0] = racine (sans mère) →
+   * ids[edges] = feuille ; `renewsOrderId` unique ⇒ au plus UNE fille par
+   * mère. Toutes armées (`autoRenew=true`) pour mesurer la révocation.
+   */
+  async function seedChain(edges: number): Promise<string[]> {
+    const ids: string[] = [];
+    let motherId: string | null = null;
+    for (let i = 0; i <= edges; i++) {
+      chainSeq += 1;
+      const order = await prisma.order.create({
+        data: {
+          customerId: t3CustomerId,
+          customerName: 'Chaîne R1-3',
+          customerEmail: t3Email,
+          productId: monthlyProductId,
+          productName: monthlyName,
+          packId,
+          status: OrderStatus.ACTIVE,
+          billingCycle: BillingCycle.MONTHLY,
+          currency: 'USD',
+          taxRatePercent: 0,
+          amountHtCents: 5_000,
+          taxAmountCents: 0,
+          amountTtcCents: 5_000,
+          paymentMethodId: virId,
+          paymentMethodName: 'Virement bancaire',
+          idempotencyKey: `r1-chain-${stamp}-${chainSeq}`,
+          renewsOrderId: motherId,
+          renewalConsentAt: daysAgo(30),
+          autoRenew: true,
+          paidAt: daysAgo(30),
+        },
+      });
+      ids.push(order.id);
+      motherId = order.id;
+      orderIds.push(order.id);
+    }
+    return ids;
+  }
+
+  /** Commande isolée (références orphelines / cycles), même dossier client. */
+  async function seedLoneOrder(renewsOrderId: string | null): Promise<string> {
+    chainSeq += 1;
+    const order = await prisma.order.create({
+      data: {
+        customerId: t3CustomerId,
+        customerName: 'Chaîne R1-3',
+        customerEmail: t3Email,
+        productId: monthlyProductId,
+        productName: monthlyName,
+        packId,
+        status: OrderStatus.ACTIVE,
+        billingCycle: BillingCycle.MONTHLY,
+        currency: 'USD',
+        taxRatePercent: 0,
+        amountHtCents: 5_000,
+        taxAmountCents: 0,
+        amountTtcCents: 5_000,
+        paymentMethodId: virId,
+        paymentMethodName: 'Virement bancaire',
+        idempotencyKey: `r1-chain-${stamp}-${chainSeq}`,
+        renewsOrderId,
+        renewalConsentAt: daysAgo(30),
+        autoRenew: true,
+        paidAt: daysAgo(30),
+      },
+    });
+    orderIds.push(order.id);
+    return order.id;
+  }
+
+  /** autoRenew de TOUS les maillons (ids), dans l'ordre de la chaîne. */
+  async function armedOf(ids: string[]): Promise<boolean[]> {
+    const rows = await prisma.order.findMany({
+      where: { id: { in: ids } },
+      select: { id: true, autoRenew: true },
+    });
+    const byId = new Map(rows.map((r) => [r.id, r.autoRenew]));
+    return ids.map((id) => byId.get(id) ?? false);
   }
 
   /** Vrai parcours de fonds : recharge (justificatif) + validation admin. */
@@ -302,11 +400,23 @@ describe('R1 — barrière chaîne création/révocation (e2e PG déterministe)'
     await mkUser(adminEmail, Role.ADMIN, 'Admin R1');
     await mkUser(t1Email, Role.USER, 'Chaîne R1-1');
     await mkUser(t2Email, Role.USER, 'Chaîne R1-2');
+    await mkUser(t3Email, Role.USER, 'Chaîne R1-3');
     adminToken = await login(adminEmail);
     t1Token = await login(t1Email);
     t2Token = await login(t2Email);
+    t3Token = await login(t3Email);
     t1UserId = (await prisma.user.findUniqueOrThrow({ where: { email: t1Email } })).id;
     t2UserId = (await prisma.user.findUniqueOrThrow({ where: { email: t2Email } })).id;
+    const t3User = await prisma.user.findUniqueOrThrow({ where: { email: t3Email } });
+    t3UserId = t3User.id;
+    // Dossier client SYNTHÉTIQUE (GO limite de chaîne) : les chaînes de
+    // 49/50/51 liens sont créées directement en base, sans checkout.
+    t3CustomerId = (
+      await prisma.customer.create({
+        data: { email: t3Email, name: 'Chaîne R1-3', userId: t3UserId },
+      })
+    ).id;
+    expect(t3UserId).toBeTruthy();
 
     const pack = await prisma.hostingPack.create({
       data: { name: `r1-pack-${stamp}`, ramMb: 512 },
@@ -352,7 +462,7 @@ describe('R1 — barrière chaîne création/révocation (e2e PG déterministe)'
   });
 
   afterAll(async () => {
-    const allEmails = [adminEmail, t1Email, t2Email];
+    const allEmails = [adminEmail, t1Email, t2Email, t3Email];
     let customers: Array<{ id: string }> = [];
     try {
       customers = await prisma.customer
@@ -600,5 +710,139 @@ describe('R1 — barrière chaîne création/révocation (e2e PG déterministe)'
       select: { autoRenew: true },
     });
     expect(chain2.filter((o) => o.autoRenew)).toHaveLength(0);
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // GO limite de chaîne : 49 / 50 / 51 liens — racine commune + révocation
+  // COMPLÈTE des descendants (l'ancienne « garde 50 » tronquait au-delà de
+  // 50 liens : ancêtre intermédiaire comme racine + succès partiel).
+  // ═══════════════════════════════════════════════════════════════════════
+  for (const edges of [49, 50, 51]) {
+    it(`limite ${edges} liens : racine commune + révocation complète de tous les descendants`, async () => {
+      const ids = await seedChain(edges);
+      const rootId = ids[0];
+      const leafId = ids[edges];
+
+      // Racine commune : la racine RÉELLE est la même depuis la feuille,
+      // le milieu et la racine (parcours complet, jamais tronqué).
+      const fromLeaf = await prisma.$transaction((tx) =>
+        renewalChainRootId(tx, leafId),
+      );
+      const fromMid = await prisma.$transaction((tx) =>
+        renewalChainRootId(tx, ids[Math.floor(edges / 2)]),
+      );
+      const fromRoot = await prisma.$transaction((tx) =>
+        renewalChainRootId(tx, rootId),
+      );
+      expect(fromLeaf).toBe(rootId);
+      expect(fromMid).toBe(rootId);
+      expect(fromRoot).toBe(rootId);
+
+      // Révocation depuis la racine : TOUS les descendants sont désarmés
+      // (au-delà de 50 liens, l'ancien walk en perdait).
+      const res = await toggleRenewal(rootId, false, t3Token).expect(200);
+      expect(res.body.autoRenew).toBe(false);
+      const armed = await armedOf(ids);
+      expect(armed.filter(Boolean)).toHaveLength(0); // 0 maillon résiduel
+
+      const toggleAudit = await prisma.auditLog.findFirst({
+        where: { action: 'subscription.renewal_toggled', resourceId: rootId },
+        orderBy: { createdAt: 'desc' },
+      });
+      expect(toggleAudit).not.toBeNull();
+      expect(
+        (toggleAudit!.details as { revokedDescendants?: number })
+          .revokedDescendants,
+      ).toBe(edges); // la racine + chacun des descendants désarmés
+
+      // Idempotence conservée : seconde révocation = no-op sûr.
+      const res2 = await toggleRenewal(rootId, false, t3Token).expect(200);
+      expect(res2.body.autoRenew).toBe(false);
+      expect((await armedOf(ids)).filter(Boolean)).toHaveLength(0);
+    });
+  }
+
+  it('clé de verrou COMMUNE : révocation (racine) attend le verrou tenu depuis la feuille à 51 liens', async () => {
+    const ids = await seedChain(51);
+    const rootId = ids[0];
+    const leafId = ids[51];
+
+    // La racine dérivée depuis la FEUILLE est bien la racine de la chaîne.
+    const ridFromLeaf = await prisma.$transaction((tx) =>
+      renewalChainRootId(tx, leafId),
+    );
+    expect(ridFromLeaf).toBe(rootId);
+
+    // Tx A : acquiert la barrière SUR CETTE racine (clé dérivée depuis la
+    // feuille), reste ouverte (gate tenu DANS la transaction).
+    let held!: () => void;
+    const heldP = new Promise<void>((r) => {
+      held = r;
+    });
+    let release!: () => void;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const holdP = prisma.$transaction(
+      async (tx) => {
+        await acquireRenewalChainBarrier(tx, ridFromLeaf);
+        held();
+        await gate;
+      },
+      { timeout: 30_000, maxWait: 10_000 },
+    );
+    holdP.catch(() => undefined);
+    await heldP;
+
+    // Révocation depuis la RACINE : même clé → constatée EN ATTENTE.
+    const rev = track(toggleRenewal(rootId, false, t3Token).expect(200));
+    await waitForWaitingChainLock();
+    expect(rev.flag.settled).toBe(false);
+
+    // Commit de A → la révocation complète la chaîne entière.
+    release();
+    await holdP;
+    const revRes = await rev.promise;
+    expect(revRes.body.autoRenew).toBe(false);
+    expect((await armedOf(ids)).filter(Boolean)).toHaveLength(0);
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // Chaînes INVALIDES : refus explicite + rollback complet (jamais de
+  // succès partiel après parcours tronqué).
+  // ═══════════════════════════════════════════════════════════════════════
+  it('cycle a↔b : refus explicite chaine_cyclique (409), AUCUN autoRenew touché', async () => {
+    const a = await seedLoneOrder(null);
+    const b = await seedLoneOrder(a);
+    // Cycle : la racine de a remonte a → b → a.
+    await prisma.order.update({
+      where: { id: a },
+      data: { renewsOrderId: b },
+    });
+
+    const res = await toggleRenewal(a, false, t3Token).expect(409);
+    expect(String(res.body.message)).toContain('chaine_cyclique');
+
+    // Rollback complet : le CAS n'a jamais été exécuté, rien n'est désarmé.
+    expect(await armedOf([a, b])).toEqual([true, true]);
+    expect(
+      await prisma.auditLog.count({
+        where: { action: 'subscription.renewal_toggled', resourceId: a },
+      }),
+    ).toBe(0);
+  });
+
+  it('référence manquante (mère orpheline) : refus explicite chaine_reference_absente (409), rien désarmé', async () => {
+    const d = await seedLoneOrder(`ghost-${stamp}`);
+
+    const res = await toggleRenewal(d, false, t3Token).expect(409);
+    expect(String(res.body.message)).toContain('chaine_reference_absente');
+
+    expect(await armedOf([d])).toEqual([true]);
+    expect(
+      await prisma.auditLog.count({
+        where: { action: 'subscription.renewal_toggled', resourceId: d },
+      }),
+    ).toBe(0);
   });
 });
