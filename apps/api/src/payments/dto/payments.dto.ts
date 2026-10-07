@@ -1,3 +1,4 @@
+import { Type } from 'class-transformer';
 import {
   IsArray,
   IsBoolean,
@@ -95,12 +96,16 @@ export class CreateCardRefundDto {
 }
 
 export class AdminCardPaymentQueryDto {
+  // `page`/`perPage` arrivent en chaîne depuis l'URL : sans `@Type(Number)` la
+  // validation rejette toute liste paginée (l'UI admin envoie page & perPage).
   @IsOptional()
+  @Type(() => Number)
   @IsInt()
   @Min(1)
   page?: number;
 
   @IsOptional()
+  @Type(() => Number)
   @IsInt()
   @Min(1)
   @Max(200)

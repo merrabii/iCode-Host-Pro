@@ -1098,6 +1098,19 @@ describe('Recharge par carte & webhooks Stripe (e2e, GO)', () => {
         .expect(200);
       expect(byEmail.body.total).toBeGreaterThanOrEqual(1);
 
+      // Pagination explicite : l'UI admin envoie page/perPage en chaîne dans
+      // l'URL — conversion obligatoire (sinon 400 = liste jamais chargée).
+      const paginated = await api()
+        .get(`/${GlobalPrefix}/store/admin/payments/card-payments`)
+        .query({ page: 1, perPage: 20, q: reference })
+        .set(auth(adminToken))
+        .expect(200);
+      expect(paginated.body.page).toBe(1);
+      expect(paginated.body.perPage).toBe(20);
+      expect(
+        paginated.body.items.some((i: { reference: string }) => i.reference === reference),
+      ).toBe(true);
+
       const events = await api()
         .get(`/${GlobalPrefix}/store/admin/payments/webhook-events`)
         .set(auth(adminToken))
