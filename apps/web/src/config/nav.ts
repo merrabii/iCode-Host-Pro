@@ -38,6 +38,7 @@ export const ADMIN_NAV: NavSection[] = [
       { label: 'Taux de taxe', href: '/manager/taxe', icon: IconChartBar },
       { label: 'Moyens de paiement', href: '/manager/moyens-paiement', icon: IconWallet },
       { label: 'Recharges', href: '/manager/recharges', icon: IconWallet },
+      { label: 'Paiements carte', href: '/manager/paiements-carte', icon: IconWallet },
       { label: 'Souscriptions & services', href: '/manager/subscriptions', icon: IconBoxes },
       { label: 'Invitations', href: '/manager/invitations', icon: IconMail },
       { label: 'Configuration mail', href: '/manager/mail', icon: IconMail },

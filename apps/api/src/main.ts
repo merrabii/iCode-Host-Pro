@@ -7,7 +7,10 @@ import { AppModule } from './app.module';
 import { GlobalPrefix } from './config/constants';
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
+  // GO Stripe — corps BRUT conservé pour la vérification de signature webhook
+  // (`Stripe-Signature` calculé sur l'octet exact reçu, jamais sur un corps
+  // re-serialisé). `rawBody: true` active la conservation Nest/Express.
+  const app = await NestFactory.create(AppModule, { rawBody: true });
   const config = app.get(ConfigService);
 
   // Trust proxy (Express) — parseTrustProxy : false par défaut. Un avertissement

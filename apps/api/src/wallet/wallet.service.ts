@@ -132,7 +132,12 @@ export class WalletService {
    */
   async ensureOwnedCustomer(
     user: JwtPayload,
-  ): Promise<{ id: string; email: string; walletBalanceCents: number }> {
+  ): Promise<{
+    id: string;
+    email: string;
+    walletBalanceCents: number;
+    walletCurrency: string;
+  }> {
     // Identité actuelle vérifiée TOUJOURS en DB AVANT tout accès (jamais le
     // seul JWT) : email courant + isActive, même si le dossier est déjà lié —
     // un compte désactivé ne lit ni ne rattache plus rien.
@@ -148,13 +153,24 @@ export class WalletService {
     for (let attempt = 0; attempt < 2; attempt++) {
       const byUser = await this.prisma.customer.findUnique({
         where: { userId: user.sub },
-        select: { id: true, email: true, walletBalanceCents: true },
+        select: {
+          id: true,
+          email: true,
+          walletBalanceCents: true,
+          walletCurrency: true,
+        },
       });
       if (byUser) return byUser;
 
       const byEmail = await this.prisma.customer.findUnique({
         where: { email: dbEmail },
-        select: { id: true, email: true, userId: true, walletBalanceCents: true },
+        select: {
+          id: true,
+          email: true,
+          userId: true,
+          walletBalanceCents: true,
+          walletCurrency: true,
+        },
       });
       if (byEmail) {
         if (byEmail.userId === user.sub) return byEmail;
@@ -171,6 +187,7 @@ export class WalletService {
             id: byEmail.id,
             email: byEmail.email,
             walletBalanceCents: byEmail.walletBalanceCents,
+            walletCurrency: byEmail.walletCurrency,
           };
         }
         continue; // course perdue → 2ᵉ tour (relecture complète)
@@ -183,7 +200,12 @@ export class WalletService {
             name: me.name?.trim() || dbEmail,
             userId: user.sub,
           },
-          select: { id: true, email: true, walletBalanceCents: true },
+          select: {
+            id: true,
+            email: true,
+            walletBalanceCents: true,
+            walletCurrency: true,
+          },
         });
       } catch (e) {
         if ((e as { code?: string }).code === 'P2002') continue; // création parallèle

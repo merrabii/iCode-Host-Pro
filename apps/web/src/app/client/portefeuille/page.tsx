@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState, type FormEvent } from 'react';
 import { useRouter } from 'next/navigation';
 import {
   apiError,
+  createCardTopup,
   createWalletRecharge,
   fetchMe,
   formatCents,
@@ -63,6 +64,10 @@ export default function ClientWalletPage() {
   const [note, setNote] = useState('');
   const [proof, setProof] = useState<File | null>(null);
   const [busy, setBusy] = useState(false);
+
+  // GO Stripe - recharge par carte (mode test, page hébergée du prestataire).
+  const [cardAmount, setCardAmount] = useState('');
+  const [cardBusy, setCardBusy] = useState(false);
 
   const loadAll = useCallback(async (t: string, p: number) => {
     const [b, h] = await Promise.all([
@@ -145,6 +150,47 @@ export default function ClientWalletPage() {
     if (input) input.value = '';
     setPage(1);
     await loadAll(token, 1);
+  };
+
+  /**
+   * GO Stripe §3 - le navigateur crée la session CÔTÉ SERVEUR puis se rend sur
+   * la page hébergée du prestataire : jamais de montant décidé côté client,
+   * jamais de numéro de carte dans l'application. Le retour arrive sur
+   * /client/portefeuille/paiement?ref=... où le serveur confirme l'état.
+   */
+  const submitCard = async (e: FormEvent) => {
+    e.preventDefault();
+    const normalized = cardAmount.trim().replace(',', '.');
+    const value = Number(normalized);
+    const cents = Math.round(value * 100);
+    if (!normalized || !Number.isFinite(value) || value <= 0) {
+      toast.warn('Indiquez un montant à recharger.');
+      return;
+    }
+    if (cents < MIN_CENTS || cents > MAX_CENTS) {
+      toast.warn('Le montant doit être compris entre 1 et 100 000.');
+      return;
+    }
+    setCardBusy(true);
+    const r = await createCardTopup(token, { amountCents: cents });
+    setCardBusy(false);
+    if (!r.ok || !r.data) {
+      toast.error(apiError(r, 'Ouverture du paiement impossible.'));
+      return;
+    }
+    const view = r.data;
+    if (view.status === 'SUCCEEDED') {
+      toast.ok('Paiement déjà constaté : portefeuille crédité.');
+      setCardAmount('');
+      setPage(1);
+      await loadAll(token, 1);
+      return;
+    }
+    if (!view.checkoutUrl) {
+      router.push(`/client/portefeuille/paiement?ref=${encodeURIComponent(view.reference)}`);
+      return;
+    }
+    window.location.href = view.checkoutUrl;
   };
 
   if (phase === 'loading') {
@@ -237,9 +283,40 @@ export default function ClientWalletPage() {
               </div>
             </form>
             <p className="muted" style={{ fontSize: 12, marginTop: 8 }}>
-              Le dépôt n’augmente pas immédiatement le solde : il reste « en
-              attente » jusqu’à validation. En cas de rejet, aucun montant n’est
+              Le dépôt n'augmente pas immédiatement le solde : il reste « en
+              attente » jusqu'à validation. En cas de rejet, aucun montant n'est
               crédité.
+            </p>
+          </Panel>
+          <Panel
+            title="Recharger par carte"
+            sub={`Mode test (Stripe) - dépôt dans la devise du compte : ${balance?.currency ?? 'USD'}. Page de paiement hébergée : aucune carte n'est saisie ici.`}
+          >
+            <form onSubmit={(e) => void submitCard(e)} className="row">
+              <Field
+                label={`Montant (${balance?.currency ?? 'USD'})`}
+                required
+                htmlFor="card-amount"
+              >
+                <Input
+                  id="card-amount"
+                  value={cardAmount}
+                  placeholder="50"
+                  inputMode="decimal"
+                  onChange={(e) => setCardAmount(e.target.value)}
+                  className="input-sm"
+                />
+              </Field>
+              <div style={{ alignSelf: 'flex-end', paddingBottom: 6 }}>
+                <Button type="submit" size="sm" disabled={cardBusy}>
+                  {cardBusy ? 'Ouverture…' : 'Payer par carte'}
+                </Button>
+              </div>
+            </form>
+            <p className="muted" style={{ fontSize: 12, marginTop: 8 }}>
+              Le solde n'est crédité qu'après confirmation signée côté serveur.
+              En cas de refus, d'annulation ou d'expiration, aucun montant n'est
+              crédité. Paiement en mode test : aucun réel encaissement.
             </p>
           </Panel>
         </div>

@@ -2831,3 +2831,290 @@ export async function downloadInvoicePdf(
   if (fresh && fresh !== token) return doGet(fresh);
   return first;
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GO Stripe — recharge par CARTE (mode test, marque Code Diali)
+// Le navigateur n'est jamais autorité : création de session puis page hébergée
+// du prestataire, état confirmé côté serveur (webhook signé / relecture).
+// Aucun numéro de carte ni CVV ne transite par cette application.
+// ═══════════════════════════════════════════════════════════════════════════
+
+export type CardPaymentStatus =
+  | 'CREATED'
+  | 'PROCESSING'
+  | 'SUCCEEDED'
+  | 'FAILED'
+  | 'CANCELED'
+  | 'EXPIRED'
+  | 'PARTIALLY_REFUNDED'
+  | 'REFUNDED'
+  | 'NEEDS_REVIEW';
+
+export interface CardTopup {
+  reference: string;
+  status: CardPaymentStatus;
+  amountCents: number;
+  currency: string;
+  refundedCents: number;
+  interventionNeeded: boolean;
+  interventionReason: string | null;
+  failureMessage: string | null;
+  disputedAt: string | null;
+  checkoutUrl: string | null;
+  createdAt: string;
+  paidAt: string | null;
+  expiresAt: string | null;
+}
+
+export interface CardTopupPage {
+  items: CardTopup[];
+  total: number;
+}
+
+export const CARD_PAYMENT_LABEL: Record<string, string> = {
+  CREATED: 'En attente de paiement',
+  PROCESSING: 'Paiement en cours',
+  SUCCEEDED: 'Payé · crédité',
+  FAILED: 'Refusé',
+  CANCELED: 'Annulé',
+  EXPIRED: 'Expiré',
+  PARTIALLY_REFUNDED: 'Remboursé partiellement',
+  REFUNDED: 'Remboursé',
+  NEEDS_REVIEW: 'Intervention requise',
+};
+
+export const CARD_PAYMENT_TONE: Record<string, 'green' | 'amber' | 'red' | 'neutral'> = {
+  CREATED: 'amber',
+  PROCESSING: 'amber',
+  SUCCEEDED: 'green',
+  FAILED: 'red',
+  CANCELED: 'red',
+  EXPIRED: 'neutral',
+  PARTIALLY_REFUNDED: 'amber',
+  REFUNDED: 'neutral',
+  NEEDS_REVIEW: 'red',
+};
+
+let cardTopupSeq = 0;
+
+/** Ouvre une session de recharge (Idempotency-Key auto : double-clic = UNE session). */
+export const createCardTopup = (
+  t: string,
+  body: { amountCents: number; currency?: string },
+): Promise<ApiResult<CardTopup>> => {
+  cardTopupSeq += 1;
+  const key = `web-topup-${Date.now()}-${cardTopupSeq}`;
+  return apiJson('/api/client/payments/topups', t, {
+    method: 'POST',
+    body: JSON.stringify(body),
+    headers: { 'Idempotency-Key': key },
+  }) as Promise<ApiResult<CardTopup>>;
+};
+
+export const listMyCardTopups = (t: string) =>
+  apiJson('/api/client/payments/topups', t) as Promise<ApiResult<CardTopupPage>>;
+
+export const getMyCardTopup = (t: string, reference: string) =>
+  apiJson(
+    `/api/client/payments/topups/${encodeURIComponent(reference)}`,
+    t,
+  ) as Promise<ApiResult<CardTopup>>;
+
+/** Relit l'état côté serveur (le serveur interroge le prestataire). */
+export const refreshMyCardTopup = (t: string, reference: string) =>
+  apiJson(
+    `/api/client/payments/topups/${encodeURIComponent(reference)}/refresh`,
+    t,
+    { method: 'POST' },
+  ) as Promise<ApiResult<CardTopup>>;
+
+// ── ADMIN ────────────────────────────────────────────────────────────────
+
+export interface ProviderMaskedView {
+  code: string;
+  displayName: string;
+  isActive: boolean;
+  environment: string;
+  liveEnabled: boolean;
+  merchantAccount: string | null;
+  publishableKey: string | null;
+  hasSecretKey: boolean;
+  hasWebhookSecret: boolean;
+  webhookEndpointUrl: string | null;
+  allowedCurrencies: string[];
+  lastCheckAt: string | null;
+  lastCheckAccount: string | null;
+  lastCheckError: string | null;
+  updatedAt: string | null;
+  updatedByEmail: string | null;
+}
+
+export interface ProviderConfigView {
+  stripe: ProviderMaskedView | null;
+  simulated: ProviderMaskedView | null;
+  endpointUrl: string;
+  note: string;
+}
+
+export interface AdminCardPayment extends CardTopup {
+  id: string;
+  providerCode: string;
+  environment: string;
+  merchantAccount: string;
+  livemode: boolean | null;
+  providerSessionRef: string | null;
+  providerPaymentRef: string | null;
+  walletTransactionId: string | null;
+  customerId: string;
+  customerEmail: string | null;
+  updatedAt: string;
+}
+
+export interface CardRefundView {
+  id: string;
+  cardPaymentId: string;
+  paymentReference: string;
+  kind: string;
+  status: 'PENDING' | 'SUCCEEDED' | 'FAILED';
+  amountCents: number;
+  currency: string;
+  reason: string | null;
+  failureReason: string | null;
+  providerRef: string | null;
+  walletTransactionId: string | null;
+  pendingProviderCall: boolean;
+  createdByEmail: string | null;
+  createdAt: string;
+  processedAt: string | null;
+}
+
+export interface AdminCardPaymentDetail extends AdminCardPayment {
+  refunds: CardRefundView[];
+  events: {
+    id: string;
+    eventId: string;
+    type: string;
+    status: string;
+    attempts: number;
+    error: string | null;
+    receivedAt: string;
+    processedAt: string | null;
+  }[];
+}
+
+export interface CardPaymentPage {
+  items: AdminCardPayment[];
+  total: number;
+  page: number;
+  perPage: number;
+}
+
+export interface WebhookEventPage {
+  items: {
+    id: string;
+    providerCode: string;
+    eventId: string;
+    type: string;
+    environment: string;
+    status: string;
+    attempts: number;
+    error: string | null;
+    receivedAt: string;
+    processedAt: string | null;
+    cardPaymentId: string | null;
+  }[];
+  total: number;
+  failed: number;
+}
+
+export const getPaymentProvider = (t: string) =>
+  apiJson('/api/store/admin/payments/provider', t) as Promise<
+    ApiResult<ProviderConfigView>
+  >;
+
+export const savePaymentProvider = (
+  t: string,
+  body: {
+    code: 'stripe';
+    displayName: string;
+    isActive: boolean;
+    merchantAccount?: string;
+    publishableKey?: string;
+    secretKey?: string;
+    webhookSecret?: string;
+    allowedCurrencies?: string[];
+  },
+) =>
+  apiJson('/api/store/admin/payments/provider', t, {
+    method: 'PUT',
+    body: JSON.stringify(body),
+  }) as Promise<ApiResult<ProviderMaskedView>>;
+
+export const checkPaymentProvider = (t: string) =>
+  apiJson('/api/store/admin/payments/provider/check', t, {
+    method: 'POST',
+  }) as Promise<ApiResult<ProviderMaskedView & { simulated?: boolean }>>;
+
+export const listCardPayments = (
+  t: string,
+  query: { page?: number; perPage?: number; q?: string; status?: string } = {},
+) => {
+  const params = new URLSearchParams();
+  if (query.page) params.set('page', String(query.page));
+  if (query.perPage) params.set('perPage', String(query.perPage));
+  if (query.q) params.set('q', query.q);
+  if (query.status) params.set('status', query.status);
+  const suffix = params.toString() ? `?${params.toString()}` : '';
+  return apiJson(`/api/store/admin/payments/card-payments${suffix}`, t) as Promise<
+    ApiResult<CardPaymentPage>
+  >;
+};
+
+export const getCardPaymentAdmin = (t: string, id: string) =>
+  apiJson(
+    `/api/store/admin/payments/card-payments/${encodeURIComponent(id)}`,
+    t,
+  ) as Promise<ApiResult<AdminCardPaymentDetail>>;
+
+export const createCardRefund = (
+  t: string,
+  id: string,
+  body: { amountCents: number; reason?: string },
+) => {
+  const key = `web-refund-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+  return apiJson(
+    `/api/store/admin/payments/card-payments/${encodeURIComponent(id)}/refunds`,
+    t,
+    {
+      method: 'POST',
+      body: JSON.stringify(body),
+      headers: { 'Idempotency-Key': key },
+    },
+  ) as Promise<ApiResult<CardRefundView>>;
+};
+
+export const retryCardRefund = (t: string, refundId: string) =>
+  apiJson(
+    `/api/store/admin/payments/refunds/${encodeURIComponent(refundId)}/retry`,
+    t,
+    { method: 'POST' },
+  ) as Promise<ApiResult<CardRefundView>>;
+
+export const cancelCardRefund = (t: string, refundId: string, reason?: string) =>
+  apiJson(
+    `/api/store/admin/payments/refunds/${encodeURIComponent(refundId)}/cancel`,
+    t,
+    { method: 'POST', body: JSON.stringify({ reason }) },
+  ) as Promise<ApiResult<CardRefundView>>;
+
+export const resolveCardIntervention = (t: string, id: string, note: string) =>
+  apiJson(
+    `/api/store/admin/payments/card-payments/${encodeURIComponent(id)}/intervention`,
+    t,
+    { method: 'POST', body: JSON.stringify({ note }) },
+  ) as Promise<ApiResult<{ ok: boolean }>>;
+
+export const listPaymentWebhookEvents = (t: string) =>
+  apiJson('/api/store/admin/payments/webhook-events', t) as Promise<
+    ApiResult<WebhookEventPage>
+  >;

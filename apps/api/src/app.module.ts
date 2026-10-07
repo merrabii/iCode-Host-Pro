@@ -22,6 +22,7 @@ import { MonitoringModule } from './monitoring/monitoring.module';
 import { BrandingModule } from './branding/branding.module';
 import { StoreModule } from './store/store.module';
 import { WalletModule } from './wallet/wallet.module';
+import { PaymentsModule } from './payments/payments.module';
 import { loadAppConfig } from './config/configuration';
 
 @Module({
@@ -54,6 +55,7 @@ import { loadAppConfig } from './config/configuration';
     BrandingModule,
     StoreModule,
     WalletModule,
+    PaymentsModule,
   ],
 })
 export class AppModule {}

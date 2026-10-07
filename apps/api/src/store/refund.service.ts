@@ -28,7 +28,9 @@ export interface CreateRefundInput {
 
 export interface RefundView {
   id: string;
-  orderId: string;
+  // GO Stripe — nullable : un remboursement de RECHARGE carte n'a pas de
+  // commande (rattachement `cardPaymentId`).
+  orderId: string | null;
   invoiceId: string | null;
   kind: RefundKind;
   status: RefundStatus;
@@ -52,7 +54,7 @@ export interface RefundView {
  */
 export function refundIdentityMatches(
   existing: {
-    orderId: string;
+    orderId: string | null;
     amountCents: number;
     kind: RefundKind;
     issueCreditNote: boolean;
@@ -622,7 +624,7 @@ export class RefundService {
   private toView(
     r: {
       id: string;
-      orderId: string;
+      orderId: string | null;
       invoiceId: string | null;
       kind: RefundKind;
       status: RefundStatus;

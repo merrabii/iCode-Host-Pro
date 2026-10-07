@@ -1309,12 +1309,20 @@ model Customer {
   accountType       CustomerAccountType @default(LIGHT)
   userId            String?             @unique // comptes « complets » liés à un User
   walletBalanceCents Int                @default(0)
+  // GO Stripe (lot carte) — devise EXPLICITE du solde. Le portefeuille reste
+  // mono-devise : `walletBalanceCents` est TOUJOURS exprimé dans cette devise.
+  // Base démontrée du rétro-remplissage (migration) : `BillingSetting.currency`
+  // de la plateforme (défaut USD) — aucune devise n'est jamais déduite d'un
+  // montant isolé. Toute opération dans une autre devise est REFUSÉE (jamais de
+  // conversion de change automatique, jamais d'addition USD+EUR).
+  walletCurrency     String              @default("USD")
   createdAt         DateTime            @default(now())
   updatedAt         DateTime            @updatedAt
 
   walletTransactions WalletTransaction[]
   orders             Order[]
   invoices           Invoice[]
+  cardPayments       CardPayment[] // GO Stripe — intentions de paiement carte
 
   @@index([email])
 }
@@ -1373,6 +1381,10 @@ model WalletTransaction {
   adminActorId    String? // qui a validé/rejeté une recharge (audit)
   adminActorEmail String? // snapshot (survit à la suppression de l'acteur)
   note            String?
+  // GO Stripe — litige carte sur CETTE recharge : drapeau visible (admin +
+  // client « intervention nécessaire »), JAMAIS de dette silencieuse et
+  // JAMAIS de modification automatique du solde à ce stade.
+  disputedAt      DateTime?
   createdAt             DateTime            @default(now())
   processedAt           DateTime?
 
@@ -1401,10 +1413,20 @@ model WalletTransaction {
 //  • avoirs : `issueCreditNote` émet un Invoice lié par `creditNoteOfId`.
 model Refund {
   id                  String           @id @default(cuid())
-  orderId             String
-  order               Order            @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  // GO Stripe — nullable DEPUIS ce lot : un remboursement de RECHARGE carte
+  // n'a pas de commande (rattachement = `cardPaymentId` ci-dessous). Les
+  // remboursements de commande continuent d'exiger `orderId` (mêmes garde-fous).
+  orderId             String?
+  order               Order?           @relation(fields: [orderId], references: [id], onDelete: Cascade)
   invoiceId           String? // facture d'origine (paiement encaissé visé)
   invoice             Invoice?         @relation("RefundOrigin", fields: [invoiceId], references: [id], onDelete: SetNull)
+  // GO Stripe — paiement carte d'origine (recharge) : rattachement au
+  // paiement, au compte marchand et à la devise d'origine, avec plafond
+  // cumulé sur CE paiement (mutuellement exclusif avec une commande).
+  // Plusieurs remboursements partiels possibles sur le même paiement
+  // (l'unicité d'intention est portée par `idempotencyKey`).
+  cardPaymentId       String?
+  cardPayment         CardPayment?     @relation(fields: [cardPaymentId], references: [id], onDelete: Cascade)
   kind                RefundKind
   status              RefundStatus     @default(PENDING)
   amountCents         Int // strictement positif
@@ -1424,6 +1446,7 @@ model Refund {
   createdAt           DateTime         @default(now())
 
   @@index([orderId])
+  @@index([cardPaymentId])
 }
 
 enum RefundStatus {
@@ -1434,7 +1457,132 @@ enum RefundStatus {
 
 enum RefundKind {
   WALLET_CREDIT // interne — recrédite le wallet (indépendant du prestataire)
-  EXTERNAL_CARD // externe — prestataire carte (bloqué sans adaptateur configuré)
+  EXTERNAL_CARD // externe — prestataire carte (adaptateur Stripe TEST actif dans ce lot)
+}
+
+// ═══ GO Stripe — connecteur carte (Code Diali) ═════════════════════════
+// Décisions propriétaires figées ici : marque publique « Code Diali », société
+// « Code Diali LLC » (identité légale CONFIGURABLE, jamais dans le logo ni les
+// titres commerciaux), Stripe = seul prestataire de ce lot, PaymentCloud
+// viendra par un connecteur DISTINCT (aucune implémentation fictive, aucun
+// bouton de paiement non fonctionnel), USD par défaut + EUR prévu, MAD hors
+// périmètre, aucun encaissement réel ni activation production.
+
+enum CardPaymentStatus {
+  CREATED // session de paiement ouverte — aucun paiement constaté
+  PROCESSING // paiement en cours côté prestataire (INCERTAIN — aucun crédit)
+  SUCCEEDED // capturé + crédité côté serveur (wallet)
+  FAILED // refusé / échec — aucun crédit
+  CANCELED // annulé par le client ou le prestataire — aucun crédit
+  EXPIRED // session expirée sans paiement — aucun crédit
+  PARTIALLY_REFUNDED // remboursé partiellement vers la carte
+  REFUNDED // intégralement remboursé vers la carte
+  NEEDS_REVIEW // incohérence montant/devise/client → intervention admin
+}
+
+enum CardPaymentKind {
+  TOPUP // recharge de portefeuille (seul cas de ce lot)
+}
+
+enum PaymentWebhookStatus {
+  RECEIVED // reçu, traitement en cours / à reprendre
+  PROCESSED // traité (ou doublon neutralisé) — 200 renvoyé
+  IGNORED // type d'événement hors périmètre — 200 renvoyé
+  FAILED // échec de traitement — 500 pour rejeu prestataire
+}
+
+// Configuration du connecteur (SINGLETON par `code`). Les SECRETS sont chiffrés
+// AES-256-GCM (CryptoService, ENCRYPTION_KEY) dans `secretKeyEnc` /
+// `webhookSecretEnc` et ne sont JAMAIS renvoyés par l'API (seuls des
+// indicateurs `has*`). `environment` = test|live ; `liveEnabled` reste false
+// (refus explicite de toute écriture live dans ce lot).
+model PaymentProviderSetting {
+  id                    String   @id @default(cuid())
+  code                  String   @unique // "stripe" (aujourd'hui) | "paymentcloud" (futur, connecteur distinct)
+  displayName           String
+  isActive              Boolean  @default(false)
+  environment           String   @default("test") // "test" uniquement dans ce lot
+  liveEnabled           Boolean  @default(false) // TOUJOURS false — garde live
+  merchantAccount       String? // identifiant compte marchand (ex. acct_…) — non secret, snapshot sur chaque opération
+  publishableKey        String? // pk_test_… — non secret (jamais la clé secrète)
+  secretKeyEnc          String? // sk_test_… chiffrée — jamais exposée
+  webhookSecretEnc      String? // whsec_… chiffrée — jamais exposée
+  webhookEndpointUrl    String? // URL affichée à l'admin pour la config côté prestataire
+  allowedCurrencies     Json? // ["USD","EUR"] — MAD hors périmètre
+  lastCheckAt           DateTime? // dernière « vérifier la connexion » (appel prestataire réel)
+  lastCheckAccount      String? // id compte marchand confirmé par ce contrôle
+  lastCheckError        String?
+  createdByUserId       String?
+  updatedByUserId       String?
+  updatedByEmail        String?
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+}
+
+// Intention de paiement PAR CARTE (recharge de portefeuille). Le navigateur
+// n'est JAMAIS autorité : montant, devise, client, compte marchand,
+// environnement et référence sont déterminés et revérifiés côté serveur, à la
+// création comme à la confirmation (webhook signé ou relecture serveur).
+model CardPayment {
+  id                   String            @id @default(cuid())
+  reference            String            @unique // ref interne affichable "CDP-XXXX"
+  customerId           String
+  customer             Customer          @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  kind                 CardPaymentKind   @default(TOPUP)
+  status               CardPaymentStatus @default(CREATED)
+  amountCents          Int
+  currency             String // ISO minuscules ("usd"/"eur") + symbole d'affichage côté UI
+  providerCode         String // "stripe" (connecteur utilisé)
+  environment          String // "test" (live refusé dans ce lot)
+  merchantAccount      String // snapshot du compte marchand au moment de l'opération
+  livemode             Boolean? // reçu du prestataire (false = test)
+  providerSessionRef   String? // ex. cs_test_…
+  providerPaymentRef   String? // ex. pi_… (paiement d'origine, cible des remboursements)
+  checkoutUrl          String? // page hébergée du prestataire (rendue au client, pas un secret)
+  idempotencyKey       String            @unique // clé client — double-clic = UNE session
+  walletTransactionId  String?           @unique // crédit wallet appliqué (jamais deux)
+  refundedCents        Int               @default(0) // déjà remboursé (engagé) vers la carte
+  failureCode          String?
+  failureMessage       String?
+  disputedAt           DateTime? // litige carte constaté (événement prestataire)
+  interventionNeeded   Boolean           @default(false)
+  interventionReason   String?
+  expiresAt            DateTime?
+  paidAt               DateTime?
+  createdAt            DateTime          @default(now())
+  updatedAt            DateTime          @updatedAt
+
+  refunds  Refund[]
+  events   PaymentWebhookEvent[]
+
+  @@index([customerId])
+  @@index([status])
+  @@index([providerSessionRef])
+}
+
+// Journal DURABLE et idempotent des événements prestataire reçus.
+// `@@unique([providerCode, eventId])` = un même événement n'est traité qu'UNE
+// fois (doublons = 200 neutre) ; l'état CAS des lignes métier protège des
+// livraisons concurrentes et désordonnées. Le payload (aucun secret) est
+// conservé pour la reprise après interruption et l'audit.
+model PaymentWebhookEvent {
+  id            String              @id @default(cuid())
+  providerCode  String
+  eventId       String // evt_…
+  type          String
+  livemode      Boolean?
+  environment   String
+  status        PaymentWebhookStatus @default(RECEIVED)
+  attempts      Int                 @default(1)
+  payload       Json?
+  error         String?
+  cardPaymentId String?
+  cardPayment   CardPayment?        @relation(fields: [cardPaymentId], references: [id], onDelete: SetNull)
+  receivedAt    DateTime            @default(now())
+  processedAt   DateTime?
+
+  @@unique([providerCode, eventId])
+  @@index([status])
 }
 
 // ── Commande (Order) ───────────────────────────────────────────────────────
