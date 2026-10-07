@@ -193,11 +193,17 @@ export default function ManagerCardPaymentsPage() {
       return;
     }
     const v = r.data;
-    setCheckMsg(
-      v?.simulated
-        ? 'Simulateur local opérationnel (aucun appel réseau).'
-        : `Connexion ${v?.code ?? 'stripe'} OK — compte ${v?.lastCheckAccount ?? '—'} (${v?.environment ?? 'test'}).`,
-    );
+    // JAMAIS de « OK » silencieux : un contrôle en échec est affiché comme tel
+    // (GO §6 — l'admin doit voir l'échec, pas un succès inventé).
+    if (v?.lastCheckError) {
+      setCheckMsg(`Contrôle de connexion ÉCHOUÉ : ${v.lastCheckError}`);
+    } else if (v?.simulated) {
+      setCheckMsg('Simulateur local opérationnel (aucun appel réseau).');
+    } else {
+      setCheckMsg(
+        `Connexion ${v?.code ?? 'stripe'} OK — compte ${v?.lastCheckAccount ?? '—'} (${v?.environment ?? 'test'}).`,
+      );
+    }
     await load(token, page, status, q);
   };
 
@@ -423,6 +429,14 @@ export default function ManagerCardPaymentsPage() {
           {checkMsg && (
             <p className="muted" style={{ fontSize: 12, marginTop: 8 }}>
               {checkMsg}
+            </p>
+          )}
+          {stripe?.lastCheckAt && (
+            <p className="muted" style={{ fontSize: 12, marginTop: 8 }}>
+              Dernier contrôle : {new Date(stripe.lastCheckAt).toLocaleString()} —{' '}
+              {stripe.lastCheckError
+                ? `échec : ${stripe.lastCheckError}`
+                : `compte ${stripe.lastCheckAccount ?? '—'}`}
             </p>
           )}
           {!stripe?.isActive && (
