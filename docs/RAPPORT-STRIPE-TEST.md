@@ -1,7 +1,7 @@
 # RAPPORT — GO Stripe mode test (recharges par carte, webhooks signés, USD/EUR, remboursements/litiges, UI client + admin)
 
 **Date :** 07/10/2026 · **Branche :** `feat/stripe-test` (worktree principal `C:\Users\mourad.errabii\Documents\Projet iCode Host`) · **Base de départ :** `main` @ `78b51ce`
-**Commits de code :** `d97d39c` (feature), `650906a` (correctif UI), `e7374ee` (correctif pagination) — **+ 1 commit documentaire** — **aucun push, aucun merge** (`main`/`origin/main` = `8bde3cd` intact ; `feat/socle-commercial` = `5555566` intact ; `feat/stripe-test` n'existe que localement).
+**Commits de code :** `d97d39c` (feature), `650906a` (correctif UI), `e7374ee` (correctif pagination) — **+ 1 commit documentaire** — **aucun push, aucun merge** (`main`/`origin/main` = `78b51ce` intact ; `feat/socle-commercial` = `5555566` intact ; `feat/stripe-test` n'existe que localement).
 **Worktree de recette :** `C:\Users\mourad.errabii\Documents\iCode-Host-Recette` détaché sur **`e7374ee`**, **stack laissée en fonctionnement** (web 3002, API 3011, proxy 3999, simulateurs 302x) ; scripts `recette/down.ps1` / `recette/up-p10.ps1` inchangés.
 **Bases :** `icode_host_pro_socle` **62 migrations** (e2e), `icode_host_pro_recette` **62** (parcours navigateur catégorie C), `icode_host_pro_c3premig` / `_c4premig` / `_c4test` (suites legacy), `icode_host_pro` (dev local) **60/62 — les 2 migrations Stripe volontairement NON appliquées** (décision du GO : migrations uniquement sur bases isolées ; `prisma migrate status` le signale).
 **Environnement de preuve :** local uniquement — **aucune clé Stripe réelle, aucun appel réseau sortant vers Stripe** (recette = connecteur `simulated`), **aucune mise en production, aucun chiffre d'argent réel**.
