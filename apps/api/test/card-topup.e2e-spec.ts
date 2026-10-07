@@ -1256,4 +1256,3 @@ describe('Recharge par carte & webhooks Stripe (e2e, GO)', () => {
     });
   });
 });
-
