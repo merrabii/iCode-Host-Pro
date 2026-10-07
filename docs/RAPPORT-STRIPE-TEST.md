@@ -1,7 +1,7 @@
 # RAPPORT — GO Stripe mode test (recharges par carte, webhooks signés, USD/EUR, remboursements/litiges, UI client + admin)
 
 **Date :** 07/10/2026 · **Branche :** `feat/stripe-test` (worktree principal `C:\Users\mourad.errabii\Documents\Projet iCode Host`) · **Base de départ :** `main` @ `78b51ce`
-**Commits de code :** `d97d39c` (feature), `650906a` (correctif UI), `e7374ee` (correctif pagination) — **+ 2 commits documentaires (`a58bd1f`, `8c76475`)** — **aucun push, aucun merge** (`main`/`origin/main` = `78b51ce` intact ; `feat/socle-commercial` = `5555566` intact ; `feat/stripe-test` n'existe que localement).
+**Commits de code :** `d97d39c` (feature), `650906a` (correctif UI), `e7374ee` (correctif pagination) — **+ des commits documentaires (liste exacte : `git log 78b51ce..HEAD`)** — **aucun push, aucun merge** (`main`/`origin/main` = `78b51ce` intact ; `feat/socle-commercial` = `5555566` intact ; `feat/stripe-test` n'existe que localement).
 **Worktree de recette :** `C:\Users\mourad.errabii\Documents\iCode-Host-Recette` détaché sur **`e7374ee`**, **stack laissée en fonctionnement** (web 3002, API 3011, proxy 3999, simulateurs 302x) ; scripts `recette/down.ps1` / `recette/up-p10.ps1` inchangés.
 **Bases :** `icode_host_pro_socle` **62 migrations** (e2e), `icode_host_pro_recette` **62** (parcours navigateur catégorie C), `icode_host_pro_c3premig` / `_c4premig` / `_c4test` (suites legacy), `icode_host_pro` (dev local) **60/62 — les 2 migrations Stripe volontairement NON appliquées** (décision du GO : migrations uniquement sur bases isolées ; `prisma migrate status` le signale).
 **Environnement de preuve :** local uniquement — **aucune clé Stripe réelle, aucun appel réseau sortant vers Stripe** (recette = connecteur `simulated`), **aucune mise en production, aucun chiffre d'argent réel**.
@@ -131,12 +131,11 @@ Statuts GO : **terminée / partielle / bloquée / non testée**. Aucun « PASS g
 
 ## 8. Inventaires (commits · fichiers · migrations · patch)
 
-- **Commits (3 de code, 2 documentaires) — `git log 78b51ce..HEAD` :**
+- **Commits (3 de code, le reste documentaire) — liste exacte `git log 78b51ce..HEAD` :**
   - `d97d39c` `feat(payments): Stripe test-mode card top-ups, signed webhooks, refunds and admin UI (GO Stripe)`
   - `650906a` `fix(web): display real connection-check outcome in Stripe admin (GO Stripe)`
   - `e7374ee` `fix(payments): coerce admin payment list pagination with @Type(Number) (GO Stripe)`
-  - + `docs(stripe): rapport de revue, suivi HTML v14 et statut projet (GO Stripe)` (`a58bd1f`)
-  - + `docs(stripe): reference de main exacte (78b51ce) dans les livrables (GO Stripe)` (`8c76475`)
+  - + commits documentaires : `git log 78b51ce..HEAD` (rapport, HTML v14, statut)
 - **Fichiers : 31** (`git diff --stat 78b51ce e7374ee` : **7 374 insertions / 14 suppressions**) — API : `payments/*` (services, connecteurs `stripe-connector`/`simulated-connector`, `stripe-signature`, 4 contrôleurs, DTO), `wallet.service.ts`, `store/refund.service.ts`, `app.module.ts` (`rawBody`), `main.ts`, `schema.prisma` + 2 migrations ; Web : `/manager/paiements-carte`, `/client/portefeuille/{page,paiement}`, `config/nav.ts`, `lib/api.ts` ; tests : `card-topup.e2e-spec.ts` + 4 specs unit.
 - **Migrations : 2 additives** (60 → 62) : `20261007000001_stripe_card_payments`, `20261007000002_refund_card_payment_index`.
 - **Patch** : `recette/diff-stripe-test.patch` (hors git, écrit par Git lui-même, `git diff 78b51ce <HEAD> --binary --full-index`) ; **statistiques + SHA-256 : `recette/GUIDE-RECETTE-STRIPE.md`** (calculés après le dernier commit, sans commit de cachet). Vérifications de fidélité : export **déterministe** (2 exports → SHA-256 identiques) + `git apply --check --reverse` → **exit 0**.
@@ -148,4 +147,4 @@ Statuts GO : **terminée / partielle / bloquée / non testée**. Aucun « PASS g
 
 Aucune **appel réseau réel vers Stripe**, aucune carte réelle, aucun compte Stripe, **aucun push ni merge**, **aucune mise en production**, **aucune activation commerciale**, aucun chiffre d'argent réel manipulé. La **catégorie B est BLOQUÉE** : la simulation (connecteur `simulated`, clés factices `pk_test_51RECETTE_DEMO_FICTIVE` / `sk_test_…_FICTIF_NON_REEL` / `whsec_recette_demo_fictif_non_reel`) ne vaut **jamais** validation du prestataire. **Limites d'exécution** : lint ESLint non exécutable (préexistant — typechecks + builds verts) ; `icode_host_pro` (dev local) non migré (60/62, voulu) ; colonne `error` du panneau webhook tenant un `note` (cosmétique). **Litiges et remboursements** n'ont été exercés que via des webhooks signés simulés.
 
-**ARRÊT ICI pour revue unique (GO item fin)** : le statut = **`feat/stripe-test` locale (5 commits : 3 de code + 2 documentaires) + rapports + patch vérifié, prêts pour revue** — merge/push **uniquement sur décision explicite**, recette laissée accessible sur `http://localhost:3002`.
+**ARRÊT ICI pour revue unique (GO item fin)** : le statut = **`feat/stripe-test` locale (3 commits de code + commits documentaires) + rapports + patch vérifié, prêts pour revue** — merge/push **uniquement sur décision explicite**, recette laissée accessible sur `http://localhost:3002`.
