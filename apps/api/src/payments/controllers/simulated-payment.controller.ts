@@ -42,14 +42,19 @@ export class SimulatedPaymentController {
   ) {}
 
   private gate(): void {
-    if (!isPaymentSimulatorEnabled()) {
+    // GO P1 — la page et les émissions du simulateur sont refusées dès qu'il
+    // n'est pas explicitement activé OU dès que l'on est en production
+    // (404 : aucune trace d'un parcours de test en prod, aucun effet).
+    if (!isPaymentSimulatorEnabled() || process.env.NODE_ENV === 'production') {
       throw new NotFoundException('Simulateur de paiement désactivé.');
     }
   }
 
   private async load(sessionRef: string): Promise<CardPayment> {
+    // GO P1 — STRICTEMENT les sessions du simulateur : une session Stripe
+    // (autre fournisseur) n'est jamais pilotable par ces routes, ni visible.
     const row = await this.prisma.cardPayment.findFirst({
-      where: { providerSessionRef: sessionRef },
+      where: { providerSessionRef: sessionRef, providerCode: 'simulated' },
     });
     if (!row) throw new NotFoundException('Session simulée introuvable.');
     return row;

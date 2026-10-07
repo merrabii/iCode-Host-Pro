@@ -2895,15 +2895,86 @@ export const CARD_PAYMENT_TONE: Record<string, 'green' | 'amber' | 'red' | 'neut
   NEEDS_REVIEW: 'red',
 };
 
+/**
+ * GO P2 — clé d'idempotence de PARCOURS conservée par le navigateur.
+ *
+ * Une tentative de recharge = UNE clé, réutilisée tant que le parcours reste
+ * ouvert (double-clic, échec réseau, retour en arrière, nouvelle fenêtre de
+ * même onglet). Le serveur rejoue alors la MÊME session : jamais de seconde
+ * intention pour la même tentative. Effacée dès que le parcours est tranché
+ * (paiement constaté, échec, expiration, annulation).
+ */
+export interface TopupAttempt {
+  amountCents: number;
+  key: string;
+  /** Référence rattachée après ouverture (pour effacer la BONNE tentative). */
+  reference?: string;
+}
+
+const TOPUP_ATTEMPT_STORAGE = 'icode-topup-attempt';
+
+export function readTopupAttempt(): TopupAttempt | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw = window.sessionStorage.getItem(TOPUP_ATTEMPT_STORAGE);
+    return raw ? (JSON.parse(raw) as TopupAttempt) : null;
+  } catch {
+    return null;
+  }
+}
+
+export function writeTopupAttempt(attempt: TopupAttempt): void {
+  if (typeof window === 'undefined') return;
+  try {
+    window.sessionStorage.setItem(TOPUP_ATTEMPT_STORAGE, JSON.stringify(attempt));
+  } catch {
+    // stockage indisponible : la clé retombe sur l'éphémère de `createCardTopup`
+  }
+}
+
+/** Clé de la tentative en cours pour ce montant (créée si nécessaire). */
+export function topupAttemptKey(amountCents: number): string {
+  const current = readTopupAttempt();
+  if (current && current.amountCents === amountCents) return current.key;
+  const key = `web-topup-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+  writeTopupAttempt({ amountCents, key });
+  return key;
+}
+
+/** Attache la référence ouverte à la tentative (nettoyage ciblé ensuite). */
+export function attachTopupAttempt(reference: string): void {
+  const current = readTopupAttempt();
+  if (current) writeTopupAttempt({ ...current, reference });
+}
+
+/** Clore la tentative : `reference` (optionnel) évite d'effacer un autre parcours. */
+export function clearTopupAttempt(reference?: string): void {
+  const current = readTopupAttempt();
+  if (!current) return;
+  if (reference && current.reference && current.reference !== reference) return;
+  if (typeof window === 'undefined') return;
+  try {
+    window.sessionStorage.removeItem(TOPUP_ATTEMPT_STORAGE);
+  } catch {
+    // ignoré
+  }
+}
+
 let cardTopupSeq = 0;
 
-/** Ouvre une session de recharge (Idempotency-Key auto : double-clic = UNE session). */
+/**
+ * Ouvre une session de recharge. La clé est FOURNIE par le parcours
+ * (persistée) ; à défaut, une clé éphémère reste générée — jamais une clé
+ * différente à chaque invocation pour la même tentative.
+ */
 export const createCardTopup = (
   t: string,
   body: { amountCents: number; currency?: string },
+  idempotencyKey?: string,
 ): Promise<ApiResult<CardTopup>> => {
-  cardTopupSeq += 1;
-  const key = `web-topup-${Date.now()}-${cardTopupSeq}`;
+  const key =
+    idempotencyKey ??
+    `web-topup-${Date.now().toString(36)}-${(cardTopupSeq += 1).toString(36)}`;
   return apiJson('/api/client/payments/topups', t, {
     method: 'POST',
     body: JSON.stringify(body),

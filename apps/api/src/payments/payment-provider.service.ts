@@ -17,6 +17,13 @@ import { SaveProviderDto } from './dto/payments.dto';
 /** Devises autorisées dans ce lot (MAD hors périmètre). */
 export const CARD_CURRENCIES = ['USD', 'EUR'] as const;
 
+/** Identité de l'OPÉRATION (snapshot) exigée pour toute reprise d'un paiement. */
+export interface OperationIdentity {
+  providerCode: string;
+  merchantAccount: string;
+  environment?: string | null;
+}
+
 export interface ResolvedProvider {
   settingId: string;
   code: 'stripe' | 'simulated';
@@ -196,19 +203,41 @@ export class PaymentProviderService {
     return this.toMasked(row);
   }
 
-  /** Contrôle de connexion réel (appel prestataire en mode test). */
+  /**
+   * Contrôle de connexion réel (appel prestataire en mode test).
+   *
+   * GO P4 — c'est CETTE vérification qui fabrique l'identité marchande Fiable :
+   *  - le compte réel (`GET /v1/account`) est mémorisé (`lastCheckAccount`) ;
+   *  - un `merchantAccount` absent est REMPLI par le compte VÉRIFIÉ (jamais par
+   *    une saisie déclarative) ;
+   *  - un `merchantAccount` déclaré ≠ compte vérifié laisse un écart VISIBLE
+   *    (`lastCheckError`) sans écrasement silencieux : les opérations sont
+   *    alors refusées tant que l'identité n'est pas résolue.
+   * `requireMerchantAccount` est désactivé ICI uniquement : sans ce contrôle,
+   * un premier enregistrement de clés ne pourrait jamais être vérifié.
+   */
   async checkConnection(
     actor: Actor,
   ): Promise<ProviderMaskedView & { simulated?: boolean }> {
     try {
-      const resolved = await this.resolve();
+      const resolved = await this.resolve({ requireMerchantAccount: false });
       const account = await resolved.connector.verifyAccount();
+      const current = await this.getSetting('stripe');
+      const declared = current?.merchantAccount ?? null;
+      const mismatch =
+        resolved.code === 'stripe' && declared && declared !== account.accountId
+          ? `Compte marchand déclaré (${declared}) ≠ compte vérifié (${account.accountId}) : corrigez la configuration.`
+          : null;
       const row = await this.prisma.paymentProviderSetting.update({
         where: { id: resolved.settingId },
         data: {
           lastCheckAt: new Date(),
           lastCheckAccount: account.accountId,
-          lastCheckError: null,
+          lastCheckError: mismatch,
+          // Identité vérifiée : renseignée par le contrôle, jamais inventée.
+          ...(resolved.code === 'stripe' && !declared
+            ? { merchantAccount: account.accountId, updatedByUserId: actor.sub }
+            : {}),
         },
       });
       return { ...this.toMasked(row), simulated: resolved.code === 'simulated' };
@@ -233,6 +262,8 @@ export class PaymentProviderService {
 
   /** Ligne du simulateur (créditée à la demande, secret local généré une fois). */
   private async ensureSimulatorSetting(): Promise<PaymentProviderSetting> {
+    // GO P1 — filet : jamais de configuration créée hors simulateur actif.
+    this.assertSimulatorUsable();
     const existing = await this.prisma.paymentProviderSetting.findUnique({
       where: { code: 'simulated' },
     });
@@ -262,12 +293,40 @@ export class PaymentProviderService {
   }
 
   /**
-   * Résolution du connecteur opérationnel :
+   * GO P1 — le simulateur n'est utilisable QUE s'il est explicitement activé
+   * ET hors production. Tout accès (page, événement, webhook, résolution) passe
+   * par cet unique contrôle, AVANT toute création de configuration.
+   */
+  assertSimulatorUsable(): void {
+    if (process.env.NODE_ENV === 'production') {
+      throw new ConflictException(
+        'Simulateur de paiement interdit en production (GO Stripe).',
+      );
+    }
+    if (!isPaymentSimulatorEnabled()) {
+      throw new ConflictException(
+        'Simulateur de paiement désactivé (PAYMENT_SIMULATOR_ENABLED).',
+      );
+    }
+  }
+
+  /**
+   * Résolution du connecteur OPÉRATIONNEL pour une NOUVELLE opération :
    *  1. Stripe configuré + actif + test → connecteur Stripe réel ;
    *  2. sinon simulateur (recette/CI) si explicitement activé ;
    *  3. sinon refus net (aucun bouton de paiement non fonctionnel).
+   *
+   * GO P4 — l'identité marchande n'est JAMAIS « acct_inconnu » :
+   *  - compte déclaré ≠ compte vérifié → refus (l'écart est déjà visible dans
+   *    `lastCheckError`, il doit être corrigé avant toute nouvelle opération) ;
+   *  - ni déclaré ni vérifié → refus (une opération exige une identité
+   *    marchande établie : « Tester la connexion » la fabrique).
+   * `requireMerchantAccount: false` sert UNIQUEMENT au contrôle de connexion.
    */
-  async resolve(): Promise<ResolvedProvider> {
+  async resolve(
+    opts: { requireMerchantAccount?: boolean } = {},
+  ): Promise<ResolvedProvider> {
+    const requireMerchant = opts.requireMerchantAccount !== false;
     const stripe = await this.getSetting('stripe');
     if (stripe && stripe.isActive) {
       if (stripe.environment !== 'test') {
@@ -278,6 +337,22 @@ export class PaymentProviderService {
           'Prestataire actif sans clé secrète : configuration invalide.',
         );
       }
+      if (requireMerchant) {
+        const declared = stripe.merchantAccount ?? null;
+        const verified = stripe.lastCheckAccount ?? null;
+        if (declared && verified && declared !== verified) {
+          throw new ConflictException(
+            `Compte marchand déclaré (${declared}) ≠ compte vérifié (${verified}) : ` +
+              'identité marchande incohérente, opération refusée.',
+          );
+        }
+        if (!declared && !verified) {
+          throw new ConflictException(
+            'Compte marchand non établi : enregistrez-le ou lancez « Tester la connexion » ' +
+              'avant toute opération (aucune identité déclarative acceptée).',
+          );
+        }
+      }
       const secretKey = this.decryptOrThrow(stripe.secretKeyEnc, 'la clé secrète');
       const webhookSecret = stripe.webhookSecretEnc
         ? this.decryptOrThrow(stripe.webhookSecretEnc, 'le secret webhook')
@@ -287,12 +362,13 @@ export class PaymentProviderService {
         code: 'stripe',
         displayName: stripe.displayName,
         environment: 'test',
-        merchantAccount: stripe.merchantAccount ?? 'acct_inconnu',
+        merchantAccount:
+          stripe.merchantAccount ?? stripe.lastCheckAccount ?? 'acct_inconnu',
         currencies: this.currenciesOf(stripe),
         connector: new StripeConnector(secretKey, webhookSecret, this.config),
       };
     }
-    if (isPaymentSimulatorEnabled()) {
+    if (isPaymentSimulatorEnabled() && process.env.NODE_ENV !== 'production') {
       const sim = await this.ensureSimulatorSetting();
       const webhookSecret = this.decryptOrThrow(
         sim.webhookSecretEnc!,
@@ -316,11 +392,101 @@ export class PaymentProviderService {
   }
 
   /**
+   * GO P1 + P4 — résolution d'une opération EXISTANTE par son identité D'ORIGINE.
+   *
+   *  - JAMAIS de repli : une opération « stripe » n'est jamais reprise par le
+   *    simulateur (ni l'inverse) — le fournisseur est celui de la ligne, pas
+   *    celui qui est actuellement configuré ;
+   *  - JAMAIS de remplacement silencieux de configuration : si le compte
+   *    marchand a CHANGÉ depuis la création, l'opération est REFUSÉE (l'appelant
+   *    signale l'intervention) ; une simple rotation de clés du MÊME compte
+   *    reste acceptée (identité inchangée) ;
+   *  - simulateur requis → refus net s'il est désactivé ou en production.
+   */
+  async resolveFor(op: OperationIdentity): Promise<ResolvedProvider> {
+    if (op.environment && op.environment !== 'test') {
+      throw new ConflictException(
+        `Environnement « ${op.environment} » non pris en charge (mode test uniquement).`,
+      );
+    }
+    if (op.providerCode === 'simulated') {
+      this.assertSimulatorUsable();
+      const sim = await this.ensureSimulatorSetting();
+      const current = sim.merchantAccount ?? 'sim_merchant_local';
+      if (current !== op.merchantAccount) {
+        throw new ConflictException(
+          `Identité marchande du simulateur modifiée (${op.merchantAccount} → ${current}) : opération gelée.`,
+        );
+      }
+      const webhookSecret = this.decryptOrThrow(
+        sim.webhookSecretEnc!,
+        'le secret webhook du simulateur',
+      );
+      return {
+        settingId: sim.id,
+        code: 'simulated',
+        displayName: sim.displayName,
+        environment: 'test',
+        merchantAccount: current,
+        currencies: this.currenciesOf(sim),
+        connector: new SimulatedConnector(webhookSecret),
+      };
+    }
+
+    const stripe = await this.getSetting(op.providerCode);
+    if (!stripe) {
+      throw new ConflictException(
+        `Fournisseur d’origine « ${op.providerCode} » inconnu : aucune reprise.`,
+      );
+    }
+    if (op.providerCode === 'stripe') {
+      if (!stripe.isActive || stripe.environment !== 'test' || !stripe.secretKeyEnc) {
+        throw new ConflictException(
+          'Prestataire d’origine « stripe » indisponible : aucune reprise par un autre fournisseur.',
+        );
+      }
+      const current = stripe.merchantAccount ?? stripe.lastCheckAccount ?? null;
+      if (current && current !== op.merchantAccount) {
+        throw new ConflictException(
+          `Compte marchand modifié pendant l’opération (${op.merchantAccount} → ${current}) : ` +
+            'reprise refusée, intervention requise.',
+        );
+      }
+      if (!current) {
+        throw new ConflictException(
+          'Identité marchande de l’opération non résoluble (configuration vidée) : intervention requise.',
+        );
+      }
+      const secretKey = this.decryptOrThrow(stripe.secretKeyEnc, 'la clé secrète');
+      const webhookSecret = stripe.webhookSecretEnc
+        ? this.decryptOrThrow(stripe.webhookSecretEnc, 'le secret webhook')
+        : '';
+      return {
+        settingId: stripe.id,
+        code: 'stripe',
+        displayName: stripe.displayName,
+        environment: 'test',
+        merchantAccount: current,
+        currencies: this.currenciesOf(stripe),
+        connector: new StripeConnector(secretKey, webhookSecret, this.config),
+      };
+    }
+
+    throw new ConflictException(
+      `Fournisseur « ${op.providerCode} » non pris en charge : aucune reprise.`,
+    );
+  }
+
+  /**
    * Secret webhook attendu pour le code donné (contrôleur webhook).
    * Teste la signature : pas de secret = refus net, jamais de « default OK ».
    */
   async webhookSecretFor(code: string): Promise<string> {
     if (code === 'simulated') {
+      // GO P1 — AVANT toute création de configuration ni écriture : un
+      // webhook simulé est refusé dès que le simulateur est désactivé ou en
+      // production (aucune ligne `PaymentProviderSetting` créée, aucun effet).
+      this.assertSimulatorUsable();
       const sim = await this.ensureSimulatorSetting();
       return this.decryptOrThrow(sim.webhookSecretEnc!, 'le secret webhook du simulateur');
     }
@@ -333,8 +499,45 @@ export class PaymentProviderService {
     return this.decryptOrThrow(setting.webhookSecretEnc, 'le secret webhook');
   }
 
-  private currenciesOf(row: PaymentProviderSetting): string[] {
-    if (Array.isArray(row.allowedCurrencies)) {
+  /**
+   * GO P1/P4 — identité MARCHANDE courante d'un fournisseur identifié par sa
+   * SIGNATURE webhook (code + secret vérifiés avant tout traitement).
+   *
+   * Servie comme preuve d'appartenance à la confirmation (compte marchand du
+   * connecteur vérifié). Aucun appel réseau, aucun repli sur un autre
+   * fournisseur : identité indisponible = événement NON acquittable (503).
+   */
+  async currentIdentity(code: string): Promise<string> {
+    if (code === 'simulated') {
+      this.assertSimulatorUsable();
+      const sim = await this.ensureSimulatorSetting();
+      return sim.merchantAccount ?? 'sim_merchant_local';
+    }
+    const setting = await this.getSetting(code);
+    if (!setting) {
+      throw new ConflictException(`Fournisseur « ${code} » non configuré : identité absente.`);
+    }
+    const identity = setting.merchantAccount ?? setting.lastCheckAccount ?? null;
+    if (!identity) {
+      throw new ConflictException(
+        `Identité marchande non établie pour « ${code} » : événement non acquittable.`,
+      );
+    }
+    return identity;
+  }
+
+  /**
+   * GO P3 — période du sweep des webhooks non rattachés (ms).
+   * Activation EXPLICITE : `PAYMENT_WEBHOOK_RECONCILE_INTERVAL_MS`
+   * (0/absent = sweep désactivé, les échéances restent persistées et sont
+   * reprises à chaque envoi webhooks / rafraîchissement client).
+   */
+  reconcileIntervalMs(): number {
+    const raw = Number(this.config.get<string>('PAYMENT_WEBHOOK_RECONCILE_INTERVAL_MS') ?? 0);
+    return Number.isFinite(raw) && raw > 0 ? raw : 0;
+  }
+
+  private currenciesOf(row: PaymentProviderSetting): string[] {    if (Array.isArray(row.allowedCurrencies)) {
       const list = row.allowedCurrencies.filter(
         (c): c is string => typeof c === 'string',
       );

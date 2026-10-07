@@ -17,13 +17,16 @@ describe('PaymentWebhookService (GO §4 — webhook signé, idempotent)', () => 
     paymentWebhookEvent: {
       create: jest.Mock;
       findUnique: jest.Mock;
+      findMany: jest.Mock;
       update: jest.Mock;
       updateMany: jest.Mock;
     };
     /** Lien événement ↔ paiement (résolution par la référence CDP-…). */
-    cardPayment: { findUnique: jest.Mock };
+    cardPayment: { findUnique: jest.Mock; findFirst: jest.Mock };
+    /** Remboursement connu ? (GO P6 — idempotence par providerRef). */
+    refund: { findFirst: jest.Mock };
   };
-  let provider: { webhookSecretFor: jest.Mock };
+  let provider: { webhookSecretFor: jest.Mock; currentIdentity: jest.Mock };
   let cards: {
     confirmPaid: jest.Mock;
     markExpired: jest.Mock;
@@ -31,8 +34,10 @@ describe('PaymentWebhookService (GO §4 — webhook signé, idempotent)', () => 
     markProcessing: jest.Mock;
     applyChargeRefunded: jest.Mock;
     applyDispute: jest.Mock;
+    markFailureNotice: jest.Mock;
   };
   let audit: { record: jest.Mock };
+  let refunds: { applyProviderRefundStatus: jest.Mock };
   let service: PaymentWebhookService;
   /** Dernière ligne insérée (l'unicité réelle est `providerCode:eventId`). */
   let stored: Row | null;
@@ -82,14 +87,23 @@ describe('PaymentWebhookService (GO §4 — webhook signé, idempotent)', () => 
           if (row) row.attempts = Number(row.attempts ?? 1) + 1;
           return { count: row ? 1 : 0 };
         }),
+        // File du rapprochement (GO P3).
+        findMany: jest.fn(async () => [] as Row[]),
       },
       cardPayment: {
         findUnique: jest.fn(async (args: { where: { reference?: string } }) =>
           args.where?.reference ? { id: 'cp1' } : null,
         ),
+        /** Cible de l'événement (GO P1/P3) : présente pour CE fournisseur. */
+        findFirst: jest.fn(async () => ({ id: 'cp1' })),
       },
+      refund: { findFirst: jest.fn(async () => null) },
     };
-    provider = { webhookSecretFor: jest.fn(async () => SECRET) };
+    provider = {
+      webhookSecretFor: jest.fn(async () => SECRET),
+      // Identité du fournisseur authentifié (GO P1/P4).
+      currentIdentity: jest.fn(async () => 'acct_stripe_test'),
+    };
     cards = {
       confirmPaid: jest.fn(async () => ({
         outcome: 'credited',
@@ -101,12 +115,16 @@ describe('PaymentWebhookService (GO §4 — webhook signé, idempotent)', () => 
       markProcessing: jest.fn(async () => undefined),
       applyChargeRefunded: jest.fn(async () => null),
       applyDispute: jest.fn(async () => null),
+      markFailureNotice: jest.fn(async () => null),
     };
     audit = { record: jest.fn(async () => undefined) };
+    // GO P6 — issue des remboursements INTERNES (par providerRef).
+    refunds = { applyProviderRefundStatus: jest.fn(async () => null) };
     service = new PaymentWebhookService(
       prisma as never,
       provider as never,
       cards as never,
+      refunds as never,
       audit as never,
     );
   });
@@ -174,7 +192,7 @@ describe('PaymentWebhookService (GO §4 — webhook signé, idempotent)', () => 
   it('mappe expiration / échec / annulation sans crédit', async () => {
     const exp = eventOf('checkout.session.expired', { id: 'cs_9' });
     await post(exp, signStripeWebhook({ rawBody: exp, secret: SECRET }));
-    expect(cards.markExpired).toHaveBeenCalledWith('cs_9');
+    expect(cards.markExpired).toHaveBeenCalledWith('cs_9', 'stripe');
 
     const fail = eventOf('payment_intent.payment_failed', {
       id: 'pi_9',
@@ -200,7 +218,7 @@ describe('PaymentWebhookService (GO §4 — webhook signé, idempotent)', () => 
       payment_intent: 'pi_async',
     });
     await post(raw, signStripeWebhook({ rawBody: raw, secret: SECRET }));
-    expect(cards.markProcessing).toHaveBeenCalledWith('cs_async', 'pi_async');
+    expect(cards.markProcessing).toHaveBeenCalledWith('cs_async', 'pi_async', 'stripe');
     expect(cards.confirmPaid).not.toHaveBeenCalled();
   });
 
@@ -242,5 +260,137 @@ describe('PaymentWebhookService (GO §4 — webhook signé, idempotent)', () => 
     });
     expect(res.httpStatus).toBe(503);
     expect(res.body).toMatchObject({ reason: 'webhook_secret_not_configured' });
+  });
+
+  // ── GO P7 — l'intent départage : jamais de terminal abusif ──────────────
+
+  it('P7 : échec sur intent encore VIVANT → note l’erreur sans verrouiller l’état', async () => {
+    const raw = eventOf('payment_intent.payment_failed', {
+      id: 'pi_live',
+      status: 'requires_payment_method',
+      last_payment_error: { message: 'Refusé' },
+    });
+    const res = await post(raw, signStripeWebhook({ rawBody: raw, secret: SECRET }));
+    expect(res.httpStatus).toBe(200);
+    expect(cards.markFailureNotice).toHaveBeenCalledWith(
+      expect.objectContaining({ paymentRef: 'pi_live', code: 'payment_failed' }),
+    );
+    expect(cards.markFailed).not.toHaveBeenCalled();
+    expect(cards.confirmPaid).not.toHaveBeenCalled();
+    expect(stored).toMatchObject({ status: PaymentWebhookStatus.PROCESSED });
+  });
+
+  it('P7 : intent ANNULÉ après échec → CANCELED terminal (jamais FAILED)', async () => {
+    const raw = eventOf('payment_intent.payment_failed', {
+      id: 'pi_cancel',
+      status: 'canceled',
+      last_payment_error: { message: 'Refusé' },
+    });
+    await post(raw, signStripeWebhook({ rawBody: raw, secret: SECRET }));
+    expect(cards.markFailed).toHaveBeenCalledWith(
+      expect.objectContaining({
+        paymentRef: 'pi_cancel',
+        status: expect.stringContaining('CANCELED'),
+      }),
+    );
+    expect(cards.markFailureNotice).not.toHaveBeenCalled();
+  });
+
+  it('P7 : sans champ status (simulateur) → échec tranché FAILED (comportement D1)', async () => {
+    const raw = eventOf('payment_intent.payment_failed', {
+      id: 'pi_sim',
+      last_payment_error: { message: 'Refusé' },
+    });
+    await post(raw, signStripeWebhook({ rawBody: raw, secret: SECRET }));
+    expect(cards.markFailed).toHaveBeenCalledWith(
+      expect.objectContaining({
+        paymentRef: 'pi_sim',
+        status: expect.stringContaining('FAILED'),
+      }),
+    );
+    expect(cards.markFailureNotice).not.toHaveBeenCalled();
+  });
+
+  // ── GO P3 — un événement géré non rattaché n’est JAMAIS « ignoré » ──────
+
+  it('P3 : rapproche l’événement à échéance (replay borné, cible réattachable)', async () => {
+    const payload = JSON.parse(
+      eventOf('checkout.session.expired', { id: 'cs_orphan_2' }),
+    ) as Row;
+    prisma.paymentWebhookEvent.findMany.mockResolvedValue([
+      {
+        id: 'evtrow-reconcile',
+        providerCode: 'stripe',
+        payload,
+        attempts: 1,
+        reconcileAt: new Date(Date.now() - 1000),
+      },
+    ]);
+    // Aucune cible connue pour ce fournisseur → encore à rapprocher.
+    prisma.cardPayment.findFirst.mockResolvedValue(null);
+    provider.currentIdentity.mockResolvedValue('acct_stripe_test');
+    const out = await service.reconcileDue(5);
+    expect(out).toEqual({ replayed: 1, attached: 0 });
+    expect(provider.currentIdentity).toHaveBeenCalledWith('stripe');
+    expect(cards.markExpired).not.toHaveBeenCalled();
+    expect(prisma.paymentWebhookEvent.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: 'evtrow-reconcile' },
+        data: expect.objectContaining({
+          status: PaymentWebhookStatus.RECEIVED,
+          reconcileAt: expect.any(Date),
+        }),
+      }),
+    );
+    expect(prisma.paymentWebhookEvent.update).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ status: PaymentWebhookStatus.IGNORED }),
+      }),
+    );
+  });
+
+  it('P3 : la file ne réclame que les événements RECEIVED arrivés à échéance', async () => {
+    prisma.paymentWebhookEvent.findMany.mockResolvedValue([]);
+    const out = await service.reconcileDue(3);
+    expect(out).toEqual({ replayed: 0, attached: 0 });
+    expect(prisma.paymentWebhookEvent.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ status: PaymentWebhookStatus.RECEIVED }),
+        take: 3,
+      }),
+    );
+  });
+
+  it('P3 : un événement sans cible est conservé en RECEIVED avec une échéance (backoff)', async () => {
+    const raw = eventOf('checkout.session.expired', { id: 'cs_orphan' });
+    // Aucun paiement connu pour CE fournisseur → rapprochement, pas d'IGNORED.
+    prisma.cardPayment.findFirst.mockResolvedValue(null);
+    await post(raw, signStripeWebhook({ rawBody: raw, secret: SECRET }));
+    expect(cards.markExpired).not.toHaveBeenCalled();
+    expect(stored).toMatchObject({ status: PaymentWebhookStatus.RECEIVED });
+    expect(stored?.reconcileAt).toBeInstanceOf(Date);
+    expect(stored?.status).not.toBe(PaymentWebhookStatus.IGNORED);
+  });
+
+  // ── GO P1 — identité de la source absente : traitable = 503, sinon neutre ─
+
+  it('P1 : identité marchande indisponible sur un type TRAITÉ → 503, aucun effet', async () => {
+    provider.currentIdentity.mockRejectedValue(new Error('Identité marchande non établie'));
+    const raw = eventOf('checkout.session.expired', { id: 'cs_noid' });
+    const res = await post(raw, signStripeWebhook({ rawBody: raw, secret: SECRET }));
+    expect(res.httpStatus).toBe(503);
+    expect(res.body).toMatchObject({ reason: 'provider_identity_unavailable' });
+    expect(cards.markExpired).not.toHaveBeenCalled();
+    expect(cards.confirmPaid).not.toHaveBeenCalled();
+  });
+
+  it('P1 : identité indisponible sur un type HORS PÉRIMÈTRE → 200 IGNORED (aucun effet)', async () => {
+    provider.currentIdentity.mockRejectedValue(new Error('Identité marchande non établie'));
+    const raw = eventOf('customer.updated', { id: 'cus_9' });
+    const res = await post(raw, signStripeWebhook({ rawBody: raw, secret: SECRET }));
+    expect(res.httpStatus).toBe(200);
+    expect(res.body).toMatchObject({ result: 'ignored' });
+    expect(stored).toMatchObject({ status: PaymentWebhookStatus.IGNORED });
+    expect(cards.confirmPaid).not.toHaveBeenCalled();
   });
 });

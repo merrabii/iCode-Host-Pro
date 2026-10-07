@@ -20,6 +20,13 @@ export interface CreateCheckoutSessionInput {
   cancelUrl: string;
   /** Métadonnées serveur → revérifiées à la confirmation. */
   metadata?: Record<string, string>;
+  /**
+   * GO P3 — clé d'idempotence PRÉSENTÉE AU PRESTATAIRE, stable pour UNE
+   * opération (`topup:<référence>`). Une reprise après réponse perdue rejoue
+   * avec la MÊME clé → même session (Stripe : rejeu sûr dans les 24 h),
+   * jamais de seconde session pour contourner une incertitude.
+   */
+  idempotencyKey: string;
 }
 
 export interface ConnectorSession {

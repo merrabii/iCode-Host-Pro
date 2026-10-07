@@ -6,6 +6,7 @@ import {
   apiError,
   CARD_PAYMENT_LABEL,
   CARD_PAYMENT_TONE,
+  clearTopupAttempt,
   fetchMe,
   formatCents,
   getMyCardTopup,
@@ -117,6 +118,14 @@ function PaymentStatusContent() {
     if (r.ok && r.data) setTopup(r.data);
     else toast.error(apiError(r, 'Relecture impossible.'));
   };
+
+  // GO P2 — parcours tranché (constaté, refusé, expiré, annulé, à revoir) :
+  // la clé d'idempotence de tentative est LIBÉRÉE : la prochaine recharge
+  // repart d'une clé neuve, jamais d'une session morte.
+  useEffect(() => {
+    if (!topup) return;
+    if (!ACTIVE.includes(topup.status)) clearTopupAttempt(topup.reference);
+  }, [topup]);
 
   if (phase === 'loading') {
     return (

@@ -68,7 +68,7 @@ describe('CardPaymentsService (GO Stripe — recharge carte)', () => {
     retrieveSession: jest.Mock;
     createRefund: jest.Mock;
   };
-  let provider: { resolve: jest.Mock };
+  let provider: { resolve: jest.Mock; resolveFor: jest.Mock };
   let audit: { record: jest.Mock };
   let service: CardPaymentsService;
   let lockRow: CardPayment;
@@ -127,6 +127,16 @@ describe('CardPaymentsService (GO Stripe — recharge carte)', () => {
     };
     provider = {
       resolve: jest.fn(async () => ({
+        settingId: 'set1',
+        code: 'simulated',
+        displayName: 'Simulateur local',
+        environment: 'test',
+        merchantAccount: 'sim_merchant_local',
+        currencies: ['USD', 'EUR'],
+        connector,
+      })),
+      // GO P4 — reprise SOUS l'identité d'origine de la ligne.
+      resolveFor: jest.fn(async () => ({
         settingId: 'set1',
         code: 'simulated',
         displayName: 'Simulateur local',
@@ -245,6 +255,7 @@ describe('CardPaymentsService (GO Stripe — recharge carte)', () => {
       currency: 'usd',
       livemode: false,
       source: 'webhook',
+      providerCode: 'simulated',
     });
     expect(first).toEqual({ outcome: 'credited', reference: 'CDP-AAAA11BB', balanceCents: 5000 });
     expect(wallet.applyWithClient).toHaveBeenCalledTimes(1);
@@ -277,6 +288,7 @@ describe('CardPaymentsService (GO Stripe — recharge carte)', () => {
       currency: 'usd',
       livemode: false,
       source: 'webhook',
+      providerCode: 'simulated',
     });
     expect(second.outcome).toBe('already');
     expect(wallet.applyWithClient).toHaveBeenCalledTimes(1);
@@ -290,6 +302,7 @@ describe('CardPaymentsService (GO Stripe — recharge carte)', () => {
       currency: 'usd',
       livemode: false,
       source: 'webhook',
+      providerCode: 'simulated',
     });
     expect(res.outcome).toBe('needs_review');
     expect(wallet.applyWithClient).not.toHaveBeenCalled();
@@ -312,6 +325,7 @@ describe('CardPaymentsService (GO Stripe — recharge carte)', () => {
       currency: 'usd',
       livemode: false,
       source: 'webhook',
+      providerCode: 'simulated',
     });
     expect(res.outcome).toBe('needs_review');
     expect(wallet.applyWithClient).not.toHaveBeenCalled();
@@ -325,6 +339,7 @@ describe('CardPaymentsService (GO Stripe — recharge carte)', () => {
       currency: 'usd',
       livemode: true,
       source: 'webhook',
+      providerCode: 'simulated',
     });
     expect(res.outcome).toBe('needs_review');
     expect(wallet.applyWithClient).not.toHaveBeenCalled();
@@ -338,6 +353,7 @@ describe('CardPaymentsService (GO Stripe — recharge carte)', () => {
       currency: 'usd',
       livemode: false,
       source: 'webhook',
+      providerCode: 'simulated',
     });
     expect(res.outcome).toBe('ignored');
     expect(wallet.applyWithClient).not.toHaveBeenCalled();
@@ -351,7 +367,11 @@ describe('CardPaymentsService (GO Stripe — recharge carte)', () => {
   it('retourne not_found pour un objet prestataire inconnu', async () => {
     tx.$queryRaw.mockReturnValue([]);
     await expect(
-      service.confirmPaid({ sessionRef: 'cs_inconnu', source: 'webhook' }),
+      service.confirmPaid({
+        sessionRef: 'cs_inconnu',
+        source: 'webhook',
+        providerCode: 'simulated',
+      }),
     ).resolves.toEqual({ outcome: 'not_found' });
   });
 
@@ -362,5 +382,93 @@ describe('CardPaymentsService (GO Stripe — recharge carte)', () => {
     const view = await service.refreshFromProvider('CDP-AAAA11BB', user);
     expect(view.status).toBe(CardPaymentStatus.SUCCEEDED);
     expect(connector.retrieveSession).not.toHaveBeenCalled();
+  });
+
+  // ── GO P3 — reprise d’un appel resté incertain (même clé, même session) ──
+
+  it('P3 : relance la création UNCERTAINE avec la MÊME clé (aucune seconde session)', async () => {
+    lockRow = basePayment({
+      providerCallState: 'UNCERTAIN',
+      providerSessionRef: null,
+      providerPaymentRef: null,
+      checkoutUrl: null,
+      dispatchedAt: new Date(),
+    } as Row);
+    prisma.cardPayment.findUnique.mockResolvedValue(lockRow);
+    const view = await service.refreshFromProvider('CDP-AAAA11BB', user);
+    expect(provider.resolveFor).toHaveBeenCalledWith({
+      providerCode: 'simulated',
+      merchantAccount: 'sim_merchant_local',
+      environment: 'test',
+    });
+    expect(connector.createCheckoutSession).toHaveBeenCalledTimes(1);
+    expect(connector.createCheckoutSession.mock.calls[0][0]).toMatchObject({
+      // Clé STABLE par opération : toute reprise = même session prestataire.
+      idempotencyKey: 'topup:CDP-AAAA11BB',
+      reference: 'CDP-AAAA11BB',
+    });
+    expect(view.checkoutUrl).toBeTruthy();
+  });
+
+  it('P3 : un paiement DÉJÀ résolu n’est jamais redispatché (issue constatée)', async () => {
+    lockRow = basePayment({ providerCallState: 'RESOLVED', status: CardPaymentStatus.CREATED });
+    prisma.cardPayment.findUnique.mockResolvedValue(lockRow);
+    await service.refreshFromProvider('CDP-AAAA11BB', user);
+    expect(connector.createCheckoutSession).not.toHaveBeenCalled();
+    expect(provider.resolve).not.toHaveBeenCalled();
+  });
+
+  // ── GO P7/P1 — notes d’échec sans changement d’état, limitées au fournisseur ─
+
+  it('P7 : une note d’échec ne change PAS l’état (un succès ultérieur reste créditable)', async () => {
+    await service.markFailureNotice({
+      paymentRef: 'pi_sim_1',
+      providerCode: 'simulated',
+      code: 'payment_failed',
+      message: 'Refusé (intent encore vivant)',
+    });
+    expect(prisma.cardPayment.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          status: { in: [CardPaymentStatus.CREATED, CardPaymentStatus.PROCESSING] },
+        }),
+        data: expect.objectContaining({
+          failureCode: 'payment_failed',
+          failureMessage: 'Refusé (intent encore vivant)',
+        }),
+      }),
+    );
+    // Aucune écriture de STATUT, aucun crédit.
+    expect(prisma.cardPayment.update).not.toHaveBeenCalled();
+    expect(wallet.applyWithClient).not.toHaveBeenCalled();
+  });
+
+  it('P1 : une note d’un AUTRE fournisseur ne touche pas la ligne (zéro effet)', async () => {
+    prisma.cardPayment.updateMany.mockResolvedValue({ count: 0 });
+    await service.markFailureNotice({
+      paymentRef: 'pi_sim_1',
+      providerCode: 'stripe',
+      message: 'Refusé',
+    });
+    expect(prisma.cardPayment.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ providerCode: 'stripe' }),
+      }),
+    );
+    expect(wallet.applyWithClient).not.toHaveBeenCalled();
+  });
+
+  it('P1 : confirmation signée par un AUTRE fournisseur → « ignoré », aucun crédit', async () => {
+    lockRow = basePayment();
+    const res = await service.confirmPaid({
+      sessionRef: 'cs_sim_1',
+      amountTotalCents: 5000,
+      currency: 'usd',
+      livemode: false,
+      source: 'webhook',
+      providerCode: 'stripe',
+    });
+    expect(res.outcome).toBe('ignored');
+    expect(wallet.applyWithClient).not.toHaveBeenCalled();
   });
 });

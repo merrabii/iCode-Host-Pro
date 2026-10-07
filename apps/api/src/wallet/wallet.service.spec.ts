@@ -206,6 +206,42 @@ describe('WalletService — C2 (crédit/débit atomiques, idempotence, anti-nég
     expect(balance).toBe(200);
     expect(balance).toBeGreaterThanOrEqual(0);
   });
+
+  // ── GO P8 — garde devise SOUS VERROU (aucun change silencieux) ──────────
+
+  it('P8 : crédit en EUR sur un portefeuille USD → refus explicite, zéro écriture', async () => {
+    lockRows = [{ walletBalanceCents: 1000, walletCurrency: 'USD' } as never];
+    await expect(
+      service.credit('cust1', {
+        amountCents: 300,
+        idempotencyKey: 'k-eur',
+        currency: 'EUR',
+      }),
+    ).rejects.toThrow(ConflictException);
+    await expect(
+      service.credit('cust1', {
+        amountCents: 300,
+        idempotencyKey: 'k-eur',
+        currency: 'EUR',
+      }),
+    ).rejects.toThrow('aucun change automatique');
+    expect(tx.walletTransaction.create).not.toHaveBeenCalled();
+    expect(tx.customer.update).not.toHaveBeenCalled();
+  });
+
+  it('P8 : la devise CONCORDANTE reste acceptée (case-insensitive)', async () => {
+    lockRows = [{ walletBalanceCents: 1000, walletCurrency: 'USD' } as never];
+    tx.customer.update.mockImplementation(() => ({ walletBalanceCents: 1300 }));
+    const res = await service.credit('cust1', {
+      amountCents: 300,
+      idempotencyKey: 'k-usd',
+      currency: 'usd',
+    });
+    expect(res.balanceCents).toBe(1300);
+    expect(tx.walletTransaction.create).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ currency: 'usd' }) }),
+    );
+  });
 });
 
 describe('WalletService — C3a (recharge virement : PENDING puis validation unique)', () => {

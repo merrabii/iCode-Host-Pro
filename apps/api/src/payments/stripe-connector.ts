@@ -150,7 +150,10 @@ export class StripeConnector implements PaymentConnector {
       status?: string;
     }>('POST', '/v1/checkout/sessions', {
       form,
-      idempotencyKey: `topup:${input.reference}`,
+      // GO P3 — clé STABLE par opération (`topup:<référence>`) : un rejeu après
+      // réponse perdue retourne la MÊME session (Stripe : ≤ 24 h), jamais une
+      // seconde. Une opération distincte = une référence = une clé distincte.
+      idempotencyKey: input.idempotencyKey,
     });
 
     if (!created.url) {

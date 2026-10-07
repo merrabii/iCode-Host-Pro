@@ -93,7 +93,7 @@ export class CardRefundsService {
     };
   }
 
-  /** Somme déjà engagée (acceptée prestataire) sur CE paiement. */
+  /** Somme déjà ENCAISSÉE côté prestataire (remboursements aboutis) — GO P6. */
   private engagedCents(row: {
     refundedCents: number;
     id: string;
@@ -102,20 +102,37 @@ export class CardRefundsService {
   }
 
   /**
-   * Réservations en cours (intention créée, appel prestataire non conclu) —
-   * comptées dans le plafond pour qu'une reprise ne puisse jamais dépasser
-   * le montant encaissé.
+   * Réservations/engagements en cours (intention créée, prestataire non
+   * encore conclu) : comptés dans le plafond pour qu'une reprise ne puisse
+   * jamais dépasser le montant encaissé.
+   *
+   * GO P6 — TOUT remboursement `PENDING` compte (avec ou sans `providerRef`) :
+   * un engagement accepté par le prestataire reste réservé jusqu'à son issue
+   * (aucun trou de plafond entre l'acceptation et le règlement).
+   * Le compteur dénormalisé `pendingRefundCents` (maintenu sous verrou) ne
+   * sert que de plancher : l'agrégat reste la vérité pour les lignes antérieures.
    */
   private async reservedCents(tx: Prisma.TransactionClient, cardPaymentId: string): Promise<number> {
     const agg = await tx.refund.aggregate({
       where: {
         cardPaymentId,
         status: RefundStatus.PENDING,
-        providerRef: null,
       },
       _sum: { amountCents: true },
     });
     return agg._sum.amountCents ?? 0;
+  }
+
+  /** Engagés = encaissés + réservations (jamais comptés deux fois) — GO P6. */
+  private async usedCents(
+    tx: Prisma.TransactionClient,
+    pay: { id: string; refundedCents: number; pendingRefundCents: number },
+  ): Promise<number> {
+    const reserved = Math.max(
+      pay.pendingRefundCents ?? 0,
+      await this.reservedCents(tx, pay.id),
+    );
+    return this.engagedCents(pay) + reserved;
   }
 
   private statusFor(refundedCents: number, amountCents: number): CardPaymentStatus {
@@ -123,6 +140,22 @@ export class CardRefundsService {
     return refundedCents >= amountCents
       ? CardPaymentStatus.REFUNDED
       : CardPaymentStatus.PARTIALLY_REFUNDED;
+  }
+
+  /**
+   * Libération d'une réservation — GO P6 : CAS borné (`>= montant`), le
+   * compteur ne devient JAMAIS négatif même si deux chemins se croisent.
+   */
+  private async releaseReservation(
+    tx: Prisma.TransactionClient,
+    cardPaymentId: string | null,
+    amountCents: number,
+  ): Promise<void> {
+    if (!cardPaymentId) return;
+    await tx.cardPayment.updateMany({
+      where: { id: cardPaymentId, pendingRefundCents: { gte: amountCents } },
+      data: { pendingRefundCents: { decrement: amountCents } },
+    });
   }
 
   // ── intention (admin) ───────────────────────────────────────────────────
@@ -169,8 +202,8 @@ export class CardRefundsService {
         );
       }
 
-      const used =
-        this.engagedCents(pay) + (await this.reservedCents(tx, pay.id));
+      // GO P6 — plafond = ENCAISSÉS + RÉSERVATIONS + demandé ≤ encaissé.
+      const used = await this.usedCents(tx, pay);
       if (refundCapExceeded(pay.amountCents, used, input.amountCents)) {
         throw new ConflictException(
           `Plafond de remboursement dépassé : encaissé ${pay.amountCents} cents, déjà engagé ${used} cents, demandé ${input.amountCents} cents.`,
@@ -242,6 +275,13 @@ export class CardRefundsService {
         'debit',
       );
 
+      // GO P6 — réservation DENORMALISÉE engagée sous verrou paiement
+      // (libérée à l'issue, jamais de compteur négatif).
+      await tx.cardPayment.update({
+        where: { id: pay.id },
+        data: { pendingRefundCents: { increment: input.amountCents } },
+      });
+
       // Traçabilité : rattachement wallet → remboursement (1 opération par
       // remboursement, contrainte UNIQUE côté Refund).
       const wtx = await tx.walletTransaction.findUnique({
@@ -284,15 +324,63 @@ export class CardRefundsService {
 
   // ── appel prestataire + confirmation / compensation ─────────────────────
 
+  /**
+   * GO P5 — émission SERIALISÉE : verrou LIGNE `Refund` (`FOR UPDATE`),
+   * validation (PENDING, sans référence prestataire) puis `dispatchedAt`
+   * COMMIS avant le moindre octet réseau. Aucun appel réseau sous transaction.
+   *
+   *  - deux émissions concurrentes = la seconde attend le verrou et repart
+   *    avec la MÊME clé d'idempotence (jamais de double remboursement) ;
+   *  - une annulation concurrente voit soit `status ≠ PENDING`, soit
+   *    `dispatchedAt` renseigné → elle est REFUSÉE (réservation conservée).
+   */
+  private async enterDispatch(
+    refundId: string,
+  ): Promise<{ refund: Refund; payment: CardPayment } | null> {
+    return this.prisma.$transaction(async (tx) => {
+      const rows = await tx.$queryRaw<Refund[]>`
+        SELECT * FROM "Refund" WHERE id = ${refundId} FOR UPDATE`;
+      const refund = rows[0];
+      if (
+        !refund ||
+        refund.kind !== RefundKind.EXTERNAL_CARD ||
+        refund.status !== RefundStatus.PENDING ||
+        refund.providerRef
+      ) {
+        return null;
+      }
+      if (!refund.dispatchedAt) {
+        await tx.refund.updateMany({
+          where: { id: refund.id, dispatchedAt: null },
+          data: { dispatchedAt: new Date() },
+        });
+      }
+      const payment = refund.cardPaymentId
+        ? await tx.cardPayment.findUnique({ where: { id: refund.cardPaymentId } })
+        : null;
+      if (!payment) return null;
+      return { refund, payment };
+    });
+  }
+
   private async callProvider(
     refund: Refund,
     paymentReference: string,
     actor: JwtPayload,
   ): Promise<CardRefundView> {
-    const payment = await this.prisma.cardPayment.findUnique({
-      where: { id: refund.cardPaymentId ?? '' },
-    });
-    if (!payment || !payment.providerPaymentRef) {
+    const entered = await this.enterDispatch(refund.id);
+    if (!entered) {
+      const fresh = await this.prisma.refund.findUnique({ where: { id: refund.id } });
+      if (fresh && (fresh.status !== RefundStatus.PENDING || fresh.providerRef)) {
+        // Déjà confirmé/clos par un autre chemin : aucun second appel.
+        return this.toView(fresh, paymentReference);
+      }
+      throw new ConflictException(
+        'Remboursement déjà en cours de traitement (appel prestataire concurrent).',
+      );
+    }
+    const payment = entered.payment;
+    if (!payment.providerPaymentRef) {
       await this.failRefund(
         refund.id,
         paymentReference,
@@ -307,15 +395,22 @@ export class CardRefundsService {
 
     let outcome: ConnectorRefundOutcome;
     try {
-      const resolved = await this.provider.resolve();
+      // GO P4 — opération sous l'IDENTITÉ D'ORIGINE du paiement (fournisseur
+      // + compte marchand), jamais la configuration active d'un autre compte.
+      const resolved = await this.provider.resolveFor({
+        providerCode: payment.providerCode,
+        merchantAccount: payment.merchantAccount,
+        environment: payment.environment,
+      });
       outcome = await resolved.connector.createRefund({
         paymentRef: payment.providerPaymentRef,
         amountCents: refund.amountCents,
         idempotencyKey: refund.idempotencyKey,
       });
     } catch (err) {
-      // INCERTITUDE (réseau/HTTP) : la réservation wallet est conservée et
-      // l'intention reste PENDING ré-exploitable (retry idempotent).
+      // INCERTITUDE (réseau/HTTP) OU identité refusée : la réservation wallet
+      // est conservée et l'intention reste PENDING ré-exploirable (retry avec
+      // la MÊME clé prestataire).
       const message =
         err instanceof StripeHttpError || err instanceof Error
           ? err.message
@@ -363,14 +458,30 @@ export class CardRefundsService {
       if (cas.count !== 1) {
         throw new ConflictException('Remboursement déjà confirmé ou clos.');
       }
-      const refundedCents = Math.min(
-        pay.refundedCents + refund.amountCents,
-        pay.amountCents,
-      );
-      await tx.cardPayment.update({
-        where: { id: pay.id },
-        data: { refundedCents, status: this.statusFor(refundedCents, pay.amountCents) },
-      });
+
+      if (outcome.status === 'succeeded') {
+        // GO P6 — L'ENCAISSEMENT RÉEL seulement entre dans `refundedCents`
+        // (aucun plafond silencieux : un cumul au-delà du montant encaissé est
+        // signalé, jamais lissé).
+        const refundedCents = pay.refundedCents + refund.amountCents;
+        const overflow = refundedCents > pay.amountCents;
+        await tx.cardPayment.update({
+          where: { id: pay.id },
+          data: {
+            refundedCents,
+            ...(overflow
+              ? {
+                  status: CardPaymentStatus.NEEDS_REVIEW,
+                  interventionNeeded: true,
+                  interventionReason: `remboursement cumulé (${refundedCents}) > montant encaissé (${pay.amountCents})`,
+                }
+              : { status: this.statusFor(refundedCents, pay.amountCents) }),
+          },
+        });
+        await this.releaseReservation(tx, pay.id, refund.amountCents);
+      }
+      // GO P6 — accepté mais non réglé (pending/requires_action) : l'engagement
+      // RESTE dans `pendingRefundCents`, `refundedCents` n'avance qu'au règlement.
       return tx.refund.findUnique({ where: { id: refund.id } });
     });
 
@@ -396,7 +507,13 @@ export class CardRefundsService {
     return this.toView(updated ?? refund, paymentReference);
   }
 
-  /** Échec définitif : statut FAILED + compensation idempotente du débit. */
+  /**
+   * Échec définitif : statut FAILED + compensation idempotente du débit.
+   *
+   * GO P5 — la compensation n'a lieu QUE si le CAS `PENDING → FAILED` a
+   * réellement franchi UNE ligne : sinon le remboursement est déjà confirmé
+   * (crédit chez le prestataire) et recréditer reviendrait à doubler.
+   */
   private async failRefund(
     refundId: string,
     paymentReference: string,
@@ -407,36 +524,10 @@ export class CardRefundsService {
     const refund = await this.prisma.refund.findUnique({ where: { id: refundId } });
     if (!refund || refund.status !== RefundStatus.PENDING) return;
 
-    await this.prisma.$transaction(async (tx) => {
-      await tx.refund.updateMany({
-        where: { id: refundId, status: RefundStatus.PENDING },
-        data: {
-          status: RefundStatus.FAILED,
-          failureReason: reason.slice(0, 300),
-          providerRef: opts.providerRef ?? null,
-          processedAt: new Date(),
-        },
-      });
-        if (opts.recredit && refund.cardPaymentId) {
-          const pay = await this.requirePayment(tx, refund.cardPaymentId);
-          // Recrédit idempotent (clé distincte du débit) — jamais de double.
-          await this.wallet.applyWithClient(
-            tx,
-            pay.customerId,
-            {
-              amountCents: refund.amountCents,
-              idempotencyKey: `cardrefund-back:${refund.id}`,
-              currency: refund.currency.toUpperCase(),
-              type: WalletTransactionType.CREDIT,
-              // `reference` volontairement absente : UNIQUE et déjà prise par
-              // le crédit initial de la recharge (jamais de collision 500).
-              note: `Échec remboursement carte ${paymentReference} : crédit restitué`,
-            },
-            'credit',
-          );
-        }
-
-    });
+    const done = await this.prisma.$transaction((tx) =>
+      this.failRefundInTx(tx, refund, paymentReference, reason, opts),
+    );
+    if (!done) return;
 
     await this.audit
       .record({
@@ -448,6 +539,49 @@ export class CardRefundsService {
         details: { reason: reason.slice(0, 300), recredit: opts.recredit },
       })
       .catch(() => undefined);
+  }
+
+  /** Cœur de l'échec, réutilisable DANS la transaction de l'appelant. */
+  private async failRefundInTx(
+    tx: Prisma.TransactionClient,
+    refund: Refund,
+    paymentReference: string,
+    reason: string,
+    opts: { recredit: boolean; providerRef?: string },
+  ): Promise<boolean> {
+    const cas = await tx.refund.updateMany({
+      where: { id: refund.id, status: RefundStatus.PENDING },
+      data: {
+        status: RefundStatus.FAILED,
+        failureReason: reason.slice(0, 300),
+        providerRef: opts.providerRef ?? null,
+        processedAt: new Date(),
+      },
+    });
+    if (cas.count !== 1) return false; // déjà clos : AUCUNE compensation
+
+    // Réservation libérée (CAS borné, compteur jamais négatif).
+    await this.releaseReservation(tx, refund.cardPaymentId, refund.amountCents);
+
+    if (opts.recredit && refund.cardPaymentId) {
+      const pay = await this.requirePayment(tx, refund.cardPaymentId);
+      // Recrédit idempotent (clé distincte du débit) — jamais de double.
+      await this.wallet.applyWithClient(
+        tx,
+        pay.customerId,
+        {
+          amountCents: refund.amountCents,
+          idempotencyKey: `cardrefund-back:${refund.id}`,
+          currency: refund.currency.toUpperCase(),
+          type: WalletTransactionType.CREDIT,
+          // `reference` volontairement absente : UNIQUE et déjà prise par
+          // le crédit initial de la recharge (jamais de collision 500).
+          note: `Échec remboursement carte ${paymentReference} : crédit restitué`,
+        },
+        'credit',
+      );
+    }
+    return true;
   }
 
   private async requirePayment(
@@ -483,31 +617,89 @@ export class CardRefundsService {
     return this.callProvider(refund, payment.reference, actor);
   }
 
-  /** Abandon d'une intention non conclue : compensation + statut FAILED. */
+  /**
+   * Abandon d'une intention non conclue : compensation + statut FAILED.
+   *
+   * GO P5 — sérialisé avec l'émission par verrou LIGNE `Refund` :
+   *  - `dispatchedAt` déjà renseigné → REFUS (le prestataire a pu créer le
+   *    remboursement : recréditer reviendrait à doubler) ; la réservation
+   *    wallet est CONSERVÉE et l'alerte est journalisée ;
+   *  - sinon échec + recrédit dans LA MÊME transaction, conditionnés au CAS
+   *    `PENDING → FAILED` (jamais de compensation sur une ligne déjà close).
+   */
   async cancelRefund(refundId: string, actor: JwtPayload, reason?: string): Promise<CardRefundView> {
-    const refund = await this.prisma.refund.findUnique({ where: { id: refundId } });
-    if (!refund || refund.kind !== RefundKind.EXTERNAL_CARD) {
-      throw new NotFoundException('Remboursement carte introuvable.');
-    }
-    if (refund.status !== RefundStatus.PENDING || refund.providerRef) {
+    const result = await this.prisma.$transaction(async (tx) => {
+      const rows = await tx.$queryRaw<Refund[]>`
+        SELECT * FROM "Refund" WHERE id = ${refundId} FOR UPDATE`;
+      const refund = rows[0];
+      if (!refund || refund.kind !== RefundKind.EXTERNAL_CARD) {
+        throw new NotFoundException('Remboursement carte introuvable.');
+      }
+      if (refund.status !== RefundStatus.PENDING || refund.providerRef) {
+        throw new ConflictException(
+          'Seul un remboursement PENDING sans référence prestataire peut être annulé.',
+        );
+      }
+      if (refund.dispatchedAt) {
+        return { refund, reference: null as string | null, refused: true, applied: false };
+      }
+      const payment = refund.cardPaymentId
+        ? await tx.cardPayment.findUnique({
+            where: { id: refund.cardPaymentId },
+            select: { reference: true },
+          })
+        : null;
+      if (!payment) throw new NotFoundException('Paiement introuvable.');
+      const applied = await this.failRefundInTx(
+        tx,
+        refund,
+        payment.reference,
+        reason?.trim() || 'Annulé par l’administrateur.',
+        { recredit: true },
+      );
+      return { refund, reference: payment.reference, refused: false, applied };
+    });
+
+    if (result.refused) {
+      await this.audit
+        .record({
+          actorId: actor.sub,
+          actorEmail: actor.email,
+          action: 'refund.topup.cancel_refused',
+          resourceType: 'refund',
+          resourceId: refundId,
+          details: {
+            dispatchedAt: result.refund.dispatchedAt,
+            handling: 'reservation_conservee_verification_requise',
+          },
+        })
+        .catch(() => undefined);
       throw new ConflictException(
-        'Seul un remboursement PENDING sans référence prestataire peut être annulé.',
+        'Appel prestataire déjà émis pour ce remboursement : annulation refusée ' +
+          '(réservation conservée — vérifiez le remboursement chez le prestataire avant toute compensation).',
       );
     }
-    const payment = await this.prisma.cardPayment.findUnique({
-      where: { id: refund.cardPaymentId ?? '' },
-      select: { reference: true },
-    });
-    if (!payment) throw new NotFoundException('Paiement introuvable.');
-    await this.failRefund(
-      refund.id,
-      payment.reference,
-      reason?.trim() || 'Annulé par l’administrateur.',
-      actor,
-      { recredit: true },
+
+    if (result.applied) {
+      await this.audit
+        .record({
+          actorId: actor.sub,
+          actorEmail: actor.email,
+          action: 'refund.topup.failed',
+          resourceType: 'refund',
+          resourceId: refundId,
+          details: {
+            reason: reason?.trim() || 'Annulé par l’administrateur.',
+            recredit: true,
+          },
+        })
+        .catch(() => undefined);
+    }
+    const fresh = await this.prisma.refund.findUnique({ where: { id: refundId } });
+    return this.toView(
+      fresh ?? result.refund,
+      result.reference ?? '—',
     );
-    const fresh = await this.prisma.refund.findUnique({ where: { id: refund.id } });
-    return this.toView(fresh ?? refund, payment.reference);
   }
 
   async listForPayment(cardPaymentId: string): Promise<CardRefundView[]> {
@@ -521,5 +713,110 @@ export class CardRefundsService {
       orderBy: { createdAt: 'desc' },
     });
     return rows.map((r) => this.toView(r, payment.reference));
+  }
+
+  /**
+   * GO P6 — issue d'un remboursement CONNU relue chez le prestataire
+   * (`refund.created/updated/failed/canceled` signés).
+   *
+   *  - idempotent par `providerRef` (CAS `PENDING → …` : un rejeu n'a aucun
+   *    effet supplémentaire) ;
+   *  - limité au fournisseur ayant authentifié l'événement (GO P1) ;
+   *  - `succeeded` = SEUL moment où `refundedCents` avance (réservation
+   *    libérée, cumul signalé s'il dépasse l'encaissé, jamais lissé) ;
+   *  - `failed`/`canceled` = compensation CAS + recrédit (la carte n'a rien
+   *    reçu, le crédit de recharge est restitué) ;
+   *  - `pending`/`requires_action` = engagement déjà enregistré, aucun effet.
+   * `null` = remboursement INCONNU (traité par l'appelant comme un
+   * remboursement hors plateforme, GO P6).
+   */
+  async applyProviderRefundStatus(input: {
+    providerRef: string;
+    status: 'pending' | 'requires_action' | 'succeeded' | 'failed' | 'canceled';
+    providerCode: string;
+  }): Promise<{
+    refundId: string;
+    cardPaymentId: string | null;
+    status: RefundStatus;
+    changed: boolean;
+  } | null> {
+    const refund = await this.prisma.refund.findFirst({
+      where: { providerRef: input.providerRef },
+    });
+    if (!refund || refund.kind !== RefundKind.EXTERNAL_CARD) return null;
+
+    const payment = refund.cardPaymentId
+      ? await this.prisma.cardPayment.findUnique({ where: { id: refund.cardPaymentId } })
+      : null;
+    if (!payment) return null;
+    // GO P1 — jamais d'effet pour un événement d'un autre fournisseur.
+    if (payment.providerCode !== input.providerCode) return null;
+
+    const base = {
+      refundId: refund.id,
+      cardPaymentId: refund.cardPaymentId,
+      status: refund.status,
+      changed: false,
+    };
+
+    if (input.status === 'pending' || input.status === 'requires_action') {
+      return base; // engagement déjà compté, rien à faire
+    }
+
+    if (input.status === 'succeeded') {
+      if (refund.status === RefundStatus.SUCCEEDED) return base; // idempotent
+      const changed = await this.prisma.$transaction(async (tx) => {
+        const rows = await tx.$queryRaw<CardPayment[]>`
+          SELECT * FROM "CardPayment" WHERE id = ${payment.id} FOR UPDATE`;
+        if (rows.length === 0) return false;
+        const pay = rows[0];
+        const cas = await tx.refund.updateMany({
+          where: { id: refund.id, status: RefundStatus.PENDING },
+          data: { status: RefundStatus.SUCCEEDED, processedAt: new Date() },
+        });
+        if (cas.count !== 1) return false;
+        const refundedCents = pay.refundedCents + refund.amountCents;
+        const overflow = refundedCents > pay.amountCents;
+        await tx.cardPayment.update({
+          where: { id: pay.id },
+          data: {
+            refundedCents,
+            ...(overflow
+              ? {
+                  status: CardPaymentStatus.NEEDS_REVIEW,
+                  interventionNeeded: true,
+                  interventionReason: `remboursement cumulé (${refundedCents}) > montant encaissé (${pay.amountCents})`,
+                }
+              : { status: this.statusFor(refundedCents, pay.amountCents) }),
+          },
+        });
+        await this.releaseReservation(tx, pay.id, refund.amountCents);
+        return true;
+      });
+      return {
+        refundId: refund.id,
+        cardPaymentId: refund.cardPaymentId,
+        status: changed ? RefundStatus.SUCCEEDED : refund.status,
+        changed,
+      };
+    }
+
+    // failed / canceled : compensation CONDITIONNÉE au CAS.
+    const changed = await this.prisma.$transaction((tx) =>
+      this.failRefundInTx(
+        tx,
+        refund,
+        payment.reference,
+        `Issue prestataire « ${input.status} » (${input.providerRef}).`,
+        { recredit: true, providerRef: input.providerRef },
+      ),
+    );
+    const fresh = await this.prisma.refund.findUnique({ where: { id: refund.id } });
+    return {
+      refundId: refund.id,
+      cardPaymentId: refund.cardPaymentId,
+      status: fresh?.status ?? refund.status,
+      changed,
+    };
   }
 }

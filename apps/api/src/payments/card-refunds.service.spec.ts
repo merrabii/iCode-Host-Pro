@@ -87,7 +87,7 @@ describe('CardRefundsService (GO §6 — recharge → carte)', () => {
       aggregate: jest.Mock;
     };
     walletTransaction: { findUnique: jest.Mock };
-    cardPayment: { findUnique: jest.Mock; update: jest.Mock };
+    cardPayment: { findUnique: jest.Mock; update: jest.Mock; updateMany: jest.Mock };
     customer: { update: jest.Mock };
   };
   let prisma: {
@@ -97,7 +97,7 @@ describe('CardRefundsService (GO §6 — recharge → carte)', () => {
   };
   let wallet: { applyWithClient: jest.Mock };
   let connector: { createRefund: jest.Mock };
-  let provider: { resolve: jest.Mock };
+  let provider: { resolve: jest.Mock; resolveFor: jest.Mock };
   let audit: { record: jest.Mock };
   let service: CardRefundsService;
 
@@ -119,6 +119,9 @@ describe('CardRefundsService (GO §6 — recharge → carte)', () => {
         const sql = strings.join(' ? ');
         if (sql.includes('FROM "CardPayment"')) return [lockPayment];
         if (sql.includes('FROM "Customer"')) return [lockCustomer];
+        // Verrou ligne remboursement (GO P5) : la ligne est retournée telle
+        // quelle pour serialiser emission / annulation.
+        if (sql.includes('FROM "Refund"')) return [lastRow];
         return [];
       }),
       refund: {
@@ -143,11 +146,13 @@ describe('CardRefundsService (GO §6 — recharge → carte)', () => {
         findUnique: jest.fn(async () => ({ id: 'wtx-refund-1' })),
       },
       cardPayment: {
-        findUnique: jest.fn(async () => ({ customerId: 'cust1' })),
+        // Ligne PAIEMENT complète : identité prestataire (GO P4) + customerId.
+        findUnique: jest.fn(async () => lockPayment),
         update: jest.fn((args: { data: Row }) => ({
           ...lockPayment,
           ...args.data,
         })),
+        updateMany: jest.fn(async () => ({ count: 1 })),
       },
       customer: { update: jest.fn() },
     };
@@ -182,6 +187,16 @@ describe('CardRefundsService (GO §6 — recharge → carte)', () => {
         displayName: 'Simulateur',
         environment: 'test',
         merchantAccount: 'sim',
+        currencies: ['USD'],
+        connector,
+      })),
+      // GO P4 — reprise sous l'identité d'origine du paiement.
+      resolveFor: jest.fn(async () => ({
+        settingId: 'set1',
+        code: 'simulated',
+        displayName: 'Simulateur',
+        environment: 'test',
+        merchantAccount: 'sim_merchant_local',
         currencies: ['USD'],
         connector,
       })),
@@ -295,7 +310,13 @@ describe('CardRefundsService (GO §6 — recharge → carte)', () => {
     expect(view.failureReason).toBeNull();
     // Aucune compensation : la réservation wallet reste (reprise possible).
     expect(wallet.applyWithClient).toHaveBeenCalledTimes(1);
-    expect(tx.cardPayment.update).not.toHaveBeenCalled();
+    // Rien sur l'ENCAISSEMENT (refundedCents / statut) : seule la réservation
+    // `pendingRefundCents` est engagée (ligne figée sous verrou).
+    expect(tx.cardPayment.update).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ refundedCents: expect.anything() }),
+      }),
+    );
   });
 
   it('compense (recrédit) et marque FAILED si le prestataire refuse', async () => {
@@ -318,7 +339,11 @@ describe('CardRefundsService (GO §6 — recharge → carte)', () => {
       }),
       'credit',
     );
-    expect(tx.cardPayment.update).not.toHaveBeenCalled();
+    expect(tx.cardPayment.update).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ refundedCents: expect.anything() }),
+      }),
+    );
   });
 
   it('rejoue un appel prestataire interrompu avec la même clé (retry)', async () => {
@@ -350,5 +375,118 @@ describe('CardRefundsService (GO §6 — recharge → carte)', () => {
       expect.objectContaining({ type: WalletTransactionType.CREDIT }),
       'credit',
     );
+  });
+
+  // ── GO P5 — l'émission est sérialisée : plus de « double compensation » ──
+
+  it('P5 : refuse l’annulation une fois l’appel prestataire émis (réservation conservée)', async () => {
+    lastRow = refundRow({
+      status: RefundStatus.PENDING,
+      providerRef: null,
+      dispatchedAt: new Date(),
+    } as Row);
+    await expect(service.cancelRefund('rfd1', actor, 'Erreur opérateur')).rejects.toThrow(
+      ConflictException,
+    );
+    await expect(service.cancelRefund('rfd1', actor, 'Erreur opérateur')).rejects.toThrow(
+      'annulation refusée',
+    );
+    // AUCUN recrédit : le remboursement existe peut-être chez le prestataire.
+    expect(wallet.applyWithClient).not.toHaveBeenCalled();
+    // Traçabilité de l'alerte.
+    expect(audit.record).toHaveBeenCalledWith(
+      expect.objectContaining({ action: 'refund.topup.cancel_refused' }),
+    );
+  });
+
+  // ── GO P6 — issue prestataire relue (refund.*) sans double effet ────────
+
+  it('P6 : « succeeded » chez le prestataire fait avancer l’encaissé et libère la réservation', async () => {
+    prisma.refund.findFirst.mockResolvedValue(
+      refundRow({ providerRef: 're_1', status: RefundStatus.PENDING }),
+    );
+    const out = await service.applyProviderRefundStatus({
+      providerRef: 're_1',
+      status: 'succeeded',
+      providerCode: 'simulated',
+    });
+    expect(out).toMatchObject({ refundId: 'rfd1', status: RefundStatus.SUCCEEDED, changed: true });
+    expect(tx.cardPayment.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          refundedCents: 2000,
+          status: CardPaymentStatus.PARTIALLY_REFUNDED,
+        }),
+      }),
+    );
+    expect(wallet.applyWithClient).not.toHaveBeenCalled();
+    // Rejeu du même événement : AUCUN second effet.
+    prisma.refund.findFirst.mockResolvedValue(
+      refundRow({ providerRef: 're_1', status: RefundStatus.SUCCEEDED }),
+    );
+    const replay = await service.applyProviderRefundStatus({
+      providerRef: 're_1',
+      status: 'succeeded',
+      providerCode: 'simulated',
+    });
+    expect(replay?.changed).toBe(false);
+    expect(tx.cardPayment.update).toHaveBeenCalledTimes(1);
+  });
+
+  it('P6 : « failed » compense par CAS avec recrédit une seule fois', async () => {
+    prisma.refund.findFirst.mockResolvedValue(
+      refundRow({ providerRef: 're_fail', status: RefundStatus.PENDING }),
+    );
+    lastRow = refundRow({ providerRef: null, status: RefundStatus.PENDING });
+    const out = await service.applyProviderRefundStatus({
+      providerRef: 're_fail',
+      status: 'failed',
+      providerCode: 'simulated',
+    });
+    expect(out?.changed).toBe(true);
+    expect(out?.status).toBe(RefundStatus.FAILED);
+    expect(wallet.applyWithClient).toHaveBeenCalledTimes(1);
+    expect(wallet.applyWithClient).toHaveBeenCalledWith(
+      expect.anything(),
+      'cust1',
+      expect.objectContaining({ type: WalletTransactionType.CREDIT }),
+      'credit',
+    );
+    expect(tx.cardPayment.update).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ refundedCents: expect.anything() }),
+      }),
+    );
+  });
+
+  it('P6 : un remboursement inconnu du fournisseur reste sans effet (constat hors plateforme)', async () => {
+    prisma.refund.findFirst.mockResolvedValue(null);
+    await expect(
+      service.applyProviderRefundStatus({
+        providerRef: 're_unknown',
+        status: 'succeeded',
+        providerCode: 'simulated',
+      }),
+    ).resolves.toBeNull();
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+    expect(wallet.applyWithClient).not.toHaveBeenCalled();
+  });
+
+  // ── GO P1 — le fournisseur authentifié limite ses propres effets ────────
+
+  it('P1 : refuse l’issue d’un remboursement porté par un autre fournisseur', async () => {
+    prisma.refund.findFirst.mockResolvedValue(
+      refundRow({ providerRef: 're_1', status: RefundStatus.PENDING }),
+    );
+    await expect(
+      service.applyProviderRefundStatus({
+        providerRef: 're_1',
+        status: 'succeeded',
+        providerCode: 'stripe',
+      }),
+    ).resolves.toBeNull();
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+    expect(wallet.applyWithClient).not.toHaveBeenCalled();
+    expect(tx.cardPayment.update).not.toHaveBeenCalled();
   });
 });

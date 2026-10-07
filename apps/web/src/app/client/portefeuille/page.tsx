@@ -4,6 +4,8 @@ import { useCallback, useEffect, useState, type FormEvent } from 'react';
 import { useRouter } from 'next/navigation';
 import {
   apiError,
+  attachTopupAttempt,
+  clearTopupAttempt,
   createCardTopup,
   createWalletRecharge,
   fetchMe,
@@ -11,6 +13,7 @@ import {
   getMyWallet,
   getSessionToken,
   listMyWalletTransactions,
+  topupAttemptKey,
   WALLET_STATUS_LABEL,
   WALLET_STATUS_TONE,
   WALLET_TYPE_LABEL,
@@ -172,19 +175,41 @@ export default function ClientWalletPage() {
       return;
     }
     setCardBusy(true);
-    const r = await createCardTopup(token, { amountCents: cents });
+    // GO P2 — MÊME tentative = MÊME clé (persistée pendant le parcours) :
+    // double-clic ou reprise réseau = la MÊME session, jamais une seconde.
+    const idemKey = topupAttemptKey(cents);
+    const r = await createCardTopup(token, { amountCents: cents }, idemKey);
     setCardBusy(false);
     if (!r.ok || !r.data) {
+      // Échec d'ouverture : la tentative reste valable (le serveur rejoue la
+      // même clé) — un nouvel essai ne crée pas d'intention parallèle.
       toast.error(apiError(r, 'Ouverture du paiement impossible.'));
       return;
     }
     const view = r.data;
     if (view.status === 'SUCCEEDED') {
+      clearTopupAttempt();
       toast.ok('Paiement déjà constaté : portefeuille crédité.');
       setCardAmount('');
       setPage(1);
       await loadAll(token, 1);
       return;
+    }
+    if (
+      view.status === 'FAILED' ||
+      view.status === 'CANCELED' ||
+      view.status === 'EXPIRED' ||
+      view.status === 'NEEDS_REVIEW'
+    ) {
+      // Parcours tranché : la clé est libérée pour qu'une NOUVELLE tentative
+      // puisse repartir de zéro (jamais de session morte réutilisée).
+      clearTopupAttempt(view.reference);
+      if (!view.checkoutUrl) {
+        router.push(`/client/portefeuille/paiement?ref=${encodeURIComponent(view.reference)}`);
+        return;
+      }
+    } else {
+      attachTopupAttempt(view.reference);
     }
     if (!view.checkoutUrl) {
       router.push(`/client/portefeuille/paiement?ref=${encodeURIComponent(view.reference)}`);

@@ -16,7 +16,8 @@ import { AuditService } from '../audit/audit.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { JwtPayload } from '../auth/types';
 import { WalletService } from '../wallet/wallet.service';
-import { PaymentProviderService } from './payment-provider.service';
+import { ConnectorSession } from './payment-connector';
+import { PaymentProviderService, ResolvedProvider } from './payment-provider.service';
 import { StripeHttpError } from './stripe-connector';
 
 export const CARD_PAYMENT_MIN_CENTS = 100;
@@ -150,6 +151,63 @@ export class CardPaymentsService {
 
   // ── création (client) ───────────────────────────────────────────────────
 
+  /**
+   * GO P2 — identité COMPLÈTE d'une intention : même clé acceptée uniquement
+   * pour le même client, le même montant et la même devise (tout écart = 409,
+   * jamais d'effet silencieux sur une autre intention).
+   */
+  private sameIntent(
+    row: CardPayment,
+    customerId: string,
+    amountCents: number,
+    currency: string,
+  ): boolean {
+    return (
+      row.customerId === customerId &&
+      row.amountCents === amountCents &&
+      row.currency.toLowerCase() === currency.toLowerCase()
+    );
+  }
+
+  /**
+   * GO P3 — fenêtre de reprise sûre : Stripe éponge les clés d'idempotence
+   * après au moins 24 h. Passé ce délai, rejouer la même clé créerait une
+   * NOUVELLE session → aucune reprise automatique, intervention humaine.
+   */
+  private static readonly IDEMPOTENCE_RETENTION_MS = 24 * 60 * 60 * 1000;
+
+  private recoveryBlockedReason(row: CardPayment): string | null {
+    if (!row.dispatchedAt) return null;
+    const ageMs = Date.now() - row.dispatchedAt.getTime();
+    if (ageMs <= CardPaymentsService.IDEMPOTENCE_RETENTION_MS) return null;
+    return `dernier envoi il y a ${Math.round(ageMs / 3_600_000)} h (clé d'idempotence prestataire épongée)`;
+  }
+
+  /** P3 — création à (re)prendre : jamais conclue, ou résultat incertain. */
+  private needsProviderDispatch(row: CardPayment): boolean {
+    if (
+      row.status !== CardPaymentStatus.CREATED &&
+      row.status !== CardPaymentStatus.PROCESSING
+    ) {
+      return false;
+    }
+    if (
+      row.providerCallState === 'DISPATCHED' ||
+      row.providerCallState === 'UNCERTAIN'
+    ) {
+      // Appel resté sans réponse concluante → reprise avec la MÊME clé.
+      return true;
+    }
+    if (row.providerCallState === 'RESOLVED') return false; // issue constatée
+    // `null` (ligne antérieure au GO) : une session déjà ouverte n'est pas
+    // relancée, une création jamais ouverte l'est avec la même clé.
+    return !row.checkoutUrl;
+  }
+
+  /**
+   * GO P2 — MÊME clé + MÊME intention = MÊME paiement, quel que soit son état.
+   * Aucune création récursive, aucune nouvelle clé, aucun second paiement.
+   */
   async createTopup(
     user: JwtPayload,
     dto: { amountCents: number; currency?: string; idempotencyKey?: string },
@@ -167,8 +225,6 @@ export class CardPaymentsService {
       );
     }
 
-    const resolved = await this.provider.resolve();
-
     const walletCurrency = customer.walletCurrency.toUpperCase();
     const currency = (dto.currency ?? customer.walletCurrency).toUpperCase();
     if (currency !== walletCurrency) {
@@ -177,77 +233,150 @@ export class CardPaymentsService {
           '(aucune conversion de change automatique dans ce lot).',
       );
     }
+
+    const idem = assertPaymentIdempotencyKey(dto.idempotencyKey ?? idempotencyHeader);
+
+    // Rejeu AVANT toute résolution : une intention déjà ouverte se relit même
+    // si la configuration a changé (aucune requalification silencieuse).
+    const existing = await this.prisma.cardPayment.findUnique({
+      where: { idempotencyKey: idem },
+    });
+    if (existing) {
+      if (!this.sameIntent(existing, customer.id, dto.amountCents, currency)) {
+        throw new ConflictException(
+          "Clé d'idempotence déjà utilisée pour une autre intention de paiement.",
+        );
+      }
+      if (this.needsProviderDispatch(existing)) {
+        // Reprise contrôlée (réponse perdue, crash, persistance échouée) :
+        // MÊME référence, MÊME clé prestataire, JAMAIS de seconde session.
+        return this.dispatchCheckout(existing, user, await this.provider.resolve());
+      }
+      return this.toClientView(existing);
+    }
+
+    const resolved = await this.provider.resolve();
     if (!resolved.currencies.includes(currency)) {
       throw new BadRequestException(
         `Devise non autorisée par le prestataire (${resolved.currencies.join(', ')}).`,
       );
     }
 
-    const idem = assertPaymentIdempotencyKey(dto.idempotencyKey ?? idempotencyHeader);
-
-    // Rejeu : même clé = MÊME session (aucun second paiement ouvert).
-    const existing = await this.prisma.cardPayment.findUnique({
-      where: { idempotencyKey: idem },
-    });
-    if (existing) {
+    const reference = await this.newReference();
+    let row: CardPayment;
+    try {
+      row = await this.prisma.cardPayment.create({
+        data: {
+          reference,
+          customerId: customer.id,
+          status: CardPaymentStatus.CREATED,
+          amountCents: dto.amountCents,
+          currency,
+          providerCode: resolved.code,
+          environment: resolved.environment,
+          merchantAccount: resolved.merchantAccount,
+          idempotencyKey: idem,
+        },
+      });
+    } catch (err) {
+      // GO P2 — double soumission CONCURRENTE sur la même clé : le second
+      // créateur n'a jamais d'erreur technique ni de second dispatch, il sert
+      // la ligne déjà ouverte par le premier (aucun appel prestataire en double).
       if (
-        existing.customerId !== customer.id ||
-        existing.amountCents !== dto.amountCents ||
-        existing.currency.toLowerCase() !== currency.toLowerCase()
+        err instanceof Prisma.PrismaClientKnownRequestError &&
+        err.code === 'P2002'
       ) {
-        throw new ConflictException(
-          "Clé d'idempotence déjà utilisée pour une autre intention de paiement.",
-        );
+        const raced = await this.prisma.cardPayment.findUnique({
+          where: { idempotencyKey: idem },
+        });
+        if (raced) {
+          if (!this.sameIntent(raced, customer.id, dto.amountCents, currency)) {
+            throw new ConflictException(
+              "Clé d'idempotence déjà utilisée pour une autre intention de paiement.",
+            );
+          }
+          return this.toClientView(raced);
+        }
       }
-      if (existing.status === CardPaymentStatus.CREATED && existing.checkoutUrl) {
-        return this.toClientView(existing);
-      }
-      if (existing.status !== CardPaymentStatus.CREATED) {
-        // Session déjà utilisée : on rouvre proprement une NOUVELLE session
-        // (clé différente) plutôt que de rejouer un paiement abouti.
-        return this.createTopup(
-          user,
-          {
-            amountCents: dto.amountCents,
-            currency,
-            idempotencyKey: undefined,
-          },
-          undefined,
-        );
-      }
-      return this.toClientView(existing);
+      throw err;
     }
 
-    const reference = await this.newReference();
-    const row = await this.prisma.cardPayment.create({
-      data: {
-        reference,
-        customerId: customer.id,
-        status: CardPaymentStatus.CREATED,
-        amountCents: dto.amountCents,
-        currency,
-        providerCode: resolved.code,
-        environment: resolved.environment,
-        merchantAccount: resolved.merchantAccount,
-        idempotencyKey: idem,
-      },
-    });
+    return this.dispatchCheckout(row, user, resolved);
+  }
+
+  /**
+   * GO P3 — appel prestataire encadré :
+   *  1. identité de l'opération COMMITEE avant le réseau (`DISPATCHED`) ;
+   *  2. réponse obtenue → références persistées (`RESOLVED`) ;
+   *  3. refus certain (4xx prestataire) → `FAILED` + message, aucun crédit ;
+   *  4. résultat incertain (réseau/timeout/5xx) → `UNCERTAIN`, statut inchangé :
+   *     le client reçoit la vue, la page de suivi relance une reprise qui
+   *     rejoue avec la MÊME clé → MÊME session chez le prestataire.
+   * Aucune de ces étapes n'exécute d'appel réseau sous transaction.
+   */
+  private async dispatchCheckout(
+    row: CardPayment,
+    user: JwtPayload,
+    resolved: ResolvedProvider,
+  ): Promise<CardPaymentClientView> {
+    if (row.checkoutUrl && row.providerCallState === 'RESOLVED') {
+      return this.toClientView(row);
+    }
+
+    // GO P4 — reprise UNIQUEMENT sous l'identité d'origine (fournisseur +
+    // compte marchand) : jamais de remplacement silencieux par la config active.
+    if (
+      row.providerCode !== resolved.code ||
+      row.merchantAccount !== resolved.merchantAccount
+    ) {
+      await this.markIntervention(
+        row.id,
+        `identité d’origine ${row.providerCode}/${row.merchantAccount} ≠ configuration active ` +
+          `${resolved.code}/${resolved.merchantAccount}`,
+      );
+      throw new ConflictException(
+        'Fournisseur ou compte marchand modifié depuis l’ouverture : reprise refusée, intervention requise.',
+      );
+    }
+
+    const blocked = this.recoveryBlockedReason(row);
+    if (blocked) {
+      await this.markIntervention(row.id, `reprise automatique impossible : ${blocked}`);
+      throw new ConflictException(
+        `Résultat incertain non repris automatiquement (${blocked}) : intervention requise.`,
+      );
+    }
 
     const webOrigin = (
       this.config.get<string>('WEB_ORIGIN') ?? 'http://localhost:3000'
     ).replace(/\/+$/, '');
 
+    // 1. Identité de l'opération persistée AVANT le premier octet réseau.
+    await this.prisma.cardPayment.update({
+      where: { id: row.id },
+      data: { providerCallState: 'DISPATCHED', dispatchedAt: new Date() },
+    });
+
+    let session: ConnectorSession;
     try {
-      const session = await resolved.connector.createCheckoutSession({
-        reference,
-        amountCents: dto.amountCents,
-        currency: currency.toLowerCase(),
-        customerEmail: customer.email,
-        successUrl: `${webOrigin}/client/portefeuille/paiement?ref=${encodeURIComponent(reference)}`,
-        cancelUrl: `${webOrigin}/client/portefeuille/paiement?ref=${encodeURIComponent(reference)}&canceled=1`,
-        metadata: { reference, customerId: customer.id },
+      session = await resolved.connector.createCheckoutSession({
+        reference: row.reference,
+        amountCents: row.amountCents,
+        currency: row.currency.toLowerCase(),
+        customerEmail: (await this.wallet.ensureOwnedCustomer(user)).email,
+        successUrl: `${webOrigin}/client/portefeuille/paiement?ref=${encodeURIComponent(row.reference)}`,
+        cancelUrl: `${webOrigin}/client/portefeuille/paiement?ref=${encodeURIComponent(row.reference)}&canceled=1`,
+        metadata: { reference: row.reference, customerId: row.customerId },
+        // Clé STABLE par opération : toute reprise = même session prestataire.
+        idempotencyKey: `topup:${row.reference}`,
       });
-      const updated = await this.prisma.cardPayment.update({
+    } catch (err) {
+      return this.handleDispatchFailure(row, user, err);
+    }
+
+    let updated: CardPayment;
+    try {
+      updated = await this.prisma.cardPayment.update({
         where: { id: row.id },
         data: {
           providerSessionRef: session.sessionRef,
@@ -255,52 +384,139 @@ export class CardPaymentsService {
           checkoutUrl: session.checkoutUrl,
           livemode: session.livemode,
           expiresAt: session.expiresAt,
+          providerCallState: 'RESOLVED',
         },
       });
-      await this.audit
-        .record({
-          actorId: user.sub,
-          actorEmail: user.email,
-          action: 'payment.topup.create',
-          resourceType: 'cardPayment',
-          resourceId: row.id,
-          details: {
-            reference,
-            amountCents: dto.amountCents,
-            currency,
-            providerCode: resolved.code,
-            environment: resolved.environment,
-          },
-        })
-        .catch(() => undefined); // l'audit ne casse jamais une session créée
-      return this.toClientView(updated);
     } catch (err) {
-      const message =
-        err instanceof StripeHttpError || err instanceof Error
-          ? err.message
-          : String(err);
-      await this.prisma.cardPayment.update({
-        where: { id: row.id },
-        data: {
-          status: CardPaymentStatus.FAILED,
-          failureCode: err instanceof StripeHttpError ? String(err.status) : 'connector_error',
-          failureMessage: message.slice(0, 500),
-        },
-      });
+      // GO P3 — échec de PERSISTANCE après création chez le prestataire :
+      // la clé `topup:<référence>` est déjà consommée, la reprise (même clé)
+      // obtient la MÊME session. Aucune seconde création.
+      await this.prisma.cardPayment
+        .update({
+          where: { id: row.id },
+          data: { providerCallState: 'UNCERTAIN' },
+        })
+        .catch(() => undefined);
       await this.audit
         .record({
           actorId: user.sub,
           actorEmail: user.email,
-          action: 'payment.topup.create_failed',
+          action: 'payment.topup.persistence_failed',
           resourceType: 'cardPayment',
           resourceId: row.id,
-          details: { reference, reason: message.slice(0, 300) },
+          details: { reference: row.reference, handling: 'reprise_meme_cle' },
         })
         .catch(() => undefined);
       throw new ConflictException(
-        `Ouverture de la session de paiement impossible : ${message}`,
+        'Session ouverte chez le prestataire mais non enregistrée : résultat incertain, ' +
+          'relancez la recharge (même intention) pour reprendre sans double création.',
       );
     }
+
+    await this.audit
+      .record({
+        actorId: user.sub,
+        actorEmail: user.email,
+        action: 'payment.topup.create',
+        resourceType: 'cardPayment',
+        resourceId: row.id,
+        details: {
+          reference: row.reference,
+          amountCents: row.amountCents,
+          currency: row.currency,
+          providerCode: resolved.code,
+          environment: resolved.environment,
+        },
+      })
+      .catch(() => undefined); // l'audit ne casse jamais une session créée
+
+    return this.toClientView(updated);
+  }
+
+  /** GO P3 — classement honnête de l'échec d'appel (jamais « FAILED » à tort). */
+  private isUncertainDispatchError(err: unknown): boolean {
+    if (err instanceof StripeHttpError) {
+      if (typeof err.status === 'number') {
+        if (err.status === 0) return true; // réseau/timeout : peut être arrivé
+        if (err.status >= 500) return true; // 5xx : traité ou non, indécidable
+        return false; // 4xx : refus certain, rien n'a été créé
+      }
+      return false; // refus qualifié par le prestataire sans code HTTP
+    }
+    if (err && typeof err === 'object' && 'name' in err) {
+      const name = String((err as { name?: unknown }).name);
+      if (name === 'StripeHttpError') return false; // déclaration de refus
+      if (name === 'AbortError' || name === 'TimeoutError') return true;
+    }
+    // Erreur non qualifiée (réponse 2xx illisible, bug d'adaptateur) : on ne
+    // peut PAS prouver que la requête n'a rien créé → RÉSULTAT INCERTAIN.
+    return true;
+  }
+
+  private async handleDispatchFailure(
+    row: CardPayment,
+    user: JwtPayload,
+    err: unknown,
+  ): Promise<CardPaymentClientView> {
+    const message =
+      err instanceof StripeHttpError || err instanceof Error
+        ? err.message
+        : String(err);
+    const uncertain = this.isUncertainDispatchError(err);
+
+    if (uncertain) {
+      await this.prisma.cardPayment.update({
+        where: { id: row.id },
+        data: { providerCallState: 'UNCERTAIN' },
+      });
+      await this.audit
+        .record({
+          actorId: user.sub,
+          actorEmail: user.email,
+          action: 'payment.topup.dispatch_uncertain',
+          resourceType: 'cardPayment',
+          resourceId: row.id,
+          details: { reference: row.reference, reason: message.slice(0, 300) },
+        })
+        .catch(() => undefined);
+      // AUCUN statut FAILED : l'issue reste à constater (reprise contrôlée).
+      const fresh = await this.prisma.cardPayment.findUnique({
+        where: { id: row.id },
+      });
+      return this.toClientView(fresh ?? row);
+    }
+
+    await this.prisma.cardPayment.update({
+      where: { id: row.id },
+      data: {
+        status: CardPaymentStatus.FAILED,
+        providerCallState: 'RESOLVED',
+        failureCode: err instanceof StripeHttpError ? String(err.status) : 'connector_error',
+        failureMessage: message.slice(0, 500),
+      },
+    });
+    await this.audit
+      .record({
+        actorId: user.sub,
+        actorEmail: user.email,
+        action: 'payment.topup.create_failed',
+        resourceType: 'cardPayment',
+        resourceId: row.id,
+        details: { reference: row.reference, reason: message.slice(0, 300) },
+      })
+      .catch(() => undefined);
+    throw new ConflictException(
+      `Ouverture de la session de paiement impossible : ${message}`,
+    );
+  }
+
+  private async markIntervention(id: string, reason: string): Promise<void> {
+    await this.prisma.cardPayment
+      .updateMany({
+        where: { id, interventionNeeded: false },
+        data: { interventionNeeded: true, interventionReason: reason.slice(0, 300) },
+      })
+      .catch(() => undefined);
   }
 
   private async newReference(): Promise<string> {
@@ -352,10 +568,36 @@ export class CardPaymentsService {
     user: JwtPayload,
   ): Promise<CardPaymentClientView> {
     const row = await this.ownedRow(reference, user);
+
+    // GO P3 — appel resté incertain (ou échec de persistance) : la relecture
+    // rejoue d'abord la CRÉATION avec la MÊME clé `topup:<référence>` →
+    // MÊME session chez le prestataire, jamais une seconde.
+    if (this.needsProviderDispatch(row)) {
+      const resolved = await this.provider.resolveFor({
+        providerCode: row.providerCode,
+        merchantAccount: row.merchantAccount,
+        environment: row.environment,
+      });
+      try {
+        return await this.dispatchCheckout(row, user, resolved);
+      } catch (err) {
+        if (err instanceof ConflictException || err instanceof BadRequestException) {
+          throw err; // refus explicite (identité changée, reprise périmée)
+        }
+        // chute : l'état courant est renvoyé plus bas, sans crédit approximatif
+      }
+    }
+
     if (TERMINAL_STATUSES.includes(row.status) || !row.providerSessionRef) {
       return this.toClientView(row);
     }
-    const resolved = await this.provider.resolve();
+    // GO P1/P4 — relecture SOUS l'identité d'origine (fournisseur + compte),
+    // JAMAIS sous la config active d'un autre fournisseur.
+    const resolved = await this.provider.resolveFor({
+      providerCode: row.providerCode,
+      merchantAccount: row.merchantAccount,
+      environment: row.environment,
+    });
     try {
       const details = await resolved.connector.retrieveSession(row.providerSessionRef);
       if (details.paymentStatus === 'paid') {
@@ -366,9 +608,12 @@ export class CardPaymentsService {
           currency: details.currency,
           livemode: details.livemode,
           source: 'poll',
+          providerCode: row.providerCode,
+          merchantAccount: row.merchantAccount,
+          reference: row.reference,
         });
       } else if (details.status === 'expired') {
-        await this.markExpired(row.providerSessionRef);
+        await this.markExpired(row.providerSessionRef, row.providerCode);
       } else if (details.status === 'unknown' && details.paymentStatus === 'unknown') {
         // Simulateur redémarré / état indisponible : aucun changement d'état.
       }
@@ -389,6 +634,12 @@ export class CardPaymentsService {
    * CHEIN UNIQUE de crédit : CAS `CREATED/PROCESSING → SUCCEEDED` sous verrou
    * ligne, avec revérification montant/devise/compte marchand/environnement.
    * Un appel parallèle ou un rejeu webhook = `already` (aucun second crédit).
+   *
+   * GO P1 — `providerCode` (fournisseur qui a AUTHENTIFIÉ la source) et, quand
+   * il est fourni, `merchantAccount` (identité du connecteur vérifié) sont
+   * obligatoires : tout écart = `ignored`/`needs_review`, JAMAIS de crédit.
+   * GO P4 — un montant ou une devise ABSENTS de la source = preuve incomplète
+   * → `needs_review` (jamais de crédit sur une déclaration partielle).
    */
   async confirmPaid(input: {
     sessionRef?: string | null;
@@ -398,6 +649,12 @@ export class CardPaymentsService {
     livemode?: boolean | null;
     source: 'webhook' | 'poll';
     eventId?: string | null;
+    /** GO P1 — fournisseur qui a authentifié cette source. */
+    providerCode: string;
+    /** GO P4 — identité marchande du connecteur vérifié de cette source. */
+    merchantAccount?: string | null;
+    /** GO P4 — référence portée par l'événement (rattachement). */
+    reference?: string | null;
   }): Promise<ConfirmOutcome> {
     if (!input.sessionRef && !input.paymentRef) return { outcome: 'not_found' };
 
@@ -410,6 +667,16 @@ export class CardPaymentsService {
             SELECT * FROM "CardPayment" WHERE "providerPaymentRef" = ${input.paymentRef} FOR UPDATE`;
       if (rows.length === 0) return { outcome: 'not_found' as const };
       const row = rows[0];
+
+      // GO P1 — un événement d'un AUTRE fournisseur ne touche JAMAIS la ligne :
+      // ni crédit, ni débit, ni changement d'état, ni intervention.
+      if (input.providerCode !== row.providerCode) {
+        return {
+          outcome: 'ignored' as const,
+          reference: row.reference,
+          reason: `fournisseur non rattaché (${input.providerCode} ≠ ${row.providerCode})`,
+        };
+      }
 
       if (TERMINAL_STATUSES.includes(row.status)) {
         return { outcome: 'already' as const, reference: row.reference };
@@ -435,14 +702,23 @@ export class CardPaymentsService {
         };
       }
 
+      // GO P4 — preuves exigeantes : tout écart ou toute absence = preuve
+      // incohérente/incomplète, jamais un crédit « à peu près ».
       const problems: string[] = [];
-      if (
-        input.amountTotalCents != null &&
-        input.amountTotalCents !== row.amountCents
-      ) {
+      if (input.merchantAccount != null && input.merchantAccount !== row.merchantAccount) {
+        problems.push('compte marchand');
+      }
+      if (input.reference != null && input.reference !== row.reference) {
+        problems.push('référence');
+      }
+      if (input.amountTotalCents == null) {
+        problems.push('montant absent de la source');
+      } else if (input.amountTotalCents !== row.amountCents) {
         problems.push('montant');
       }
-      if (input.currency != null && input.currency.toLowerCase() !== row.currency.toLowerCase()) {
+      if (input.currency == null) {
+        problems.push('devise absente de la source');
+      } else if (input.currency.toLowerCase() !== row.currency.toLowerCase()) {
         problems.push('devise');
       }
       if (input.livemode === true) {
@@ -528,19 +804,30 @@ export class CardPaymentsService {
     });
   }
 
-  /** CAS `CREATED → EXPIRED` (aucun crédit). */
-  async markExpired(sessionRef: string): Promise<boolean> {
+  /**
+   * CAS `CREATED → EXPIRED` (aucun crédit).
+   * GO P1 — limité au fournisseur ayant authentifié l'événement.
+   */
+  async markExpired(sessionRef: string, providerCode: string): Promise<boolean> {
     const res = await this.prisma.cardPayment.updateMany({
-      where: { providerSessionRef: sessionRef, status: CardPaymentStatus.CREATED },
+      where: {
+        providerSessionRef: sessionRef,
+        providerCode,
+        status: CardPaymentStatus.CREATED,
+      },
       data: { status: CardPaymentStatus.EXPIRED },
     });
     return res.count === 1;
   }
 
-  /** CAS `CREATED/PROCESSING → CANCELED|FAILED` (aucun crédit). */
+  /**
+   * CAS `CREATED/PROCESSING → CANCELED|FAILED` (aucun crédit).
+   * GO P1 — limité au fournisseur ayant authentifié l'événement.
+   */
   async markFailed(input: {
     sessionRef?: string | null;
     paymentRef?: string | null;
+    providerCode: string;
     status: 'FAILED' | 'CANCELED';
     code?: string | null;
     message?: string | null;
@@ -552,6 +839,7 @@ export class CardPaymentsService {
     const res = await this.prisma.cardPayment.updateMany({
       where: {
         ...where,
+        providerCode: input.providerCode,
         status: { in: [CardPaymentStatus.CREATED, CardPaymentStatus.PROCESSING] },
       },
       data: {
@@ -563,14 +851,46 @@ export class CardPaymentsService {
     return res.count === 1 ? null : null;
   }
 
-  /** CAS `CREATED → PROCESSING` : paiement non confirmé (aucun crédit). */
-  async markProcessing(sessionRef: string | null, paymentRef: string | null): Promise<void> {
+  /**
+   * GO P7 — note d'échec SANS changement d'état : un `payment_intent` encore
+   * vivant reste `CREATED/PROCESSING` (un succès ultérieur reste créditable),
+   * l'erreur est simplement rendue visible côté client.
+   */
+  async markFailureNotice(input: {
+    paymentRef: string;
+    providerCode: string;
+    code?: string | null;
+    message?: string | null;
+  }): Promise<string | null> {
+    const res = await this.prisma.cardPayment.updateMany({
+      where: {
+        providerPaymentRef: input.paymentRef,
+        providerCode: input.providerCode,
+        status: { in: [CardPaymentStatus.CREATED, CardPaymentStatus.PROCESSING] },
+      },
+      data: {
+        failureCode: input.code ?? null,
+        failureMessage: input.message?.slice(0, 500) ?? null,
+      },
+    });
+    return res.count === 1 ? null : null;
+  }
+
+  /**
+   * CAS `CREATED → PROCESSING` : paiement non confirmé (aucun crédit).
+   * GO P1 — limité au fournisseur ayant authentifié l'événement.
+   */
+  async markProcessing(
+    sessionRef: string | null,
+    paymentRef: string | null,
+    providerCode: string,
+  ): Promise<void> {
     if (!sessionRef && !paymentRef) return;
     const where: Prisma.CardPaymentWhereInput = sessionRef
       ? { providerSessionRef: sessionRef }
       : { providerPaymentRef: paymentRef! };
     await this.prisma.cardPayment.updateMany({
-      where: { ...where, status: CardPaymentStatus.CREATED },
+      where: { ...where, providerCode, status: CardPaymentStatus.CREATED },
       data: { status: CardPaymentStatus.PROCESSING },
     });
   }
@@ -580,14 +900,20 @@ export class CardPaymentsService {
    * mis à jour, mais le crédit wallet n'est PAS modifié automatiquement —
    * c'est une opération hors plateforme → intervention + audit explicite
    * (jamais de dette silencieuse, jamais de remboursement double).
+   *
+   * GO P6 — le montant remboursé constaté n'est JAMAIS plafonné silencieusement
+   * (`Math.min` masquait un écart de preuve) : au-delà du montant du paiement,
+   * l'état devient `NEEDS_REVIEW` + intervention (signal honnête).
    */
   async applyChargeRefunded(input: {
     paymentRef: string;
     amountRefundedCents: number;
     chargeRefundIds: string[];
+    /** GO P1 — fournisseur ayant authentifié l'événement. */
+    providerCode: string;
   }): Promise<string | null> {
     const row = await this.prisma.cardPayment.findFirst({
-      where: { providerPaymentRef: input.paymentRef },
+      where: { providerPaymentRef: input.paymentRef, providerCode: input.providerCode },
     });
     if (!row) return null;
 
@@ -604,10 +930,25 @@ export class CardPaymentsService {
           })
         : null;
 
-    const refunded = Math.min(
-      Math.max(input.amountRefundedCents, row.refundedCents),
-      row.amountCents,
-    );
+    const amountRefunded = Math.max(0, input.amountRefundedCents);
+    if (amountRefunded > row.amountCents) {
+      // GO P6 — preuve de remboursement supérieure au paiement : écart VISIBLE,
+      // jamais un chiffre lissé.
+      const reason = `remboursement constaté (${amountRefunded}) > montant du paiement (${row.amountCents})`;
+      await this.prisma.cardPayment.update({
+        where: { id: row.id },
+        data: {
+          refundedCents: row.refundedCents,
+          status: CardPaymentStatus.NEEDS_REVIEW,
+          interventionNeeded: true,
+          interventionReason: reason,
+        },
+      });
+      return row.id;
+    }
+
+    // Somme SANS plafond artificiel : `refundedCents` = réellement remboursé.
+    const refunded = Math.max(amountRefunded, row.refundedCents);
     const fully = refunded >= row.amountCents;
     await this.prisma.cardPayment.update({
       where: { id: row.id },
@@ -638,9 +979,11 @@ export class CardPaymentsService {
     disputeId: string;
     reason: string | null;
     closed?: boolean;
+    /** GO P1 — fournisseur ayant authentifié l'événement. */
+    providerCode: string;
   }): Promise<string | null> {
     const row = await this.prisma.cardPayment.findFirst({
-      where: { providerPaymentRef: input.paymentRef },
+      where: { providerPaymentRef: input.paymentRef, providerCode: input.providerCode },
     });
     if (!row) return null;
     await this.prisma.cardPayment.update({

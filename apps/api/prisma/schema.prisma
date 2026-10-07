@@ -1439,14 +1439,21 @@ model Refund {
   creditNoteInvoiceId String?          // pièce d'avoir émise pour CE remboursement (GO P5 : une pièce par remboursement, liée via creditNoteOfId)
   creditNoteInvoice   Invoice?         @relation("RefundCreditNote", fields: [creditNoteInvoiceId], references: [id], onDelete: SetNull)
   providerRef         String? // référence prestataire — null tant que non confirmé RÉELLEMENT
+  // GO P5 — instant (commité AVANT tout appel réseau) où l'intention a été
+  // RÉELLEMENT DISPATCHÉE au prestataire. Distingue « jamais envoyée »
+  // (null → annulation sûre + compensation) d'« envoyée mais non résolue»
+  // (non null → RÉSULTAT INCERTAIN : annulation REFUSÉE, réservation conservée,
+  // preuve concluante exigée avant toute compensation).
+  dispatchedAt         DateTime?
   createdByUserId     String?
-  createdByEmail      String? // snapshot acteur (survit à la suppression)
+  createdByEmail       String? // snapshot acteur (survit à la suppression)
   failureReason       String?
   processedAt         DateTime?
   createdAt           DateTime         @default(now())
 
   @@index([orderId])
   @@index([cardPaymentId])
+  @@index([providerRef])
 }
 
 enum RefundStatus {
@@ -1541,7 +1548,25 @@ model CardPayment {
   checkoutUrl          String? // page hébergée du prestataire (rendue au client, pas un secret)
   idempotencyKey       String            @unique // clé client — double-clic = UNE session
   walletTransactionId  String?           @unique // crédit wallet appliqué (jamais deux)
-  refundedCents        Int               @default(0) // déjà remboursé (engagé) vers la carte
+  refundedCents        Int               @default(0) // REMBOURSÉ RÉELLEMENT (issue connue, confirmée)
+  // GO P6 — séparation montants : `pendingRefundCents` = SOMME DES RÉSERVATIONS
+  // (remboursements encore PENDING, avec ou sans référence prestataire).
+  // Plafond = refundedCents + pendingRefundCents + demande ≤ amountCents.
+  pendingRefundCents   Int               @default(0)
+  // GO P3 — machine d'état de l'APPEL PRESTATAIRE de création (jamais un statut
+  // métier, toujours en parallèle) :
+  //   null       = appel jamais tenté ;
+  //   DISPATCHED = identité persistée AVANT le réseau (en vol) ;
+  //   RESOLVED   = réponse prestataire obtenue (références persistées, OU
+  //                refus certain 4xx) ;
+  //   UNCERTAIN  = réponse perdue / échec réseau ou 5xx : RÉSULTAT INCERTAIN,
+  //                reprise contrôlée avec la MÊME clé d'idempotence prestataire
+  //                (Stripe : rejeu sûr 24 h), JAMAIS de seconde session.
+  providerCallState    String?
+  // GO P3 — instant du DERNIER envoi réseau : au-delà de 24 h, la clé
+  // d'idempotence Stripe étant épongée, une reprise automatique ne garantit
+  // plus l'absence de seconde session → intervention humaine.
+  dispatchedAt         DateTime?
   failureCode          String?
   failureMessage       String?
   disputedAt           DateTime? // litige carte constaté (événement prestataire)
@@ -1578,11 +1603,19 @@ model PaymentWebhookEvent {
   error         String?
   cardPaymentId String?
   cardPayment   CardPayment?        @relation(fields: [cardPaymentId], references: [id], onDelete: SetNull)
+  // GO P3 — rapprochement fiable : un événement de CONFIRMATION reçu AVANT le
+  // rattachement des références n'est jamais enterré en « ignoré ». La ligne
+  // reste RECEIVED avec une échéance `reconcileAt` (état durable à reprendre) ;
+  // le rapprochement est rejoué à la persistance des références puis à chaque
+  // réception webhook. `reconciledAt` trace l'issue.
+  reconcileAt    DateTime?
+  reconciledAt   DateTime?
   receivedAt    DateTime            @default(now())
   processedAt   DateTime?
 
   @@unique([providerCode, eventId])
   @@index([status])
+  @@index([reconcileAt])
 }
 
 // ── Commande (Order) ───────────────────────────────────────────────────────

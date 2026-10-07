@@ -12,6 +12,26 @@ import {
 import { verifyStripeSignature } from './stripe-signature';
 
 /**
+ * GO P2/P3 — compteurs d'APPELS prestataire (simulateur).
+ *
+ * Instrumentation de preuve : le connecteur simulé est recréé à chaque
+ * résolution, les compteurs sont donc MODULE pour survivre aux instances et
+ * permettre de prouver, en test, qu'un rejeu ou une double soumission ne
+ * multiplie PAS les créations côté prestataire.
+ */
+export const simulatedConnectorCounters = {
+  createCheckoutSession: 0,
+  createRefund: 0,
+  retrieveSession: 0,
+};
+
+export function resetSimulatedConnectorCounters(): void {
+  simulatedConnectorCounters.createCheckoutSession = 0;
+  simulatedConnectorCounters.createRefund = 0;
+  simulatedConnectorCounters.retrieveSession = 0;
+}
+
+/**
  * GO Stripe — connecteur SIMULÉ (recette/CI uniquement).
  *
  *  - Aucun appel réseau : la page « hébergée » est servie par l'API elle-même ;
@@ -30,15 +50,28 @@ export class SimulatedConnector implements PaymentConnector {
   readonly displayName = 'Simulateur local (aucun appel réseau)';
 
   private readonly sessions = new Map<string, SessionDetails>();
+  /** GO P3 — même clé d'idempotence = MÊME session (comme le prestataire réel). */
+  private readonly dispatched = new Map<string, SessionDetails>();
 
   constructor(private readonly webhookSecret: string) {}
 
   async createCheckoutSession(
     input: CreateCheckoutSessionInput,
   ): Promise<ConnectorSession> {
+    const replay = this.dispatched.get(input.idempotencyKey);
+    if (replay) {
+      return {
+        sessionRef: replay.sessionRef,
+        paymentRef: replay.paymentRef,
+        checkoutUrl: `/api/payments/simulated/sessions/${replay.sessionRef}`,
+        livemode: false,
+        expiresAt: null,
+      };
+    }
+    simulatedConnectorCounters.createCheckoutSession += 1;
     const sessionRef = `cs_sim_${randomBytes(8).toString('hex')}`;
     const paymentRef = `pi_sim_${randomBytes(8).toString('hex')}`;
-    this.sessions.set(sessionRef, {
+    const details: SessionDetails = {
       sessionRef,
       status: 'open',
       paymentStatus: 'unpaid',
@@ -46,7 +79,9 @@ export class SimulatedConnector implements PaymentConnector {
       currency: input.currency,
       paymentRef,
       livemode: false,
-    });
+    };
+    this.sessions.set(sessionRef, details);
+    this.dispatched.set(input.idempotencyKey, details);
     return {
       sessionRef,
       paymentRef,
@@ -59,6 +94,7 @@ export class SimulatedConnector implements PaymentConnector {
   }
 
   async retrieveSession(sessionRef: string): Promise<SessionDetails> {
+    simulatedConnectorCounters.retrieveSession += 1;
     const known = this.sessions.get(sessionRef);
     if (known) return known;
     // Après redémarrage : état inconnu → aucun changement d'état côté métier.
@@ -75,6 +111,7 @@ export class SimulatedConnector implements PaymentConnector {
 
   /** Remboursement simulé : abouti (la ME est produite par le parcours C). */
   async createRefund(input: ConnectorRefundInput): Promise<ConnectorRefundOutcome> {
+    simulatedConnectorCounters.createRefund += 1;
     return {
       providerRef: `re_sim_${randomBytes(8).toString('hex')}`,
       status: 'succeeded',

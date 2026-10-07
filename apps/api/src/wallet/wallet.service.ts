@@ -297,12 +297,25 @@ export class WalletService {
     if (dup) {
       return this.replayResult(tx, dup, customerId, input, direction);
     }
-    const rows = await tx.$queryRaw<{ walletBalanceCents: number }[]>`
-      SELECT "walletBalanceCents" FROM "Customer" WHERE id = ${customerId} FOR UPDATE`;
+    const rows = await tx.$queryRaw<{ walletBalanceCents: number; walletCurrency: string }[]>`
+      SELECT "walletBalanceCents", "walletCurrency" FROM "Customer" WHERE id = ${customerId} FOR UPDATE`;
     if (rows.length === 0) {
       throw new NotFoundException('Dossier client introuvable.');
     }
     const current = Number(rows[0].walletBalanceCents);
+    // GO P8 — garde DEVISE SOUS VERROU : une opération ne s'applique que dans
+    // la devise du portefeuille. Aucune conversion de change, aucune écriture
+    // d'un solde dans une autre devise qu'annoncée (un écart = refus explicite,
+    // jamais un montant mélangé ou un repli silencieux sur `USD`).
+    if (input.currency) {
+      const wanted = input.currency.toUpperCase();
+      const owned = String(rows[0].walletCurrency ?? '').toUpperCase();
+      if (owned && wanted !== owned) {
+        throw new ConflictException(
+          `Opération en ${wanted} refusée : le portefeuille est en ${owned} (aucun change automatique).`,
+        );
+      }
+    }
     if (direction === 'debit' && current < input.amountCents) {
       throw new ConflictException('Solde insuffisant.');
     }

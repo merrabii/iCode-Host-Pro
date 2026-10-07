@@ -1135,5 +1135,125 @@ describe('Recharge par carte & webhooks Stripe (e2e, GO)', () => {
       expect(res.body.stripe.hasWebhookSecret).toBe(true);
     });
   });
+
+  // ── I — corrections GO2 (P3 / P5 / P6 / P7) ──────────────────────────────
+  describe('I — corrections GO2 (rapprochement, annulation, refund.*, intent)', () => {
+    it('I1 (P3) — session inconnue : RECEIVED + échéance de rapprochement (jamais IGNORED)', async () => {
+      const secret = await simulatedSecret();
+      const res = await postWebhook(
+        event('i3_orphan', 'checkout.session.expired', { id: 'cs_orphan_go2' }),
+        { secret },
+      );
+      expect(res.status).toBe(200);
+      const row = await prisma.paymentWebhookEvent.findUnique({
+        where: {
+          providerCode_eventId: { providerCode: 'simulated', eventId: 'i3_orphan' },
+        },
+      });
+      expect(row?.status).toBe('RECEIVED');
+      expect(row?.reconcileAt).toBeInstanceOf(Date);
+      expect(row?.status).not.toBe('IGNORED');
+    });
+
+    it('I2 (P7) — intent encore VIVANT : note d’échec visible, état et solde inchangés', async () => {
+      const created = await createTopup(aliceToken, 5000, { key: `i7-${uid}` });
+      const reference = String(created.body.reference);
+      refs.push(reference);
+      const row = await paymentRow(reference);
+      const secret = await simulatedSecret();
+      const before = await balanceOf(aliceEmail);
+
+      const res = await postWebhook(
+        event('i7_fail', 'payment_intent.payment_failed', {
+          id: row?.providerPaymentRef,
+          status: 'requires_payment_method',
+          last_payment_error: { message: 'Refusé (intent vivant)' },
+        }),
+        { secret },
+      );
+      expect(res.status).toBe(200);
+
+      const fresh = await paymentRow(reference);
+      expect(fresh?.status).toBe('CREATED'); // AUCUN verrouillage terminal
+      expect(String(fresh?.failureMessage)).toContain('Refusé (intent vivant)');
+      expect((await balanceOf(aliceEmail)) - before).toBe(0);
+    });
+
+    it('I3 (P6) — issue d’un remboursement INTERNE connu : idempotente, solde inchangé', async () => {
+      const refund = await prisma.refund.findFirst({
+        where: {
+          kind: 'EXTERNAL_CARD',
+          status: 'SUCCEEDED',
+          providerRef: { not: null },
+          cardPayment: { customer: { email: aliceEmail } },
+        },
+        orderBy: { createdAt: 'desc' },
+      });
+      expect(refund?.providerRef).toBeTruthy();
+      const before = await balanceOf(aliceEmail);
+      const payBefore = await prisma.cardPayment.findUnique({
+        where: { id: String(refund?.cardPaymentId) },
+      });
+      const secret = await simulatedSecret();
+
+      const res = await postWebhook(
+        event('i6_updated', 'refund.updated', {
+          id: refund?.providerRef,
+          status: 'succeeded',
+          payment_intent: 'pi_absent',
+          amount: refund?.amountCents,
+        }),
+        { secret },
+      );
+      expect(res.status).toBe(200);
+      expect(res.body.result).toBe('processed');
+      // Aucun second effet : ni recrédit, ni avance de `refundedCents`.
+      expect((await balanceOf(aliceEmail)) - before).toBe(0);
+      const fresh = await prisma.refund.findUnique({ where: { id: refund!.id } });
+      expect(fresh?.status).toBe('SUCCEEDED');
+      const payAfter = await prisma.cardPayment.findUnique({
+        where: { id: String(refund?.cardPaymentId) },
+      });
+      expect(payAfter?.refundedCents).toBe(payBefore?.refundedCents);
+      expect(payAfter?.status).toBe(payBefore?.status);
+    });
+
+    it('I4 (P5) — annulation REFUSÉE une fois l’appel prestataire émis (aucun recrédit)', async () => {
+      const created = await createTopup(bobToken, 5000, { key: `i5-${uid}` });
+      const reference = String(created.body.reference);
+      refs.push(reference);
+      await completeSimulated(sessionRefOf(created.body.checkoutUrl), 'success');
+      const row = await paymentRow(reference);
+      const refund = await prisma.refund.create({
+        data: {
+          cardPaymentId: row!.id,
+          kind: 'EXTERNAL_CARD',
+          status: 'PENDING',
+          amountCents: 1000,
+          currency: 'USD',
+          reason: 'GO P5 (fixture : appel déjà émis)',
+          idempotencyKey: `i5-refund-${uid}`,
+          dispatchedAt: new Date(),
+        },
+      });
+      const before = await balanceOf(bobEmail);
+
+      const res = await api()
+        .post(`/${GlobalPrefix}/store/admin/payments/refunds/${refund.id}/cancel`)
+        .set(auth(adminToken))
+        .send({ reason: 'Test P5' })
+        .expect(409);
+      expect(String(res.body.message)).toContain('annulation refusée');
+
+      // Zéro compensation : le remboursement existe peut-être chez le prestataire.
+      expect((await balanceOf(bobEmail)) - before).toBe(0);
+      const fresh = await prisma.refund.findUnique({ where: { id: refund.id } });
+      expect(fresh?.status).toBe('PENDING');
+      const aud = await prisma.auditLog.findFirst({
+        where: { action: 'refund.topup.cancel_refused', resourceId: refund.id },
+      });
+      expect(aud).toBeTruthy();
+    });
+  });
 });
 
