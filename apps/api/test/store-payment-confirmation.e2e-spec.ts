@@ -195,6 +195,16 @@ describe('Confirmation de paiement (e2e, P2)', () => {
     lifecycle = moduleRef.get(OrderLifecycleService);
     limiter.reset();
 
+    // Lot « paiement direct des commandes » : le parcours CARTe est un
+    // interrupteur EN BASE (migration : `cardOrderPaymentEnabled = false`).
+    // Cette recette porte sur ce parcours (liste publique, checkout, simulateur)
+    // → activation EXPLICITE ici, puis retour aux valeurs par défaut en afterAll.
+    await prisma.paymentSettings.upsert({
+      where: { id: 'singleton' },
+      update: { cardOrderPaymentEnabled: true },
+      create: { id: 'singleton', cardOrderPaymentEnabled: true },
+    });
+
     await prisma.user.create({
       data: {
         email: adminEmail,
@@ -318,6 +328,14 @@ describe('Confirmation de paiement (e2e, P2)', () => {
     delete process.env.PAYMENT_SIMULATOR_ENABLED;
     delete process.env.PENDING_PAYMENT_TTL_HOURS;
     delete process.env.ORDER_SWEEP_ENABLED;
+    // Retour aux valeurs par défaut de la migration (parcours carte éteint).
+    await prisma.paymentSettings
+      .upsert({
+        where: { id: 'singleton' },
+        update: { cardOrderPaymentEnabled: false },
+        create: { id: 'singleton', cardOrderPaymentEnabled: false },
+      })
+      .catch(() => {});
     await app.close();
   });
 

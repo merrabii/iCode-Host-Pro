@@ -5,7 +5,15 @@ import Link from 'next/link';
 import { useSearchParams } from 'next/navigation';
 import { StoreShell } from '@/components/store-shell';
 import { IconAlert, IconCheck, IconChevronRight, IconInfo, IconRefresh } from '@/components/icons';
-import { getOrderStatus, getSessionToken, payMyOrderWithWallet } from '@/lib/api';
+import {
+  createOrderCardPayment,
+  getPaymentCapabilities,
+  getOrderStatus,
+  getSessionToken,
+  payMyOrderWithWallet,
+  refreshOrderCardPayment,
+  type PaymentCapabilities,
+} from '@/lib/api';
 
 const ORDER_KEY = 'codiali.order.v1';
 
@@ -68,6 +76,8 @@ export default function CheckoutSuccessPage() {
 function SuccessInner() {
   const sp = useSearchParams();
   const orderId = sp.get('orderId') ?? '';
+  // Retour de la page HÉBERGÉE du prestataire (`ref` = référence du paiement).
+  const cardRef = sp.get('ref') ?? '';
   const [saved, setSaved] = useState<{ orderId?: string; invoiceNumber?: string; email?: string; subdomain?: string } | null>(null);
   const [savedLoaded, setSavedLoaded] = useState(false);
 
@@ -78,9 +88,14 @@ function SuccessInner() {
   // Q-A (item 1) — règlement par solde depuis la confirmation.
   const [paying, setPaying] = useState(false);
   const [payError, setPayError] = useState<string | null>(null);
+  // Paiement DIRECT par carte (règlement d'une commande, sans portefeuille).
+  const [payingCard, setPayingCard] = useState(false);
+  // Parcours activés côté admin (masquage UI — le serveur re-gate de toute façon).
+  const [caps, setCaps] = useState<PaymentCapabilities | null>(null);
   // Garde anti-réponse périmée : seule la réponse de la DERNIÈRE référence
   // demandée (changement d'orderId en cours de vol) a le droit d'écrire l'état.
   const seqRef = useRef(0);
+  const refreshedRef = useRef('');
 
   useEffect(() => {
     try {
@@ -133,6 +148,68 @@ function SuccessInner() {
     if (!orderId) return;
     verify();
   }, [orderId, attempt, verify]);
+
+  // Parcours activés (public) : masquage des boutons. Le serveur applique
+  // TOUJOURS son gate à l'opération — ce n'est qu'une affordance d'UI.
+  useEffect(() => {
+    let alive = true;
+    void getPaymentCapabilities().then((c) => {
+      if (alive) setCaps(c);
+    });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  /**
+   * Retour de la page hébergée : le SERVEUR relit le prestataire (le
+   * navigateur ne décide de rien), puis l'état réel de la commande est
+   * re-vérifié. Une seule relecture par référence de retour.
+   */
+  useEffect(() => {
+    if (!orderId || !cardRef) return;
+    if (refreshedRef.current === cardRef) return;
+    refreshedRef.current = cardRef;
+    void (async () => {
+      const t = await getSessionToken();
+      if (t) await refreshOrderCardPayment(t, orderId);
+      setAttempt((a) => a + 1);
+    })();
+  }, [orderId, cardRef]);
+
+  /**
+   * Paiement DIRECT d'une commande par carte : ouverture de la session
+   * HÉBERGÉE du prestataire (montant/devise lus côté serveur), puis
+   * redirection. Aucun numéro de carte n'est saisi ici.
+   */
+  const payByCard = useCallback(async () => {
+    setPayError(null);
+    setPayingCard(true);
+    try {
+      const t = await getSessionToken();
+      if (!t) {
+        window.location.href = `/client/commandes?id=${encodeURIComponent(orderId)}`;
+        return;
+      }
+      const r = await createOrderCardPayment(t, orderId);
+      if (!r.ok) {
+        const msg = (r.data as { message?: string } | null)?.message;
+        setPayError(
+          msg && typeof msg === 'string' ? msg : 'Règlement par carte indisponible pour le moment.',
+        );
+        return;
+      }
+      const url =
+        r.data && typeof r.data.checkoutUrl === 'string' ? r.data.checkoutUrl : null;
+      if (!url) {
+        setPayError('Session de paiement indisponible : réessayez dans un instant.');
+        return;
+      }
+      window.location.href = url;
+    } finally {
+      setPayingCard(false);
+    }
+  }, [orderId]);
 
   // ── États d'attente / erreur de vérification ────────────────────
   if (!orderId) {
@@ -288,18 +365,50 @@ function SuccessInner() {
             </div>
           )}
 
+          {/* Retour de la page hébergée : relecture serveur déjà effectuée.
+              Si le règlement n'est pas encore constaté, aucun succès n'est
+              affirmé — le client peut relancer sans double paiement. */}
+          {cardRef && st === 'PENDING_PAYMENT' && (
+            <div className="store-success-note">
+              <p>
+                <b>Paiement par carte en cours de vérification.</b>
+              </p>
+              <p>
+                Le règlement n&apos;est pas encore confirmé par le serveur. Rechargez cette page
+                ou réessayez : une tentative déjà ouverte est reprise, jamais doublée.
+              </p>
+            </div>
+          )}
+
           <div className="store-success-actions">
-            {/* Q-A (item 1) — encaissement direct par solde sur commande en attente. */}
-            {st === 'PENDING_PAYMENT' && (
+            {/* Paiement DIRECT par carte (règlement de la commande — aucun
+                portefeuille, aucune saisie de carte côté client). */}
+            {st === 'PENDING_PAYMENT' && caps?.cardOrderPaymentEnabled && (
               <button
                 type="button"
                 className="btn-primary"
-                disabled={paying}
-                onClick={() => void payByWallet()}
+                disabled={payingCard}
+                onClick={() => void payByCard()}
               >
-                {paying ? 'Règlement…' : 'Régler par solde'}
+                {payingCard ? 'Ouverture du paiement…' : 'Régler par carte'}
               </button>
             )}
+            {/* Q-A (item 1) — encaissement direct par solde sur commande en
+                attente. Fail-closed (GO §5) : affiché UNIQUEMENT une fois la
+                lecture des capacités réussie ET le parcours activé — chargement
+                ou échec de lecture = aucun moyen présupposé. */}
+            {st === 'PENDING_PAYMENT' &&
+              caps !== null &&
+              caps.walletPaymentEnabled && (
+                <button
+                  type="button"
+                  className="btn-primary"
+                  disabled={paying}
+                  onClick={() => void payByWallet()}
+                >
+                  {paying ? 'Règlement…' : 'Régler par solde'}
+                </button>
+              )}
             <Link href="/client" className="btn-primary">Accéder à mon espace <IconChevronRight size={15} /></Link>
             <Link href="/client/commandes" className="btn-secondary">Voir mes commandes</Link>
             <Link href="/shop" className="btn-secondary">Retour à la boutique</Link>

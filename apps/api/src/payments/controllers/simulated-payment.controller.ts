@@ -10,7 +10,7 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
-import { CardPayment, CardPaymentStatus } from '@prisma/client';
+import { CardPayment, CardPaymentKind, CardPaymentStatus } from '@prisma/client';
 import type { Response } from 'express';
 import { isPaymentSimulatorEnabled } from '../../config/payment-simulator';
 import { PrismaService } from '../../prisma/prisma.service';
@@ -75,6 +75,7 @@ export class SimulatedPaymentController {
       status: row.status,
       sessionRef: row.providerSessionRef,
       webOrigin,
+      kind: row.kind,
       editable: row.status === CardPaymentStatus.CREATED,
       failed: row.status === CardPaymentStatus.FAILED,
       expired: row.status === CardPaymentStatus.EXPIRED,
@@ -143,11 +144,17 @@ export class SimulatedPaymentController {
     const webOrigin = (
       this.config.get<string>('WEB_ORIGIN') ?? 'http://localhost:3000'
     ).replace(/\/+$/, '');
+    // Retour : recharge → portefeuille ; règlement de commande → page de
+    // succès du tunnel (la commande y est déjà réglée par le serveur).
+    const redirect =
+      row.kind === CardPaymentKind.ORDER
+        ? `${webOrigin}/checkout/success?orderId=${encodeURIComponent(row.orderId ?? '')}&ref=${encodeURIComponent(row.reference)}`
+        : `${webOrigin}/client/portefeuille/paiement?ref=${encodeURIComponent(row.reference)}`;
     return {
       providerResult: result.body,
       httpStatus: result.httpStatus,
       reference: row.reference,
-      redirect: `${webOrigin}/client/portefeuille/paiement?ref=${encodeURIComponent(row.reference)}`,
+      redirect,
     };
   }
 
@@ -158,10 +165,21 @@ export class SimulatedPaymentController {
     status: string;
     sessionRef: string | null;
     webOrigin: string;
+    kind: string;
     editable: boolean;
     failed: boolean;
     expired: boolean;
   }): string {
+    const isOrder = data.kind === CardPaymentKind.ORDER;
+    const headline = isOrder
+      ? 'Règlement <span>de commande</span>'
+      : 'Recharge <span>de portefeuille</span>';
+    const failedWarn = isOrder
+      ? 'Cette session a échoué : la commande reste en attente de règlement.'
+      : 'Cette session a échoué (aucun crédit).';
+    const expiredWarn = isOrder
+      ? 'Cette session est expirée : la commande reste en attente de règlement.'
+      : 'Cette session est expirée (aucun crédit).';
     const amount = new Intl.NumberFormat('fr-FR', {
       style: 'currency',
       currency: data.currency.toUpperCase(),
@@ -189,7 +207,7 @@ export class SimulatedPaymentController {
  .foot{margin-top:14px;font-size:11px;color:var(--muted)}
 </style></head><body><div class="card">
  <div class="badge">Simulateur local · aucun paiement réel</div>
- <h1>Code <span>Diali</span> — recharge de portefeuille</h1>
+ <h1>Code <span>Diali</span> — ${headline}</h1>
  <div class="amount">${amount}</div>
  <div class="muted">Référence ${data.reference} · statut ${data.status}</div>
  <div class="row"><span>Session</span><b>${data.sessionRef ?? '—'}</b></div>
@@ -201,8 +219,8 @@ export class SimulatedPaymentController {
    <button class="ex" id="ex" ${data.editable ? '' : 'disabled'}>Simuler une expiration</button>
  </div>
  <div id="msg" class="muted" style="margin-top:12px"></div>
- ${data.failed ? '<div class="warn">Cette session a échoué (aucun crédit).</div>' : ''}
- ${data.expired ? '<div class="warn">Cette session est expirée (aucun crédit).</div>' : ''}
+ ${data.failed ? `<div class="warn">${failedWarn}</div>` : ''}
+ ${data.expired ? `<div class="warn">${expiredWarn}</div>` : ''}
  <div class="foot">Aucune donnée de carte n'est saisie ici : la page sert uniquement à produire les événements de test (signés, dédupliqués, confirmés par le serveur).</div>
 </div>
 <script>

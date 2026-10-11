@@ -8,11 +8,15 @@ import { useCart } from '@/components/cart-provider';
 import { IconChevronLeft, IconMail, IconShield } from '@/components/icons';
 import {
   billingCycleLabel,
+  createOrderCardPayment,
   formatCents,
+  getPaymentCapabilities,
+  getSessionToken,
   listPaymentMethods,
   promoActive,
   quoteCart,
   storeCheckout,
+  type PaymentCapabilities,
   type PublicPaymentMethod,
   type QuoteResult,
 } from '@/lib/api';
@@ -27,6 +31,9 @@ interface CheckoutResult {
 }
 
 const ORDER_KEY = 'codiali.order.v1';
+
+/** GO revue §5a — sentinel du choix « Solde du portefeuille » (pas un PaymentMethod). */
+const WALLET_METHOD_ID = '__wallet__';
 
 export default function CheckoutPaymentPage() {
   return (
@@ -43,6 +50,10 @@ function CheckoutPaymentView() {
   const [methods, setMethods] = useState<PublicPaymentMethod[] | null>(null);
   const [methodsError, setMethodsError] = useState(false);
   const [methodId, setMethodId] = useState('');
+  // GO revue §5a — capacités EFFECTIVES (interrupteur solde ∩ dispo réelle).
+  // Fail-closed : `null` (chargement/erreur) = pas d'option solde affichée.
+  const [caps, setCaps] = useState<PaymentCapabilities | null>(null);
+  const [loggedIn, setLoggedIn] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // Q7 (GO item 7) — total SERVEUR : devis `/store/quote` re-fetché à chaque
@@ -82,6 +93,9 @@ function CheckoutPaymentView() {
 
   useEffect(() => {
     loadMethods();
+    // §5a — capacités effectives + état de connexion (option solde).
+    void getPaymentCapabilities().then(setCaps);
+    void getSessionToken().then((t) => setLoggedIn(!!t));
   }, [loadMethods]);
 
   // Hydratation du panier confirmée ET aucun produit → retour boutique promis
@@ -93,6 +107,7 @@ function CheckoutPaymentView() {
   // Q7 — devis serveur : configuration EXACTE à confirmer + moyen sélectionné
   // (frais inclus). Clé du devis = clé de la confirmation : le bouton reste
   // bloqué tant que le total affiché n'est pas celui du moyen courant.
+  // §5a — le choix « Solde » n'a AUCUN frais : devis SANS paymentMethodId.
   const quoteKeyNow = useMemo(() => {
     const slug = item?.product.slug;
     if (!slug) return '';
@@ -121,7 +136,13 @@ function CheckoutPaymentView() {
     setQuoteLoading(true);
     setQuoteError(false);
     void (async () => {
-      const res = await quoteCart({ productSlug: slug, options, addonIds, paymentMethodId: mid });
+      const res = await quoteCart({
+        productSlug: slug,
+        options,
+        addonIds,
+        // §5a — solde : devis sans moyen (aucun frais de paiement).
+        ...(mid === WALLET_METHOD_ID ? {} : { paymentMethodId: mid }),
+      });
       if (cancelled || my !== quoteSeqRef.current) return;
       setQuoteLoading(false);
       if (!res.ok || !res.data) {
@@ -162,12 +183,15 @@ function CheckoutPaymentView() {
 
     setLoading(true);
     try {
+      const byWallet = methodId === WALLET_METHOD_ID;
       const res = await storeCheckout({
         productSlug,
         name: contact.name,
         email: contact.email,
         phone: contact.phone,
-        paymentMethodId: methodId,
+        // §5a — solde : AUCUN moyen externe (exclusif), commande créée puis
+        // réglée atomiquement par le serveur (débit + confirmation).
+        ...(byWallet ? { payWithWallet: true } : { paymentMethodId: methodId }),
         options,
         addonIds,
         subdomain,
@@ -180,7 +204,7 @@ function CheckoutPaymentView() {
         // P7 — preuve COMPLÈTE du devis serveur (devise + moyen + empreinte) :
         // le serveur recompare total, devise, moyen et empreinte tarifaire.
         acceptedCurrency: quote.currency,
-        acceptedPaymentMethodId: quote.paymentMethodId ?? methodId,
+        acceptedPaymentMethodId: byWallet ? null : (quote.paymentMethodId ?? methodId),
         acceptedQuoteKey: quote.quoteKey,
       });
       const data = res.data as unknown;
@@ -205,6 +229,28 @@ function CheckoutPaymentView() {
       // Persister l'ordre pour la page de succès (id + numéro de facture).
       // La page de succès re-vérifiera l'état réel côté serveur.
       try { sessionStorage.setItem(ORDER_KEY, JSON.stringify(r)); } catch { /* noop */ }
+
+      // Paiement DIRECT par carte : la commande est créée (ou reprise), puis
+      // la session HÉBERGÉE du prestataire est ouverte — le montant et la
+      // devise sont relus par le serveur sur la commande, jamais envoyés ici.
+      // Échec d'ouverture (moyen désactivé, prestataire indisponible…) :
+      // retour sur la page de confirmation qui affiche l'état RÉEL et les
+      // actions de règlement disponibles.
+      const selected = methods?.find((m) => m.id === methodId);
+      if (selected?.type === 'CARD') {
+        const t = await getSessionToken();
+        if (t) {
+          const pay = await createOrderCardPayment(t, r.orderId);
+          const url =
+            pay.ok && pay.data && typeof pay.data.checkoutUrl === 'string'
+              ? pay.data.checkoutUrl
+              : null;
+          if (url) {
+            window.location.href = url;
+            return;
+          }
+        }
+      }
       router.replace(`/checkout/success?orderId=${encodeURIComponent(r.orderId)}`);
     } finally {
       setLoading(false);
@@ -236,6 +282,9 @@ function CheckoutPaymentView() {
   const total = quoteFresh ? quote.amountTtcCents : null;
   const taxRate = quoteFresh ? Number(quote.taxRatePercent) : 0;
   const quoteTax = quoteFresh ? quote.taxAmountCents : 0;
+  // §5a — option solde : interrupteur actif (caps NON nulles = fail-closed)
+  // ET client connecté (le solde appartient à un compte, jamais à un invité).
+  const showWallet = !!caps?.walletPaymentEnabled && loggedIn;
 
   return (
     <div className="store-single">
@@ -281,15 +330,36 @@ function CheckoutPaymentView() {
                 </button>
               </div>
             )}
-            {methods !== null && methods.length === 0 && !methodsError && (
+            {methods !== null && methods.length === 0 && !methodsError && !showWallet && (
               <div className="alert error" role="alert">
                 <b>Paiement indisponible :</b> aucun moyen de paiement n&apos;est actuellement actif.
                 La confirmation de commande est donc bloquée — réessayez plus tard.
               </div>
             )}
 
-            {methods !== null && methods.length > 0 && (
+            {methods !== null && (methods.length > 0 || showWallet) && (
               <div className="store-payment-methods">
+                {/* GO revue §5a — VRAI choix « Solde du portefeuille » : affiché
+                    si le parcours est activé (caps effectives) ET que le client
+                    est connecté (le solde appartient à un compte). Masquage UI
+                    seulement : le serveur re-gate à chaque opération. */}
+                {showWallet && (
+                  <label className={`store-payment${methodId === WALLET_METHOD_ID ? ' active' : ''}`}>
+                    <input
+                      type="radio"
+                      name="method"
+                      value={WALLET_METHOD_ID}
+                      checked={methodId === WALLET_METHOD_ID}
+                      onChange={() => setMethodId(WALLET_METHOD_ID)}
+                    />
+                    <span className="store-payment-body">
+                      <span className="store-payment-name">Solde du portefeuille</span>
+                      <span className="muted" style={{ fontSize: 12 }}>
+                        Réglé immédiatement depuis votre solde (USD) — sans carte bancaire.
+                      </span>
+                    </span>
+                  </label>
+                )}
                 {methods.map((m) => (
                   <label key={m.id} className={`store-payment${methodId === m.id ? ' active' : ''}`}>
                     <input

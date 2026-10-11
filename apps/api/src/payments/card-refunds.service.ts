@@ -5,6 +5,7 @@ import {
 } from '@nestjs/common';
 import {
   CardPayment,
+  CardPaymentKind,
   CardPaymentStatus,
   Prisma,
   Refund,
@@ -12,6 +13,7 @@ import {
   RefundStatus,
   WalletTransactionType,
 } from '@prisma/client';
+import { randomUUID } from 'node:crypto';
 import { AuditService } from '../audit/audit.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { JwtPayload } from '../auth/types';
@@ -22,6 +24,7 @@ import {
 import { WalletService } from '../wallet/wallet.service';
 import { ConnectorRefundOutcome } from './payment-connector';
 import { PaymentProviderService } from './payment-provider.service';
+import { syncRefundedCents } from './refund-accounting';
 import { StripeHttpError } from './stripe-connector';
 
 export interface CardRefundView {
@@ -60,6 +63,26 @@ export interface CardRefundView {
  */
 @Injectable()
 export class CardRefundsService {
+  /**
+   * GO revue §3b — Stripe éponge les clés d'idempotence après au moins 24 h :
+   * rejouer une demande PLUS VIEILLE que cette fenêtre n'est plus garantie
+   * « même opération » → risque de SECOND remboursement. La reprise est donc
+   * BORNÉE : passé 24 h, refus + intervention (jamais de relance à l'aveugle).
+   */
+  private static readonly IDEMPOTENCE_RETENTION_MS = 24 * 60 * 60 * 1000;
+
+  /**
+   * GO V3 §1 — durée du lease d'une émission EN COURS : au-delà, une relance
+   * peut déposséder le propriétaire (reprise contrôlée, même clé). Tant que
+   * le lease court, AUCUNE seconde émission n'est possible.
+   */
+  private static readonly DISPATCH_LEASE_MS = 60_000;
+
+  /** Jeton unique du propriétaire de l'émission en cours. */
+  private newDispatchOwner(): string {
+    return `${Date.now()}:${randomUUID()}`;
+  }
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly wallet: WalletService,
@@ -135,13 +158,6 @@ export class CardRefundsService {
     return this.engagedCents(pay) + reserved;
   }
 
-  private statusFor(refundedCents: number, amountCents: number): CardPaymentStatus {
-    if (refundedCents <= 0) return CardPaymentStatus.SUCCEEDED;
-    return refundedCents >= amountCents
-      ? CardPaymentStatus.REFUNDED
-      : CardPaymentStatus.PARTIALLY_REFUNDED;
-  }
-
   /**
    * Libération d'une réservation — GO P6 : CAS borné (`>= montant`), le
    * compteur ne devient JAMAIS négatif même si deux chemins se croisent.
@@ -178,6 +194,19 @@ export class CardRefundsService {
       if (rows.length === 0) throw new NotFoundException('Paiement introuvable.');
       const pay = rows[0];
 
+      // GO revue §5c — un règlement de COMMANDE (kind = ORDER) n'a JAMAIS
+      // crédité le portefeuille : le parcours « recharge » (qui débite le
+      // crédit associé) lui est INTERDIT. Le remboursement suit son origine
+      // via `POST /store/admin/orders/:orderId/refunds` (EXTERNAL_CARD, zéro
+      // mouvement portefeuille).
+      if (pay.kind === CardPaymentKind.ORDER || pay.orderId) {
+        throw new ConflictException(
+          `Paiement de commande (${pay.reference}) : le remboursement de recharge (débit portefeuille) ` +
+            'est interdit — utilisez le remboursement de commande (POST /store/admin/orders/:orderId/refunds, ' +
+            'vers la carte, sans mouvement portefeuille).',
+        );
+      }
+
       // Idempotence AVANT tout effet.
       const existing = await tx.refund.findUnique({ where: { idempotencyKey: key } });
       if (existing) {
@@ -199,6 +228,19 @@ export class CardRefundsService {
       ) {
         throw new ConflictException(
           `Remboursement carte impossible sur un paiement « ${pay.status} » : seul un paiement encaissé peut être remboursé.`,
+        );
+      }
+
+      // GO revue §1 — incertitude prestataire non rapprochée : toute
+      // opération dépendante du plafond est REFUSÉE tant que l'observation
+      // sans montant n'est pas acquittée par l'admin (acknowledgedAt).
+      const uncertain = await tx.refundObservation.findFirst({
+        where: { cardPaymentId: pay.id, amountCents: null, acknowledgedAt: null },
+        select: { providerRef: true },
+      });
+      if (uncertain) {
+        throw new ConflictException(
+          `Rapprochement requis : observation prestataire ${uncertain.providerRef} sans montant non acquittée — remboursement REFUSÉ tant que le rapprochement n'est pas effectué.`,
         );
       }
 
@@ -325,18 +367,26 @@ export class CardRefundsService {
   // ── appel prestataire + confirmation / compensation ─────────────────────
 
   /**
-   * GO P5 — émission SERIALISÉE : verrou LIGNE `Refund` (`FOR UPDATE`),
-   * validation (PENDING, sans référence prestataire) puis `dispatchedAt`
+   * GO P5 + V3 §1 — émission SERIALISÉE : verrou LIGNE `Refund` (`FOR UPDATE`),
+   * validation (PENDING, sans référence prestataire) puis revendication
+   * EXCLUSIVE (`dispatchOwner` + lease `dispatchClaimedAt`) + `dispatchedAt`
    * COMMIS avant le moindre octet réseau. Aucun appel réseau sous transaction.
    *
-   *  - deux émissions concurrentes = la seconde attend le verrou et repart
-   *    avec la MÊME clé d'idempotence (jamais de double remboursement) ;
+   *  - une émission fraîche n'entre que si `dispatchedAt` est null (jamais
+   *    envoyée) ;
+   *  - une émission INTERROMPUE (PENDING, déjà dispatchée, lease expiré) est
+   *    dépossédée par CAS conditionné aux valeurs observées — reprise avec la
+   *    MÊME clé d'idempotence (jamais de double remboursement) ;
+   *  - une émission encore sous lease (tentative vivante chez un pair) est
+   *    REFUSÉE : la seconde requête n'émet aucun octet réseau ;
    *  - une annulation concurrente voit soit `status ≠ PENDING`, soit
    *    `dispatchedAt` renseigné → elle est REFUSÉE (réservation conservée).
    */
   private async enterDispatch(
     refundId: string,
-  ): Promise<{ refund: Refund; payment: CardPayment } | null> {
+  ): Promise<{ refund: Refund; payment: CardPayment; owner: string } | null> {
+    const owner = this.newDispatchOwner();
+    const now = new Date();
     return this.prisma.$transaction(async (tx) => {
       const rows = await tx.$queryRaw<Refund[]>`
         SELECT * FROM "Refund" WHERE id = ${refundId} FOR UPDATE`;
@@ -350,16 +400,40 @@ export class CardRefundsService {
         return null;
       }
       if (!refund.dispatchedAt) {
-        await tx.refund.updateMany({
-          where: { id: refund.id, dispatchedAt: null },
-          data: { dispatchedAt: new Date() },
+        // Fraîche : revendication exclusive (sous verrou, sérialisée).
+        const claimed = await tx.refund.updateMany({
+          where: { id: refund.id, dispatchedAt: null, dispatchOwner: null },
+          data: {
+            dispatchedAt: now,
+            dispatchOwner: owner,
+            dispatchClaimedAt: now,
+          },
         });
+        if (claimed.count !== 1) return null;
+      } else {
+        // Déjà dispatchée : reprise UNIQUEMENT si lease expiré (tentative
+        // interrompue) ou propriétaire absent (ligne antérieure au lot V3).
+        const leaseExpired =
+          now.getTime() - (refund.dispatchClaimedAt?.getTime() ?? 0) >=
+          CardRefundsService.DISPATCH_LEASE_MS;
+        if (!leaseExpired && refund.dispatchOwner) return null;
+        const claimed = await tx.refund.updateMany({
+          where: {
+            id: refund.id,
+            status: RefundStatus.PENDING,
+            providerRef: null,
+            dispatchOwner: refund.dispatchOwner,
+            dispatchedAt: refund.dispatchedAt,
+          },
+          data: { dispatchOwner: owner, dispatchClaimedAt: now },
+        });
+        if (claimed.count !== 1) return null;
       }
       const payment = refund.cardPaymentId
         ? await tx.cardPayment.findUnique({ where: { id: refund.cardPaymentId } })
         : null;
       if (!payment) return null;
-      return { refund, payment };
+      return { refund, payment, owner };
     });
   }
 
@@ -379,14 +453,46 @@ export class CardRefundsService {
         'Remboursement déjà en cours de traitement (appel prestataire concurrent).',
       );
     }
+    const owner = entered.owner;
     const payment = entered.payment;
+    // GO revue §3b — reprise BORNÉE : le premier envoi doit rester dans la
+    // fenêtre d'idempotence du prestataire (24 h), sinon la relance pourrait
+    // créer un SECOND remboursement → refus + intervention, jamais à l'aveugle.
+    const expired = this.recoveryWindowExpiredReason(entered.refund);
+    if (expired) {
+      // GO V3 §1 — aucun octet réseau n'a été émis : on REND la
+      // revendication (lease annulé) pour que la prochaine relance revoie
+      // le MÊME refus « fenêtre dépassée », jamais un conflit de lease
+      // fantôme.
+      try {
+        await this.prisma.refund.updateMany({
+          where: { id: refund.id, dispatchOwner: owner },
+          data: { dispatchOwner: null, dispatchClaimedAt: null },
+        });
+      } catch {
+        // Le lease expire de toute façon : jamais d'erreur masquant le refus.
+      }
+      await this.audit
+        .record({
+          actorId: actor.sub,
+          actorEmail: actor.email,
+          action: `${this.prefixFor(entered.refund)}.recovery_window_expired`,
+          resourceType: 'refund',
+          resourceId: entered.refund.id,
+          details: { reason: expired, handling: 'intervention_requise' },
+        })
+        .catch(() => undefined);
+      throw new ConflictException(
+        `Reprise refusée (${expired}) : intervention requise, jamais de second remboursement.`,
+      );
+    }
     if (!payment.providerPaymentRef) {
       await this.failRefund(
         refund.id,
         paymentReference,
         'Aucune référence de paiement prestataire (impossible de rembourser).',
         actor,
-        { recredit: true },
+        { recredit: true, owner },
       );
       throw new ConflictException(
         'Référence prestataire absente : remboursement impossible (statut porté en échec, solde recrédité).',
@@ -408,18 +514,31 @@ export class CardRefundsService {
         idempotencyKey: refund.idempotencyKey,
       });
     } catch (err) {
-      // INCERTITUDE (réseau/HTTP) OU identité refusée : la réservation wallet
-      // est conservée et l'intention reste PENDING ré-exploirable (retry avec
-      // la MÊME clé prestataire).
       const message =
         err instanceof StripeHttpError || err instanceof Error
           ? err.message
           : String(err);
+      // GO revue §3c — refus CERTAIN du prestataire (4xx hors 408/429) :
+      // rien n'a été créé → échec TRANCHÉ + compensation CAS (réservation
+      // libérée, recrédit recharge), JAMAIS de reprise perpétuelle d'une
+      // demande refusée (sinon la réservation resterait prise à vie).
+      // Réseau/timeout/5xx/408/429 OU identité refusée = INCERTITUDE →
+      // réservation conservée, PENDING ré-exploirable (retry même clé).
+      if (this.isDefiniteProviderRefusal(err)) {
+        await this.failRefund(refund.id, paymentReference, message, actor, {
+          recredit: true,
+          owner,
+        });
+        const freshRefusal = await this.prisma.refund.findUnique({
+          where: { id: refund.id },
+        });
+        return this.toView(freshRefusal ?? refund, paymentReference);
+      }
       await this.audit
         .record({
           actorId: actor.sub,
           actorEmail: actor.email,
-          action: 'refund.topup.provider_call_deferred',
+          action: `${this.prefixFor(refund)}.provider_call_deferred`,
           resourceType: 'refund',
           resourceId: refund.id,
           details: { reason: message.slice(0, 300), handling: 'pending_retry' },
@@ -435,7 +554,7 @@ export class CardRefundsService {
         paymentReference,
         outcome.failureReason ?? `Réponse prestataire : ${outcome.status}.`,
         actor,
-        { recredit: true, providerRef: outcome.providerRef },
+        { recredit: true, providerRef: outcome.providerRef, owner },
       );
       const fresh = await this.prisma.refund.findUnique({ where: { id: refund.id } });
       return this.toView(fresh ?? refund, paymentReference);
@@ -447,8 +566,12 @@ export class CardRefundsService {
         SELECT * FROM "CardPayment" WHERE id = ${refund.cardPaymentId} FOR UPDATE`;
       if (rows.length === 0) throw new NotFoundException('Paiement introuvable.');
       const pay = rows[0];
+      // GO V3 §1 — confirmation conditionnée au PROPRIÉTAIRE courant de
+      // l'émission : une réponse TARDIVE d'un prédécesseur dépossédé n'écrase
+      // jamais l'issue écrite par le successeur (ni un statut clos par le
+      // webhook).
       const cas = await tx.refund.updateMany({
-        where: { id: refund.id, status: RefundStatus.PENDING },
+        where: { id: refund.id, status: RefundStatus.PENDING, dispatchOwner: owner },
         data: {
           providerRef: outcome.providerRef,
           processedAt: outcome.status === 'succeeded' ? new Date() : null,
@@ -460,24 +583,11 @@ export class CardRefundsService {
       }
 
       if (outcome.status === 'succeeded') {
-        // GO P6 — L'ENCAISSEMENT RÉEL seulement entre dans `refundedCents`
-        // (aucun plafond silencieux : un cumul au-delà du montant encaissé est
-        // signalé, jamais lissé).
-        const refundedCents = pay.refundedCents + refund.amountCents;
-        const overflow = refundedCents > pay.amountCents;
-        await tx.cardPayment.update({
-          where: { id: pay.id },
-          data: {
-            refundedCents,
-            ...(overflow
-              ? {
-                  status: CardPaymentStatus.NEEDS_REVIEW,
-                  interventionNeeded: true,
-                  interventionReason: `remboursement cumulé (${refundedCents}) > montant encaissé (${pay.amountCents})`,
-                }
-              : { status: this.statusFor(refundedCents, pay.amountCents) }),
-          },
-        });
+        // GO §2 — comptabilisation UNITAIRE (règle `max` monotone) : la même
+        // issue arrivée par la réponse API, le webhook ou le rapprochement
+        // n'avance `refundedCents` qu'UNE fois ; un cumul au-delà du montant
+        // encaissé est signalé (`NEEDS_REVIEW`), jamais lissé.
+        await syncRefundedCents(tx, pay.id);
         await this.releaseReservation(tx, pay.id, refund.amountCents);
       }
       // GO P6 — accepté mais non réglé (pending/requires_action) : l'engagement
@@ -491,8 +601,8 @@ export class CardRefundsService {
         actorEmail: actor.email,
         action:
           updated?.status === RefundStatus.SUCCEEDED
-            ? 'refund.topup.succeeded'
-            : 'refund.topup.engaged',
+            ? `${this.prefixFor(refund)}.succeeded`
+            : `${this.prefixFor(refund)}.engaged`,
         resourceType: 'refund',
         resourceId: refund.id,
         details: {
@@ -508,6 +618,42 @@ export class CardRefundsService {
   }
 
   /**
+   * GO revue §3b — première fenêtre de reprise dépassée ? `null` = reprise
+   * encore sûre (ou jamais émis : rien à rejouer).
+   */
+  private recoveryWindowExpiredReason(refund: Refund): string | null {
+    if (!refund.dispatchedAt) return null;
+    const ageMs = Date.now() - refund.dispatchedAt.getTime();
+    if (ageMs <= CardRefundsService.IDEMPOTENCE_RETENTION_MS) return null;
+    return `premier envoi il y a ${Math.round(ageMs / 3_600_000)} h (clé d'idempotence prestataire épongée)`;
+  }
+
+  /**
+   * GO revue §3c — refus QUALIFIÉ du prestataire prouvant que la demande
+   * n'a rien créé. Miroir exact de `isUncertainDispatchError` (card-payments)
+   * lu par NÉGATION : ici l'incertain est le cas par défaut (réservation
+   * conservée, PENDING ré-exploirable), le certain est l'exception.
+   */
+  private isDefiniteProviderRefusal(err: unknown): boolean {
+    const qualified =
+      err instanceof StripeHttpError ||
+      (err !== null &&
+        typeof err === 'object' &&
+        'name' in err &&
+        String((err as { name?: unknown }).name) === 'StripeHttpError');
+    if (!qualified) return false;
+    const status = err instanceof StripeHttpError ? err.status : undefined;
+    // Refus qualifié sans code HTTP (ou instance) : le prestataire a tranché.
+    if (typeof status !== 'number') return true;
+    // 408/429 ne prouvent JAMAIS que la demande n'a rien créé (incertains).
+    // GO V3 §1 — idem pour 409 (conflit, souvent idempotence) : jamais
+    // classé certain sur le seul statut HTTP (la demande a pu être créée).
+    return (
+      status >= 400 && status < 500 && status !== 408 && status !== 429 && status !== 409
+    );
+  }
+
+  /**
    * Échec définitif : statut FAILED + compensation idempotente du débit.
    *
    * GO P5 — la compensation n'a lieu QUE si le CAS `PENDING → FAILED` a
@@ -519,7 +665,7 @@ export class CardRefundsService {
     paymentReference: string,
     reason: string,
     actor: JwtPayload,
-    opts: { recredit: boolean; providerRef?: string },
+    opts: { recredit: boolean; providerRef?: string; owner?: string },
   ): Promise<void> {
     const refund = await this.prisma.refund.findUnique({ where: { id: refundId } });
     if (!refund || refund.status !== RefundStatus.PENDING) return;
@@ -533,10 +679,13 @@ export class CardRefundsService {
       .record({
         actorId: actor.sub,
         actorEmail: actor.email,
-        action: 'refund.topup.failed',
+        action: `${this.prefixFor(refund)}.failed`,
         resourceType: 'refund',
         resourceId: refundId,
-        details: { reason: reason.slice(0, 300), recredit: opts.recredit },
+        details: {
+          reason: reason.slice(0, 300),
+          recredit: opts.recredit && refund.orderId === null,
+        },
       })
       .catch(() => undefined);
   }
@@ -547,10 +696,18 @@ export class CardRefundsService {
     refund: Refund,
     paymentReference: string,
     reason: string,
-    opts: { recredit: boolean; providerRef?: string },
+    opts: { recredit: boolean; providerRef?: string; owner?: string },
   ): Promise<boolean> {
+    // GO V3 §1 — `owner` présent (émission prestataire) : CAS conditionné au
+    // PROPRIÉTAIRE courant, une réponse tardive d'un prédécesseur dépossédé
+    // n'égare jamais la compensation. Sans owner (annulation admin avant
+    // émission, constatation webhook) : CAS `PENDING` seul (inchangé).
     const cas = await tx.refund.updateMany({
-      where: { id: refund.id, status: RefundStatus.PENDING },
+      where: {
+        id: refund.id,
+        status: RefundStatus.PENDING,
+        ...(opts.owner ? { dispatchOwner: opts.owner } : {}),
+      },
       data: {
         status: RefundStatus.FAILED,
         failureReason: reason.slice(0, 300),
@@ -563,7 +720,10 @@ export class CardRefundsService {
     // Réservation libérée (CAS borné, compteur jamais négatif).
     await this.releaseReservation(tx, refund.cardPaymentId, refund.amountCents);
 
-    if (opts.recredit && refund.cardPaymentId) {
+    if (opts.recredit && refund.cardPaymentId && !refund.orderId) {
+      // Compensation UNIQUEMENT pour une RECHARGE (un débit wallet a été
+      // opéré à la création). Un remboursement de COMMANDE réglée par carte
+      // n'a JAMAIS débité le portefeuille : recréditer ferait crédit gratuit.
       const pay = await this.requirePayment(tx, refund.cardPaymentId);
       // Recrédit idempotent (clé distincte du débit) — jamais de double.
       await this.wallet.applyWithClient(
@@ -594,6 +754,11 @@ export class CardRefundsService {
     });
     if (!row) throw new NotFoundException('Paiement introuvable.');
     return row;
+  }
+
+  /** Traçabilité : recharge (`refund.topup.*`) vs commande (`refund.order.*`). */
+  private prefixFor(refund: { orderId: string | null }): 'refund.order' | 'refund.topup' {
+    return refund.orderId ? 'refund.order' : 'refund.topup';
   }
 
   // ── reprise / annulation (admin) ────────────────────────────────────────
@@ -665,7 +830,7 @@ export class CardRefundsService {
         .record({
           actorId: actor.sub,
           actorEmail: actor.email,
-          action: 'refund.topup.cancel_refused',
+          action: `${this.prefixFor(result.refund)}.cancel_refused`,
           resourceType: 'refund',
           resourceId: refundId,
           details: {
@@ -685,13 +850,13 @@ export class CardRefundsService {
         .record({
           actorId: actor.sub,
           actorEmail: actor.email,
-          action: 'refund.topup.failed',
-          resourceType: 'refund',
-          resourceId: refundId,
-          details: {
-            reason: reason?.trim() || 'Annulé par l’administrateur.',
-            recredit: true,
-          },
+        action: `${this.prefixFor(result.refund)}.failed`,
+        resourceType: 'refund',
+        resourceId: refundId,
+        details: {
+          reason: reason?.trim() || 'Annulé par l’administrateur.',
+          recredit: result.refund.orderId === null,
+        },
         })
         .catch(() => undefined);
     }
@@ -775,21 +940,10 @@ export class CardRefundsService {
           data: { status: RefundStatus.SUCCEEDED, processedAt: new Date() },
         });
         if (cas.count !== 1) return false;
-        const refundedCents = pay.refundedCents + refund.amountCents;
-        const overflow = refundedCents > pay.amountCents;
-        await tx.cardPayment.update({
-          where: { id: pay.id },
-          data: {
-            refundedCents,
-            ...(overflow
-              ? {
-                  status: CardPaymentStatus.NEEDS_REVIEW,
-                  interventionNeeded: true,
-                  interventionReason: `remboursement cumulé (${refundedCents}) > montant encaissé (${pay.amountCents})`,
-                }
-              : { status: this.statusFor(refundedCents, pay.amountCents) }),
-          },
-        });
+        // GO §2 — comptabilisation UNITAIRE (règle `max` monotone) : le
+        // webhook, la réponse API et le rejeu convergent vers le MÊME
+        // compteur ; jamais d'incrément cumulatif.
+        await syncRefundedCents(tx, pay.id);
         await this.releaseReservation(tx, pay.id, refund.amountCents);
         return true;
       });

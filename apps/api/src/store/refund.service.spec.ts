@@ -1,5 +1,7 @@
 import { BadRequestException, ConflictException } from '@nestjs/common';
 import {
+  CardPaymentKind,
+  CardPaymentStatus,
   OrderStatus,
   RefundKind,
   RefundStatus,
@@ -47,6 +49,12 @@ describe('RefundService (GO Q9 — remboursements et avoirs)', () => {
         create: jest.fn(),
         update: jest.fn(),
         updateMany: jest.fn(),
+        findMany: jest.fn(async (): Promise<unknown[]> => []),
+      },
+      // GO revue §1 — aucune observation prestataire par défaut en unitaire.
+      refundObservation: {
+        findFirst: jest.fn(async () => null),
+        findMany: jest.fn(async (): Promise<unknown[]> => []),
       },
       invoice: {
         findUnique: jest.fn(),
@@ -61,6 +69,12 @@ describe('RefundService (GO Q9 — remboursements et avoirs)', () => {
       order: { updateMany: jest.fn() },
       walletTransaction: { findUnique: jest.fn() },
       billingSetting: { findFirst: jest.fn() },
+      // Lot « paiement direct des commandes » : aucune origine carte par défaut.
+      cardPayment: {
+        findUnique: jest.fn(),
+        findMany: jest.fn(async (): Promise<unknown[]> => []),
+        update: jest.fn(),
+      },
     };
   }
 
@@ -70,6 +84,7 @@ describe('RefundService (GO Q9 — remboursements et avoirs)', () => {
       $transaction: jest.fn(async (cb: (t: typeof tx) => unknown) => cb(tx)),
       refund: { findUnique: jest.fn() },
       order: { findUnique: jest.fn() },
+      cardPayment: { findMany: jest.fn(async (): Promise<unknown[]> => []) },
     };
     const wallet = { applyWithClient: jest.fn() };
     const audit = { record: jest.fn() };
@@ -810,6 +825,184 @@ describe('RefundService (GO Q9 — remboursements et avoirs)', () => {
       await expect(
         service.applyExternalConfirmation(tx as never, 'rf-ext-1', 'ch_1'),
       ).rejects.toThrow(ConflictException);
+    });
+  });
+
+  // ── I. Lot « paiement direct des commandes » — le remboursement suit
+  //       l'ORIGINE du règlement (carte = rattachement, jamais de wallet) ──
+  describe('createRefund — ORIGINE CARTE (I)', () => {
+    function cardOriginRow() {
+      return {
+        id: 'cp-1',
+        reference: 'ordpay-0001',
+        status: CardPaymentStatus.SUCCEEDED,
+        kind: CardPaymentKind.ORDER,
+        interventionNeeded: false,
+        currency: 'USD',
+      };
+    }
+
+    function paidCardRow() {
+      return {
+        id: 'cp-1',
+        reference: 'ordpay-0001',
+        status: CardPaymentStatus.SUCCEEDED,
+        kind: CardPaymentKind.ORDER,
+        currency: 'USD',
+        amountCents: 1500,
+        refundedCents: 0,
+        pendingRefundCents: 0,
+        interventionNeeded: false,
+      };
+    }
+
+    it('WALLET_CREDIT refusé 409 REFUND_ORIGIN_CARD (aucune transaction, aucun wallet)', async () => {
+      const { service, prisma, tx, wallet } = makeService();
+      prisma.cardPayment.findMany.mockResolvedValue([cardOriginRow()]);
+
+      const err = await service
+        .createRefund(
+          'ord-1',
+          { amountCents: 500, kind: RefundKind.WALLET_CREDIT },
+          KEY,
+          actor,
+        )
+        .catch((e: unknown) => e);
+
+      expect(err).toBeInstanceOf(ConflictException);
+      expect((err as ConflictException).getResponse()).toMatchObject({
+        code: 'REFUND_ORIGIN_CARD',
+      });
+      // refus AVANT toute écriture : zéro transaction, zéro mouvement wallet
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+      expect(wallet.applyWithClient).not.toHaveBeenCalled();
+      expect(tx.refund.create).not.toHaveBeenCalled();
+    });
+
+    it('EXTERNAL_CARD accepté : rattaché aux DEUX liens, réservation, audit, JAMAIS wallet', async () => {
+      const { service, prisma, tx, wallet, audit } = makeService();
+      prisma.cardPayment.findMany.mockResolvedValue([cardOriginRow()]);
+      tx.$queryRaw
+        .mockResolvedValueOnce([]) // verrou PAIEMENT (CardPayment FOR UPDATE)
+        .mockResolvedValueOnce(paidOrderRow()); // verrou COMMANDE
+      tx.refund.findUnique.mockResolvedValue(null);
+      tx.refund.aggregate.mockResolvedValue({ _sum: { amountCents: 0 } });
+      tx.invoice.findUnique.mockResolvedValue(originInvoice());
+      tx.cardPayment.findMany.mockResolvedValue([cardOriginRow()]);
+      tx.cardPayment.findUnique.mockResolvedValue(paidCardRow());
+      tx.refund.create.mockResolvedValue({
+        id: 'rf-card-1',
+        orderId: 'ord-1',
+        cardPaymentId: 'cp-1',
+        invoiceId: 'inv-1',
+        kind: RefundKind.EXTERNAL_CARD,
+        status: RefundStatus.PENDING,
+        amountCents: 500,
+        currency: 'USD',
+        reason: null,
+        issueCreditNote: false,
+        idempotencyKey: KEY,
+        walletTransactionId: null,
+        creditNoteInvoiceId: null,
+        providerRef: null,
+        createdByEmail: actor.email ?? null,
+        processedAt: null,
+        createdAt: new Date('2026-10-08T10:00:00Z'),
+      });
+
+      const view = await service.createRefund(
+        'ord-1',
+        { amountCents: 500, kind: RefundKind.EXTERNAL_CARD },
+        KEY,
+        actor,
+      );
+
+      expect(view.status).toBe(RefundStatus.PENDING);
+      expect(view.cardPaymentId).toBe('cp-1');
+      expect(view.walletTransactionId).toBeNull();
+      // création rattachée aux DEUX liens (commande + paiement d'origine)
+      expect(tx.refund.create.mock.calls[0][0].data).toMatchObject({
+        orderId: 'ord-1',
+        cardPaymentId: 'cp-1',
+        kind: RefundKind.EXTERNAL_CARD,
+        issueCreditNote: false,
+      });
+      // réservation dénormalisée sur le paiement (plafond partagé)
+      expect(tx.cardPayment.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 'cp-1' },
+          data: { pendingRefundCents: { increment: 500 } },
+        }),
+      );
+      // AUCUN mouvement wallet, AUCUNE bascule de statut commande/facture
+      expect(wallet.applyWithClient).not.toHaveBeenCalled();
+      expect(tx.order.updateMany).not.toHaveBeenCalled();
+      expect(tx.invoice.updateMany).not.toHaveBeenCalled();
+      expect(tx.invoice.create).not.toHaveBeenCalled();
+      // audit kind-aware : préfixe `refund.order.*`
+      expect(audit.record).toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'refund.order.create' }),
+        tx,
+      );
+    });
+
+    it('origine apparue entre la lecture initiale et les verrous : refus explicite', async () => {
+      const { service, prisma, tx } = makeService();
+      // lecture initiale : AUCUNE origine (règlement carte concurrent)
+      prisma.cardPayment.findMany.mockResolvedValue([]);
+      tx.$queryRaw.mockResolvedValueOnce(paidOrderRow()); // verrou commande
+      tx.refund.findUnique.mockResolvedValue(null);
+      tx.refund.aggregate.mockResolvedValue({ _sum: { amountCents: 0 } });
+      tx.invoice.findUnique.mockResolvedValue(originInvoice());
+      // sous verrou : l'origine existe → verrous PAIEMENT non tenus → refus
+      tx.cardPayment.findMany.mockResolvedValue([cardOriginRow()]);
+
+      const err = await service
+        .createRefund(
+          'ord-1',
+          { amountCents: 500, kind: RefundKind.EXTERNAL_CARD },
+          KEY,
+          actor,
+        )
+        .catch((e: unknown) => e);
+
+      expect(err).toBeInstanceOf(ConflictException);
+      expect(String((err as ConflictException).message)).toContain(
+        'apparue pendant la préparation',
+      );
+      expect(tx.refund.create).not.toHaveBeenCalled();
+    });
+
+    it('WALLET_CREDIT bloqué MÊME sous verrou (origine encaissée entre les deux lectures)', async () => {
+      const { service, prisma, tx, wallet } = makeService();
+      // lecture initiale : paiement EN COURS (verrouillé quand même), puis
+      // encaissement constaté SOUS verrou → le contrôle d'origine tient.
+      prisma.cardPayment.findMany.mockResolvedValue([
+        { ...cardOriginRow(), status: CardPaymentStatus.PROCESSING },
+      ]);
+      tx.$queryRaw
+        .mockResolvedValueOnce([]) // verrou PAIEMENT
+        .mockResolvedValueOnce(paidOrderRow()); // verrou COMMANDE
+      tx.refund.findUnique.mockResolvedValue(null);
+      tx.refund.aggregate.mockResolvedValue({ _sum: { amountCents: 0 } });
+      tx.invoice.findUnique.mockResolvedValue(originInvoice());
+      tx.cardPayment.findMany.mockResolvedValue([cardOriginRow()]);
+
+      const err = await service
+        .createRefund(
+          'ord-1',
+          { amountCents: 500, kind: RefundKind.WALLET_CREDIT },
+          KEY,
+          actor,
+        )
+        .catch((e: unknown) => e);
+
+      expect(err).toBeInstanceOf(ConflictException);
+      expect((err as ConflictException).getResponse()).toMatchObject({
+        code: 'REFUND_ORIGIN_CARD',
+      });
+      expect(wallet.applyWithClient).not.toHaveBeenCalled();
+      expect(tx.refund.create).not.toHaveBeenCalled();
     });
   });
 });

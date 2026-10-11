@@ -91,10 +91,28 @@ export class CheckoutDto {
   @IsString()
   requestedDomainId?: string;
 
-  @ApiProperty({ description: 'id d’un moyen de paiement actif (PaymentMethod)' })
+  @ApiPropertyOptional({
+    description:
+      'id d’un moyen de paiement actif (PaymentMethod) — obligatoire sauf ' +
+      'règlement par solde (payWithWallet: true, exclusif).',
+  })
+  @IsOptional()
   @IsString()
   @IsNotEmpty()
-  paymentMethodId!: string;
+  @MaxLength(120)
+  paymentMethodId?: string;
+
+  @ApiPropertyOptional({
+    description:
+      'GO revue §5a — vrai choix « Solde du portefeuille » à l’étape de ' +
+      'paiement : la commande est créée SANS moyen (frais nuls) puis réglée ' +
+      'par le solde (POST /client/store/orders/:id/pay-with-wallet, débit ' +
+      'serveur atomique). Réservé aux clients connectés ; exclusif de ' +
+      'paymentMethodId.',
+  })
+  @IsOptional()
+  @IsBoolean()
+  payWithWallet?: boolean;
 
   @ApiPropertyOptional({
     description:
@@ -143,13 +161,14 @@ export class CheckoutDto {
     description:
       'Moyen de paiement affiché/accepté (ses frais inclus dans le total accepté) — ' +
       'OBLIGATOIRE pour une commande payante (GO P7). Doit correspondre au paymentMethodId ' +
-      'de la commande.',
+      'de la commande. `null` = règlement par solde du portefeuille (GO revue §5a, ' +
+      'exclusif de paymentMethodId).',
   })
   @IsOptional()
   @IsString()
   @IsNotEmpty()
   @MaxLength(120)
-  acceptedPaymentMethodId?: string;
+  acceptedPaymentMethodId?: string | null;
 
   @ApiPropertyOptional({
     description:

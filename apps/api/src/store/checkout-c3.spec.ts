@@ -210,6 +210,7 @@ describe('checkout C3 (17B.4F-C3) + confirmation de paiement', () => {
       { checkSubdomainAvailability: jest.fn(async () => ({ available: true, fqdn: 'x.y' })) } as never,
       c3 as never,
       { applyWithClient: jest.fn(async () => ({ balanceCents: 0, replayed: false })) } as never,
+      { assertEnabled: jest.fn(), capabilities: jest.fn() } as never,
     );
   };
 

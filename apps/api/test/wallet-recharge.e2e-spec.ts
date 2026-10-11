@@ -481,6 +481,7 @@ describe('Portefeuille & recharge virement (e2e, P6)', () => {
         Array.from({ length: 5 }, (_, i) =>
           wallet.debit(customer.id, {
             amountCents: 400,
+            currency: customer.walletCurrency,
             idempotencyKey: `p6-race-${stamp}-${i}`,
             note: 'concurrence recette',
           }),
@@ -508,9 +509,17 @@ describe('Portefeuille & recharge virement (e2e, P6)', () => {
       });
       const before = customer.walletBalanceCents;
       const key = `p6-dup-${stamp}`;
-      const first = await wallet.credit(customer.id, { amountCents: 500, idempotencyKey: key });
+      const first = await wallet.credit(customer.id, {
+        amountCents: 500,
+        currency: customer.walletCurrency,
+        idempotencyKey: key,
+      });
       expect(first.replayed).toBe(false);
-      const second = await wallet.credit(customer.id, { amountCents: 500, idempotencyKey: key });
+      const second = await wallet.credit(customer.id, {
+        amountCents: 500,
+        currency: customer.walletCurrency,
+        idempotencyKey: key,
+      });
       expect(second.replayed).toBe(true);
       expect(second.balanceCents).toBe(before + 500);
       expect(await balanceOf(bobEmail)).toBe(before + 500);

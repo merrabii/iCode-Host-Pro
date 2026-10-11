@@ -7,6 +7,7 @@ import {
   CARD_PAYMENT_LABEL,
   CARD_PAYMENT_TONE,
   checkPaymentProvider,
+  createAdminRefund,
   createCardRefund,
   getCardPaymentAdmin,
   getPaymentProvider,
@@ -215,24 +216,43 @@ export default function ManagerCardPaymentsPage() {
       toast.warn('Montant de remboursement invalide.');
       return;
     }
-    if (
-      !window.confirm(
-        `Rembourser ${money(cents, detail.currency)} vers la carte du client (réf. ${detail.reference}) ?`,
-      )
-    ) {
+    // GO revue §5c — ORDER (règlement de commande) vs TOPUP (recharge) :
+    // le remboursement suit son origine. La commande réglée par carte est
+    // remboursée SANS mouvement portefeuille (le client n'a jamais été
+    // crédité) ; la recharge est reversée en débitant le crédit associé.
+    const isOrder = detail.kind === 'ORDER' || !!detail.orderId;
+    const pathLabel = isOrder
+      ? `rembourser la commande ${detail.orderId ?? '—'} vers la carte (sans débit portefeuille)`
+      : `rembourser ${money(cents, detail.currency)} vers la carte du client (réf. ${detail.reference})`;
+    if (!window.confirm(`Confirmer : ${pathLabel} ?`)) {
       return;
     }
     setBusy(true);
-    const r = await createCardRefund(token, detail.id, {
-      amountCents: cents,
-      reason: rfReason.trim() || undefined,
-    });
+    const r = isOrder
+      ? await createAdminRefund(
+          token,
+          detail.orderId!,
+          {
+            amountCents: cents,
+            reason: rfReason.trim() || `Remboursement commande ${detail.reference}`,
+            kind: 'EXTERNAL_CARD',
+          },
+          `web-order-refund-${detail.id}-${Date.now()}`,
+        )
+      : await createCardRefund(token, detail.id, {
+          amountCents: cents,
+          reason: rfReason.trim() || undefined,
+        });
     setBusy(false);
     if (!r.ok) {
       toast.error(apiError(r, 'Remboursement impossible.'));
       return;
     }
-    toast.ok('Remboursement enregistré (traitement côté prestataire).');
+    toast.ok(
+      isOrder
+        ? 'Remboursement de commande enregistré (vers la carte, sans débit portefeuille).'
+        : 'Remboursement enregistré (traitement côté prestataire).',
+    );
     setRfAmount('');
     setRfReason('');
     await loadDetail(detail.id);
@@ -629,7 +649,7 @@ export default function ManagerCardPaymentsPage() {
         {detail && (
           <Panel
             title={`Paiement ${detail.reference}`}
-            sub={`${detail.customerEmail ?? '—'} · créé le ${new Date(detail.createdAt).toLocaleString()} · ${detail.environment}`}
+            sub={`${detail.customerEmail ?? '—'} · créé le ${new Date(detail.createdAt).toLocaleString()} · ${detail.environment}${detail.kind === 'ORDER' ? ' · règlement de commande' : detail.kind === 'TOPUP' ? ' · recharge de portefeuille' : ''}`}
           >
             <div className="grid-2 mb">
               <div>
@@ -729,11 +749,16 @@ export default function ManagerCardPaymentsPage() {
                   disabled={busy || detail.status === 'NEEDS_REVIEW'}
                   onClick={() => void refund()}
                 >
-                  Rembourser vers la carte
+                  {detail.kind === 'ORDER' || detail.orderId
+                    ? 'Rembourser la commande vers la carte'
+                    : 'Rembourser vers la carte'}
                 </Button>
                 <p className="muted" style={{ fontSize: 11, marginTop: 6 }}>
-                  Le remboursement est réservé sur le portefeuille AVANT l’appel
-                  prestataire : en cas d’échec définitif, le crédit est restitué.
+                  {detail.kind === 'ORDER' || detail.orderId
+                    ? 'Règlement de commande : remboursement vers la carte d’origine, ' +
+                      'SANS mouvement de portefeuille (le client n’a jamais été crédité).'
+                    : 'Le remboursement est réservé sur le portefeuille AVANT l’appel ' +
+                      'prestataire : en cas d’échec définitif, le crédit est restitué.'}
                 </p>
               </div>
             </div>

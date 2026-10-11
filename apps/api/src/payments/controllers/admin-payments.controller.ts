@@ -229,7 +229,7 @@ export class AdminPaymentsController {
     @Body() dto: ResolveInterventionDto,
     @CurrentUser() actor: JwtPayload,
   ) {
-    await this.cards.resolveIntervention(id, dto.note);
+    await this.cards.resolveIntervention(id, dto.note, actor.email);
     await this.audit.record({
       actorId: actor.sub,
       actorEmail: actor.email,

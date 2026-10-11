@@ -79,7 +79,8 @@ export interface PricingAcceptanceRefusal {
 export interface PricingAcceptance {
   acceptedTotalTtcCents?: number;
   acceptedCurrency?: string;
-  acceptedPaymentMethodId?: string;
+  /** GO revue §5a — `null` = règlement par solde (aucun moyen externe). */
+  acceptedPaymentMethodId?: string | null;
   acceptedQuoteKey?: string;
 }
 
@@ -89,6 +90,9 @@ export interface PricingAcceptance {
  * - **Commande payante** (total > 0) : les 4 conditions sont OBLIGATOIRES —
  *   toute omission est un refus (`ACCEPTANCE_REQUIRED`), aucun contournement ;
  *   puis total, devise, moyen et empreinte doivent correspondre dans cet ordre.
+ *   Le moyen accepté peut être `null` (règlement par solde, §5a) : la
+ *   correspondance reste stricte (un `null` accepté ne valide JAMAIS un moyen
+ *   externe, ni l'inverse).
  * - **Commande gratuite** (total = 0) : aucune preuve requise (contrat
  *   explicite des chemins gratuits) ; si un champ est fourni, il doit
  *   correspondre — jamais de valeur acceptée « par défaut ».
@@ -97,7 +101,7 @@ export interface PricingAcceptance {
  */
 export function evaluatePricingAcceptance(params: {
   amountTtcCents: number;
-  server: { currency: string; paymentMethodId: string; quoteKey: string };
+  server: { currency: string; paymentMethodId: string | null; quoteKey: string };
   accepted: PricingAcceptance;
 }): PricingAcceptanceRefusal | null {
   const { amountTtcCents, server, accepted } = params;

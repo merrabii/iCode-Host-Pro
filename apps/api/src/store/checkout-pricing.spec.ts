@@ -108,6 +108,7 @@ describe('P5 — buildPricing : prix actif + taxe ARRONDIE PAR LIGNE (B2)', () =
       mockCloudflare as never,
       { resolveTracking: jest.fn(), operational: jest.fn().mockResolvedValue(false) } as never,
       { applyWithClient: jest.fn() } as never,
+      { assertEnabled: jest.fn(), capabilities: jest.fn() } as never,
     );
     svc = service as unknown as Svc;
   });
@@ -304,6 +305,7 @@ describe('Q7 — buildPricing/quote : frais du moyen de paiement APPLIQUÉS (GO 
       mockCloudflare as never,
       { resolveTracking: jest.fn(), operational: jest.fn().mockResolvedValue(false) } as never,
       { applyWithClient: jest.fn() } as never,
+      { assertEnabled: jest.fn(), capabilities: jest.fn() } as never,
     );
     svc = service as unknown as Svc;
   });

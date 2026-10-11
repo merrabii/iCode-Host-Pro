@@ -31,6 +31,18 @@ export class CreateCardTopupDto {
   idempotencyKey?: string;
 }
 
+/**
+ * Lot « paiement direct des commandes » — montant et devise sont LUS côté
+ * serveur sur la commande : le client ne fournit que la clé d'idempotence
+ * optionnelle (double-clic = UNE tentative).
+ */
+export class CreateOrderCardPaymentDto {
+  @IsOptional()
+  @IsString()
+  @Length(8, 128)
+  idempotencyKey?: string;
+}
+
 export class SaveProviderDto {
   @IsIn(['stripe'])
   code!: 'stripe';

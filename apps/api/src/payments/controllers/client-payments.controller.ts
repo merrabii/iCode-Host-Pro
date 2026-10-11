@@ -12,7 +12,7 @@ import { JwtAuthGuard } from '../../auth/guards/jwt-auth.guard';
 import { CurrentUser } from '../../auth/decorators/current-user.decorator';
 import { JwtPayload } from '../../auth/types';
 import { CardPaymentsService } from '../card-payments.service';
-import { CreateCardTopupDto } from '../dto/payments.dto';
+import { CreateCardTopupDto, CreateOrderCardPaymentDto } from '../dto/payments.dto';
 
 /**
  * GO Stripe — espace CLIENT : recharge par carte (page hébergée du
@@ -21,6 +21,10 @@ import { CreateCardTopupDto } from '../dto/payments.dto';
  * ISOLATION : tout passe par le dossier du JWT (`ensureOwnedCustomer`) —
  * lecture d'un paiement d'un tiers = 404. Le navigateur déclenche seulement
  * des appels : montant, devise et confirmation restent côté serveur.
+ *
+ * Lot « paiement direct des commandes » — même isolation sur la COMMANDE
+ * (proprieté exigée avant toute écriture) et mêmes règles que le portefeuille :
+ * le serveur seul décide du montant, de la devise et du règlement.
  */
 @ApiTags('client/payments')
 @ApiBearerAuth()
@@ -59,5 +63,39 @@ export class ClientPaymentsController {
   })
   async refresh(@Param('reference') reference: string, @CurrentUser() user: JwtPayload) {
     return this.cards.refreshFromProvider(reference, user);
+  }
+
+  // ── lot « paiement direct des commandes » ──────────────────────────────
+
+  @Post('orders/:orderId/card')
+  @ApiOperation({ summary: 'Ouvrir une session pour régler une commande par carte (client)' })
+  async createOrderPayment(
+    @Param('orderId') orderId: string,
+    @CurrentUser() user: JwtPayload,
+    @Body() dto: CreateOrderCardPaymentDto,
+    @Headers('idempotency-key') idempotencyKey?: string,
+  ) {
+    return this.cards.createOrderPayment(orderId, user, dto ?? {}, idempotencyKey);
+  }
+
+  @Get('orders/:orderId/card')
+  @ApiOperation({ summary: 'Dernière tentative de règlement carte d’une commande (client)' })
+  async getOrderPayment(
+    @Param('orderId') orderId: string,
+    @CurrentUser() user: JwtPayload,
+  ) {
+    return this.cards.getOrderPayment(orderId, user);
+  }
+
+  @Post('orders/:orderId/card/refresh')
+  @ApiOperation({
+    summary:
+      'Relire le règlement d’une commande auprès du serveur après retour de la page hébergée',
+  })
+  async refreshOrderPayment(
+    @Param('orderId') orderId: string,
+    @CurrentUser() user: JwtPayload,
+  ) {
+    return this.cards.refreshOrderPayment(orderId, user);
   }
 }

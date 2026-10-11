@@ -298,7 +298,10 @@ export const storeCheckout = async (payload: {
   name: string;
   email: string;
   phone?: string;
-  paymentMethodId: string;
+  /** §5a — absent quand `payWithWallet` (règlement par solde, exclusif). */
+  paymentMethodId?: string;
+  /** GO revue §5a — vrai choix « Solde du portefeuille » (client connecté). */
+  payWithWallet?: boolean;
   options?: Array<{ optionId: string; choiceId: string }>;
   addonIds?: string[];
   extraFields?: Record<string, string>;
@@ -323,9 +326,9 @@ export const storeCheckout = async (payload: {
    *  toute commande payante (omission → 409 PRICING_CHANGED, raison
    *  ACCEPTANCE_REQUIRED ; gratuit à 0 : facultatif). Le tunnel web les envoie
    *  TOUJOURS depuis le dernier `/store/quote` — jamais de valeur calculée
-   *  côté client. */
+   *  côté client. `null` = règlement par solde (§5a). */
   acceptedCurrency?: string;
-  acceptedPaymentMethodId?: string;
+  acceptedPaymentMethodId?: string | null;
   acceptedQuoteKey?: string;
 }): Promise<ApiResult> => {
   // Tunnel de commande UNIQUE (Bloc 2) : le checkout API reconnaît le client via
@@ -775,6 +778,9 @@ export const createAdminRefund = (
     amountCents: number;
     reason?: string;
     issueCreditNote?: boolean;
+    /** GO revue §5c — `EXTERNAL_CARD` pour une commande réglée par carte
+     *  (vers la carte, zéro mouvement portefeuille) ; défaut WALLET_CREDIT. */
+    kind?: 'WALLET_CREDIT' | 'EXTERNAL_CARD';
   },
   idempotencyKey: string,
 ) =>
@@ -803,6 +809,9 @@ export interface AdminPaymentMethod {
   feeType: string;
   feePercent: string | null;
   feeFixedCents: number;
+  /** État calculé côté serveur (jamais une interprétation client). */
+  state?: 'disabled' | 'incomplete' | 'operational';
+  stateReason?: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -2903,9 +2912,22 @@ export const CARD_PAYMENT_TONE: Record<string, 'green' | 'amber' | 'red' | 'neut
  * même onglet). Le serveur rejoue alors la MÊME session : jamais de seconde
  * intention pour la même tentative. Effacée dès que le parcours est tranché
  * (paiement constaté, échec, expiration, annulation).
+ *
+ * GO revue §5d — l'intention est liée au CLIENT (userId), au PARCOURS
+ * (`flow`) et à la DEVISE, pas au seul montant : un changement de compte ou
+ * de devise ne réutilise JAMAIS la clé d'une autre intention. Si le
+ * sessionStorage est indisponible, la clé retombe sur une copie MÉMOIRE du
+ * module (même page) : une opération non résolue ne déclenche jamais une
+ * NOUVELLE intention faute de stockage.
  */
 export interface TopupAttempt {
   amountCents: number;
+  /** Devise de l'intention (ex. « USD ») — jamais réutilisée en EUR. */
+  currency: string;
+  /** Compte propriétaire (Me.id) — un changement de compte = NOUVELLE clé. */
+  userId: string;
+  /** Parcours (« topup ») — le règlement de commande suit son propre chemin. */
+  flow: 'topup';
   key: string;
   /** Référence rattachée après ouverture (pour effacer la BONNE tentative). */
   reference?: string;
@@ -2913,31 +2935,70 @@ export interface TopupAttempt {
 
 const TOPUP_ATTEMPT_STORAGE = 'icode-topup-attempt';
 
+/** Repli mémoire (même page) quand le sessionStorage est refusé/cassé. */
+let memoryTopupAttempt: TopupAttempt | null = null;
+
 export function readTopupAttempt(): TopupAttempt | null {
-  if (typeof window === 'undefined') return null;
-  try {
-    const raw = window.sessionStorage.getItem(TOPUP_ATTEMPT_STORAGE);
-    return raw ? (JSON.parse(raw) as TopupAttempt) : null;
-  } catch {
-    return null;
+  if (typeof window !== 'undefined') {
+    try {
+      const raw = window.sessionStorage.getItem(TOPUP_ATTEMPT_STORAGE);
+      if (raw) {
+        const parsed = JSON.parse(raw) as TopupAttempt;
+        // Anti-corruption : un ancien format (montant seul) n'est jamais cru.
+        if (
+          typeof parsed?.key === 'string' &&
+          typeof parsed?.amountCents === 'number' &&
+          typeof parsed?.currency === 'string' &&
+          typeof parsed?.userId === 'string' &&
+          parsed?.flow === 'topup'
+        ) {
+          return parsed;
+        }
+      }
+    } catch {
+      // stockage indisponible → repli mémoire
+    }
   }
+  return memoryTopupAttempt;
 }
 
 export function writeTopupAttempt(attempt: TopupAttempt): void {
+  memoryTopupAttempt = attempt;
   if (typeof window === 'undefined') return;
   try {
     window.sessionStorage.setItem(TOPUP_ATTEMPT_STORAGE, JSON.stringify(attempt));
   } catch {
-    // stockage indisponible : la clé retombe sur l'éphémère de `createCardTopup`
+    // stockage indisponible : la copie mémoire sert de vérité pour cette page
+    // (jamais de clé fraîche à chaque appel pour la MÊME tentative).
   }
 }
 
-/** Clé de la tentative en cours pour ce montant (créée si nécessaire). */
-export function topupAttemptKey(amountCents: number): string {
+/**
+ * Clé de la tentative en cours pour CETTE intention (créée si nécessaire).
+ * Réutilisation strictement conditionnée : montant + devise + compte + parcours.
+ */
+export function topupAttemptKey(
+  amountCents: number,
+  identity: { currency: string; userId: string },
+): string {
   const current = readTopupAttempt();
-  if (current && current.amountCents === amountCents) return current.key;
+  if (
+    current &&
+    current.amountCents === amountCents &&
+    current.currency === identity.currency &&
+    current.userId === identity.userId &&
+    current.flow === 'topup'
+  ) {
+    return current.key;
+  }
   const key = `web-topup-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
-  writeTopupAttempt({ amountCents, key });
+  writeTopupAttempt({
+    amountCents,
+    currency: identity.currency,
+    userId: identity.userId,
+    flow: 'topup',
+    key,
+  });
   return key;
 }
 
@@ -2952,6 +3013,7 @@ export function clearTopupAttempt(reference?: string): void {
   const current = readTopupAttempt();
   if (!current) return;
   if (reference && current.reference && current.reference !== reference) return;
+  memoryTopupAttempt = null;
   if (typeof window === 'undefined') return;
   try {
     window.sessionStorage.removeItem(TOPUP_ATTEMPT_STORAGE);
@@ -2999,6 +3061,92 @@ export const refreshMyCardTopup = (t: string, reference: string) =>
     { method: 'POST' },
   ) as Promise<ApiResult<CardTopup>>;
 
+// ── lot « paiement direct des commandes » + réglages des moyens ──────────
+
+/** Vue CLIENT d'un paiement carte — identique pour recharge et règlement de
+ *  commande (`kind` reste interne : jamais exposé au client). */
+export type CardPaymentView = CardTopup;
+
+/** Parcours de paiement activés (GET /store/payment-capabilities — PUBLIC).
+ *  Maschage UI uniquement : chaque opération est ENCORE gate côté serveur.
+ *  GO revue §5b : les 3 interrupteurs BRUTS + la disponibilité EFFECTIVE de
+ *  la carte (connecteur réellement résolvable, ligne CARTE active, devise). */
+export interface PaymentCapabilities {
+  walletPaymentEnabled: boolean;
+  cardOrderPaymentEnabled: boolean;
+  cardTopupEnabled: boolean;
+  cardAvailable?: boolean;
+  cardCurrencies?: string[];
+  cardUnavailableReason?: string | null;
+}
+
+export async function getPaymentCapabilities(): Promise<PaymentCapabilities | null> {
+  try {
+    const res = await fetch('/api/store/payment-capabilities', {
+      headers: { 'Content-Type': 'application/json' },
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as PaymentCapabilities;
+  } catch {
+    return null;
+  }
+}
+
+let orderCardSeq = 0;
+
+/** Ouvre (ou relance) le règlement d'UNE commande par carte — montant et
+ *  devise lus côté serveur sur la commande, jamais envoyés par le client. */
+export const createOrderCardPayment = (
+  t: string,
+  orderId: string,
+  idempotencyKey?: string,
+): Promise<ApiResult<CardPaymentView>> => {
+  const key =
+    idempotencyKey ??
+    `web-orderpay-${Date.now().toString(36)}-${(orderCardSeq += 1).toString(36)}`;
+  return apiJson(
+    `/api/client/payments/orders/${encodeURIComponent(orderId)}/card`,
+    t,
+    {
+      method: 'POST',
+      body: JSON.stringify({}),
+      headers: { 'Idempotency-Key': key },
+    },
+  ) as Promise<ApiResult<CardPaymentView>>;
+};
+
+/** Dernière tentative de règlement carte d'une commande (polling UI). */
+export const getOrderCardPayment = (t: string, orderId: string) =>
+  apiJson(
+    `/api/client/payments/orders/${encodeURIComponent(orderId)}/card`,
+    t,
+  ) as Promise<ApiResult<CardPaymentView | null>>;
+
+/** Retour de la page hébergée : le SERVEUR relit le prestataire (jamais le
+ *  navigateur) puis confirme la commande si le paiement est constaté. */
+export const refreshOrderCardPayment = (t: string, orderId: string) =>
+  apiJson(
+    `/api/client/payments/orders/${encodeURIComponent(orderId)}/card/refresh`,
+    t,
+    { method: 'POST' },
+  ) as Promise<ApiResult<CardPaymentView>>;
+
+/** ADMIN — états des moyens de paiement (GET /store/admin/payment-settings). */
+export const getPaymentSettings = (t: string) =>
+  apiJson('/api/store/admin/payment-settings', t) as Promise<
+    ApiResult<PaymentCapabilities>
+  >;
+
+/** ADMIN — PATCH des trois interrupteurs (audité côté serveur). */
+export const updatePaymentSettings = (
+  t: string,
+  body: Partial<PaymentCapabilities>,
+) =>
+  apiJson('/api/store/admin/payment-settings', t, {
+    method: 'PATCH',
+    body: JSON.stringify(body),
+  }) as Promise<ApiResult<PaymentCapabilities>>;
+
 // ── ADMIN ────────────────────────────────────────────────────────────────
 
 export interface ProviderMaskedView {
@@ -3038,6 +3186,10 @@ export interface AdminCardPayment extends CardTopup {
   walletTransactionId: string | null;
   customerId: string;
   customerEmail: string | null;
+  /** GO revue §5c — TOPUP (recharge) vs ORDER (règlement de commande). */
+  kind: string;
+  /** Commande réglée par ce paiement (null = recharge de portefeuille). */
+  orderId: string | null;
   updatedAt: string;
 }
 

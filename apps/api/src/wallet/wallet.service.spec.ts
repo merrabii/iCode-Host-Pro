@@ -31,10 +31,10 @@ describe('WalletService — C2 (crédit/débit atomiques, idempotence, anti-nég
     user: { findUnique: jest.Mock };
     walletTransaction: { findUnique: jest.Mock; create: jest.Mock; updateMany: jest.Mock };
   };
-  let lockRows: { walletBalanceCents: number }[];
+  let lockRows: { walletBalanceCents: number; walletCurrency?: string }[];
 
   beforeEach(() => {
-    lockRows = [{ walletBalanceCents: 0 }];
+    lockRows = [{ walletBalanceCents: 0, walletCurrency: 'USD' }];
     tx = {
       $queryRaw: jest.fn(() => lockRows),
       walletTransaction: {
@@ -61,9 +61,13 @@ describe('WalletService — C2 (crédit/débit atomiques, idempotence, anti-nég
   });
 
   it('credit : verrou + création SUCCEEDED + incrément (balance retournée)', async () => {
-    lockRows = [{ walletBalanceCents: 500 }];
+    lockRows = [{ walletBalanceCents: 500, walletCurrency: 'USD' }];
     tx.customer.update.mockImplementation(() => ({ walletBalanceCents: 1300 }));
-    const res = await service.credit('cust1', { amountCents: 800, idempotencyKey: 'k1' });
+    const res = await service.credit('cust1', {
+      amountCents: 800,
+      idempotencyKey: 'k1',
+      currency: 'USD',
+    });
     expect(res).toEqual({ balanceCents: 1300, replayed: false });
     expect(tx.$queryRaw).toHaveBeenCalledTimes(1);
     expect(tx.walletTransaction.create).toHaveBeenCalledWith(
@@ -84,9 +88,13 @@ describe('WalletService — C2 (crédit/débit atomiques, idempotence, anti-nég
   });
 
   it('debit suffisant : décrément + ligne DEBIT', async () => {
-    lockRows = [{ walletBalanceCents: 1000 }];
+    lockRows = [{ walletBalanceCents: 1000, walletCurrency: 'USD' }];
     tx.customer.update.mockImplementation(() => ({ walletBalanceCents: 700 }));
-    const res = await service.debit('cust1', { amountCents: 300, idempotencyKey: 'k2' });
+    const res = await service.debit('cust1', {
+      amountCents: 300,
+      idempotencyKey: 'k2',
+      currency: 'USD',
+    });
     expect(res.balanceCents).toBe(700);
     expect(tx.customer.update).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -96,16 +104,16 @@ describe('WalletService — C2 (crédit/débit atomiques, idempotence, anti-nég
   });
 
   it('debit insuffisant → 409, AUCUNE écriture (solde jamais négatif)', async () => {
-    lockRows = [{ walletBalanceCents: 100 }];
+    lockRows = [{ walletBalanceCents: 100, walletCurrency: 'USD' }];
     await expect(
-      service.debit('cust1', { amountCents: 300, idempotencyKey: 'k3' }),
+      service.debit('cust1', { amountCents: 300, idempotencyKey: 'k3', currency: 'USD' }),
     ).rejects.toBeInstanceOf(ConflictException);
     expect(tx.walletTransaction.create).not.toHaveBeenCalled();
     expect(tx.customer.update).not.toHaveBeenCalled();
   });
 
   it('rejeu P2002 (même clé, même client) → replay neutre, pas de 2e écriture', async () => {
-    lockRows = [{ walletBalanceCents: 1000 }];
+    lockRows = [{ walletBalanceCents: 1000, walletCurrency: 'USD' }];
     // Q-A (item 2) : le rejeu n'est accepté que si l'IDENTITÉ complète est la
     // même (sens, montant, devise, statut abouti, liens commande/facture).
     prisma.walletTransaction.findUnique.mockResolvedValue({
@@ -120,7 +128,11 @@ describe('WalletService — C2 (crédit/débit atomiques, idempotence, anti-nég
     });
     prisma.customer.findUnique.mockResolvedValue({ walletBalanceCents: 700 });
     tx.walletTransaction.create.mockImplementation(p2002);
-    const res = await service.debit('cust1', { amountCents: 300, idempotencyKey: 'k2' });
+    const res = await service.debit('cust1', {
+      amountCents: 300,
+      idempotencyKey: 'k2',
+      currency: 'USD',
+    });
     expect(res).toEqual({ balanceCents: 700, replayed: true });
     expect(tx.walletTransaction.create).not.toHaveBeenCalled();
     expect(tx.customer.update).not.toHaveBeenCalled();
@@ -130,7 +142,7 @@ describe('WalletService — C2 (crédit/débit atomiques, idempotence, anti-nég
     prisma.walletTransaction.findUnique.mockResolvedValue({ customerId: 'autre' });
     tx.walletTransaction.create.mockImplementation(p2002);
     await expect(
-      service.credit('cust1', { amountCents: 100, idempotencyKey: 'k-x' }),
+      service.credit('cust1', { amountCents: 100, idempotencyKey: 'k-x', currency: 'USD' }),
     ).rejects.toBeInstanceOf(ConflictException);
   });
 
@@ -146,7 +158,7 @@ describe('WalletService — C2 (crédit/débit atomiques, idempotence, anti-nég
       reference: null,
     });
     await expect(
-      service.debit('cust1', { amountCents: 300, idempotencyKey: 'k2' }),
+      service.debit('cust1', { amountCents: 300, idempotencyKey: 'k2', currency: 'USD' }),
     ).rejects.toBeInstanceOf(ConflictException);
     expect(tx.walletTransaction.create).not.toHaveBeenCalled();
     expect(tx.customer.update).not.toHaveBeenCalled();
@@ -155,7 +167,11 @@ describe('WalletService — C2 (crédit/débit atomiques, idempotence, anti-nég
   it('montants invalides (0, négatif, décimal) → 400, jamais écrit', async () => {
     for (const amountCents of [0, -5, 12.5]) {
       await expect(
-        service.credit('cust1', { amountCents, idempotencyKey: `k-${amountCents}` }),
+        service.credit('cust1', {
+          amountCents,
+          idempotencyKey: `k-${amountCents}`,
+          currency: 'USD',
+        }),
       ).rejects.toBeInstanceOf(BadRequestException);
     }
     expect(tx.customer.update).not.toHaveBeenCalled();
@@ -164,7 +180,7 @@ describe('WalletService — C2 (crédit/débit atomiques, idempotence, anti-nég
   it('dossier inconnu (verrou vide) → 404', async () => {
     lockRows = [];
     await expect(
-      service.credit('ghost', { amountCents: 100, idempotencyKey: 'k4' }),
+      service.credit('ghost', { amountCents: 100, idempotencyKey: 'k4', currency: 'USD' }),
     ).rejects.toBeInstanceOf(NotFoundException);
     expect(tx.walletTransaction.create).not.toHaveBeenCalled();
   });
@@ -183,7 +199,9 @@ describe('WalletService — C2 (crédit/débit atomiques, idempotence, anti-nég
       );
       return run;
     });
-    tx.$queryRaw.mockImplementation(() => [{ walletBalanceCents: balance }]);
+    tx.$queryRaw.mockImplementation(() => [
+      { walletBalanceCents: balance, walletCurrency: 'USD' },
+    ]);
     tx.customer.update.mockImplementation(() => {
       balance -= 400;
       creates += 1;
@@ -192,7 +210,7 @@ describe('WalletService — C2 (crédit/débit atomiques, idempotence, anti-nég
 
     const results = await Promise.allSettled(
       Array.from({ length: 5 }, (_, i) =>
-        service.debit('cust1', { amountCents: 400, idempotencyKey: `race-${i}` }),
+        service.debit('cust1', { amountCents: 400, idempotencyKey: `race-${i}`, currency: 'USD' }),
       ),
     );
     const ok = results.filter((r) => r.status === 'fulfilled');
@@ -241,6 +259,66 @@ describe('WalletService — C2 (crédit/débit atomiques, idempotence, anti-nég
     expect(tx.walletTransaction.create).toHaveBeenCalledWith(
       expect.objectContaining({ data: expect.objectContaining({ currency: 'usd' }) }),
     );
+  });
+
+  // ── GO §6 — jamais de contournement de la garde par absence de devise ─────
+
+  it('§6 : opération SANS devise (credit ou debit) → 400, zéro écriture', async () => {
+    lockRows = [{ walletBalanceCents: 1000, walletCurrency: 'USD' } as never];
+    await expect(
+      service.credit('cust1', { amountCents: 300, idempotencyKey: 'k-noccy' }),
+    ).rejects.toThrow('contournée');
+    await expect(
+      service.debit('cust1', { amountCents: 300, idempotencyKey: 'k-nocd' }),
+    ).rejects.toBeInstanceOf(BadRequestException);
+    expect(tx.walletTransaction.create).not.toHaveBeenCalled();
+    expect(tx.customer.update).not.toHaveBeenCalled();
+  });
+
+  it('§6 : devise vide ou blanche → 400 (aucun implicite)', async () => {
+    lockRows = [{ walletBalanceCents: 1000, walletCurrency: 'USD' } as never];
+    for (const currency of ['', '   ']) {
+      await expect(
+        service.credit('cust1', { amountCents: 300, idempotencyKey: `k-empty`, currency }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+    }
+    expect(tx.walletTransaction.create).not.toHaveBeenCalled();
+  });
+
+  it('§6 : devise invalide (hors code ISO 3 lettres) → 400', async () => {
+    lockRows = [{ walletBalanceCents: 1000, walletCurrency: 'USD' } as never];
+    for (const currency of ['EURO', 'US', 'USD1']) {
+      await expect(
+        service.credit('cust1', { amountCents: 300, idempotencyKey: `k-bad`, currency }),
+      ).rejects.toThrow('invalide');
+    }
+    expect(tx.walletTransaction.create).not.toHaveBeenCalled();
+  });
+
+  it('§6 : portefeuille EUR + opération SANS devise → 400 (le défaut ne contourne rien)', async () => {
+    lockRows = [{ walletBalanceCents: 1000, walletCurrency: 'EUR' } as never];
+    await expect(
+      service.credit('cust1', { amountCents: 300, idempotencyKey: 'k-eur-nc' }),
+    ).rejects.toThrow('contournée');
+    expect(tx.walletTransaction.create).not.toHaveBeenCalled();
+    expect(tx.customer.update).not.toHaveBeenCalled();
+  });
+
+  it('§6 : devise du portefeuille inconnue → 409 conservateur, zéro écriture', async () => {
+    lockRows = [{ walletBalanceCents: 1000, walletCurrency: '' } as never];
+    await expect(
+      service.credit('cust1', { amountCents: 300, idempotencyKey: 'k-unk', currency: 'USD' }),
+    ).rejects.toThrow('donnée historique ambiguë');
+    expect(tx.walletTransaction.create).not.toHaveBeenCalled();
+    expect(tx.customer.update).not.toHaveBeenCalled();
+  });
+
+  it('§6 : portefeuille EUR + opération USD → refus explicite (miroir P8)', async () => {
+    lockRows = [{ walletBalanceCents: 1000, walletCurrency: 'EUR' } as never];
+    await expect(
+      service.debit('cust1', { amountCents: 300, idempotencyKey: 'k-mirror', currency: 'USD' }),
+    ).rejects.toThrow('aucun change automatique');
+    expect(tx.walletTransaction.create).not.toHaveBeenCalled();
   });
 });
 

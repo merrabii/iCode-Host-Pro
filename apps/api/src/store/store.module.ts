@@ -11,7 +11,6 @@ import { PanelTransportFactory } from '../servers/panel-transport.factory';
 import { BillingPaymentAdminController } from './billing-payment.admin.controller';
 import { AdminBillingController } from './admin-billing.controller';
 import { AdminOrdersController } from './admin-orders.controller';
-import { AdminRefundsController } from './admin-refunds.controller';
 import { CheckoutController } from './checkout.controller';
 import { CheckoutService } from './checkout.service';
 import { ClientStoreController } from './client-store.controller';
@@ -20,7 +19,9 @@ import { DeploymentEvidenceService } from './deployment-evidence.service';
 import { InvoicePdfService } from './invoice-pdf.service';
 import { OrderCancelService } from './order-cancel.service';
 import { OrderLifecycleService } from './order-lifecycle.service';
-import { PaymentMethodsController } from './payment-methods.controller';
+import { PaymentMethodsController, PaymentCapabilitiesController } from './payment-methods.controller';
+import { PaymentSettingsAdminController } from './payment-settings.admin.controller';
+import { PaymentSettingsService } from './payment-settings.service';
 import { ProvisioningService } from './provisioning.service';
 import { ReconcileRunnerService } from './reconcile.runner.service';
 import { RefundService } from './refund.service';
@@ -58,9 +59,10 @@ import { RenewalService } from './renewal.service';
   ],
   controllers: [
     PaymentMethodsController,
+    PaymentCapabilitiesController,
+    PaymentSettingsAdminController,
     BillingPaymentAdminController,
     AdminOrdersController,
-    AdminRefundsController,
     AdminBillingController,
     ClientStoreController,
     CheckoutController,
@@ -71,6 +73,7 @@ import { RenewalService } from './renewal.service';
   ],
   providers: [
     CheckoutService,
+    PaymentSettingsService,
     InvoicePdfService,
     ProvisioningService,
     OrderCancelService,
@@ -92,6 +95,8 @@ import { RenewalService } from './renewal.service';
     SuspensionEffectsService,
   ],
   exports: [
+    CheckoutService,
+    PaymentSettingsService,
     ProvisioningService,
     OrderCancelService,
     HttpAvailabilityService,
@@ -99,6 +104,10 @@ import { RenewalService } from './renewal.service';
     DeploymentEvidenceService,
     ReconcileService,
     SuspensionEffectsService,
+    // Remboursements de commande : le contrôleur admin (module PAIEMENTS)
+    // crée via RefundService puis émet vers la carte via CardRefundsService —
+    // aucune importation store → paiements (donc aucun cycle de modules).
+    RefundService,
   ],
 })
 export class StoreModule {}

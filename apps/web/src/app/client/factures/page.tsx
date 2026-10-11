@@ -7,6 +7,7 @@ import {
   fetchMe,
   formatCents,
   getMyInvoice,
+  getPaymentCapabilities,
   getSessionToken,
   listMyInvoices,
   INVOICE_STATUS_LABEL,
@@ -15,6 +16,7 @@ import {
   type InvoiceDetail,
   type InvoiceListPage,
   type Me,
+  type PaymentCapabilities,
 } from '@/lib/api';
 import { AppShell } from '@/components/app-shell';
 import { CLIENT_NAV } from '@/config/nav';
@@ -52,6 +54,9 @@ export default function ClientInvoicesPage() {
   const [detailLoading, setDetailLoading] = useState(false);
   // Q-A (GO item 1) — règlement d'une facture UNPAID par solde (atomique).
   const [paying, setPaying] = useState(false);
+  // GO §5 — parcours activés (public). Fail-closed : `caps === null`
+  // (chargement OU échec de lecture) = aucun moyen présupposé autorisé.
+  const [caps, setCaps] = useState<PaymentCapabilities | null>(null);
 
   const load = useCallback(
     async (t: string, p: number, st: string) => {
@@ -159,6 +164,18 @@ export default function ClientInvoicesPage() {
       if (id) await openDetail(t, id);
     })();
   }, [router, load, openDetail]);
+
+  // GO §5 — lecture des capacités (endpoint PUBLIC) : seule cette réponse
+  // permet d'afficher le bouton de règlement ; échec = aucun affichage.
+  useEffect(() => {
+    let alive = true;
+    void getPaymentCapabilities().then((c) => {
+      if (alive) setCaps(c);
+    });
+    return () => {
+      alive = false;
+    };
+  }, []);
 
   const changeStatus = (v: string) => {
     setStatus(v);
@@ -334,8 +351,12 @@ export default function ClientInvoicesPage() {
                 <Badge tone={INVOICE_STATUS_TONE[detail.status] ?? 'neutral'}>
                   {INVOICE_STATUS_LABEL[detail.status] ?? detail.status}
                 </Badge>
-                {/* Q-A (item 1) — règlement par solde depuis le détail. */}
-                {detail.status === 'UNPAID' && (
+                {/* Q-A (item 1) — règlement par solde depuis le détail.
+                    Fail-closed (GO §5) : affiché UNIQUEMENT une fois la lecture
+                    des capacités réussie ET le parcours solde activé. */}
+                {detail.status === 'UNPAID' &&
+                  caps !== null &&
+                  caps.walletPaymentEnabled && (
                   <Button
                     size="sm"
                     disabled={paying}

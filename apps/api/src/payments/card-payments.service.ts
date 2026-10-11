@@ -7,17 +7,27 @@ import {
 import { ConfigService } from '@nestjs/config';
 import {
   CardPayment,
+  CardPaymentKind,
   CardPaymentStatus,
+  OrderStatus,
   Prisma,
   WalletTransactionType,
 } from '@prisma/client';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { AuditService } from '../audit/audit.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { JwtPayload } from '../auth/types';
 import { WalletService } from '../wallet/wallet.service';
+import {
+  ConfirmPaidContext,
+  ConfirmTxOutcome,
+  CheckoutService,
+} from '../store/checkout.service';
+import { PaymentSettingsService } from '../store/payment-settings.service';
 import { ConnectorSession } from './payment-connector';
 import { PaymentProviderService, ResolvedProvider } from './payment-provider.service';
+import { assertNoBlockingCardPayment } from './blocking-payment.guard';
+import { syncRefundedCents } from './refund-accounting';
 import { StripeHttpError } from './stripe-connector';
 
 export const CARD_PAYMENT_MIN_CENTS = 100;
@@ -31,12 +41,52 @@ const TERMINAL_STATUSES: CardPaymentStatus[] = [
   CardPaymentStatus.NEEDS_REVIEW,
 ];
 
+/** Statuts « encore ouverts » : une tentative de règlement en cours. */
+export const LIVE_CARD_STATUSES: CardPaymentStatus[] = [
+  CardPaymentStatus.CREATED,
+  CardPaymentStatus.PROCESSING,
+];
+
 export type ConfirmOutcome =
   | { outcome: 'credited'; reference: string; balanceCents: number }
+  | { outcome: 'settled'; reference: string; orderId: string }
   | { outcome: 'already'; reference: string }
   | { outcome: 'needs_review'; reference: string; reason: string }
   | { outcome: 'ignored'; reference: string; reason: string }
   | { outcome: 'not_found' };
+
+/** Résultat INTERNE d'une confirmation (les effets post-commit sont séparés). */
+interface ConfirmBranch {
+  outcome: ConfirmOutcome;
+  /** Confirmation commande à rejouer APRÈS commit (email, provisioning). */
+  postEffect?: { outcome: ConfirmTxOutcome; orderId: string; ctx: ConfirmPaidContext };
+}
+
+/** Entrée d'une confirmation (webhook signé ou relecture serveur). */
+export interface ConfirmPaidInput {
+  sessionRef?: string | null;
+  paymentRef?: string | null;
+  amountTotalCents?: number | null;
+  currency?: string | null;
+  livemode?: boolean | null;
+  source: 'webhook' | 'poll';
+  eventId?: string | null;
+  /** GO P1 — fournisseur qui a authentifié cette source. */
+  providerCode: string;
+  /** GO P4 — identité marchande du connecteur vérifié de cette source. */
+  merchantAccount?: string | null;
+  /** GO P4 — référence portée par l'événement (rattachement). */
+  reference?: string | null;
+}
+
+/** Commande verrouillée `FOR UPDATE` (colonnes utiles au règlement). */
+type LockedOrderRow = {
+  id: string;
+  status: OrderStatus;
+  customerId: string;
+  amountTtcCents: number;
+  currency: string;
+};
 
 export interface CardPaymentClientView {
   reference: string;
@@ -65,6 +115,10 @@ export interface CardPaymentAdminView extends CardPaymentClientView {
   walletTransactionId: string | null;
   customerId: string;
   customerEmail: string | null;
+  // GO revue §5c — le remboursement admin distingue ORDER / TOPUP : la vue
+  // expose le kind et la commande liée (UI + garde serveur).
+  kind: CardPaymentKind;
+  orderId: string | null;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -107,6 +161,8 @@ export class CardPaymentsService {
     private readonly provider: PaymentProviderService,
     private readonly audit: AuditService,
     private readonly config: ConfigService,
+    private readonly settings: PaymentSettingsService,
+    private readonly checkout: CheckoutService,
   ) {}
 
   // ── vues ────────────────────────────────────────────────────────────────
@@ -145,6 +201,8 @@ export class CardPaymentsService {
       walletTransactionId: row.walletTransactionId,
       customerId: row.customerId,
       customerEmail: row.customer?.email ?? null,
+      kind: row.kind,
+      orderId: row.orderId,
       updatedAt: row.updatedAt,
     };
   }
@@ -176,6 +234,18 @@ export class CardPaymentsService {
    */
   private static readonly IDEMPOTENCE_RETENTION_MS = 24 * 60 * 60 * 1000;
 
+  /**
+   * GO V3 §1 — durée du lease d'une tentative d'appel EN COURS : au-delà,
+   * l'inviteur peut déposséder le propriétaire (reprise contrôlée). Tant que
+   * le lease court, AUCUNE seconde émission n'est possible.
+   */
+  private static readonly DISPATCH_LEASE_MS = 60_000;
+
+  /** Jeton unique du propriétaire de la tentative d'appel en cours. */
+  private newDispatchOwner(): string {
+    return `${Date.now()}:${randomUUID()}`;
+  }
+
   private recoveryBlockedReason(row: CardPayment): string | null {
     if (!row.dispatchedAt) return null;
     const ageMs = Date.now() - row.dispatchedAt.getTime();
@@ -205,6 +275,18 @@ export class CardPaymentsService {
   }
 
   /**
+   * GO §4 — aucun NOUVEL encaissement tant qu'un paiement du client reste
+   * `UNCERTAIN` (issue non constatée) ou `NEEDS_REVIEW` avec alerte ouverte.
+   *
+   * Délègue à l'autorité UNIQUE partagée (`assertNoBlockingCardPayment`) :
+   * recharge, règlement commande par carte et règlement PAR SOLDE opposent
+   * exactement les mêmes conditions.
+   */
+  private async assertNoBlockingPayment(customerId: string): Promise<void> {
+    await assertNoBlockingCardPayment(this.prisma, customerId);
+  }
+
+  /**
    * GO P2 — MÊME clé + MÊME intention = MÊME paiement, quel que soit son état.
    * Aucune création récursive, aucune nouvelle clé, aucun second paiement.
    */
@@ -213,6 +295,11 @@ export class CardPaymentsService {
     dto: { amountCents: number; currency?: string; idempotencyKey?: string },
     idempotencyHeader?: string,
   ): Promise<CardPaymentClientView> {
+    // GATE SERVEUR (réglage admin + ligne moyen CARTE) — avant toute lecture
+    // ou écriture : le rejeu/reprise d'une intention passe par le même
+    // contrôle (émission = création), un appel API direct subit le même 409.
+    await this.settings.assertEnabled('cardTopup');
+    await this.settings.assertCardMethodActive();
     const customer = await this.wallet.ensureOwnedCustomer(user);
 
     if (
@@ -254,6 +341,11 @@ export class CardPaymentsService {
       }
       return this.toClientView(existing);
     }
+
+    // GO §4 — un résultat non établi (UNCERTAIN / alerte ouverte) bloque tout
+    // NOUVEL encaissement du client (le rejeu d'une intention EXISTANTE,
+    // traité ci-dessus, reste autorisé pour établir son issue).
+    await this.assertNoBlockingPayment(customer.id);
 
     const resolved = await this.provider.resolve();
     if (!resolved.currencies.includes(currency)) {
@@ -305,6 +397,202 @@ export class CardPaymentsService {
   }
 
   /**
+   * Lot « paiement direct des commandes » — ouverture (ou relance) d'un
+   * règlement PAR CARTE pour une commande, sans passer par le portefeuille.
+   *
+   *  - GATE `cardOrder` (réglage ADMIN, indépendant de la recharge) AVANT
+   *    toute écriture : un appel API direct subit le même refus 409 ;
+   *  - création sous VERROU `FOR UPDATE` de la commande → deux clics
+   *    concurrents ne créent qu'UNE tentative ;
+   *  - tentative vivante (CREATED/PROCESSING) = relance de la MÊME session
+   *    (même clé prestataire), JAMAIS de seconde session ;
+   *  - AUCUN mouvement de portefeuille : encaissement côté prestataire, puis
+   *    règlement de la commande dans `confirmPaid` (CAS unique de la commande).
+   */
+  async createOrderPayment(
+    orderId: string,
+    user: JwtPayload,
+    dto: { idempotencyKey?: string } = {},
+    idempotencyHeader?: string,
+  ): Promise<CardPaymentClientView> {
+    // GATE SERVEUR (réglage admin + ligne moyen CARTE) — avant toute lecture
+    // ou écriture : un appel API direct subit le même refus 409.
+    await this.settings.assertEnabled('cardOrder');
+    await this.settings.assertCardMethodActive();
+
+    const order = await this.prisma.order.findUnique({
+      where: { id: orderId },
+      include: { customer: { select: { id: true, userId: true } } },
+    });
+    if (!order || !order.customer.userId || order.customer.userId !== user.sub) {
+      throw new NotFoundException('Commande introuvable.');
+    }
+    if (order.status !== OrderStatus.PENDING_PAYMENT) {
+      throw new ConflictException(
+        `Commande ${order.status} : règlement par carte impossible.`,
+      );
+    }
+    const amountCents = order.amountTtcCents;
+    if (
+      !Number.isInteger(amountCents) ||
+      amountCents < CARD_PAYMENT_MIN_CENTS ||
+      amountCents > CARD_PAYMENT_MAX_CENTS
+    ) {
+      throw new BadRequestException(
+        `Montant ${amountCents} centimes hors de la plage de paiement par carte ` +
+          `(${CARD_PAYMENT_MIN_CENTS} à ${CARD_PAYMENT_MAX_CENTS} centimes).`,
+      );
+    }
+    const currency = order.currency.toUpperCase();
+    const clientKey = dto.idempotencyKey ?? idempotencyHeader;
+    const idem = clientKey ? assertPaymentIdempotencyKey(clientKey) : null;
+
+    const resolved = await this.provider.resolve();
+    if (!resolved.currencies.includes(currency)) {
+      throw new BadRequestException(
+        `Devise non autorisée par le prestataire (${resolved.currencies.join(', ')}).`,
+      );
+    }
+
+    const row = await this.prisma.$transaction(async (tx) => {
+      // Verrou commande : sérialise les tentatives concurrentes de règlement
+      // (règle de verrous : Carte puis Commande — ici la commande d'abord pour
+      // la création, `confirmPaid` prend paiement puis commande ensuite).
+      const locked = await tx.$queryRaw<{ id: string }[]>`
+        SELECT id FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
+      if (!locked.length) throw new NotFoundException('Commande introuvable.');
+
+      const cur = await tx.order.findUnique({
+        where: { id: orderId },
+        select: { status: true },
+      });
+      if (cur?.status !== OrderStatus.PENDING_PAYMENT) {
+        throw new ConflictException(
+          `Commande ${cur?.status ?? 'inconnue'} : règlement par carte impossible.`,
+        );
+      }
+
+      // Relance : une tentative encore ouverte = MÊME session.
+      const live = await tx.cardPayment.findFirst({
+        where: { orderId, status: { in: LIVE_CARD_STATUSES } },
+        orderBy: { createdAt: 'desc' },
+      });
+      if (live) {
+        if (live.amountCents !== amountCents || live.currency !== currency) {
+          throw new ConflictException(
+            'Tentative de règlement en cours incohérente avec la commande (montant/devise) : intervention requise.',
+          );
+        }
+        return live;
+      }
+
+      // Rejeu par clé client : MÊME clé = MÊME intention (jamais d'effet 2×).
+      if (idem) {
+        const prev = await tx.cardPayment.findUnique({
+          where: { idempotencyKey: idem },
+        });
+        if (prev) {
+          if (
+            prev.orderId !== orderId ||
+            prev.customerId !== order.customer.id ||
+            prev.amountCents !== amountCents ||
+            prev.currency !== currency
+          ) {
+            throw new ConflictException(
+              "Clé d'idempotence déjà utilisée pour une autre intention de paiement.",
+            );
+          }
+          return prev;
+        }
+      }
+
+      // GO §4 — blocage customer-level avant toute NOUVELLE tentative
+      // (les relances de tentative vivante / rejeu par clé ci-dessus restent
+      // autorisés : ils établissent l'issue d'une opération déjà engagée).
+      // Autorité UNIQUE partagée : recharge / commande par carte / solde.
+      await assertNoBlockingCardPayment(tx, order.customer.id);
+
+      const priorCount = await tx.cardPayment.count({ where: { orderId } });
+      const reference = await this.newReference(tx);
+      try {
+        return await tx.cardPayment.create({
+          data: {
+            reference,
+            kind: CardPaymentKind.ORDER,
+            orderId,
+            customerId: order.customer.id,
+            status: CardPaymentStatus.CREATED,
+            amountCents,
+            currency,
+            providerCode: resolved.code,
+            environment: resolved.environment,
+            merchantAccount: resolved.merchantAccount,
+            idempotencyKey: idem ?? `order:${orderId}:${priorCount}`,
+          },
+        });
+      } catch (err) {
+        if (
+          err instanceof Prisma.PrismaClientKnownRequestError &&
+          err.code === 'P2002'
+        ) {
+          throw new ConflictException(
+            "Clé d'idempotence déjà utilisée pour une autre intention de paiement.",
+          );
+        }
+        throw err;
+      }
+    });
+
+    return this.dispatchCheckout(row, user, resolved);
+  }
+
+  /** Commande du client connecté — propriété exigée (jamais d'accès par sondage). */
+  private async ownedOrder(
+    orderId: string,
+    user: JwtPayload,
+  ): Promise<{ id: string; customerId: string }> {
+    const order = await this.prisma.order.findUnique({
+      where: { id: orderId },
+      include: { customer: { select: { id: true, userId: true } } },
+    });
+    if (!order || !order.customer.userId || order.customer.userId !== user.sub) {
+      throw new NotFoundException('Commande introuvable.');
+    }
+    return { id: order.id, customerId: order.customer.id };
+  }
+
+  /** Dernière tentative de règlement carte d'une commande (pour l'UI/polling). */
+  async getOrderPayment(
+    orderId: string,
+    user: JwtPayload,
+  ): Promise<CardPaymentClientView | null> {
+    const owned = await this.ownedOrder(orderId, user);
+    const row = await this.prisma.cardPayment.findFirst({
+      where: { orderId: owned.id, customerId: owned.customerId },
+      orderBy: { createdAt: 'desc' },
+    });
+    return row ? this.toClientView(row) : null;
+  }
+
+  /**
+   * Relecture serveur après retour de la page hébergée — chemin de REPRISE
+   * (jamais d'émission) : aucun gate ici, même si le moyen vient d'être
+   * désactivé, pour conclure un paiement déjà ouvert.
+   */
+  async refreshOrderPayment(
+    orderId: string,
+    user: JwtPayload,
+  ): Promise<CardPaymentClientView> {
+    const owned = await this.ownedOrder(orderId, user);
+    const row = await this.prisma.cardPayment.findFirst({
+      where: { orderId: owned.id, customerId: owned.customerId },
+      orderBy: { createdAt: 'desc' },
+    });
+    if (!row) throw new NotFoundException('Paiement introuvable.');
+    return this.refreshFromProvider(row.reference, user);
+  }
+
+  /**
    * GO P3 — appel prestataire encadré :
    *  1. identité de l'opération COMMITEE avant le réseau (`DISPATCHED`) ;
    *  2. réponse obtenue → références persistées (`RESOLVED`) ;
@@ -347,15 +635,87 @@ export class CardPaymentsService {
       );
     }
 
+    const isOrder = row.kind === CardPaymentKind.ORDER;
     const webOrigin = (
       this.config.get<string>('WEB_ORIGIN') ?? 'http://localhost:3000'
     ).replace(/\/+$/, '');
 
+    // Destinataire de retour : recharge = portefeuille ; règlement d'une
+    // commande = page de succès du tunnel (orderId + référence affichés).
+    const backTo = isOrder
+      ? `/checkout/success?orderId=${encodeURIComponent(row.orderId ?? '')}&ref=${encodeURIComponent(row.reference)}`
+      : `/client/portefeuille/paiement?ref=${encodeURIComponent(row.reference)}`;
+    const backToCancel = isOrder
+      ? `/checkout/payment?orderId=${encodeURIComponent(row.orderId ?? '')}&ref=${encodeURIComponent(row.reference)}&canceled=1`
+      : `/client/portefeuille/paiement?ref=${encodeURIComponent(row.reference)}&canceled=1`;
+
+    const customerEmail = isOrder
+      ? (
+          await this.prisma.order.findUnique({
+            where: { id: row.orderId! },
+            select: { customerEmail: true },
+          })
+        )?.customerEmail ?? ''
+      : (await this.wallet.ensureOwnedCustomer(user)).email;
+
     // 1. Identité de l'opération persistée AVANT le premier octet réseau.
-    await this.prisma.cardPayment.update({
-      where: { id: row.id },
-      data: { providerCallState: 'DISPATCHED', dispatchedAt: new Date() },
+    // GO §4 — `dispatchedAt` est le PREMIER envoi et reste IMMUABLE : chaque
+    // reprise ne réécrit pas la fenêtre de 24 h de la reprise automatique.
+    await this.prisma.cardPayment.updateMany({
+      where: { id: row.id, dispatchedAt: null },
+      data: { dispatchedAt: new Date() },
     });
+    // GO V3 §1 — revendication EXCLUSIVE : un seul propriétaire émet à la
+    // fois. La première revendication n'entre que sur une ligne JAMAIS
+    // dispatchée (`providerCallState: null` + aucun propriétaire) ; une
+    // tentative interrompue (`DISPATCHED` dont le lease est expiré) ou une
+    // issue `UNCERTAIN` (appel terminé sans conclusion) est dépossédée par
+    // CAS conditionné aux valeurs OBSERVÉES (jamais à l'aveugle). Tant qu'un
+    // lease court, AUCUNE seconde émission n'est possible.
+    const owner = this.newDispatchOwner();
+    const now = new Date();
+    let claimed = await this.prisma.cardPayment.updateMany({
+      where: { id: row.id, providerCallState: null, dispatchOwner: null },
+      data: {
+        providerCallState: 'DISPATCHED',
+        dispatchOwner: owner,
+        dispatchClaimedAt: now,
+      },
+    });
+    if (claimed.count !== 1) {
+      const fresh = await this.prisma.cardPayment.findUnique({ where: { id: row.id } });
+      if (!fresh) throw new NotFoundException('Paiement introuvable.');
+      if (fresh.providerCallState === 'RESOLVED') return this.toClientView(fresh);
+      // Reprise bornée : UNCERTAIN (issue non tranchée) OU DISPATCHED dont le
+      // lease est expiré (tentative interrompue, plus personne n'émet).
+      const leaseExpired =
+        now.getTime() - (fresh.dispatchClaimedAt?.getTime() ?? 0) >=
+        CardPaymentsService.DISPATCH_LEASE_MS;
+      if (
+        fresh.providerCallState === 'UNCERTAIN' ||
+        (fresh.providerCallState === 'DISPATCHED' && leaseExpired)
+      ) {
+        claimed = await this.prisma.cardPayment.updateMany({
+          where: {
+            id: fresh.id,
+            providerCallState: fresh.providerCallState,
+            dispatchOwner: fresh.dispatchOwner,
+            dispatchClaimedAt: fresh.dispatchClaimedAt,
+          },
+          data: {
+            providerCallState: 'DISPATCHED',
+            dispatchOwner: owner,
+            dispatchClaimedAt: now,
+          },
+        });
+      }
+      if (claimed.count !== 1) {
+        // Lease encore courant (tentative vivante chez un pair) OU course perdue :
+        // retour de l'état RÉEL, AUCUN octet réseau émis par ce chemin.
+        const latest = await this.prisma.cardPayment.findUnique({ where: { id: row.id } });
+        return this.toClientView(latest ?? fresh);
+      }
+    }
 
     let session: ConnectorSession;
     try {
@@ -363,37 +723,47 @@ export class CardPaymentsService {
         reference: row.reference,
         amountCents: row.amountCents,
         currency: row.currency.toLowerCase(),
-        customerEmail: (await this.wallet.ensureOwnedCustomer(user)).email,
-        successUrl: `${webOrigin}/client/portefeuille/paiement?ref=${encodeURIComponent(row.reference)}`,
-        cancelUrl: `${webOrigin}/client/portefeuille/paiement?ref=${encodeURIComponent(row.reference)}&canceled=1`,
-        metadata: { reference: row.reference, customerId: row.customerId },
+        customerEmail,
+        successUrl: `${webOrigin}${backTo}`,
+        cancelUrl: `${webOrigin}${backToCancel}`,
+        metadata: {
+          reference: row.reference,
+          customerId: row.customerId,
+          kind: row.kind,
+          ...(row.orderId ? { orderId: row.orderId } : {}),
+        },
         // Clé STABLE par opération : toute reprise = même session prestataire.
-        idempotencyKey: `topup:${row.reference}`,
+        idempotencyKey: `${isOrder ? 'orderpay' : 'topup'}:${row.reference}`,
       });
     } catch (err) {
-      return this.handleDispatchFailure(row, user, err);
+      return this.handleDispatchFailure(row, user, err, owner);
     }
 
-    let updated: CardPayment;
+    // GO revue §3d + V3 §1 — issue BORNÉE par CAS (`updateMany` = WhereInput
+    // complet + nombre de lignes franchis) sur le PROPRIÉTAIRE courant : la
+    // réponse n'est persistée que si CET appel est toujours propriétaire
+    // (jamais l'issue d'un pair, jamais un rejeu dépossédé).
+    const written = {
+      providerSessionRef: session.sessionRef,
+      providerPaymentRef: session.paymentRef,
+      checkoutUrl: session.checkoutUrl,
+      livemode: session.livemode,
+      expiresAt: session.expiresAt,
+      providerCallState: 'RESOLVED' as const,
+    };
+    let cas: { count: number };
     try {
-      updated = await this.prisma.cardPayment.update({
-        where: { id: row.id },
-        data: {
-          providerSessionRef: session.sessionRef,
-          providerPaymentRef: session.paymentRef,
-          checkoutUrl: session.checkoutUrl,
-          livemode: session.livemode,
-          expiresAt: session.expiresAt,
-          providerCallState: 'RESOLVED',
-        },
+      cas = await this.prisma.cardPayment.updateMany({
+        where: { id: row.id, dispatchOwner: owner, providerCallState: 'DISPATCHED' },
+        data: written,
       });
-    } catch (err) {
+    } catch {
       // GO P3 — échec de PERSISTANCE après création chez le prestataire :
-      // la clé `topup:<référence>` est déjà consommée, la reprise (même clé)
+      // la clé `<kind>:<référence>` est déjà consommée, la reprise (même clé)
       // obtient la MÊME session. Aucune seconde création.
       await this.prisma.cardPayment
-        .update({
-          where: { id: row.id },
+        .updateMany({
+          where: { id: row.id, dispatchOwner: owner, providerCallState: 'DISPATCHED' },
           data: { providerCallState: 'UNCERTAIN' },
         })
         .catch(() => undefined);
@@ -401,7 +771,9 @@ export class CardPaymentsService {
         .record({
           actorId: user.sub,
           actorEmail: user.email,
-          action: 'payment.topup.persistence_failed',
+          action: isOrder
+            ? 'payment.order.persistence_failed'
+            : 'payment.topup.persistence_failed',
           resourceType: 'cardPayment',
           resourceId: row.id,
           details: { reference: row.reference, handling: 'reprise_meme_cle' },
@@ -412,18 +784,29 @@ export class CardPaymentsService {
           'relancez la recharge (même intention) pour reprendre sans double création.',
       );
     }
+    if (cas.count !== 1) {
+      // GO revue §3d — réponse TARDIVE : une issue concurrente est déjà
+      // persistée → retour de l'état RÉEL, AUCUN écrasement, aucun effet.
+      const fresh = await this.prisma.cardPayment.findUnique({ where: { id: row.id } });
+      return this.toClientView(fresh ?? row);
+    }
+    const fresh = await this.prisma.cardPayment.findUnique({ where: { id: row.id } });
+    const updated: CardPayment =
+      fresh && fresh.providerCallState === 'RESOLVED' ? fresh : { ...row, ...written };
 
     await this.audit
       .record({
         actorId: user.sub,
         actorEmail: user.email,
-        action: 'payment.topup.create',
+        action: isOrder ? 'payment.order.create' : 'payment.topup.create',
         resourceType: 'cardPayment',
         resourceId: row.id,
         details: {
           reference: row.reference,
           amountCents: row.amountCents,
           currency: row.currency,
+          kind: row.kind,
+          ...(row.orderId ? { orderId: row.orderId } : {}),
           providerCode: resolved.code,
           environment: resolved.environment,
         },
@@ -433,12 +816,19 @@ export class CardPaymentsService {
     return this.toClientView(updated);
   }
 
-  /** GO P3 — classement honnête de l'échec d'appel (jamais « FAILED » à tort). */
+  /** GO P3 + §4 — classement honnête de l'échec d'appel (jamais « FAILED » à tort). */
   private isUncertainDispatchError(err: unknown): boolean {
     if (err instanceof StripeHttpError) {
       if (typeof err.status === 'number') {
         if (err.status === 0) return true; // réseau/timeout : peut être arrivé
         if (err.status >= 500) return true; // 5xx : traité ou non, indécidable
+        // GO §4 — 408 (timeout côté serveur) et 429 (rate limit) ne prouvent
+        // JAMAIS que la requête n'a rien créé : résultat incertain.
+        if (err.status === 408 || err.status === 429) return true;
+        // GO V3 §1 — un 409 (conflit, souvent idempotence) n'est JAMAIS
+        // classé comme preuve d'absence de création sur le seul statut HTTP :
+        // la demande a pu être créée sous une autre tentative → incertain.
+        if (err.status === 409) return true;
         return false; // 4xx : refus certain, rien n'a été créé
       }
       return false; // refus qualifié par le prestataire sans code HTTP
@@ -457,23 +847,34 @@ export class CardPaymentsService {
     row: CardPayment,
     user: JwtPayload,
     err: unknown,
+    owner: string,
   ): Promise<CardPaymentClientView> {
     const message =
       err instanceof StripeHttpError || err instanceof Error
         ? err.message
         : String(err);
     const uncertain = this.isUncertainDispatchError(err);
+    const auditPrefix = row.kind === CardPaymentKind.ORDER ? 'payment.order' : 'payment.topup';
 
     if (uncertain) {
-      await this.prisma.cardPayment.update({
-        where: { id: row.id },
+      // GO revue §3d + V3 §1 + GO V5 §1 — CAS borné au PROPRIÉTAIRE courant
+      // ET à l'état encore admissible (`DISPATCHED` = en vol) : une décision
+      // webhook déjà établie (`RESOLVED` — confirmation SUCCEEDED/FAILED/
+      // EXPIRED) n'est JAMAIS dégradée à `UNCERTAIN` par une réponse tardive,
+      // même si la revendication n'a pas encore été invalidée.
+      const cas = await this.prisma.cardPayment.updateMany({
+        where: { id: row.id, dispatchOwner: owner, providerCallState: 'DISPATCHED' },
         data: { providerCallState: 'UNCERTAIN' },
       });
+      if (cas.count !== 1) {
+        const settled = await this.prisma.cardPayment.findUnique({ where: { id: row.id } });
+        return this.toClientView(settled ?? row);
+      }
       await this.audit
         .record({
           actorId: user.sub,
           actorEmail: user.email,
-          action: 'payment.topup.dispatch_uncertain',
+          action: `${auditPrefix}.dispatch_uncertain`,
           resourceType: 'cardPayment',
           resourceId: row.id,
           details: { reference: row.reference, reason: message.slice(0, 300) },
@@ -486,8 +887,12 @@ export class CardPaymentsService {
       return this.toClientView(fresh ?? row);
     }
 
-    await this.prisma.cardPayment.update({
-      where: { id: row.id },
+    // GO revue §3d + V3 §1 + GO V5 §1 — refus certain CAS borné au
+    // PROPRIÉTAIRE courant ET à l'état encore admissible : une confirmation
+    // webhook (`RESOLVED`) n'est JAMAIS convertie en `FAILED` par un refus
+    // réseau tardif — le crédit déjà enregistré reste intact.
+    const failCas = await this.prisma.cardPayment.updateMany({
+      where: { id: row.id, dispatchOwner: owner, providerCallState: 'DISPATCHED' },
       data: {
         status: CardPaymentStatus.FAILED,
         providerCallState: 'RESOLVED',
@@ -495,11 +900,17 @@ export class CardPaymentsService {
         failureMessage: message.slice(0, 500),
       },
     });
+    if (failCas.count !== 1) {
+      // Réponse TARDIVE : issue concurrente déjà tranchée → retour de l'état
+      // RÉEL, sans audit « create_failed » mensonger.
+      const fresh = await this.prisma.cardPayment.findUnique({ where: { id: row.id } });
+      return this.toClientView(fresh ?? row);
+    }
     await this.audit
       .record({
         actorId: user.sub,
         actorEmail: user.email,
-        action: 'payment.topup.create_failed',
+        action: `${auditPrefix}.create_failed`,
         resourceType: 'cardPayment',
         resourceId: row.id,
         details: { reference: row.reference, reason: message.slice(0, 300) },
@@ -519,10 +930,12 @@ export class CardPaymentsService {
       .catch(() => undefined);
   }
 
-  private async newReference(): Promise<string> {
+  private async newReference(
+    client: Prisma.TransactionClient | PrismaService = this.prisma,
+  ): Promise<string> {
     for (let attempt = 0; attempt < 5; attempt++) {
       const reference = `CDP-${randomBytes(5).toString('hex').toUpperCase()}`;
-      const clash = await this.prisma.cardPayment.findUnique({
+      const clash = await client.cardPayment.findUnique({
         where: { reference },
         select: { id: true },
       });
@@ -569,10 +982,20 @@ export class CardPaymentsService {
   ): Promise<CardPaymentClientView> {
     const row = await this.ownedRow(reference, user);
 
-    // GO P3 — appel resté incertain (ou échec de persistance) : la relecture
-    // rejoue d'abord la CRÉATION avec la MÊME clé `topup:<référence>` →
-    // MÊME session chez le prestataire, jamais une seconde.
+    // GO P3 + §5 — appel resté incertain (ou échec de persistance) : la
+    // relecture rejoue d'abord la CRÉATION avec la MÊME clé `topup:<référence>`
+    // → MÊME session chez le prestataire, jamais une seconde.
     if (this.needsProviderDispatch(row)) {
+      // GO §5 — une PREMIÈRE émission (jamais envoyée) subit le gate du
+      // moyen : désactiver le parcours (réglage OU ligne moyen CARTE) bloque
+      // aussi ce rejeu. Une opération DÉJÀ émise (reprise d'issue) reste
+      // autorisée sans gate : établir l'issue prime sur la désactivation.
+      if (!row.dispatchedAt && !row.checkoutUrl) {
+        await this.settings.assertEnabled(
+          row.kind === CardPaymentKind.ORDER ? 'cardOrder' : 'cardTopup',
+        );
+        await this.settings.assertCardMethodActive();
+      }
       const resolved = await this.provider.resolveFor({
         providerCode: row.providerCode,
         merchantAccount: row.merchantAccount,
@@ -641,45 +1064,34 @@ export class CardPaymentsService {
    * GO P4 — un montant ou une devise ABSENTS de la source = preuve incomplète
    * → `needs_review` (jamais de crédit sur une déclaration partielle).
    */
-  async confirmPaid(input: {
-    sessionRef?: string | null;
-    paymentRef?: string | null;
-    amountTotalCents?: number | null;
-    currency?: string | null;
-    livemode?: boolean | null;
-    source: 'webhook' | 'poll';
-    eventId?: string | null;
-    /** GO P1 — fournisseur qui a authentifié cette source. */
-    providerCode: string;
-    /** GO P4 — identité marchande du connecteur vérifié de cette source. */
-    merchantAccount?: string | null;
-    /** GO P4 — référence portée par l'événement (rattachement). */
-    reference?: string | null;
-  }): Promise<ConfirmOutcome> {
+  async confirmPaid(input: ConfirmPaidInput): Promise<ConfirmOutcome> {
     if (!input.sessionRef && !input.paymentRef) return { outcome: 'not_found' };
 
-    return this.prisma.$transaction(async (tx) => {
+    const branch = await this.prisma.$transaction(
+      async (tx): Promise<ConfirmBranch> => {
       const rows =
         input.sessionRef != null
           ? await tx.$queryRaw<CardPayment[]>`
             SELECT * FROM "CardPayment" WHERE "providerSessionRef" = ${input.sessionRef} FOR UPDATE`
           : await tx.$queryRaw<CardPayment[]>`
             SELECT * FROM "CardPayment" WHERE "providerPaymentRef" = ${input.paymentRef} FOR UPDATE`;
-      if (rows.length === 0) return { outcome: 'not_found' as const };
+      if (rows.length === 0) return { outcome: { outcome: 'not_found' as const } };
       const row = rows[0];
 
       // GO P1 — un événement d'un AUTRE fournisseur ne touche JAMAIS la ligne :
       // ni crédit, ni débit, ni changement d'état, ni intervention.
       if (input.providerCode !== row.providerCode) {
         return {
-          outcome: 'ignored' as const,
-          reference: row.reference,
-          reason: `fournisseur non rattaché (${input.providerCode} ≠ ${row.providerCode})`,
+          outcome: {
+            outcome: 'ignored' as const,
+            reference: row.reference,
+            reason: `fournisseur non rattaché (${input.providerCode} ≠ ${row.providerCode})`,
+          },
         };
       }
 
       if (TERMINAL_STATUSES.includes(row.status)) {
-        return { outcome: 'already' as const, reference: row.reference };
+        return { outcome: { outcome: 'already' as const, reference: row.reference } };
       }
       if (
         row.status === CardPaymentStatus.FAILED ||
@@ -696,9 +1108,11 @@ export class CardPaymentsService {
           },
         });
         return {
-          outcome: 'ignored' as const,
-          reference: row.reference,
-          reason: 'succession contradictoire',
+          outcome: {
+            outcome: 'ignored' as const,
+            reference: row.reference,
+            reason: 'succession contradictoire',
+          },
         };
       }
 
@@ -732,76 +1146,262 @@ export class CardPaymentsService {
             status: CardPaymentStatus.NEEDS_REVIEW,
             interventionNeeded: true,
             interventionReason: reason,
+            providerCallState: 'RESOLVED',
+            // GO V5 §1 — décision webhook terminale : revendication invalidée.
+            dispatchOwner: null,
+            dispatchClaimedAt: null,
           },
         });
-        return { outcome: 'needs_review' as const, reference: row.reference, reason };
+        return {
+          outcome: { outcome: 'needs_review' as const, reference: row.reference, reason },
+        };
       }
 
-      const customer = await tx.customer.findUnique({
-        where: { id: row.customerId },
-        select: { walletCurrency: true },
-      });
-      if (!customer) {
-        return { outcome: 'not_found' as const };
-      }
-      if (customer.walletCurrency.toUpperCase() !== row.currency.toUpperCase()) {
-        const reason = 'devise du paiement ≠ devise du portefeuille';
-        await tx.cardPayment.update({
-          where: { id: row.id },
-          data: {
-            status: CardPaymentStatus.NEEDS_REVIEW,
-            interventionNeeded: true,
-            interventionReason: reason,
-          },
-        });
-        return { outcome: 'needs_review' as const, reference: row.reference, reason };
+      // ─── DIVERGENCE DES PARCOURS ─────────────────────────────────────────
+      // `kind = ORDER` : règlement d'UNE COMMANDE (aucun mouvement de
+      // portefeuille) — chemin du lot « paiement direct ». `kind = TOPUP` :
+      // recharge du portefeuille (chemin historique, inchangé).
+      if (row.kind === CardPaymentKind.ORDER) {
+        return this.settleOrderInTx(tx, row, input);
       }
 
-      const idempotencyKey = `cardpay:${row.id}`;
-      const credit = await this.wallet.applyWithClient(
-        tx,
-        row.customerId,
-        {
-          amountCents: row.amountCents,
-          idempotencyKey,
-          currency: row.currency.toUpperCase(),
-          type: WalletTransactionType.CREDIT,
-          reference: row.reference,
-          note: `Recharge carte ${row.reference}`,
-        },
-        'credit',
+      return { outcome: await this.settleTopupInTx(tx, row, input) };
+      },
+    );
+
+    // Effets POST-COMMIT d'un règlement de commande (email + provisioning) :
+    // best-effort, JAMAIS après un commit sans les avoir tentés.
+    if (branch.postEffect && !branch.postEffect.outcome.alreadyConfirmed) {
+      await this.checkout.afterConfirmOrderPaid(
+        branch.postEffect.outcome,
+        branch.postEffect.orderId,
+        branch.postEffect.ctx,
       );
+    }
+    return branch.outcome;
+  }
 
-      const walletTx = await tx.walletTransaction.findUnique({
-        where: { idempotencyKey },
-        select: { id: true },
+  /**
+   * Corps de la RECHARGE (kind = TOPUP) : contrôle de la devise du
+   * portefeuille, crédit idempotent (`cardpay:<id>`), CAS du paiement.
+   */
+  private async settleTopupInTx(
+    tx: Prisma.TransactionClient,
+    row: CardPayment,
+    input: ConfirmPaidInput,
+  ): Promise<ConfirmOutcome> {
+    const customer = await tx.customer.findUnique({
+      where: { id: row.customerId },
+      select: { walletCurrency: true },
+    });
+    if (!customer) {
+      return { outcome: 'not_found' };
+    }
+    if (customer.walletCurrency.toUpperCase() !== row.currency.toUpperCase()) {
+      const reason = 'devise du paiement ≠ devise du portefeuille';
+      await tx.cardPayment.update({
+        where: { id: row.id },
+        data: {
+          status: CardPaymentStatus.NEEDS_REVIEW,
+          interventionNeeded: true,
+          interventionReason: reason,
+        },
       });
+      return { outcome: 'needs_review', reference: row.reference, reason };
+    }
 
-      const cas = await tx.cardPayment.updateMany({
+    const idempotencyKey = `cardpay:${row.id}`;
+    const credit = await this.wallet.applyWithClient(
+      tx,
+      row.customerId,
+      {
+        amountCents: row.amountCents,
+        idempotencyKey,
+        currency: row.currency.toUpperCase(),
+        type: WalletTransactionType.CREDIT,
+        reference: row.reference,
+        note: `Recharge carte ${row.reference}`,
+      },
+      'credit',
+    );
+
+    const walletTx = await tx.walletTransaction.findUnique({
+      where: { idempotencyKey },
+      select: { id: true },
+    });
+
+    const cas = await tx.cardPayment.updateMany({
+      where: {
+        id: row.id,
+        status: { in: [CardPaymentStatus.CREATED, CardPaymentStatus.PROCESSING] },
+      },
+      data: {
+        status: CardPaymentStatus.SUCCEEDED,
+        paidAt: new Date(),
+        walletTransactionId: walletTx?.id ?? null,
+        providerPaymentRef: input.paymentRef ?? row.providerPaymentRef,
+        livemode: input.livemode ?? row.livemode,
+        // §4 — issue ÉTABLIE : l'appel n'est plus UNCERTAIN (le blocage des
+        // nouveaux encaissements s'efface pour ce paiement).
+        providerCallState: 'RESOLVED',
+        // GO V5 §1 — la décision webhook est TERMINALE : la revendication
+        // d'expédition est INVALIDÉE (lease annulé) pour qu'aucune réponse
+        // tardive ne tente plus d'écrire sur cette ligne.
+        dispatchOwner: null,
+        dispatchClaimedAt: null,
+      },
+    });
+    if (cas.count !== 1) {
+      // Course perdue malgré le verrou (défense en profondeur) : aucun
+      // double crédit possible, le crédit éventuel reste rattaché à la clé.
+      return { outcome: 'already', reference: row.reference };
+    }
+
+    return {
+      outcome: 'credited',
+      reference: row.reference,
+      balanceCents: credit.balanceCents,
+    };
+  }
+
+  /**
+   * Règlement d'UNE COMMANDE par carte (kind = ORDER) — LA transaction porte à
+   * la fois le règlement et le marquage du paiement :
+   *
+   *  1. verrou `FOR UPDATE` de la commande (ordre canonique Carte puis
+   *     Commande — verrous déjà pris : paiement puis commande) ;
+   *  2. contrôles défensifs client / montant / devise (la source a déjà été
+   *     contrôlée contre le paiement ci-dessus) ;
+   *  3. CAS unique `PENDING_PAYMENT → PAID` via `CheckoutService.confirmOrderWithin`
+   *     : mêmes droits, mêmes états, même historique qu'un règlement par solde ;
+   *  4. CAS du paiement `CREATED/PROCESSING → SUCCEEDED` (défense en profondeur) ;
+   *  5. effets (email, provisioning) RENVOYÉS pour exécution APRÈS commit.
+   *
+   * ZÉRO mouvement de portefeuille : la commande réglée par carte n'est ni
+   * créditée ni débitée (encaissement côté prestataire uniquement).
+   */
+  private async settleOrderInTx(
+    tx: Prisma.TransactionClient,
+    row: CardPayment,
+    input: ConfirmPaidInput,
+  ): Promise<ConfirmBranch> {
+    const review = async (reason: string): Promise<ConfirmBranch> => {
+      await tx.cardPayment.update({
+        where: { id: row.id },
+        data: {
+          status: CardPaymentStatus.NEEDS_REVIEW,
+          paidAt: new Date(),
+          interventionNeeded: true,
+          interventionReason: reason.slice(0, 300),
+          providerCallState: 'RESOLVED',
+          // GO V5 §1 — branche terminal (intervention humaine) : revendication
+          // invalidée, aucune réponse tardive ne peut plus dégrader ce constat.
+          dispatchOwner: null,
+          dispatchClaimedAt: null,
+        },
+      });
+      return { outcome: { outcome: 'needs_review', reference: row.reference, reason } };
+    };
+
+    if (!row.orderId) {
+      return review('paiement de commande sans commande rattachée');
+    }
+
+    // 1. Verrou commande — sérialise avec tout autre règlement concurrent.
+    const orders = await tx.$queryRaw<LockedOrderRow[]>`
+      SELECT id, status, "customerId", "amountTtcCents", currency
+      FROM "Order" WHERE id = ${row.orderId} FOR UPDATE`;
+    if (orders.length === 0) {
+      return review('commande rattachée introuvable');
+    }
+    const order = orders[0];
+
+    // 2. Contrôles commande ↔ paiement (jamais de règlement « à peu près »).
+    const mismatches: string[] = [];
+    if (order.customerId !== row.customerId) mismatches.push('client');
+    if (order.amountTtcCents !== row.amountCents) mismatches.push('montant');
+    if (String(order.currency).toUpperCase() !== row.currency.toUpperCase()) {
+      mismatches.push('devise');
+    }
+    if (mismatches.length > 0) {
+      return review(`commande/paiement incohérents (${mismatches.join(' + ')})`);
+    }
+
+    // 3. CAS de la commande — MÊME corps que tout autre règlement.
+    const ctx: ConfirmPaidContext = {
+      source: 'card',
+      reference: row.reference,
+    };
+    let conf: ConfirmTxOutcome;
+    try {
+      conf = await this.checkout.confirmOrderWithin(tx, row.orderId, ctx);
+    } catch (err) {
+      if (
+        err instanceof ConflictException ||
+        err instanceof NotFoundException ||
+        err instanceof BadRequestException
+      ) {
+        // Commande annulée / remboursée / non réglable : fonds encaissés chez
+        // le prestataire, AUCUN droit ouvert, AUCUN recrédit → intervention
+        // (remboursement suivi par l'admin, jamais un crédit wallet inventé).
+        const reason = err instanceof Error ? err.message : 'règlement refusé';
+        return review(`règlement de commande refusé : ${reason}`);
+      }
+      throw err; // autre erreur → rollback intégral (le prestataire rejoue)
+    }
+
+    // 4. Marquage du paiement (défense en profondeur sous verrou).
+    const common = {
+      paidAt: new Date(),
+      providerPaymentRef: input.paymentRef ?? row.providerPaymentRef,
+      livemode: input.livemode ?? row.livemode,
+      // §4 — issue ÉTABLIE (règlement ou contradiction tranchée) : l'appel
+      // n'est plus UNCERTAIN.
+      providerCallState: 'RESOLVED',
+      // GO V5 §1 — décision webhook TERMINALE : revendication invalidée
+      // (aucune réponse tardive ne peut plus écrire sur cette ligne).
+      dispatchOwner: null,
+      dispatchClaimedAt: null,
+    };
+    if (conf.alreadyConfirmed) {
+      // La commande est déjà réglée par un AUTRE moyen alors que la session
+      // carte était ouverte : fonds encaissés → aucun recrédit automatique,
+      // intervention explicite pour rembourser sur le paiement d'origine.
+      await tx.cardPayment.updateMany({
         where: {
           id: row.id,
           status: { in: [CardPaymentStatus.CREATED, CardPaymentStatus.PROCESSING] },
         },
         data: {
-          status: CardPaymentStatus.SUCCEEDED,
-          paidAt: new Date(),
-          walletTransactionId: walletTx?.id ?? null,
-          providerPaymentRef: input.paymentRef ?? row.providerPaymentRef,
-          livemode: input.livemode ?? row.livemode,
+          ...common,
+          interventionNeeded: true,
+          interventionReason:
+            'commande réglée par un autre moyen alors que ce règlement par carte était ouvert',
         },
       });
-      if (cas.count !== 1) {
-        // Course perdue malgré le verrou (défense en profondeur) : aucun
-        // double crédit possible, le crédit éventuel reste rattaché à la clé.
-        return { outcome: 'already' as const, reference: row.reference };
-      }
-
       return {
-        outcome: 'credited' as const,
-        reference: row.reference,
-        balanceCents: credit.balanceCents,
+        outcome: {
+          outcome: 'needs_review',
+          reference: row.reference,
+          reason: 'commande déjà réglée par un autre moyen',
+        },
       };
+    }
+
+    const cas = await tx.cardPayment.updateMany({
+      where: {
+        id: row.id,
+        status: { in: [CardPaymentStatus.CREATED, CardPaymentStatus.PROCESSING] },
+      },
+      data: { ...common, status: CardPaymentStatus.SUCCEEDED },
     });
+    return {
+      outcome:
+        cas.count === 1
+          ? { outcome: 'settled', reference: row.reference, orderId: row.orderId }
+          : { outcome: 'already', reference: row.reference },
+      postEffect: { outcome: conf, orderId: row.orderId, ctx },
+    };
   }
 
   /**
@@ -815,7 +1415,13 @@ export class CardPaymentsService {
         providerCode,
         status: CardPaymentStatus.CREATED,
       },
-      data: { status: CardPaymentStatus.EXPIRED },
+      data: {
+        status: CardPaymentStatus.EXPIRED,
+        providerCallState: 'RESOLVED',
+        // GO V5 §1 — décision webhook terminale : revendication invalidée.
+        dispatchOwner: null,
+        dispatchClaimedAt: null,
+      },
     });
     return res.count === 1;
   }
@@ -844,8 +1450,12 @@ export class CardPaymentsService {
       },
       data: {
         status: input.status,
+        providerCallState: 'RESOLVED',
         failureCode: input.code ?? null,
         failureMessage: input.message?.slice(0, 500) ?? null,
+        // GO V5 §1 — décision webhook terminale : revendication invalidée.
+        dispatchOwner: null,
+        dispatchClaimedAt: null,
       },
     });
     return res.count === 1 ? null : null;
@@ -901,9 +1511,18 @@ export class CardPaymentsService {
    * c'est une opération hors plateforme → intervention + audit explicite
    * (jamais de dette silencieuse, jamais de remboursement double).
    *
-   * GO P6 — le montant remboursé constaté n'est JAMAIS plafonné silencieusement
-   * (`Math.min` masquait un écart de preuve) : au-delà du montant du paiement,
-   * l'état devient `NEEDS_REVIEW` + intervention (signal honnête).
+   * GO §2/§1 — l'observation prestataire n'est qu'un PLANCHER : le compteur
+   * `refundedCents` est RECALCULÉ par l'UNION DES IDENTITÉS (somme des
+   * remboursements internes soldés ∪ observations externes distinctes ∪
+   * plancher cumulatif `charge.amount_refunded` ∪ courant). Une même opération
+   * arrivant par `charge.refunded`, `refund.updated` et la réponse API
+   * n'avance donc qu'UNE fois (le double count est structurellement
+   * impossible) ; un dépassement du montant encaissé devient `NEEDS_REVIEW`
+   * + intervention, jamais un chiffre lissé.
+   *
+   * NB : `amountRefundedCents` est le CUMUL `charge.amount_refunded` (seule
+   * source cumulée) — le montant INDIVIDUEL d'un `refund.*` passe par
+   * `recordRefundObservation` (identité), JAMAIS par ici.
    */
   async applyChargeRefunded(input: {
     paymentRef: string;
@@ -930,39 +1549,21 @@ export class CardPaymentsService {
           })
         : null;
 
-    const amountRefunded = Math.max(0, input.amountRefundedCents);
-    if (amountRefunded > row.amountCents) {
-      // GO P6 — preuve de remboursement supérieure au paiement : écart VISIBLE,
-      // jamais un chiffre lissé.
-      const reason = `remboursement constaté (${amountRefunded}) > montant du paiement (${row.amountCents})`;
-      await this.prisma.cardPayment.update({
-        where: { id: row.id },
-        data: {
-          refundedCents: row.refundedCents,
-          status: CardPaymentStatus.NEEDS_REVIEW,
-          interventionNeeded: true,
-          interventionReason: reason,
-        },
-      });
-      return row.id;
-    }
-
-    // Somme SANS plafond artificiel : `refundedCents` = réellement remboursé.
-    const refunded = Math.max(amountRefunded, row.refundedCents);
-    const fully = refunded >= row.amountCents;
-    await this.prisma.cardPayment.update({
-      where: { id: row.id },
-      data: {
-        refundedCents: refunded,
-        status: fully ? CardPaymentStatus.REFUNDED : CardPaymentStatus.PARTIALLY_REFUNDED,
-        ...(ours
-          ? {}
-          : {
-              interventionNeeded: true,
-              interventionReason:
-                'remboursement prestataire hors plateforme : vérifier le solde wallet',
-            }),
-      },
+    const observed = Math.max(0, Math.floor(input.amountRefundedCents));
+    await this.prisma.$transaction(async (tx) => {
+      await syncRefundedCents(tx, row.id, { observedCumulativeCents: observed });
+      if (!ours) {
+        // GO §2/§6 — remboursement hors plateforme : signal VISIBLE, solde
+        // jamais modifié automatiquement (l'admin vérifie et rembourse).
+        await tx.cardPayment.update({
+          where: { id: row.id },
+          data: {
+            interventionNeeded: true,
+            interventionReason:
+              'remboursement prestataire hors plateforme : vérifier le solde wallet',
+          },
+        });
+      }
     });
     if (!ours && row.walletTransactionId) {
       await this.prisma.walletTransaction.updateMany({
@@ -970,6 +1571,94 @@ export class CardPaymentsService {
         data: { disputedAt: new Date() },
       });
     }
+    return row.id;
+  }
+
+  /**
+   * GO revue §1 — remboursement EXTERNE observé par IDENTITÉ (`refund.*`).
+   *
+   * Le montant individuel du remboursement est enregistré comme une
+   * observation `[cardPaymentId, providerRef]` (jamais comme un plancher
+   * cumulé de charge) puis le compteur est recalculé par UNION : deux
+   * remboursements externes distincts 300 puis 400 donnent 700, jamais
+   * max → 400. Une observation SANS montant est une incertitude explicite
+   * (motif « rapprochement ») qui bloque les opérations dépendantes du
+   * plafond jusqu'à l'acquittement admin.
+   *
+   * Sans remboursement interne correspondant : signal hors plateforme
+   * visible (`interventionNeeded`), solde wallet JAMAIS modifié ici.
+   */
+  async recordRefundObservation(input: {
+    paymentRef: string;
+    providerRef: string;
+    /** Montant individuel du remboursement ; null = inconnu (incertitude). */
+    amountCents: number | null;
+    providerStatus: string;
+    /** GO P1 — fournisseur ayant authentifié l'événement. */
+    providerCode: string;
+  }): Promise<string | null> {
+    const row = await this.prisma.cardPayment.findFirst({
+      where: { providerPaymentRef: input.paymentRef, providerCode: input.providerCode },
+    });
+    if (!row) return null;
+
+    await this.prisma.$transaction(async (tx) => {
+      // Verrou PAIEMENT en PREMIER (ordre canonique) : l'upsert des
+      // observations prend une clé étrangère sur le paiement (FOR KEY SHARE)
+      // qui bloquerait le FOR UPDATE de sync — deux observations concurrentes
+      // se croiseraient (deadlock). Le verrou ligne rend l'upsert suivant
+      // sérialisé ; sync reprend le même verrou (réentrant dans la tx).
+      await tx.$queryRaw`SELECT id FROM "CardPayment" WHERE id = ${row.id} FOR UPDATE`;
+
+      // Identité durable : rejeu = même ligne (aucun second avancement).
+      await tx.refundObservation.upsert({
+        where: {
+          cardPaymentId_providerRef: {
+            cardPaymentId: row.id,
+            providerRef: input.providerRef,
+          },
+        },
+        // Un montant ultérieur comble l'incertitude ; un repli sans montant
+        // ne dégrade JAMAIS une identité déjà chiffrée.
+        update: { amountCents: input.amountCents ?? undefined },
+        create: {
+          cardPaymentId: row.id,
+          providerCode: input.providerCode,
+          providerRef: input.providerRef,
+          amountCents: input.amountCents,
+          status: input.providerStatus,
+          source: 'webhook:refund.*',
+        },
+      });
+
+      const ours = await tx.refund.findFirst({
+        where: { cardPaymentId: row.id, providerRef: input.providerRef },
+        select: { id: true },
+      });
+      if (!ours) {
+        // Signal hors plateforme : AVANT sync (la raison « rapprochement » de
+        // sync prime si une incertitude est ouverte).
+        await tx.cardPayment.update({
+          where: { id: row.id },
+          data: {
+            interventionNeeded: true,
+            interventionReason:
+              'remboursement prestataire hors plateforme : vérifier le solde wallet',
+          },
+        });
+      }
+
+      // UNION des identités (l'incertitude sans montant est relevée ici).
+      await syncRefundedCents(tx, row.id);
+    });
+
+    if (!row.walletTransactionId) return row.id;
+    // Observation externe : la trace wallet est marquée (solde INCHANGÉ —
+    // aucun crédit annulé automatiquement, l'admin vérifie et rembourse).
+    await this.prisma.walletTransaction.updateMany({
+      where: { id: row.walletTransactionId },
+      data: { disputedAt: new Date() },
+    });
     return row.id;
   }
 
@@ -1006,7 +1695,7 @@ export class CardPaymentsService {
   }
 
   /** Levée admin d'une alerte après vérification manuelle. */
-  async resolveIntervention(id: string, note: string): Promise<void> {
+  async resolveIntervention(id: string, note: string, resolvedBy?: string): Promise<void> {
     const res = await this.prisma.cardPayment.updateMany({
       where: { id, interventionNeeded: true },
       data: { interventionNeeded: false, interventionReason: note.slice(0, 300) },
@@ -1014,5 +1703,20 @@ export class CardPaymentsService {
     if (res.count !== 1) {
       throw new ConflictException('Aucune intervention en attente sur ce paiement.');
     }
+    // GO revue §1 — le rapprochement acquitte les observations ouvertes :
+    // l'incertitude (montant inconnu) est levée, la TRACE est conservée
+    // (acknowledgedAt/acknowledgedBy) — jamais de ligne effacée.
+    await this.prisma.refundObservation.updateMany({
+      where: { cardPaymentId: id, acknowledgedAt: null },
+      data: { acknowledgedAt: new Date(), acknowledgedBy: resolvedBy ?? null },
+    });
+    // §4 — l'humain a établi l'issue : l'appel n'est plus UNCERTAIN (le
+    // blocage des nouveaux encaissements s'efface, l'historique est conservé).
+    await this.prisma.cardPayment
+      .updateMany({
+        where: { id, providerCallState: 'UNCERTAIN' },
+        data: { providerCallState: 'RESOLVED' },
+      })
+      .catch(() => undefined);
   }
 }

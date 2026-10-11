@@ -10,6 +10,7 @@ import {
 import {
   BillingCycle,
   BillingSetting,
+  CardPaymentStatus,
   CustomerAccountType,
   HostingServiceStatus,
   InvoiceLineKind,
@@ -31,7 +32,9 @@ import { PrismaService } from '../prisma/prisma.service';
 import { WalletService } from '../wallet/wallet.service';
 import { CloudflareService } from '../cloudflare/cloudflare.service';
 import { isPaymentSimulatorEnabled } from '../config/payment-simulator';
+import { assertNoBlockingCardPayment } from '../payments/blocking-payment.guard';
 import { regexFromRejectPattern } from './subdomain.util';
+import { PaymentSettingsService } from './payment-settings.service';
 import { clientAreaUrl, loginUrl } from './web-links';
 import { addBillingCycle } from './billing-cycle';
 import { claimInvoiceSequence } from './invoice-sequence';
@@ -91,7 +94,12 @@ export interface CheckoutResult {
 }
 
 /** Source d'une confirmation de règlement (traçabilité, audit). */
-export type ConfirmSource = 'free' | 'admin-transfer' | 'card-simulator' | 'wallet';
+export type ConfirmSource =
+  | 'free'
+  | 'admin-transfer'
+  | 'card-simulator'
+  | 'wallet'
+  | 'card'; // paiement DIRECT par carte (webhook signé / relecture serveur)
 
 /** Contexte de confirmation serveur d'une commande. */
 export interface ConfirmPaidContext {
@@ -115,7 +123,7 @@ export interface ConfirmPaidResult {
 }
 
 /** Résultat interne d'une confirmation transactionnelle (tx → post-commit). */
-type ConfirmTxOutcome = {
+export type ConfirmTxOutcome = {
   alreadyConfirmed: boolean;
   order: {
     id: string;
@@ -193,6 +201,7 @@ export class CheckoutService {
     private readonly cloudflare: CloudflareService,
     private readonly c3: C3CapabilityService,
     private readonly wallet: WalletService,
+    private readonly paymentSettings: PaymentSettingsService,
   ) {}
 
   /**
@@ -235,21 +244,83 @@ export class CheckoutService {
     // racines éligibles sans choix → erreur d'ambiguïté (#10).
     const { requestedSubdomain, requestedDomainId } = await this.resolveSubdomainAndRoot(product, dto);
 
-    // 2. Moyen de paiement actif (jamais les secrets — PaymentMethod.config est
-    //    non secret, configEnc reste chiffré et n'est pas lu ici).
-    const method = await this.prisma.paymentMethod.findFirst({
-      where: { id: dto.paymentMethodId, isActive: true },
-    });
-    if (!method) {
-      throw new BadRequestException('Ce moyen de paiement n’est pas disponible.');
-    }
-    // 2b. Carte : refus HONNÊTE tant qu'aucun adaptateur réel n'est configuré
-    //     (aucun prestataire choisi). Le simulateur (recette/tests) doit être
-    //     explicitement activé — jamais en production (payment-simulator.ts).
-    if (method.type === PaymentMethodType.CARD && !isPaymentSimulatorEnabled()) {
-      throw new BadRequestException(
-        'Le paiement par carte n’est pas encore disponible : aucun prestataire configuré. Choisissez un autre moyen de paiement.',
-      );
+    // 2. Moyen de paiement — GO revue §5a : le VRAI choix « Solde du
+    //    portefeuille » crée la commande SANS moyen (frais nuls) ; le débit
+    //    solde est ensuite fait par `payOrderWithWallet` (débit + confirmation
+    //    atomiques, même que « Mes commandes »). Invité refusé (le solde
+    //    appartient à un compte) ; exclusif de tout moyen externe ; gate
+    //    serveur `wallet` appliqué AVANT toute écriture.
+    let method: {
+      id: string;
+      name: string;
+      type: PaymentMethodType;
+      feeType: string;
+      feePercent: Prisma.Decimal | number | null;
+      feeFixedCents: number | null;
+    } | null = null;
+    if (dto.payWithWallet) {
+      if (dto.paymentMethodId) {
+        throw new BadRequestException(
+          'Solde du portefeuille et moyen de paiement externe sont exclusifs — ne renvoyez pas les deux.',
+        );
+      }
+      if (!user?.sub) {
+        throw new BadRequestException(
+          'Le règlement par solde est réservé aux clients connectés : connectez-vous ' +
+            'ou choisissez un autre moyen de paiement.',
+        );
+      }
+      await this.paymentSettings.assertEnabled('wallet');
+      // Devise : le portefeuille n'opère qu'en USD (même contrat que
+      // payOrderWithWallet) — refus anticipé, sans écriture.
+      const walletCurrency = await this.billingCurrency();
+      if (walletCurrency !== 'USD') {
+        throw new ConflictException(
+          `Règlement par solde indisponible : facturation en ${walletCurrency} ` +
+            '(le portefeuille n’opère qu’en USD).',
+        );
+      }
+      // Contrôle ADVISORY de solde (avant toute écriture) — le verrou serveur
+      // reste dans payOrderWithWallet : une course ne fait jamais de dette.
+      const holder = await this.prisma.customer.findUnique({
+        where: { userId: user.sub },
+        select: { walletBalanceCents: true },
+      });
+      if (!holder || holder.walletBalanceCents <= 0) {
+        throw new ConflictException(
+          'Solde portefeuille insuffisant : rechargez votre portefeuille ou ' +
+            'choisissez un autre moyen de paiement.',
+        );
+      }
+      // (Le contrôle exact montant ≤ solde est revérifié sous verrou au débit.)
+    } else {
+      if (!dto.paymentMethodId) {
+        throw new BadRequestException('Choisissez un moyen de paiement.');
+      }
+      method = await this.prisma.paymentMethod.findFirst({
+        where: { id: dto.paymentMethodId, isActive: true },
+      });
+      if (!method) {
+        throw new BadRequestException('Ce moyen de paiement n’est pas disponible.');
+      }
+      // 2b. Carte : refus HONNÊTE tant qu'aucun traitement carte n'est
+      //     OPÉRATIONNEL — GO §5 : un connecteur Stripe test correctement
+      //     configuré (identité VÉRIFIÉE, §3) fonctionne SANS simulateur, et le
+      //     simulateur (recette/tests) reste accepté lorsqu'il est activé
+      //     explicitement (jamais en production). Aucun repli automatique :
+      //     indisponible = refus net avec message clair, jamais de moyen imposé.
+      if (method.type === PaymentMethodType.CARD) {
+        const provider = await this.paymentSettings.cardProviderStatus();
+        if (provider.kind === 'unavailable') {
+          throw new BadRequestException(
+            `Le paiement par carte n’est pas encore disponible : ${provider.reason}. Choisissez un autre moyen de paiement.`,
+          );
+        }
+        // 2c. PARCOURS « paiement direct par carte » = réglage ADMIN indépendant :
+        //     désactivé → refus NET avant toute écriture (aucune commande créée,
+        //     aucun paiement ouvert). Le même gate protège l'appel API direct.
+        await this.paymentSettings.assertEnabled('cardOrder');
+      }
     }
 
     // 3. Montants recalculés serveur (produit + options + addons +
@@ -324,7 +395,8 @@ export class CheckoutService {
     //    bougé entre-temps (jamais de hash « périmé » par le prix courant).
     const baseKey = this.idempotencyKey(
       dto,
-      method.id,
+      // §5a — intention « solde » = sentinelle distincte de tout id réel.
+      method?.id ?? 'wallet',
       dto.acceptedTotalTtcCents ?? amountTtcCents,
       billingEmail,
       requestedSubdomain,
@@ -360,7 +432,7 @@ export class CheckoutService {
       this.quoteConditions({
         dto,
         product,
-        methodId: method.id,
+        methodId: method?.id ?? null,
         method,
         currency: serverCurrency,
         pricing: { amountHtCents, taxAmountCents, amountTtcCents, taxRatePercent },
@@ -370,7 +442,8 @@ export class CheckoutService {
       amountTtcCents,
       server: {
         currency: serverCurrency,
-        paymentMethodId: method.id,
+        // §5a — solde : moyen serveur `null` (aucun frais, aucun externe).
+        paymentMethodId: method?.id ?? null,
         quoteKey: serverQuoteKey,
       },
       accepted: {
@@ -400,7 +473,7 @@ export class CheckoutService {
         ...(refusal.missing ? { missing: refusal.missing } : {}),
         currentTotalTtcCents: amountTtcCents,
         currentCurrency: serverCurrency,
-        currentPaymentMethodId: method.id,
+        currentPaymentMethodId: method?.id ?? null,
         currentQuoteKey: serverQuoteKey,
       });
     }
@@ -547,8 +620,9 @@ export class CheckoutService {
             amountHtCents,
             taxAmountCents,
             amountTtcCents,
-            paymentMethodId: method.id,
-            paymentMethodName: method.name,
+            // §5a — solde : `null` (aucun moyen externe rattaché).
+            paymentMethodId: method?.id ?? null,
+            paymentMethodName: method?.name ?? 'Solde du portefeuille',
             optionsSnapshot: (dto.options ?? []).length
               ? this.optionsSnapshot(dto, product)
               : Prisma.JsonNull,
@@ -631,10 +705,10 @@ export class CheckoutService {
         return { user, order, invoice, billing: claim };
       });
 
-      await this.traceAudit(product.id, created.order.id, amountTtcCents, method.id, true, undefined, {
+      await this.traceAudit(product.id, created.order.id, amountTtcCents, method?.id ?? 'wallet', true, undefined, {
         stage: 'order-created',
         status: OrderStatus.PENDING_PAYMENT,
-        methodType: method.type,
+        methodType: method?.type ?? 'WALLET',
       }, { id: created.user?.id ?? null, email: billingEmail });
 
       const invoiceNumber = created.billing.invoiceNumber;
@@ -665,7 +739,7 @@ export class CheckoutService {
             confirmed.subscriptionAction ?? null,
             { phase: 'confirmed' },
           ).catch((e) =>
-            this.traceAudit(product.id, created.order.id, amountTtcCents, method.id, false, String(e), {
+            this.traceAudit(product.id, created.order.id, amountTtcCents, method?.id ?? 'wallet', false, String(e), {
               stage: 'free-confirm-email',
             }, { id: created.user?.id ?? null, email: receiptEmail }),
           );
@@ -676,10 +750,49 @@ export class CheckoutService {
             nextStep: 'provisioning-pending',
           };
         } catch (e) {
-          await this.traceAudit(product.id, created.order.id, amountTtcCents, method.id, false, String(e), {
+          await this.traceAudit(product.id, created.order.id, amountTtcCents, method?.id ?? 'wallet', false, String(e), {
             stage: 'free-confirm-failed',
           }, { id: created.user?.id ?? null, email: receiptEmail });
           // Chute honnête : règlement à confirmer plus tard, aucun droit ouvert.
+        }
+      }
+
+      // 7b. GO revue §5a — règlement par SOLDE : débit + confirmation ATOMIQUES
+      //     dans la MÊME requête (`payOrderWithWallet`, verrous identiques à
+      //     « Mes commandes »). Échec (solde insuffisant sous verrou, course) :
+      //     la commande PENDING est RÉCUPÉRABLE (page succès / mes commandes) —
+      //     jamais de dette, jamais de commande jetable cachée.
+      if (dto.payWithWallet && amountTtcCents > 0 && user?.sub) {
+        const walletPayload: JwtPayload = { sub: user.sub, email: billingEmail, role: user.role };
+        try {
+          await this.payOrderWithWallet(created.order.id, walletPayload);
+          await this.traceAudit(product.id, created.order.id, amountTtcCents, 'wallet', true, undefined, {
+            stage: 'wallet-settled',
+          }, { id: created.user?.id ?? null, email: billingEmail });
+          await this.sendPostCheckoutEmail(
+            receiptEmail,
+            receiptName,
+            tempPassword,
+            invoiceNumber,
+            null,
+            { phase: 'confirmed', methodLabel: 'Solde du portefeuille' },
+          ).catch((e) =>
+            this.traceAudit(product.id, created.order.id, amountTtcCents, 'wallet', false, String(e), {
+              stage: 'wallet-confirm-email',
+            }, { id: created.user?.id ?? null, email: receiptEmail }),
+          );
+          return {
+            orderId: created.order.id,
+            invoiceNumber,
+            email: receiptEmail,
+            nextStep: 'provisioning-pending',
+          };
+        } catch (e) {
+          // Solde devenu insuffisant sous verrou (course) : commande créée,
+          // NON réglée — email « en attente » honnête + piste de reprise.
+          await this.traceAudit(product.id, created.order.id, amountTtcCents, 'wallet', false, String(e), {
+            stage: 'wallet-settle-failed',
+          }, { id: created.user?.id ?? null, email: billingEmail });
         }
       }
 
@@ -687,9 +800,9 @@ export class CheckoutService {
       //    Invité : identifiants + mot de passe temporaire (le compte existe).
       await this.sendPostCheckoutEmail(receiptEmail, receiptName, tempPassword, invoiceNumber, null, {
         phase: 'pending',
-        methodLabel: method.name,
+        methodLabel: method?.name ?? 'Solde du portefeuille',
       }).catch((e) =>
-        this.traceAudit(product.id, created.order.id, amountTtcCents, method.id, false, String(e), {
+        this.traceAudit(product.id, created.order.id, amountTtcCents, method?.id ?? 'wallet', false, String(e), {
           stage: 'pending-email',
         }, { id: created.user?.id ?? null, email: receiptEmail }),
       );
@@ -867,6 +980,38 @@ export class CheckoutService {
       alreadyConfirmed: false,
       subscriptionAction: outcome.subscriptionAction,
     };
+  }
+
+  /**
+   * Corps transactionnel PUBLIC — appelé par la confirmation d'un règlement
+   * PAR CARTE dans LA MÊME transaction que le marquage du paiement : le CAS
+   * `PENDING_PAYMENT → PAID` reste l'unique garde d'un règlement unique, quel
+   * que soit le moyen (solde, carte, virement, simulateur).
+   */
+  confirmOrderWithin(
+    tx: Prisma.TransactionClient,
+    orderId: string,
+    ctx: ConfirmPaidContext,
+  ): Promise<ConfirmTxOutcome> {
+    return this.confirmOrderInTx(tx, orderId, ctx);
+  }
+
+  /**
+   * Effets POST-COMMIT d'une confirmation (email, lancement de provisioning) —
+   * best-effort TOUJOURS, appelés APRÈS le commit de la transaction portant le
+   * CAS. Aucun échec ici ne retourne une erreur (l'état committé est la vérité).
+   */
+  async afterConfirmOrderPaid(
+    outcome: ConfirmTxOutcome,
+    orderId: string,
+    ctx: ConfirmPaidContext,
+  ): Promise<void> {
+    if (outcome.alreadyConfirmed) return;
+    try {
+      await this.postConfirmEffects(outcome, orderId, ctx);
+    } catch (e) {
+      this.log.warn(`confirm order=${orderId}: post effects failed: ${String(e)}`);
+    }
   }
 
   /**
@@ -1319,6 +1464,9 @@ export class CheckoutService {
     user: JwtPayload,
     opts?: { requireRenewalConsent?: boolean },
   ): Promise<PayWithWalletResult> {
+    // GATE SERVEUR (réglage admin) — avant tout débit : un appel API direct
+    // subit le même refus que le bouton masqué côté client.
+    await this.paymentSettings.assertEnabled('wallet');
     const key = `wallet-pay:${orderId}`;
     const preview = await this.prisma.order.findUnique({
       where: { id: orderId },
@@ -1433,6 +1581,36 @@ export class CheckoutService {
         }
         const amountTtcCents = rows[0].amountTtcCents;
 
+        // Course solde ↔ carte : un règlement CARTE encore ouvert ou incertain
+        // interdit tout NOUVEAU débit (sinon double paiement possible).
+        // Lecture SANS verrou ligne : aucun cycle d'attente (l'ordre de verrou
+        // canonique commande → … reste intact).
+        const liveCard = await tx.cardPayment.findFirst({
+          where: {
+            orderId,
+            status: {
+              in: [CardPaymentStatus.CREATED, CardPaymentStatus.PROCESSING],
+            },
+          },
+          select: { reference: true },
+        });
+        if (liveCard) {
+          throw new ConflictException({
+            message:
+              `Un règlement par carte est en cours (${liveCard.reference}) : ` +
+              'nouveau débit par solde refusé (aucun double paiement).',
+            code: 'CARD_PAYMENT_IN_PROGRESS',
+          });
+        }
+
+        // GO revue §4 (C4.8) — garde SOLDE : autorité UNIQUE partagée avec la
+        // recharge et le règlement par carte. Une opération du CLIENT encore
+        // `UNCERTAIN` ou `NEEDS_REVIEW` (alerte ouverte) interdit TOUT nouveau
+        // règlement : un débit solde pendant l'investigation pourrait doubler
+        // l'encaissement si l'issue s'avère « payé ». Mêmes conditions, même
+        // verbiage 409 qu'ailleurs — jamais de copie divergente.
+        await assertNoBlockingCardPayment(tx, preview.customer.id);
+
         // P2 — prélèvement AUTOMATIQUE : consentement + éligibilité revérifiés
         // SOUS VERROU (ci-dessus : commande déjà verrouillée `FOR UPDATE`),
         // AVANT tout débit. La révocation committée avant ce verrou → 409 →
@@ -1537,6 +1715,9 @@ export class CheckoutService {
         'Simulateur de paiement désactivé (réservé aux tests et à la recette).',
       );
     }
+    // Le simulateur REMPLACE le règlement direct par carte : mêmes règles de
+    // parcours (désactivé = refus net, aucune confirmation fabriquée).
+    await this.paymentSettings.assertEnabled('cardOrder');
     const order = await this.prisma.order.findUnique({
       where: { id: orderId },
       include: { paymentMethod: { select: { type: true } } },
@@ -1594,6 +1775,8 @@ export class CheckoutService {
         return 'Règlement confirmé (simulateur de recette — aucun prestataire réel).';
       case 'wallet':
         return 'Prélevé sur le solde du portefeuille (renouvellement d\'abonnement - P8).';
+      case 'card':
+        return 'Réglé par carte auprès du prestataire (paiement direct — aucun mouvement de portefeuille).';
     }
   }
 

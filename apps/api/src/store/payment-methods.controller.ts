@@ -2,7 +2,7 @@ import { Controller, Get } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { PaymentMethodType } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
-import { isPaymentSimulatorEnabled } from '../config/payment-simulator';
+import { PaymentSettingsService } from './payment-settings.service';
 
 /**
  * PUBLIC — moyens de paiement actifs pour le tunnel checkout (Bloc C).
@@ -13,19 +13,32 @@ import { isPaymentSimulatorEnabled } from '../config/payment-simulator';
  * aussi exposés — ce sont des paramètres de GRILLE tarifaire publique
  * (affichés au client avant paiement), pas des secrets ; ils sont APPLIQUÉS
  * dans `buildPricing` (devis + commande), plus seulement journalisés.
- * Carte : masquée honnêtement tant qu'aucun adaptateur réel n'est configuré
- * (aucun prestataire choisi) — visible uniquement sous simulateur de recette
- * explicitement activé.
+ *
+ * Lot « moyens de paiement » — le client ne voit QUE les moyens :
+ *  - activés côté admin (`isActive`) ;
+ *  - dont le PARCOURS correspondant est activé (règlement de commande par
+ *    carte = `cardOrderPaymentEnabled`, interrupteur indépendant) ;
+ *  - et techniquement configurés (simulateur de recette OU prestataire de
+ *    test réel) — masquer ne remplace pas le gate serveur, qui reste appliqué
+ *    à chaque création/débit.
+ * Aucun repli automatique vers un autre moyen : liste vide = le client ne peut
+ * pas valider (message + bouton bloqué côté UI).
  */
 @ApiTags('store/payment-methods')
 @Controller('store/payment-methods')
 export class PaymentMethodsController {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly settings: PaymentSettingsService,
+  ) {}
 
   @Get()
   @ApiOperation({ summary: 'Méthodes de paiement actives (publiques, sans secrets)' })
   async listActive() {
-    const simulator = isPaymentSimulatorEnabled();
+    // GO revue §5b — UNE seule lecture effective (interrupteur ∩ ligne CARTE
+    // ∩ connecteur réellement résolvable) pour filtrer la carte : jamais un
+    // moyen affiché que le gate serveur refuserait ensuite.
+    const caps = await this.settings.effectiveCapabilities();
     const methods = await this.prisma.paymentMethod.findMany({
       where: { isActive: true },
       orderBy: { displayOrder: 'asc' },
@@ -41,9 +54,13 @@ export class PaymentMethodsController {
       },
     });
     // Vue lisible : on ne renvoie que les champs publics (jamais configEnc),
-    // et on masque la carte tant que personne ne peut réellement la traiter.
+    // et la carte uniquement si son PARCOURS commande est activé ET traitable.
     return methods
-      .filter((m) => m.type !== PaymentMethodType.CARD || simulator)
+      .filter(
+        (m) =>
+          m.type !== PaymentMethodType.CARD ||
+          (caps.cardOrderPaymentEnabled && caps.cardAvailable),
+      )
       .map((m) => ({
         id: m.id,
         name: m.name,
@@ -53,5 +70,28 @@ export class PaymentMethodsController {
         feePercent: m.feePercent !== null ? Number(m.feePercent) : null,
         feeFixedCents: m.feeFixedCents,
       }));
+  }
+}
+
+/**
+ * PUBLIC — disponibilité RÉELLE des parcours de paiement (masquage UI côté
+ * client : bouton « Régler par solde », bloc « Payer par carte », recharge).
+ * GO revue §5b : renvoie les interrupteurs BRUTS + la disponibilité
+ * opérationnelle de la carte (connecteur réellement résolvable, ligne CARTE
+ * active, devise) — un affichage « solde + carte » ne doit jamais proposer
+ * une carte que le serveur refusera. La décision d'AUTORISATION reste
+ * serveur : chaque opération re-passe par son gate.
+ */
+@ApiTags('store/payment-capabilities')
+@Controller('store')
+export class PaymentCapabilitiesController {
+  constructor(private readonly settings: PaymentSettingsService) {}
+
+  @Get('payment-capabilities')
+  @ApiOperation({
+    summary: 'Parcours de paiement activés + disponibilité carte (public)',
+  })
+  async capabilities() {
+    return this.settings.effectiveCapabilities();
   }
 }

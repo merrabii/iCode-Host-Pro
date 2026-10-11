@@ -688,6 +688,7 @@ describe('Abonnements récurrents (e2e, P8)', () => {
     await fundWallet(carolToken, 50_000);
     await walletSvc.debit(carolCustomerId, {
       amountCents: inv.amountTtcCents,
+      currency: inv.currency,
       idempotencyKey: `renewal:${carolRenewalId}`,
       orderId: carolRenewalId,
       invoiceId: inv.id,

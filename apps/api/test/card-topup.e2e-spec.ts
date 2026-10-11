@@ -373,14 +373,15 @@ describe('Recharge par carte & webhooks Stripe (e2e, GO)', () => {
       expect(JSON.stringify(detail.body)).not.toContain('sk_test_51DemoSecret');
     });
 
-    it('A5 — sans secret webhook : contrôle de connexion expose l’échec (pas de « OK » silencieux)', async () => {
-      // Stripe existe mais est inactif → repli sur le simulateur (désactivé) → échec visible.
+    it('A5 — sans prestataire actif : contrôle de connexion REFUSÉ (409, jamais de « OK » silencieux)', async () => {
+      // §3 — aucune identité résoluble (Stripe inactif, simulateur hors ligne) :
+      // le contrôle est un REFUS EXPLICITE (409), jamais un 201 qui présenterait
+      // un échec comme une vérification aboutie.
       const res = await api()
         .post(`/${GlobalPrefix}/store/admin/payments/provider/check`)
         .set(auth(adminToken))
-        .expect(201);
-      expect(res.body.lastCheckError).toBeTruthy();
-      expect(res.body.lastCheckAt).toBeTruthy();
+        .expect(409);
+      expect(String(res.body.message)).toContain('Aucun prestataire');
     });
   });
 
@@ -482,6 +483,44 @@ describe('Recharge par carte & webhooks Stripe (e2e, GO)', () => {
         .get(`/${GlobalPrefix}/store/admin/payments/provider`)
         .set(auth(bobToken))
         .expect(403);
+    });
+
+    // GO revue §5d — la protection serveur complète le stockage client :
+    // un rechargement (perte de la mémoire du navigateur) ne doit PAS permettre
+    // de contourner une tentative non résolue par une NOUVELLE clé.
+
+    it('B9 — rechargement/mémoire perdue → NOUVELLE clé sur tentative non résolue → refus 409 (protection serveur)', async () => {
+      // (1) Tente A, clé A : envoi resté sans réponse concluante.
+      const keyA = `b9a-${uid}`;
+      const first = await createTopup(aliceToken, 3000, { key: keyA });
+      expect(first.status).toBe(201);
+      const reference = String(first.body.reference);
+      refs.push(reference);
+      await prisma.cardPayment.update({
+        where: { reference },
+        data: { providerCallState: 'UNCERTAIN', checkoutUrl: null },
+      });
+
+      // (2) Rechargement complet : le client a perdu sessionStorage ET la
+      //     mémoire du module → génère une clé DIFFÉRENTE (key B).
+      const keyB = `b9b-${uid}`;
+      const second = await createTopup(aliceToken, 3000, { key: keyB });
+      expect(second.status).toBe(409);
+      expect(JSON.stringify(second.body)).toContain('non résolu');
+      // Aucune seconde tentative ouverte malgré la nouvelle clé.
+      expect(await prisma.cardPayment.count({ where: { idempotencyKey: keyB } })).toBe(0);
+
+      // (3) Rejeu avec la MÊME clé A : déterministe → MÊME session, issue établie.
+      const replay = await createTopup(aliceToken, 3000, { key: keyA });
+      expect(replay.status).toBe(201);
+      expect(String(replay.body.reference)).toBe(reference);
+      const after = await paymentRow(reference);
+      expect(after?.providerCallState).toBe('RESOLVED');
+
+      // (4) Issue établie → la clé B devient acceptée (jamais de blocage éternel).
+      const ok = await createTopup(aliceToken, 3000, { key: keyB });
+      expect(ok.status).toBe(201);
+      refs.push(String(ok.body.reference));
     });
   });
 
@@ -801,6 +840,18 @@ describe('Recharge par carte & webhooks Stripe (e2e, GO)', () => {
       expect(fresh?.interventionNeeded).toBe(true);
       expect(String(fresh?.interventionReason)).toContain('montant');
       expect((await balanceOf(aliceEmail)) - before).toBe(0);
+
+      // §4.8 — une alerte OUVERE bloquerait tout nouvel encaissement du client :
+      // la levée reproduit la vérification admin (le statut NEEDS_REVIEW, lui,
+      // est conservé — jamais redescendu).
+      await api()
+        .post(`/${GlobalPrefix}/store/admin/payments/card-payments/${row?.id}/intervention`)
+        .set(auth(adminToken))
+        .send({ note: 'Vérifié : signal relevé, recette poursuivie.' })
+        .expect(201);
+      const lifted = await paymentRow(reference);
+      expect(lifted?.status).toBe('NEEDS_REVIEW');
+      expect(lifted?.interventionNeeded).toBe(false);
     });
 
     it('F2 — détail admin visible ; levée après vérification (statut conservé)', async () => {

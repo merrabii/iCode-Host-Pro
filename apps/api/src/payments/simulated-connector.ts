@@ -1,5 +1,5 @@
 import { Injectable } from '@nestjs/common';
-import { randomBytes } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import {
   ConnectorAccount,
   ConnectorRefundInput,
@@ -10,6 +10,26 @@ import {
   SessionDetails,
 } from './payment-connector';
 import { verifyStripeSignature } from './stripe-signature';
+
+/**
+ * GO clôture §4.5 — état d'une session simulée DURCI en base (la table
+ * `CardPayment` EST la source de vérité du simulateur) : le redémarrage ou
+ * une seconde instance d'API ne perd plus l'état, et une rejeu avec la même
+ * clé d'idempotence retrouve la MÊME session.
+ */
+export interface SimulatedSessionSnapshot {
+  paymentRef: string | null;
+  amountTotalCents: number;
+  currency: string;
+  paid: boolean;
+  expired: boolean;
+  canceled: boolean;
+}
+
+export interface SimulatedSessionStore {
+  findSession(sessionRef: string): Promise<SimulatedSessionSnapshot | null>;
+  hasSession(sessionRef: string): Promise<boolean>;
+}
 
 /**
  * GO P2/P3 — compteurs d'APPELS prestataire (simulateur).
@@ -41,6 +61,9 @@ export function resetSimulatedConnectorCounters(): void {
  *    confirmation) : aucun chemin court qui simulerait un crédit ;
  *  - Activé uniquement via `PAYMENT_SIMULATOR_ENABLED=true` et jamais en
  *    production (le drapeau est vérifié au niveau du contrôleur) ;
+ *  - §4.5 — références DÉTERMINISTES dérivées de la clé d'idempotence :
+ *    deux instances (ou un redémarrage) produisent la MÊME session pour la
+ *    MÊME clé, et l'état est relu depuis la base via `SimulatedSessionStore` ;
  *  - Distinction assumée : ce sont des PREUVES DE CLASSE C (parcours navigateur),
  *    jamais des échanges réels avec Stripe (classe B).
  */
@@ -53,7 +76,15 @@ export class SimulatedConnector implements PaymentConnector {
   /** GO P3 — même clé d'idempotence = MÊME session (comme le prestataire réel). */
   private readonly dispatched = new Map<string, SessionDetails>();
 
-  constructor(private readonly webhookSecret: string) {}
+  constructor(
+    private readonly webhookSecret: string,
+    private readonly store?: SimulatedSessionStore,
+  ) {}
+
+  /** §4.5 — référence prestataire DÉTERMINISTE par clé (jamais aléatoire). */
+  private deterministic(prefix: string, key: string): string {
+    return `${prefix}${createHash('sha256').update(key).digest('hex').slice(0, 20)}`;
+  }
 
   async createCheckoutSession(
     input: CreateCheckoutSessionInput,
@@ -68,9 +99,30 @@ export class SimulatedConnector implements PaymentConnector {
         expiresAt: null,
       };
     }
+    const sessionRef = this.deterministic('cs_sim_', input.idempotencyKey);
+    const paymentRef = this.deterministic('pi_sim_', `${input.idempotencyKey}:pi`);
+    // §4.5 — la base est la vérité : une session déjà ouverte pour cette clé
+    // (autre instance, redémarrage) est REJOUÉE, jamais recréée.
+    if (this.store && (await this.store.hasSession(sessionRef))) {
+      const details: SessionDetails = {
+        sessionRef,
+        status: 'open',
+        paymentStatus: 'unpaid',
+        amountTotalCents: input.amountCents,
+        currency: input.currency,
+        paymentRef,
+        livemode: false,
+      };
+      this.dispatched.set(input.idempotencyKey, details);
+      return {
+        sessionRef,
+        paymentRef,
+        checkoutUrl: `/api/payments/simulated/sessions/${sessionRef}`,
+        livemode: false,
+        expiresAt: new Date(Date.now() + 30 * 60 * 1000),
+      };
+    }
     simulatedConnectorCounters.createCheckoutSession += 1;
-    const sessionRef = `cs_sim_${randomBytes(8).toString('hex')}`;
-    const paymentRef = `pi_sim_${randomBytes(8).toString('hex')}`;
     const details: SessionDetails = {
       sessionRef,
       status: 'open',
@@ -97,7 +149,28 @@ export class SimulatedConnector implements PaymentConnector {
     simulatedConnectorCounters.retrieveSession += 1;
     const known = this.sessions.get(sessionRef);
     if (known) return known;
-    // Après redémarrage : état inconnu → aucun changement d'état côté métier.
+    // §4.5 — état relu depuis la base (le redémarrage ne perd plus l'issue :
+    // expiré/annulé/succès constaté côté plateforme reste lisible).
+    const snap = await this.store?.findSession(sessionRef);
+    if (snap) {
+      return {
+        sessionRef,
+        status: snap.paid
+          ? 'complete'
+          : snap.expired
+            ? 'expired'
+            : snap.canceled
+              ? 'unknown'
+              : 'open',
+        paymentStatus: snap.paid ? 'paid' : 'unpaid',
+        amountTotalCents: snap.amountTotalCents,
+        currency: snap.currency,
+        paymentRef: snap.paymentRef,
+        livemode: false,
+      };
+    }
+    // Jamais connue (session d'un autre prestataire / ligne purgée) :
+    // état inconnu → aucun changement d'état côté métier.
     return {
       sessionRef,
       status: 'unknown',
@@ -113,7 +186,9 @@ export class SimulatedConnector implements PaymentConnector {
   async createRefund(input: ConnectorRefundInput): Promise<ConnectorRefundOutcome> {
     simulatedConnectorCounters.createRefund += 1;
     return {
-      providerRef: `re_sim_${randomBytes(8).toString('hex')}`,
+      // §4.5 — même clé d'idempotence = MÊME référence (rejeu sûr, y compris
+      // après redémarrage ou depuis une autre instance d'API).
+      providerRef: this.deterministic('re_sim_', input.idempotencyKey),
       status: 'succeeded',
       amountCents: input.amountCents,
       failureReason: null,

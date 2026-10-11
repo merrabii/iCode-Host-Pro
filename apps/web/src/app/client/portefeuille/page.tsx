@@ -11,6 +11,7 @@ import {
   fetchMe,
   formatCents,
   getMyWallet,
+  getPaymentCapabilities,
   getSessionToken,
   listMyWalletTransactions,
   topupAttemptKey,
@@ -18,6 +19,7 @@ import {
   WALLET_STATUS_TONE,
   WALLET_TYPE_LABEL,
   type Me,
+  type PaymentCapabilities,
   type WalletBalance,
   type WalletTxPage,
 } from '@/lib/api';
@@ -71,6 +73,9 @@ export default function ClientWalletPage() {
   // GO Stripe - recharge par carte (mode test, page hébergée du prestataire).
   const [cardAmount, setCardAmount] = useState('');
   const [cardBusy, setCardBusy] = useState(false);
+  // Parcours activés côté admin (masquage UI — le serveur re-gate de toute
+  // façon, ici comme sur toutes les pages : aucune autorité client).
+  const [caps, setCaps] = useState<PaymentCapabilities | null>(null);
 
   const loadAll = useCallback(async (t: string, p: number) => {
     const [b, h] = await Promise.all([
@@ -101,6 +106,17 @@ export default function ClientWalletPage() {
       await loadAll(t, 1);
     })();
   }, [router, loadAll]);
+
+  // Interrupteurs « moyens de paiement » (public) — masquage du parcours carte.
+  useEffect(() => {
+    let alive = true;
+    void getPaymentCapabilities().then((c) => {
+      if (alive) setCaps(c);
+    });
+    return () => {
+      alive = false;
+    };
+  }, []);
 
   const changePage = (p: number) => {
     setPage(p);
@@ -163,6 +179,13 @@ export default function ClientWalletPage() {
    */
   const submitCard = async (e: FormEvent) => {
     e.preventDefault();
+    // Interrupteur admin « recharge par carte » : affordance d'UI seulement,
+    // le serveur applique son gate (409 PAYMENT_METHOD_DISABLED) de toute façon.
+    // Fail-closed (GO §5) : sans lecture réussie des capacités = non présupposé.
+    if (!caps || !caps.cardTopupEnabled) {
+      toast.error('La recharge par carte est actuellement indisponible.');
+      return;
+    }
     const normalized = cardAmount.trim().replace(',', '.');
     const value = Number(normalized);
     const cents = Math.round(value * 100);
@@ -174,10 +197,19 @@ export default function ClientWalletPage() {
       toast.warn('Le montant doit être compris entre 1 et 100 000.');
       return;
     }
+    if (!me) {
+      toast.error('Session introuvable : reconnectez-vous.');
+      return;
+    }
     setCardBusy(true);
     // GO P2 — MÊME tentative = MÊME clé (persistée pendant le parcours) :
     // double-clic ou reprise réseau = la MÊME session, jamais une seconde.
-    const idemKey = topupAttemptKey(cents);
+    // GO revue §5d — la clé est liée au client, au parcours et à la devise
+    // (jamais au seul montant) : changement de compte = NOUVELLE intention.
+    const idemKey = topupAttemptKey(cents, {
+      currency: balance?.currency ?? 'USD',
+      userId: me.id,
+    });
     const r = await createCardTopup(token, { amountCents: cents }, idemKey);
     setCardBusy(false);
     if (!r.ok || !r.data) {
@@ -317,32 +349,48 @@ export default function ClientWalletPage() {
             title="Recharger par carte"
             sub={`Mode test (Stripe) - dépôt dans la devise du compte : ${balance?.currency ?? 'USD'}. Page de paiement hébergée : aucune carte n'est saisie ici.`}
           >
-            <form onSubmit={(e) => void submitCard(e)} className="row">
-              <Field
-                label={`Montant (${balance?.currency ?? 'USD'})`}
-                required
-                htmlFor="card-amount"
-              >
-                <Input
-                  id="card-amount"
-                  value={cardAmount}
-                  placeholder="50"
-                  inputMode="decimal"
-                  onChange={(e) => setCardAmount(e.target.value)}
-                  className="input-sm"
-                />
-              </Field>
-              <div style={{ alignSelf: 'flex-end', paddingBottom: 6 }}>
-                <Button type="submit" size="sm" disabled={cardBusy}>
-                  {cardBusy ? 'Ouverture…' : 'Payer par carte'}
-                </Button>
-              </div>
-            </form>
-            <p className="muted" style={{ fontSize: 12, marginTop: 8 }}>
-              Le solde n'est crédité qu'après confirmation signée côté serveur.
-              En cas de refus, d'annulation ou d'expiration, aucun montant n'est
-              crédité. Paiement en mode test : aucun réel encaissement.
-            </p>
+            {caps === null ? (
+              // Fail-closed (GO §5) : tant que les capacités ne sont pas
+              // lues avec succès, aucun moyen n'est présupposé autorisé.
+              <p className="muted" style={{ fontSize: 13, margin: 0 }}>
+                Vérification des moyens de paiement disponibles… Le paiement
+                par carte ne s'affiche qu'après confirmation du serveur.
+              </p>
+            ) : !caps.cardTopupEnabled ? (
+              <p className="muted" style={{ fontSize: 13, margin: 0 }}>
+                La recharge par carte est momentanément désactivée. Le virement
+                (avec justificatif) reste disponible ci-dessus.
+              </p>
+            ) : (
+              <>
+                <form onSubmit={(e) => void submitCard(e)} className="row">
+                  <Field
+                    label={`Montant (${balance?.currency ?? 'USD'})`}
+                    required
+                    htmlFor="card-amount"
+                  >
+                    <Input
+                      id="card-amount"
+                      value={cardAmount}
+                      placeholder="50"
+                      inputMode="decimal"
+                      onChange={(e) => setCardAmount(e.target.value)}
+                      className="input-sm"
+                    />
+                  </Field>
+                  <div style={{ alignSelf: 'flex-end', paddingBottom: 6 }}>
+                    <Button type="submit" size="sm" disabled={cardBusy}>
+                      {cardBusy ? 'Ouverture…' : 'Payer par carte'}
+                    </Button>
+                  </div>
+                </form>
+                <p className="muted" style={{ fontSize: 12, marginTop: 8 }}>
+                  Le solde n'est crédité qu'après confirmation signée côté serveur.
+                  En cas de refus, d'annulation ou d'expiration, aucun montant n'est
+                  crédité. Paiement en mode test : aucun réel encaissement.
+                </p>
+              </>
+            )}
           </Panel>
         </div>
 

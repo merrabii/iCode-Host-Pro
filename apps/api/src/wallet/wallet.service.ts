@@ -116,6 +116,28 @@ export class WalletService {
   }
 
   /**
+   * GO §6 (l.102) — toute opération de solde PORTE une devise valide : la
+   * garde ne peut JAMAIS être contournée parce que la devise est absente.
+   * « USD par défaut » (l.100) est la devise de la plateforme (défauts schéma
+   * + `BillingSetting`), jamais un implicite d'opération. Retourne la devise
+   * normalisée (trim + majuscules).
+   */
+  private assertOperationCurrency(currency: string | undefined): string {
+    const raw = String(currency ?? '').trim();
+    if (!raw) {
+      throw new BadRequestException(
+        "Devise de l'opération absente : refus (la garde de devise ne peut pas être contournée).",
+      );
+    }
+    if (!/^[A-Za-z]{3}$/.test(raw)) {
+      throw new BadRequestException(
+        `Devise d'opération invalide : « ${raw} » (code ISO à 3 lettres attendu).`,
+      );
+    }
+    return raw.toUpperCase();
+  }
+
+  /**
    * Dossier du membre connecté (GO Q3) :
    *  - rattaché au compte (`userId`) → retour immédiat ;
    *  - dossier INVITÉ (`userId: null`) au même email **de la DB** → rattachement
@@ -218,12 +240,14 @@ export class WalletService {
   /** Crédit immédiat (idempotent) : verrou + insertion + incrément, un seul tour. */
   async credit(customerId: string, input: ApplyWalletInput): Promise<ApplyResult> {
     this.assertAmount(input.amountCents);
+    this.assertOperationCurrency(input.currency);
     return this.apply(customerId, input, 'credit');
   }
 
   /** Débit immédiat (idempotent) : solde insuffisant = 409, jamais de négatif. */
   async debit(customerId: string, input: ApplyWalletInput): Promise<ApplyResult> {
     this.assertAmount(input.amountCents);
+    this.assertOperationCurrency(input.currency);
     return this.apply(customerId, input, 'debit');
   }
 
@@ -303,18 +327,24 @@ export class WalletService {
       throw new NotFoundException('Dossier client introuvable.');
     }
     const current = Number(rows[0].walletBalanceCents);
-    // GO P8 — garde DEVISE SOUS VERROU : une opération ne s'applique que dans
-    // la devise du portefeuille. Aucune conversion de change, aucune écriture
-    // d'un solde dans une autre devise qu'annoncée (un écart = refus explicite,
-    // jamais un montant mélangé ou un repli silencieux sur `USD`).
-    if (input.currency) {
-      const wanted = input.currency.toUpperCase();
-      const owned = String(rows[0].walletCurrency ?? '').toUpperCase();
-      if (owned && wanted !== owned) {
-        throw new ConflictException(
-          `Opération en ${wanted} refusée : le portefeuille est en ${owned} (aucun change automatique).`,
-        );
-      }
+    // GO P8 + §6 — garde DEVISE SOUS VERROU : une opération ne s'applique que
+    // dans la devise du portefeuille. Aucune conversion de change, aucune
+    // écriture d'un solde dans une autre devise qu'annoncée (un écart = refus
+    // explicite, jamais un montant mélangé ou un repli silencieux). La devise
+    // de l'opération est EXIGÉE en entrée : jamais de contournement de la garde
+    // par absence ; un portefeuille à devise inconnue = donnée ambiguë → refus
+    // conservateur (aucun changement supposé).
+    const wanted = this.assertOperationCurrency(input.currency);
+    const owned = String(rows[0].walletCurrency ?? '').trim().toUpperCase();
+    if (!owned) {
+      throw new ConflictException(
+        'Devise du portefeuille inconnue : opération refusée (donnée historique ambiguë, aucun changement supposé).',
+      );
+    }
+    if (wanted !== owned) {
+      throw new ConflictException(
+        `Opération en ${wanted} refusée : le portefeuille est en ${owned} (aucun change automatique).`,
+      );
     }
     if (direction === 'debit' && current < input.amountCents) {
       throw new ConflictException('Solde insuffisant.');
@@ -405,6 +435,7 @@ export class WalletService {
     direction: 'credit' | 'debit',
   ): Promise<ApplyResult> {
     this.assertAmount(input.amountCents);
+    this.assertOperationCurrency(input.currency);
     return this.applyInTx(tx, customerId, input, direction);
   }
 

@@ -15,6 +15,7 @@ import { Roles } from '../auth/decorators/roles.decorator';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import { AuditService } from '../audit/audit.service';
 import { PrismaService } from '../prisma/prisma.service';
+import { PaymentSettingsService } from './payment-settings.service';
 import { UpdatePaymentMethodDto } from './dto/update-payment-method.dto';
 
 interface AdminActor {
@@ -36,28 +37,36 @@ export class BillingPaymentAdminController {
   constructor(
     private readonly prisma: PrismaService,
     private readonly audit: AuditService,
+    private readonly settings: PaymentSettingsService,
   ) {}
 
   @Get()
-  @ApiOperation({ summary: 'Liste les moyens de paiement (admin, sans secrets)' })
+  @ApiOperation({
+    summary: 'Liste les moyens de paiement (admin, sans secrets)',
+  })
   async list() {
     const methods = await this.prisma.paymentMethod.findMany({
       orderBy: { displayOrder: 'asc' },
     });
-    return methods.map((m) => ({
-      id: m.id,
-      name: m.name,
-      type: m.type,
-      isActive: m.isActive,
-      displayOrder: m.displayOrder,
-      config: m.config,
-      hasConfigEnc: !!m.configEnc,
-      feeType: m.feeType,
-      feePercent: m.feePercent?.toString() ?? null,
-      feeFixedCents: m.feeFixedCents,
-      createdAt: m.createdAt,
-      updatedAt: m.updatedAt,
-    }));
+    // État LISIBLE pour l'admin : « désactivé » / « configuration incomplète »
+    // / « opérationnel », avec une explication honnête (jamais de secret).
+    return Promise.all(
+      methods.map(async (m) => ({
+        id: m.id,
+        name: m.name,
+        type: m.type,
+        isActive: m.isActive,
+        displayOrder: m.displayOrder,
+        config: m.config,
+        hasConfigEnc: !!m.configEnc,
+        feeType: m.feeType,
+        feePercent: m.feePercent?.toString() ?? null,
+        feeFixedCents: m.feeFixedCents,
+        createdAt: m.createdAt,
+        updatedAt: m.updatedAt,
+        ...(await this.settings.methodState(m)),
+      })),
+    );
   }
 
   @Patch(':id')

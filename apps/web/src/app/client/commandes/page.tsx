@@ -3,10 +3,12 @@
 import { useCallback, useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import {
+  createOrderCardPayment,
   fetchMe,
   formatCents,
   getMyInvoice,
   getMyOrder,
+  getPaymentCapabilities,
   getSessionToken,
   listMyOrders,
   ORDER_STATUS_LABEL,
@@ -17,6 +19,7 @@ import {
   type Me,
   type OrderDetail,
   type OrderListPage,
+  type PaymentCapabilities,
 } from '@/lib/api';
 import { AppShell } from '@/components/app-shell';
 import { CLIENT_NAV } from '@/config/nav';
@@ -57,7 +60,12 @@ export default function ClientOrdersPage() {
   const [invoice, setInvoice] = useState<InvoiceDetail | null>(null);
   // Q-A (GO item 1+4) — règlement par solde + armement/révocation renouvellement.
   const [paying, setPaying] = useState(false);
+  const [payingCard, setPayingCard] = useState(false);
   const [renewing, setRenewing] = useState(false);
+  // GO §5 — parcours activés (public) : masquage des boutons de règlement.
+  // Fail-closed : `caps === null` (chargement OU échec de lecture) = aucun
+  // moyen présupposé autorisé. Le serveur re-gate l'opération de toute façon.
+  const [caps, setCaps] = useState<PaymentCapabilities | null>(null);
 
   const load = useCallback(
     async (t: string, p: number, st: string) => {
@@ -125,6 +133,18 @@ export default function ClientOrdersPage() {
     })();
   }, [router, load, openDetail]);
 
+  // GO §5 — lecture des capacités (endpoint PUBLIC) : seule cette réponse
+  // permet d'afficher un bouton de règlement ; échec = aucun affichage.
+  useEffect(() => {
+    let alive = true;
+    void getPaymentCapabilities().then((c) => {
+      if (alive) setCaps(c);
+    });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
   const changeStatus = (v: string) => {
     setStatus(v);
     setPage(1);
@@ -156,6 +176,33 @@ export default function ClientOrdersPage() {
     await openDetail(token, detail.id);
     await load(token, page, status);
   }, [detail, token, toast, openDetail, load, page, status]);
+
+  /**
+   * Lot « paiement direct des commandes » — règlement d'une commande PAR
+   * CARTE : ouverture de la session hébergée du prestataire (montant/devise
+   * lus côté serveur). Aucun portefeuille sollicité, aucune carte saisie ici.
+   * Une tentative déjà ouverte est reprise (clé côté serveur), jamais doublée.
+   */
+  const payByCard = useCallback(async () => {
+    if (!detail) return;
+    setPayingCard(true);
+    const r = await createOrderCardPayment(token, detail.id);
+    setPayingCard(false);
+    if (!r.ok) {
+      const msg = (r.data as { message?: string } | null)?.message;
+      toast.error(
+        msg && typeof msg === 'string' ? msg : 'Paiement par carte indisponible pour le moment.',
+      );
+      return;
+    }
+    const url =
+      r.data && typeof r.data.checkoutUrl === 'string' ? r.data.checkoutUrl : null;
+    if (!url) {
+      toast.error('Session de paiement indisponible : réessayez dans un instant.');
+      return;
+    }
+    window.location.href = url;
+  }, [detail, token, toast]);
 
   /**
    * Q-A (item 4) — armement (consentement daté) / RÉVOCATION immédiate du
@@ -367,18 +414,39 @@ export default function ClientOrdersPage() {
                 </span>
               </div>
 
-              {/* Q-A (item 1) — réglage direct par solde sur commande en attente. */}
-              {detail.status === 'PENDING_PAYMENT' && (
+              {/* Q-A (item 1) — réglage direct par solde sur commande en attente.
+                  Fail-closed (GO §5) : boutons affichés UNIQUEMENT après
+                  lecture réussie des capacités ET parcours activé. */}
+              {detail.status === 'PENDING_PAYMENT' &&
+                caps !== null &&
+                (caps.walletPaymentEnabled || caps.cardOrderPaymentEnabled) && (
                 <div className="row mb" style={{ gap: 10, flexWrap: 'wrap' }}>
-                  <Button size="sm" disabled={paying} onClick={() => void payByWallet()}>
-                    {paying ? 'Règlement…' : 'Régler par solde'}
-                  </Button>
+                  {caps.walletPaymentEnabled && (
+                    <Button size="sm" disabled={paying} onClick={() => void payByWallet()}>
+                      {paying ? 'Règlement…' : 'Régler par solde'}
+                    </Button>
+                  )}
+                  {caps.cardOrderPaymentEnabled && (
+                    <Button size="sm" disabled={payingCard} onClick={() => void payByCard()}>
+                      {payingCard ? 'Ouverture…' : 'Régler par carte'}
+                    </Button>
+                  )}
                   <span className="muted cell-sub">
-                    Débit et confirmation sont exécutés en une seule opération sur votre
-                    portefeuille.
+                    Solde : débit et confirmation en une opération. Carte : page de
+                    paiement sécurisée du prestataire (aucun numéro saisi ici).
                   </span>
                 </div>
               )}
+              {/* Aucun parcours activé (caps lue) : message clair, aucun repli. */}
+              {detail.status === 'PENDING_PAYMENT' &&
+                caps !== null &&
+                !caps.walletPaymentEnabled &&
+                !caps.cardOrderPaymentEnabled && (
+                  <p className="muted cell-sub" style={{ margin: 0 }}>
+                    Aucun règlement en ligne n&apos;est actuellement disponible
+                    pour cette commande — les moyens de paiement sont désactivés.
+                  </p>
+                )}
               {(detail.statusHistory ?? []).length > 0 && (
                 <ol className="muted" style={{ margin: 0, paddingLeft: 18, fontSize: 13 }}>
                   {(detail.statusHistory ?? []).map((h) => (

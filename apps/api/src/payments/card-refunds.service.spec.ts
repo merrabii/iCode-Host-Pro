@@ -9,6 +9,7 @@ import {
 } from '@prisma/client';
 import { JwtPayload } from '../auth/types';
 import { CardRefundsService } from './card-refunds.service';
+import { StripeHttpError } from './stripe-connector';
 
 // GO Stripe §6 — remboursement d’une RECHARGE vers la CARTE : plafond cumulé,
 // idempotence, refus si le crédit est déjà dépensé (jamais de dette implicite),
@@ -85,14 +86,21 @@ describe('CardRefundsService (GO §6 — recharge → carte)', () => {
       update: jest.Mock;
       updateMany: jest.Mock;
       aggregate: jest.Mock;
+      findMany: jest.Mock;
     };
+    refundObservation: { findFirst: jest.Mock; findMany: jest.Mock };
     walletTransaction: { findUnique: jest.Mock };
     cardPayment: { findUnique: jest.Mock; update: jest.Mock; updateMany: jest.Mock };
     customer: { update: jest.Mock };
   };
   let prisma: {
     $transaction: jest.Mock;
-    refund: { findUnique: jest.Mock; findMany: jest.Mock; findFirst: jest.Mock };
+    refund: {
+      findUnique: jest.Mock;
+      updateMany: jest.Mock;
+      findMany: jest.Mock;
+      findFirst: jest.Mock;
+    };
     cardPayment: { findUnique: jest.Mock };
   };
   let wallet: { applyWithClient: jest.Mock };
@@ -106,6 +114,8 @@ describe('CardRefundsService (GO §6 — recharge → carte)', () => {
   let replayRow: Refund | null;
   let lastRow: Refund;
   let reservedSum: number | null;
+  /** GO §2 — somme des remboursements INTERNES soldés (règle `max`). */
+  let succeededSum: number | null;
 
   beforeEach(() => {
     lockPayment = payment();
@@ -113,6 +123,7 @@ describe('CardRefundsService (GO §6 — recharge → carte)', () => {
     replayRow = null;
     lastRow = refundRow();
     reservedSum = null;
+    succeededSum = null;
 
     tx = {
       $queryRaw: jest.fn((strings: TemplateStringsArray) => {
@@ -140,7 +151,21 @@ describe('CardRefundsService (GO §6 — recharge → carte)', () => {
           lastRow = refundRow({ ...lastRow, ...args.data });
           return { count: 1 };
         }),
-        aggregate: jest.fn(async () => ({ _sum: { amountCents: reservedSum } })),
+        // GO §2 — l'agrégat sert deux besoins : réservations PENDING (plafond)
+        // et remboursements INTERNES soldés SUCCEEDED (union des identités).
+        aggregate: jest.fn(async (args: { where?: { status?: string } }) => {
+          if (args?.where?.status === 'SUCCEEDED') {
+            return { _sum: { amountCents: succeededSum } };
+          }
+          return { _sum: { amountCents: reservedSum } };
+        }),
+        // GO revue §1 — identités internes pour l'exclusion (aucune par défaut).
+        findMany: jest.fn(async () => []),
+      },
+      // GO revue §1 — aucune observation prestataire par défaut en unitaire.
+      refundObservation: {
+        findFirst: jest.fn(async () => null),
+        findMany: jest.fn(async () => []),
       },
       walletTransaction: {
         findUnique: jest.fn(async () => ({ id: 'wtx-refund-1' })),
@@ -164,6 +189,11 @@ describe('CardRefundsService (GO §6 — recharge → carte)', () => {
         findUnique: jest.fn(async (args: { where: Row }) =>
           args.where?.idempotencyKey !== undefined ? replayRow : lastRow,
         ),
+        // GO V3 §1 — libération de lease (hors transaction) en unitaire.
+        updateMany: jest.fn(async (args: { where: Row; data: Row }) => {
+          lastRow = refundRow({ ...lastRow, ...args.data });
+          return { count: 1 };
+        }),
         findMany: jest.fn(async () => [lastRow]),
         findFirst: jest.fn(async () => null),
       },
@@ -238,12 +268,38 @@ describe('CardRefundsService (GO §6 — recharge → carte)', () => {
     expect(connector.createRefund).not.toHaveBeenCalled();
   });
 
+  it('§6 : devise du paiement ≠ devise du portefeuille → 409 « aucune opération mixte »', async () => {
+    lockCustomer = { walletBalanceCents: 99999, walletCurrency: 'EUR', email: 'c@d' };
+    await expect(request(2000)).rejects.toThrow(ConflictException);
+    await expect(request(2000)).rejects.toThrow('aucune opération mixte');
+    expect(wallet.applyWithClient).not.toHaveBeenCalled();
+    expect(connector.createRefund).not.toHaveBeenCalled();
+  });
+
   it('refuse sur un paiement non encaissé', async () => {
     lockPayment = payment({ status: CardPaymentStatus.CREATED });
     await expect(request()).rejects.toThrow('seul un paiement encaissé');
   });
 
+  it('§5c : REFUSE un règlement de COMMANDe (kind ORDER) — parcours recharge interdit', async () => {
+    lockPayment = payment({ kind: 'ORDER', orderId: 'ord-1' });
+    await expect(request(100)).rejects.toThrow(ConflictException);
+    await expect(request(100)).rejects.toThrow('/store/admin/orders/');
+    expect(wallet.applyWithClient).not.toHaveBeenCalled();
+    expect(connector.createRefund).not.toHaveBeenCalled();
+    expect(tx.refund.create).not.toHaveBeenCalled();
+  });
+
+  it('§5c : REFUSE aussi un paiement TOPUP ayant un orderId (défensif double lien)', async () => {
+    lockPayment = payment({ kind: 'TOPUP', orderId: 'ord-2' });
+    await expect(request(100)).rejects.toThrow('de commande');
+    expect(wallet.applyWithClient).not.toHaveBeenCalled();
+    expect(tx.refund.create).not.toHaveBeenCalled();
+  });
+
   it('débite le crédit, appelle le prestataire puis confirme (crédit une seule fois)', async () => {
+    // GO §2 — ce remboursement est le SEUL soldé : la règle `max` avance à 2000.
+    succeededSum = 2000;
     const view = await request();
     expect(view.status).toBe(RefundStatus.SUCCEEDED);
     expect(view.providerRef).toBe('re_1');
@@ -282,6 +338,8 @@ describe('CardRefundsService (GO §6 — recharge → carte)', () => {
 
   it('bascule REFUNDED quand le paiement est intégralement remboursé', async () => {
     lockPayment = payment({ refundedCents: 3000 });
+    // GO §2 — 3000 déjà comptabilisés + 2000 nouveaux = somme interne soldée 5000.
+    succeededSum = 5000;
     await request(2000);
     expect(tx.cardPayment.update).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -347,7 +405,12 @@ describe('CardRefundsService (GO §6 — recharge → carte)', () => {
   });
 
   it('rejoue un appel prestataire interrompu avec la même clé (retry)', async () => {
-    lastRow = refundRow({ status: RefundStatus.PENDING, providerRef: null });
+    // GO revue §3b — premier envoi RÉCENT : la reprise reste dans la fenêtre.
+    lastRow = refundRow({
+      status: RefundStatus.PENDING,
+      providerRef: null,
+      dispatchedAt: new Date(Date.now() - 60 * 60 * 1000),
+    } as Row);
     prisma.refund.findUnique.mockImplementation(async (args: { where: Row }) =>
       args.where?.idempotencyKey !== undefined ? replayRow : lastRow,
     );
@@ -361,6 +424,134 @@ describe('CardRefundsService (GO §6 — recharge → carte)', () => {
     lastRow = refundRow({ status: RefundStatus.SUCCEEDED, providerRef: 're_1' });
     await expect(service.retryProviderCall('rfd1', actor)).rejects.toThrow(
       ConflictException,
+    );
+  });
+
+  // ── GO V3 §1 — émission exclusive (lease) + écriture sous propriétaire ────
+
+  it('V3 §1 : seconde émission PENDANT une tentative vivante → un SEUL appel prestataire', async () => {
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    connector.createRefund.mockImplementationOnce(async () => {
+      await gate;
+      return { providerRef: 're_only', status: 'succeeded', amountCents: 2000, failureReason: null };
+    });
+    const first = service.retryProviderCall('rfd1', actor);
+    // Premier rendez-vous : la tentative a revendiqué (owner + lease).
+    await new Promise((r) => setImmediate(r));
+    expect(lastRow.dispatchOwner).toBeTruthy();
+    // Seconde émission pendant le lease : revendication REFUSÉE, zéro octet.
+    await expect(service.retryProviderCall('rfd1', actor)).rejects.toThrow(
+      ConflictException,
+    );
+    expect(connector.createRefund).toHaveBeenCalledTimes(1);
+    release();
+    const view = await first;
+    expect(view.providerRef).toBe('re_only');
+    expect(view.status).toBe(RefundStatus.SUCCEEDED);
+  });
+
+  it('V3 §1 : réponse TARDIVE d’un prédécesseur dépossédé → CAS perdu, aucun écrasement', async () => {
+    // Tentative A interrompue (lease expiré), propriétaire « crashed ».
+    lastRow = refundRow({
+      status: RefundStatus.PENDING,
+      providerRef: null,
+      dispatchedAt: new Date(Date.now() - 5 * 60_000),
+      dispatchOwner: 'crashed-owner',
+      dispatchClaimedAt: new Date(Date.now() - 5 * 60_000),
+    } as Row);
+    // La tentative B (ce retry) dépossède puis ÉCHOUE certainement : le
+    // CAS d'échec est conditionné au propriétaire B ; une écriture tardive
+    // « A » (owner crashed) ne passerait JAMAIS ce CAS.
+    connector.createRefund.mockRejectedValueOnce(
+      new StripeHttpError('Montant invalide.', 400, 'invalid_amount'),
+    );
+    const view = await service.retryProviderCall('rfd1', actor);
+    expect(view.status).toBe(RefundStatus.FAILED);
+    expect(lastRow.dispatchOwner).not.toBe('crashed-owner');
+    // Preuve : l'écriture de résultat portait le where propriétaire.
+    expect(tx.refund.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ dispatchOwner: expect.any(String) }),
+        data: expect.objectContaining({ status: RefundStatus.FAILED }),
+      }),
+    );
+  });
+
+  it('V3 §1 : un 409 prestataire n’est JAMAIS un refus certain pour un remboursement', async () => {
+    connector.createRefund.mockRejectedValueOnce(
+      new StripeHttpError('idempotency conflict', 409, 'invalid_request_error'),
+    );
+    const view = await request();
+    expect(view.status).toBe(RefundStatus.PENDING); // incertain, jamais FAILED
+    expect(view.failureReason).toBeNull();
+    // Aucune compensation : la réservation est conservée (reprise possible).
+    expect(wallet.applyWithClient).toHaveBeenCalledTimes(1);
+  });
+
+  // ── GO revue §3b — reprise BORNÉE à la fenêtre d’idempotence (24 h) ─────
+
+  it('§3b : retry hors fenêtre 24 h → refus + intervention (jamais de second remboursement)', async () => {
+    lastRow = refundRow({
+      status: RefundStatus.PENDING,
+      providerRef: null,
+      dispatchedAt: new Date(Date.now() - 25 * 60 * 60 * 1000),
+    } as Row);
+    await expect(service.retryProviderCall('rfd1', actor)).rejects.toThrow(
+      ConflictException,
+    );
+    await expect(service.retryProviderCall('rfd1', actor)).rejects.toThrow(
+      'jamais de second remboursement',
+    );
+    expect(connector.createRefund).not.toHaveBeenCalled();
+    expect(audit.record).toHaveBeenCalledWith(
+      expect.objectContaining({ action: 'refund.topup.recovery_window_expired' }),
+    );
+  });
+
+  // ── GO revue §3c — refus certain TRANCHÉ, incertain DIFFÉRÉ ─────────────
+
+  it('§3c : refus certain 4xx → échec tranché + recrédit (jamais de reprise perpétuelle)', async () => {
+    connector.createRefund.mockRejectedValue(
+      new StripeHttpError('Le montant est invalide.', 400, 'invalid_amount'),
+    );
+    const view = await request();
+    expect(view.status).toBe(RefundStatus.FAILED);
+    expect(view.failureReason).toContain('Le montant est invalide.');
+    expect(view.pendingProviderCall).toBe(false);
+    // Débit initial + compensation (réservation libérée, solde restitué).
+    expect(wallet.applyWithClient).toHaveBeenCalledTimes(2);
+    expect(wallet.applyWithClient).toHaveBeenLastCalledWith(
+      expect.anything(),
+      'cust1',
+      expect.objectContaining({
+        type: WalletTransactionType.CREDIT,
+        idempotencyKey: `cardrefund-back:${lastRow.id}`,
+      }),
+      'credit',
+    );
+    // JAMAIS classé « pending_retry » (une demande refusée ne se reprend pas).
+    expect(audit.record).not.toHaveBeenCalledWith(
+      expect.objectContaining({ action: 'refund.topup.provider_call_deferred' }),
+    );
+    expect(audit.record).toHaveBeenCalledWith(
+      expect.objectContaining({ action: 'refund.topup.failed' }),
+    );
+  });
+
+  it('§3c : 429 reste INCERTAIN (réservation conservée, retry possible)', async () => {
+    connector.createRefund.mockRejectedValue(
+      new StripeHttpError('Trop de requêtes.', 429, 'rate_limit'),
+    );
+    const view = await request();
+    expect(view.status).toBe(RefundStatus.PENDING);
+    expect(view.pendingProviderCall).toBe(true);
+    // Aucun recrédit : seul le débit initial a eu lieu.
+    expect(wallet.applyWithClient).toHaveBeenCalledTimes(1);
+    expect(audit.record).toHaveBeenCalledWith(
+      expect.objectContaining({ action: 'refund.topup.provider_call_deferred' }),
     );
   });
 
@@ -402,6 +593,8 @@ describe('CardRefundsService (GO §6 — recharge → carte)', () => {
   // ── GO P6 — issue prestataire relue (refund.*) sans double effet ────────
 
   it('P6 : « succeeded » chez le prestataire fait avancer l’encaissé et libère la réservation', async () => {
+    // GO §2 — seul remboursement soldé : la règle `max` avance à 2000 UNE fois.
+    succeededSum = 2000;
     prisma.refund.findFirst.mockResolvedValue(
       refundRow({ providerRef: 're_1', status: RefundStatus.PENDING }),
     );
@@ -431,6 +624,28 @@ describe('CardRefundsService (GO §6 — recharge → carte)', () => {
     });
     expect(replay?.changed).toBe(false);
     expect(tx.cardPayment.update).toHaveBeenCalledTimes(1);
+  });
+
+  it('§2 : la règle `max` n’avance JAMAIS deux fois (API puis webhook = 2000, pas 4000)', async () => {
+    // L'appel API a déjà porté refundedCents à 2000 ; le webhook `succeeded`
+    // arrive ensuite : le CAS du remboursement avance, le COMPTEUR non.
+    succeededSum = 2000;
+    lockPayment = payment({ refundedCents: 2000 });
+    prisma.refund.findFirst.mockResolvedValue(
+      refundRow({ providerRef: 're_1', status: RefundStatus.PENDING }),
+    );
+    const out = await service.applyProviderRefundStatus({
+      providerRef: 're_1',
+      status: 'succeeded',
+      providerCode: 'simulated',
+    });
+    expect(out).toMatchObject({ status: RefundStatus.SUCCEEDED, changed: true });
+    // Aucune écriture de compteur : max(2000 courant, 2000 interne) = 2000.
+    expect(tx.cardPayment.update).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ refundedCents: expect.anything() }),
+      }),
+    );
   });
 
   it('P6 : « failed » compense par CAS avec recrédit une seule fois', async () => {

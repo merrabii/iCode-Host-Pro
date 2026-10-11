@@ -5,6 +5,8 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import {
+  CardPaymentKind,
+  CardPaymentStatus,
   InvoiceLineKind,
   InvoiceStatus,
   OrderStatus,
@@ -31,6 +33,10 @@ export interface RefundView {
   // GO Stripe — nullable : un remboursement de RECHARGE carte n'a pas de
   // commande (rattachement `cardPaymentId`).
   orderId: string | null;
+  // Lot « paiement direct des commandes » — un remboursement de COMMANDE
+  // réglée par carte porte les DEUX rattachements (orderId + cardPaymentId) :
+  // suivi de l'origine, AUCUN mouvement de portefeuille.
+  cardPaymentId: string | null;
   invoiceId: string | null;
   kind: RefundKind;
   status: RefundStatus;
@@ -223,8 +229,53 @@ export class RefundService {
       );
     }
     const reason = input.reason?.trim() || null;
+
+    // ── Lot « paiement direct des commandes » — ORIGINE DU RÈGLEMENT ──────
+    // Une commande réglée PAR CARTE est remboursée VERS LA CARTE : le
+    // règlement suit son origine (rattachement `orderId` + `cardPaymentId`,
+    // AUCUN mouvement de portefeuille). Lecture NON verrouillée : elle sert
+    // seulement à choisir l'ordre de verrou (paiement → commande, l'ordre
+    // canonique partagé avec `confirmPaid` — jamais d'attente circulaire).
+    const cardRows = await this.prisma.cardPayment.findMany({
+      where: { orderId },
+      orderBy: { id: 'asc' },
+      select: {
+        id: true,
+        reference: true,
+        status: true,
+        kind: true,
+        interventionNeeded: true,
+        currency: true,
+      },
+    });
+    const originOf = (rows: typeof cardRows) =>
+      rows.find(
+        (p) =>
+          p.kind === CardPaymentKind.ORDER &&
+          !p.interventionNeeded &&
+          (p.status === CardPaymentStatus.SUCCEEDED ||
+            p.status === CardPaymentStatus.PARTIALLY_REFUNDED),
+      ) ?? null;
+    const cardOrigin = originOf(cardRows);
+
+    if (cardOrigin && input.kind === RefundKind.WALLET_CREDIT) {
+      throw new ConflictException({
+        message:
+          `Commande réglée par carte (${cardOrigin.reference}) : le remboursement vers le solde ` +
+          'du portefeuille est REFUSÉ — le règlement suit son origine ' +
+          '(remboursement vers la carte, sans mouvement de portefeuille).',
+        code: 'REFUND_ORIGIN_CARD',
+      });
+    }
+
     try {
       return await this.prisma.$transaction(async (tx) => {
+        // 0) Verrou PAIEMENT(S) de la commande AVANT la commande — ordre
+        //    canonique Carte → Commande (identique à `confirmPaid` : un
+        //    règlement concurrent attend notre libération, jamais l'inverse).
+        for (const p of cardRows) {
+          await tx.$queryRaw`SELECT id FROM "CardPayment" WHERE id = ${p.id} FOR UPDATE`;
+        }
         // 1) Verrou COMMANDE (ordre canonique : commande → facture → client).
         const rows = await tx.$queryRaw<
           Array<{
@@ -291,6 +342,54 @@ export class RefundService {
             billingAddress: true,
           },
         });
+
+        // 3bis) ORIGINE revérifiée SOUS verrou : un règlement concurrent ne
+        //       peut pas se committer pendant que nous tenons la commande, le
+        //       statut lu ici est stable.
+        const freshCardRows = await tx.cardPayment.findMany({
+          where: { orderId },
+          orderBy: { id: 'asc' },
+          select: {
+            id: true,
+            reference: true,
+            status: true,
+            kind: true,
+            interventionNeeded: true,
+            currency: true,
+          },
+        });
+        const originNow = originOf(freshCardRows);
+        if (originNow) {
+          const lockedIds = new Set(cardRows.map((p) => p.id));
+          if (!lockedIds.has(originNow.id)) {
+            // Défensif : origine apparue entre la lecture et les verrous —
+            // refus explicite (aucune attente de verrou sous verrou commande,
+            // donc aucun cycle avec un règlement en cours).
+            throw new ConflictException(
+              'Origine de règlement apparue pendant la préparation : nouvelle tentative requise.',
+            );
+          }
+          if (input.kind !== RefundKind.EXTERNAL_CARD) {
+            throw new ConflictException({
+              message:
+                `Commande réglée par carte (${originNow.reference}) : le remboursement vers le solde ` +
+                'du portefeuille est REFUSÉ — le règlement suit son origine ' +
+                '(remboursement vers la carte, sans mouvement de portefeuille).',
+              code: 'REFUND_ORIGIN_CARD',
+            });
+          }
+          return this.createCardOrderRefundInTx(tx, {
+            orderId,
+            order,
+            invoiceId: origin?.id ?? null,
+            input,
+            key,
+            reason,
+            actor,
+            orderUsed: used,
+            cardRow: originNow,
+          });
+        }
 
         // 4) Enregistrement de l'intention (PENDING d'abord).
         const refund = await tx.refund.create({
@@ -540,6 +639,142 @@ export class RefundService {
     }
   }
 
+  /**
+   * Remboursement d'une COMMANDE RÉGLÉE PAR CARTE — suivi de l'origine.
+   *
+   * Verrous déjà acquis par l'appelant, dans l'ordre canonique PAIEMENT →
+   * COMMANDE (le seul partagé avec `confirmPaid` : aucun cycle d'attente).
+   *
+   *  • double plafond : commande (cumul PENDING+SUCCEEDED ≤ encaissé) +
+   *    paiement (encaissés + réservations ≤ encaissé sur CE paiement) ;
+   *  • création `PENDING` rattachée aux DEUX liens (`orderId` +
+   *    `cardPaymentId`) + réservation dénormalisée `pendingRefundCents` ;
+   *  • AUCUN mouvement de portefeuille (le client n'a jamais été crédité) et
+   *    AUCUN avoir (réservé au parcours interne `WALLET_CREDIT`) ;
+   *  • l'ÉMISSION vers le prestataire est déclenchée par l'appelant (hors
+   *    transaction : aucun réseau sous verrou), idempotente par clé.
+   */
+  private async createCardOrderRefundInTx(
+    tx: Prisma.TransactionClient,
+    args: {
+      orderId: string;
+      order: {
+        id: string;
+        status: OrderStatus;
+        paidAt: Date | null;
+        amountTtcCents: number;
+        currency: string;
+        customerId: string;
+      };
+      invoiceId: string | null;
+      input: CreateRefundInput;
+      key: string;
+      reason: string | null;
+      actor: JwtPayload;
+      orderUsed: number;
+      cardRow: {
+        id: string;
+        reference: string;
+        status: CardPaymentStatus;
+        currency: string;
+      };
+    },
+  ): Promise<RefundView> {
+    const { orderId, order, invoiceId, input, key, reason, actor, cardRow } = args;
+
+    if (
+      cardRow.status !== CardPaymentStatus.SUCCEEDED &&
+      cardRow.status !== CardPaymentStatus.PARTIALLY_REFUNDED
+    ) {
+      throw new ConflictException(
+        `Paiement d'origine « ${cardRow.status} » : seul un règlement encaissé peut être remboursé.`,
+      );
+    }
+    if (cardRow.currency.toUpperCase() !== order.currency.toUpperCase()) {
+      throw new ConflictException(
+        `Devise du paiement (${cardRow.currency}) ≠ devise de la commande (${order.currency}) : aucune opération mixte.`,
+      );
+    }
+
+    // Paiement DÉJÀ verrouillé par l'appelant : valeurs stables.
+    const pay = await tx.cardPayment.findUnique({ where: { id: cardRow.id } });
+    if (!pay) throw new NotFoundException('Paiement d’origine introuvable.');
+
+    // GO revue §1 — incertitude prestataire non rapprochée : opération
+    // dépendante du plafond REFUSÉE jusqu'à l'acquittement admin.
+    const uncertain = await tx.refundObservation.findFirst({
+      where: { cardPaymentId: pay.id, amountCents: null, acknowledgedAt: null },
+      select: { providerRef: true },
+    });
+    if (uncertain) {
+      throw new ConflictException(
+        `Rapprochement requis : observation prestataire ${uncertain.providerRef} sans montant non acquittée — remboursement REFUSÉ tant que le rapprochement n'est pas effectué (paiement ${pay.reference}).`,
+      );
+    }
+
+    // Plafond PAIEMENT : encaissés + réservations (aucun cumul au-delà).
+    const reserved = await tx.refund.aggregate({
+      where: { cardPaymentId: pay.id, status: RefundStatus.PENDING },
+      _sum: { amountCents: true },
+    });
+    const payUsed =
+      pay.refundedCents +
+      Math.max(pay.pendingRefundCents ?? 0, reserved._sum.amountCents ?? 0);
+    if (refundCapExceeded(pay.amountCents, payUsed, input.amountCents)) {
+      throw new ConflictException(
+        `Plafond de remboursement dépassé sur le paiement ${pay.reference} : encaissé ${pay.amountCents} cents, déjà engagé ${payUsed} cents, demandé ${input.amountCents} cents.`,
+      );
+    }
+
+    const refund = await tx.refund.create({
+      data: {
+        orderId,
+        cardPaymentId: pay.id,
+        invoiceId,
+        kind: RefundKind.EXTERNAL_CARD,
+        status: RefundStatus.PENDING,
+        amountCents: input.amountCents,
+        currency: order.currency,
+        reason,
+        issueCreditNote: false,
+        idempotencyKey: key,
+        createdByUserId: actor.sub,
+        createdByEmail: actor.email ?? null,
+      },
+    });
+
+    // Réservation dénormalisée (libérée à l'issue du règlement prestataire).
+    await tx.cardPayment.update({
+      where: { id: pay.id },
+      data: { pendingRefundCents: { increment: input.amountCents } },
+    });
+
+    await this.audit.record(
+      {
+        actorId: actor.sub,
+        actorEmail: actor.email,
+        action: 'refund.order.create',
+        resourceType: 'refund',
+        resourceId: refund.id,
+        details: {
+          orderId,
+          cardPaymentId: pay.id,
+          paymentReference: pay.reference,
+          amountCents: input.amountCents,
+          currency: order.currency,
+          kind: input.kind,
+          orderUsedAfter: args.orderUsed + input.amountCents,
+          paymentUsedAfter: payUsed + input.amountCents,
+          provider: 'card_origin',
+          handling: 'rattaché_origine_sans_mouvement_wallet',
+        },
+      },
+      tx,
+    );
+
+    return this.toView(refund, false);
+  }
+
   async listForOrder(orderId: string): Promise<RefundView[]> {
     const order = await this.prisma.order.findUnique({
       where: { id: orderId },
@@ -625,6 +860,7 @@ export class RefundService {
     r: {
       id: string;
       orderId: string | null;
+      cardPaymentId?: string | null;
       invoiceId: string | null;
       kind: RefundKind;
       status: RefundStatus;
@@ -642,6 +878,6 @@ export class RefundService {
     },
     replayed: boolean,
   ): RefundView {
-    return { ...r, replayed };
+    return { ...r, cardPaymentId: r.cardPaymentId ?? null, replayed };
   }
 }

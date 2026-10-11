@@ -3,9 +3,12 @@
 import { useCallback, useEffect, useState, type FormEvent } from 'react';
 import {
   apiError,
+  getPaymentSettings,
   listAdminPaymentMethods,
   updateAdminPaymentMethod,
+  updatePaymentSettings,
   type AdminPaymentMethod,
+  type PaymentCapabilities,
 } from '@/lib/api';
 import { useAdminSession } from '@/lib/session';
 import { useToast } from '@/components/toast';
@@ -41,6 +44,41 @@ const FEE_TYPE_LABEL: Record<string, string> = {
 
 const FEE_TYPE_KEYS = ['NONE', 'PERCENT', 'FIXED', 'PERCENT_AND_FIXED'];
 
+/** Les trois PARCOURS activables (interrupteurs en base — pas de fichier env). */
+const TOGGLES: {
+  key: keyof PaymentCapabilities;
+  label: string;
+  detail: string;
+}[] = [
+  {
+    key: 'walletPaymentEnabled',
+    label: 'Règlement par solde',
+    detail: 'Le client règle une commande avec le solde de son portefeuille.',
+  },
+  {
+    key: 'cardOrderPaymentEnabled',
+    label: 'Carte — règlement de commande',
+    detail: "Paiement direct d'une commande par carte (page hébergée, sans portefeuille).",
+  },
+  {
+    key: 'cardTopupEnabled',
+    label: 'Carte — recharge du portefeuille',
+    detail: 'Recharge du portefeuille par carte (page hébergée, mode test).',
+  },
+];
+
+const STATE_LABEL: Record<string, string> = {
+  operational: 'Opérationnel',
+  incomplete: 'Configuration incomplète',
+  disabled: 'Désactivé',
+};
+
+const STATE_TONE: Record<string, 'green' | 'amber' | 'gray'> = {
+  operational: 'green',
+  incomplete: 'amber',
+  disabled: 'gray',
+};
+
 /** Frais lisibles (le serveur expose `feePercent` en string décimale). */
 function feeSummary(m: AdminPaymentMethod): string {
   const parts: string[] = [];
@@ -75,6 +113,9 @@ export default function ManagerPaymentMethodsPage() {
   const [feeFixedCents, setFeeFixedCents] = useState('0');
   const [configText, setConfigText] = useState('{}');
   const [busy, setBusy] = useState(false);
+  // Parcours de paiement (les trois interrupteurs en base).
+  const [caps, setCaps] = useState<PaymentCapabilities | null>(null);
+  const [capsBusy, setCapsBusy] = useState(false);
 
   const load = useCallback(
     async (t: string) => {
@@ -84,9 +125,29 @@ export default function ManagerPaymentMethodsPage() {
         return;
       }
       setRows(r.data);
+      const c = await getPaymentSettings(t);
+      if (c.ok) setCaps(c.data);
     },
     [toast],
   );
+
+  /**
+   * Bascule UN interrupteur de parcours. La valeur est relue depuis le
+   * serveur (PAS un optimiste local) : l'état affiché est toujours celui de
+   * la base. Le gate reste appliqué côté serveur à chaque opération.
+   */
+  const toggleCap = async (key: keyof PaymentCapabilities) => {
+    if (!caps) return;
+    setCapsBusy(true);
+    const r = await updatePaymentSettings(token, { [key]: !caps[key] });
+    setCapsBusy(false);
+    if (!r.ok) {
+      toast.error(apiError(r, 'Modification impossible.'));
+      return;
+    }
+    setCaps(r.data);
+    toast.ok('Parcours de paiement mis à jour (journalisé côté serveur).');
+  };
 
   useEffect(() => {
     if (sessionPhase === 'loading') return;
@@ -199,6 +260,55 @@ export default function ManagerPaymentMethodsPage() {
           sub="Activation, ordre d'affichage, config d'affichage non secrète et frais — jamais les secrets de carte (configEnc)."
         />
 
+        <Panel
+          title="Parcours de paiement"
+          sub="Trois interrupteurs stockés en base (jamais un fichier d'environnement). Chaque écriture est journalisée avec l'ancienne et la nouvelle valeur ; le serveur ré-applique le réglage à TOUTE opération — un appel API direct reçoit le même refus (409), sans effet."
+        >
+          {!caps ? (
+            <p className="muted" style={{ fontSize: 13, margin: 0 }}>
+              Chargement des réglages…
+            </p>
+          ) : (
+            <div className="row" style={{ gap: 14, flexWrap: 'wrap', alignItems: 'flex-start' }}>
+              {TOGGLES.map((t) => {
+                const on = caps[t.key];
+                return (
+                  <div
+                    key={t.key}
+                    style={{
+                      border: '1px solid var(--border)',
+                      borderRadius: 10,
+                      padding: '12px 14px',
+                      minWidth: 260,
+                      flex: '1 1 260px',
+                    }}
+                  >
+                    <div className="row" style={{ justifyContent: 'space-between', gap: 10 }}>
+                      <strong style={{ fontSize: 14 }}>{t.label}</strong>
+                      <Badge tone={on ? 'green' : 'gray'}>{on ? 'Activé' : 'Désactivé'}</Badge>
+                    </div>
+                    <p className="muted" style={{ fontSize: 12, margin: '6px 0 10px' }}>
+                      {t.detail}
+                    </p>
+                    <Button
+                      size="sm"
+                      variant={on ? 'secondary' : 'primary'}
+                      disabled={capsBusy}
+                      onClick={() => void toggleCap(t.key)}
+                    >
+                      {capsBusy
+                        ? 'Enregistrement…'
+                        : on
+                          ? 'Désactiver'
+                          : 'Activer'}
+                    </Button>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </Panel>
+
         {editing && (
           <Panel title={`Modifier — ${editing.name}`}>
             <form onSubmit={submit}>
@@ -291,6 +401,7 @@ export default function ManagerPaymentMethodsPage() {
                 <tr>
                   <th>Nom</th>
                   <th>Type</th>
+                  <th>État</th>
                   <th>Actif</th>
                   <th>Ordre</th>
                   <th>Frais</th>
@@ -303,6 +414,20 @@ export default function ManagerPaymentMethodsPage() {
                   <tr key={m.id}>
                     <td>{m.name}</td>
                     <td className="nowrap">{TYPE_LABEL[m.type] ?? m.type}</td>
+                    <td className="nowrap">
+                      {m.state ? (
+                        <Badge tone={STATE_TONE[m.state] ?? 'gray'}>
+                          {STATE_LABEL[m.state] ?? m.state}
+                        </Badge>
+                      ) : (
+                        <span className="muted">—</span>
+                      )}
+                      {m.stateReason ? (
+                        <div className="muted" style={{ fontSize: 12, maxWidth: 320 }}>
+                          {m.stateReason}
+                        </div>
+                      ) : null}
+                    </td>
                     <td>
                       <Badge tone={m.isActive ? 'green' : 'gray'}>{m.isActive ? 'Actif' : 'Inactif'}</Badge>
                     </td>
