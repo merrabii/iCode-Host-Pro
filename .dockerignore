@@ -1,0 +1,34 @@
+# Build context exclusions — Code Diali (packaging déploiement).
+# Garder ce contexte minimal : jamais de .env, secrets, bases, preuves locales.
+.git
+.kilo
+.claude
+.turbo
+.tools
+node_modules
+apps/*/node_modules
+apps/web/.next
+apps/api/dist
+**/dist
+**/.next
+recette
+docs
+*.log
+api.log
+.env
+.env.*
+!.env.example
+apps/api/storage
+apps/api/public/wallet-proofs
+apps/api/public/invoices
+storage
+**/*.pem
+**/*.key
+**/*.p12
+**/*.pfx
+**/*.crt
+coverage
+PROJECT_STATUS.md
+HANDOVER.md
+MASTER_PROMPT.md
+PROJECT_CONTEXT.md

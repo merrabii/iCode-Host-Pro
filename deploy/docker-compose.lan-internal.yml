@@ -1,0 +1,60 @@
+# Code Diali — override ISOLATION EGRESS (campagne de test provider).
+#
+# Usage exclusif : test de blocage de sortie Internet depuis les conteneurs,
+# SANS consultation depuis l'hôte (Docker 29 : internal:true supprime la
+# publication des ports). Chargé EN PLUS de docker-compose.yml :
+#   docker compose -f docker-compose.yml -f docker-compose.lan-internal.yml up -d
+#
+# HONNÊTETÉ : ce mode n'autorise PAS la consultation LAN (aucun port publié).
+# C'est le mode dédié aux campagnes d'isolation réseau — distinct du mode
+# LAN consultation (docker-compose.lan.yml).
+#
+# TOPOLOGIE TÉMOIN LOCAL (preuve d'isolation sans Internet/provider) :
+#
+#   ┌─────────────────────────────────────────────┐
+#   │ Réseau isolé (internal:true)                │
+#   │  ┌──────────────────────┐                   │
+#   │  │ api / web / db       │                   │
+#   │  │ (stack Code Diali)   │                   │
+#   │  └──────────┬───────────┘                   │
+#   └─────────────┼───────────────────────────────┘
+#                 │ routes sortantes BLOQUÉES
+#                 ▼
+#   ┌─────────────────────────────────────────────┐
+#   │ Réseau externe (bridge par défaut)          │
+#   │  ┌─────────┐                                │
+#   │  │ witness │  ← accessible depuis l'HÔTE    │
+#   │  │ :8080   │  ← INACCESSIBLE depuis isolé   │
+#   │  └─────────┘                                │
+#   └─────────────────────────────────────────────┘
+#            │
+#            ▼
+#   ┌─────────────────┐
+#   │ Hôte / Internet │  ← inaccessible depuis le réseau isolé
+#   └─────────────────┘
+#
+# Le témoin (witness) vit sur le réseau EXTERNE (bridge). Depuis l'hôte,
+# il répond « WITNESS_OK ». Depuis le réseau isolé (internal:true), il est
+# INACCESSIBLE (ENETUNREACH) — preuve que les routes sortantes sont bloquées.
+# Aucun appel Internet/provider n'est effectué pendant la campagne.
+#
+# Campagne type (exécuter depuis l'hôte) :
+#   # 1. Démarrer la stack isolée + témoin
+#   docker compose -f docker-compose.yml -f docker-compose.lan-internal.yml \
+#     -f tests/egress-witness.yml up -d
+#
+#   # 2. Témoin accessible depuis l'HÔTE ? (attendu : OUI — WITNESS_OK)
+#   curl -sf http://$(docker inspect -f \
+#     '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' \
+#     code-diali-v2-witness-1):8080/
+#
+#   # 3. Témoin accessible depuis la stack ISOLÉE ? (attendu : NON)
+#   docker compose -f docker-compose.yml -f docker-compose.lan-internal.yml \
+#     -f tests/egress-witness.yml run --rm --no-deps --entrypoint node api -e \
+#     "fetch('http://<WITNESS_IP>:8080').then(r=>r.text()).then(t=>{console.log('WITNESS_UNEXPECTED_OK '+t.trim());process.exit(1)}).catch(e=>{console.log('WITNESS_ISOLATED_BLOCKED '+(e.cause&&e.cause.code||e.message));process.exit(0)})"
+#
+# Ce fichier n'est JAMAIS chargé en production ni dans le parcours nominal.
+
+networks:
+  default:
+    internal: true

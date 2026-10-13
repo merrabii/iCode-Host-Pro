@@ -1,4 +1,4 @@
-﻿<!doctype html>
+<!doctype html>
 <html lang="fr">
 <head>
 <meta charset="utf-8">
@@ -344,6 +344,94 @@ body.dark{background:#101b1a;color:#e0ede8}
 </div>
 </section>
 
+<section id="ere-10">
+<h3>ERE 10 — RECETTE STRIPE RÉELLE EN ATTENTE (compte de test non créé), 2026-10-11 (lot committé + poussé, CI VERT)</h3>
+<p class="small">Décision : <b>recette Stripe réelle mise en attente</b> jusqu'à la création du compte Stripe test — <b>aucun changement de code</b>, aucun appel Stripe, aucune activation production. Preuves, patches, journaux et configuration existants conservés ; worktrees et bases inchangés.</p>
+<div class="table">
+<table>
+<thead><tr><th>Élément</th><th>État (11/10)</th><th>Référence</th></tr></thead>
+<tbody>
+<tr><td>Lot paiements (V6)</td><td><b class="s-ok">commité + intégré + poussé</b> — commit <code>463f0146</code> (parent <code>b01951b</code>), fast-forward <code>78b51ce</code> → <code>463f0146</code> (13 commits), <code>origin/main</code> = <code>463f0146</code>, divergence <b>0/0</b>, arbre/index propres.</td><td><b class="s-ok">poussé</b> · message <code>feat(payments): finalize direct card payments and guarded settlement</code></td></tr>
+<tr><td>CI GitHub <code>463f0146</code></td><td><b class="s-ok">SUCCESS</b> — run <code>38145740652</code>, <b>18/18 étapes</b>, aucune ignorée (typechecks ×2, <code>next build</code>, unit, e2e base CI isolée, suites legacy 17B).</td><td><b class="s-ok">vert</b> · workflow <code>ci.yml</code> (validations isolées uniquement : PostgreSQL jetable, <code>migrate deploy</code> sur base CI)</td></tr>
+<tr><td>Blocage — compte Stripe test</td><td><b class="s-no">NON créé</b> → catégories <b>B (Stripe réel)</b> et <b>D (production)</b> restent <b>BLOQUÉES</b>. Validations acquises = <b>connecteur simulé / transport factice loopback</b>, <b>jamais</b> un appel Stripe externe.</td><td><b class="s-no">bloqué</b> · prérequis : <code>sk_test_</code>/<code>pk_test_</code>/<code>whsec_</code> + endpoint webhook réel</td></tr>
+<tr><td>Reprise des essais</td><td>Essais catégorie B selon <code>docs/GUIDE-STRIPE-TEST.md</code> dès disponibilité des clés et de l'endpoint.</td><td><b class="s-part">en attente</b> · aucune activation production</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section id="ere-11">
+<h3>ERE 11 — REPRISE DE SESSION : recette rétablie + plan de déploiement préparé, 2026-10-11 (aucun commit/push/migration)</h3>
+<p class="small">Après redémarrage PC, <code>http://localhost:3002</code> était inaccessible. <b>Diagnostic</b> : Docker OK (<code>icode-postgres</code> healthy), PostgreSQL 5432 OK, base recette = <b>66 migrations toutes terminées</b>, worktree recette @ <code>e7374ee</code> (detached — <b>pas</b> le même commit que <code>main</code>), build Web <b>absent</b>. <b>Relances</b> : reconstruction du build Web (composant autorisé) ; 1er build mal configuré (routing → 3001 → <code>RECETTE_BLOCKED</code>) → arrêt propre <code>down.ps1</code> → 2e build avec <code>API_UPSTREAM=http://localhost:3011</code> → relance <code>up.ps1</code> (sims 3022/3023, proxy 3999, API 3011, Web 3002). <b>Vérifié</b> : <code>3011/api/health</code> 200 db ok · <code>3002/</code> 200 · <code>3002/api/health</code> 200 · <code>/auth</code> 200 Code Diali · <code>/api/brand</code> 200 Code Diali · simulateur actif · 3000/3001 non touchés. <b>Plan</b> : <code>docs/PLAN-DEPLOIEMENT-CODE-DIALI.md</code> (inventaire, commandes, variables, sauvegarde/restauration, matrice, 10 blocages). <b>Recette accessible</b> : <code>http://localhost:3002</code> (version <code>e7374ee</code>, fixture <code>stripe-client@icode.test</code>).</p>
+<div class="table">
+<table>
+<thead><tr><th>Élément</th><th>État (11/10)</th><th>Référence</th></tr></thead>
+<tbody>
+<tr><td>Recette Web</td><td><b class="s-ok">rétablie</b> — <code>http://localhost:3002</code> → 200, page connexion Code Diali</td><td><b class="s-ok">accessible</b> · version <code>e7374ee</code></td></tr>
+<tr><td>Recette API</td><td><b class="s-ok">200 database ok</b> — <code>http://localhost:3011/api/health</code></td><td><b class="s-ok">saine</b> · 66 migrations terminées</td></tr>
+<tr><td>Simulateurs + proxy</td><td><b class="s-ok">actifs</b> — 3022/3023 (sims), 3999 (proxy navigateur)</td><td><b class="s-ok">opérationnels</b> · garde <code>RECETTE_BLOCKED</code> active</td></tr>
+<tr><td>Plan de déploiement</td><td><b class="s-ok">créé</b> — inventaire, commandes, variables, procédures, matrice, 10 blocages</td><td><code>docs/PLAN-DEPLOIEMENT-CODE-DIALI.md</code></td></tr>
+<tr><td>Services 3000/3001</td><td><b class="s-ok">non touchés</b> — aucun kill global, aucun écrasement</td><td><b class="s-ok">préservés</b></td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section id="ere-12">
+<h3>ERE 12 — FIABILISATION DE LA PRÉPARATION AU DÉPLOIEMENT (documents sourcés sur le code), 2026-10-11 (aucun commit/push/migration/build)</h3>
+<p class="small">GO documentaire uniquement (vérifications lecture seule sur <code>463f0146</code>) : le plan et la checklist ont été <b>refaits depuis le code</b>. Corrections majeures : (1) <b>table de configuration reconstruite</b> — variables inexistantes supprimées (<code>RECOMMANDED_ENABLED</code>, <code>STRIPE_API_KEY</code>/<code>SMTP_*</code>/<code>CLOUDFLARE_API_TOKEN</code> qui n'existent pas : Stripe/SMTP/DNS se configurent <b>en base via l'admin</b>, chiffrés avec <code>ENCRYPTION_KEY</code>), défauts réels alignés (<code>JWT_EXPIRES_IN=15m</code>, <code>REFRESH_EXPIRES_IN_DAYS=30</code>, sweeps et réconciliateur <b>OFF</b> par défaut, <code>TURNSTILE_SITE_KEY</code>), priorité base→env→défauts documentée ; (2) <b>architecture</b> : contradiction « Coolify pour la plateforme » résolue selon <code>CLAUDE.md</code> (topologie VPS séparé + projet Coolify isolé = décision ; <b>bootstrap = décision à prendre</b>, installateur/one-liner à développer), parcours principal unique = construction contrôlée sur cible (la CI ne publie <b>aucun</b> artefact), systemd/PM2/Compose listés comme <b>à développer</b> (rien n'existe dans le dépôt), « rolling update » renommé arrêt/reconstruction/redémarrage ; (3) <b>capacités rectifiées</b> — le <b>virement existe</b> (justificatif → validation admin, <code>WalletTransaction.proofPath</code>, UI portefeuille + <code>/manager/recharges</code>), gates solde/carte/recharge documentés séparément (<code>cardOrderPaymentEnabled</code> défaut <b>false</b> + refus dur du simulateur en production) ; (4) <b>procédures sécurisées</b> — 66 migrations (pas 64), garde <b>bloquante</b> sur la base cible (afficher <code>current_database()</code> ne protège pas — incident migrations), aucune suppression automatique de base de test, retour arrière applicatif ≠ restauration de données, suspension contrôlée des écritures + export état courant + rapprochement paiements/remboursements/portefeuille/provider avant réouverture, RPO/RTO proposés <b>non mesurés</b>, admin de prod via le <b>seed ADR-017</b> (jamais de fixture). Livrables : plan, checklist (sections A prouvées / B non exécutées), ce suivi, <code>PROJECT_STATUS.md</code>, <code>recette/ETAT-REPRISE.md</code>.</p>
+<div class="table">
+<table>
+<thead><tr><th>Élément</th><th>État (11/10)</th><th>Référence</th></tr></thead>
+<tbody>
+<tr><td>Plan de déploiement</td><td><b class="s-ok">refait</b> — chaque configuration/commande sourcée fichier:ligne, étiquettes [V]/[P]/[D]/[NT]</td><td><code>docs/PLAN-DEPLOIEMENT-CODE-DIALI.md</code></td></tr>
+<tr><td>Checklist production</td><td><b class="s-ok">refaite</b> — A = acquis prouvés · B = opérations non exécutées (cases vides)</td><td><code>docs/CHECKLIST-PRODUCTION.md</code></td></tr>
+<tr><td>Variables de configuration</td><td><b class="s-ok">vérifiées</b> sur 454 fichiers source — environ 15 inexactitudes corrigées</td><td><code>apps/api/src/config/configuration.ts</code> + 12 fichiers cités</td></tr>
+<tr><td>Parcours virement</td><td><b class="s-ok">confirmé existant</b> (modèle/services/UI) — indépendant de Stripe ; exercice complet [NT]</td><td><code>WalletTransaction.proofPath</code>, portefeuille, <code>/manager/recharges</code></td></tr>
+<tr><td>Chantiers listés (non ouverts)</td><td><b class="s-part">~</b> installateur web, one-liner, garde migr. bloquante, unités superviseur, sauvegarde auto, (option) artefacts CI</td><td>plan §8.2 — <b>aucun développement dans ce GO</b></td></tr>
+<tr><td>Décisions attendues (propriétaire)</td><td><b class="s-part">~</b> VPS, domaine, bootstrap, origine artefacts, superviseur, compte Stripe test, SMTP/CF/Turnstile, RPO/RTO, flags</td><td>plan §8.1 — <b>9 décisions minimales</b></td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section id="ere-13">
+<h3>ERE 13 — PRÉPARATION TECHNIQUE DU 1er DÉPLOIEMENT (packaging + validation VM), 2026-10-12 (aucun commit/push)</h3>
+<p class="small">GO technique (complément autorisant l'accès SSH à la <b>VM de test locale 172.20.116.6</b> — Ubuntu 22.04, 6 cœurs, 4,9 Gio RAM, Docker <b>installé 29.9.0</b>, aucun conteneur/volume préexistant, ports préexistants 22/80 apache2/7999 mariadb/10000 webmin <b>préservés</b>) : branche dédiée <code>prep/premier-deploiement</code> (aucun reset/clean). <b>Packaging livré</b> dans <code>deploy/</code> : <code>api.Dockerfile</code>/<code>web.Dockerfile</code> multi-stage (node 22, pnpm 9.15.0, <b>aucun migrate/seed au démarrage</b>, pg_dump 16 via PGDG — le client 15 refuse un serveur 16), <code>docker-compose.yml</code> (stack <code>code-diali</code>, volumes <code>cdiali_*</code>, gates OFF, jobs <code>ops</code> profilés), <code>.env.example</code> sans secret, scripts <code>migrate-guarded.sh</code> (URL obligatoire sans repli + identité SQL base/hôte résolu/port sur la même connexion + backup préalable vérifié + refus exit 3), <code>backup.sh</code> (SHA-256, 0600, exit bruyant), <code>restore.sh</code> (base vierge exigée, empreintes revérifiées, rapprochement lecture seule sans replay), <code>bootstrap-check.mjs</code> (gates base+env), <code>README.md</code> (Coolify = autorité HTTPS unique ; pas de systemd/PM2 parallèle ; installateur/one-liner = futurs, non nécessaires). <b>Corrections révélées par la validation</b> : <code>start:prod</code> → <code>node dist/src/main.js</code> ; <code>pnpm exec prisma generate</code> (sans <code>exec</code> le generate ne tourne pas — 355 erreurs TS) ; <code>openssl</code> builder ; strip <code>?schema=public</code> pour pg_dump ; scripts sans BOM ; <code>package.json</code> requis dans l'image runtime (seed silencieux sinon). <b>Validation VM complète</b> : transfert contrôlé (tar 1,9 Mo, SHA-256 vérifié des deux côtés, aucun .env/secret) → build images (api 1,21 Go + web 1,33 Go) → <b>66 migrations</b> sur base dédiée <code>code_diali</code> → seed admin idempotent (<code>Admin ensured</code>) → <b>login 201</b> → health 200/200 → gates <b>exit 1 → désactivation recharge carte → exit 0</b> → refus garde <b>exit 3</b> (cible inattendue) → sauvegarde (177 717 o + PNG synthétique, SHA-256, 0600) → <b>RESTORE_OK</b> dans <code>code_diali_restore</code> (refus exit 3 sur base non vierge) → <b>persistance stop+up</b> (login 201, fichier toujours présent). URL de consultation : <code>http://172.20.116.6:3112</code> (web) / <code>:3111</code> (api). <b>NON TESTÉ</b> : intégration Coolify réelle (non installée — Docker ≠ Coolify), TLS, simulateur en production (refus dur dans le code, non exercé), Stripe/SMTP/DNS (interdits). Recette Windows 3002/3011 <b>intacte</b> (200/200).</p>
+<div class="table">
+<table>
+<thead><tr><th>Élément</th><th>État (12/10)</th><th>Référence</th></tr></thead>
+<tbody>
+<tr><td>Packaging images</td><td><b class="s-ok">PASS</b> — build + démarrage + santé sur VM (zéro secret dans l'image/build)</td><td><code>deploy/docker/*.Dockerfile</code></td></tr>
+<tr><td>Migration protégée</td><td><b class="s-ok">PASS</b> — 66 migrations + refus exit 3 prouvé (identité SQL complète)</td><td><code>deploy/scripts/migrate-guarded.sh</code></td></tr>
+<tr><td>Sauvegarde/restauration</td><td><b class="s-ok">PASS</b> — BACKUP_OK + RESTORE_OK + refus base non vierge + rapprochement sans replay</td><td><code>deploy/scripts/backup.sh</code> / <code>restore.sh</code></td></tr>
+<tr><td>Gates premier démarrage</td><td><b class="s-ok">PASS</b> — exit 1 (recharge carte active) → désactivation admin → exit 0</td><td><code>deploy/scripts/bootstrap-check.mjs</code></td></tr>
+<tr><td>Persistance</td><td><b class="s-ok">PASS</b> — stop+up : login 201 + fichier synthétique toujours présent</td><td>VM 172.20.116.6</td></tr>
+<tr><td>Intégration Coolify</td><td><b class="s-no">NON TESTÉ</b> — Coolify non installée sur la VM (catégorie distincte)</td><td>checklist B — validation d'infrastructure réelle restante</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section id="ere-14">
+<h3>ERE 14 - FINITIONS DE LIVRAISON V4 (commande, preuves, export), 2026-10-13 (commit local contr&ocirc;l&eacute;)</h3>
+<p class="small">Revue V4 accept&eacute;e : corrections fonctionnelles cibl&eacute;es du packaging Docker local - <b>validation Docker locale uniquement</b> (VM de test 172.20.116.6, pas la production). <b>Commande canonique de restauration</b> : pass-through <code>RESTORE_MANIFEST: ${RESTORE_MANIFEST:-}</code> ajout&eacute; au service <code>restore</code> (sans cette ligne, <code>docker compose run</code> ne la transmettait pas au conteneur) ; README, tableau et commentaires compose align&eacute;s sur une seule commande (URL via env, aucun secret en argument). <b>Tests ex&eacute;cut&eacute;s</b> (journaux conserv&eacute;s) : restauration T1-T9 <b>PASS</b> (assertions effectives, z&eacute;ro &eacute;criture DB sur refus, empreintes dump+fichiers inchang&eacute;es, persistance post <code>--rm</code>), isolation r&eacute;seau E1-E4 <b>PASS</b> (t&eacute;moin externe <code>WITNESS_OK</code> depuis le contrôle, <code>ENETUNREACH</code> depuis le r&eacute;seau isol&eacute;, codes retour Docker pr&eacute;serv&eacute;s, sonde example.com supprim&eacute;e). <b>Script de campagne s&eacute;curis&eacute; apr&egrave;s ces ex&eacute;cutions</b> : r&eacute;pertoire unique <code>run-&lt;UTC&gt;_&lt;pid&gt;</code> + sous-r&eacute;pertoires par sc&eacute;nario (aucun effacement), base unique <code>cd_v4r_*</code> sans <code>DROP</code> (collision = refus) - <b>v&eacute;rifications statiques uniquement</b> (<code>bash -n</code> + gardes OK, script r&eacute;vis&eacute; non rejou&eacute;). <b>Export</b> : patch <code>recette/PATCH-deploy-v4.diff</code> r&eacute;g&eacute;n&eacute;r&eacute; depuis <code>463f0146</code> (Git <code>--output</code>, sans BOM, hors Git) - application sur base propre + <b>fid&eacute;lit&eacute; octet 19/19</b> ; manifeste SHA256SUMS 25/25 v&eacute;rifi&eacute; apr&egrave;s extraction.</p>
+<div class="table">
+<table>
+<thead><tr><th>&Eacute;l&eacute;ment</th><th>&Eacute;tat</th><th>Nature</th></tr></thead>
+<tbody>
+<tr><td>Commande canonique restore</td><td><b class="s-ok">PASS</b> - ex&eacute;cut&eacute;e telle quelle (T1-T7)</td><td>test ex&eacute;cut&eacute;</td></tr>
+<tr><td>Restauration T1-T9</td><td><b class="s-ok">PASS</b> - assertions effectives</td><td>test ex&eacute;cut&eacute; (camp-restore-v4.log)</td></tr>
+<tr><td>Isolation r&eacute;seau E1-E4</td><td><b class="s-ok">PASS</b> - t&eacute;moin local contr&ocirc;l&eacute;</td><td>test ex&eacute;cut&eacute; (camp-egress-v4.log)</td></tr>
+<tr><td>Script campagne r&eacute;vis&eacute;</td><td><b class="s-ok">OK</b> - syntaxe + gardes</td><td>v&eacute;rification statique (non rejou&eacute;)</td></tr>
+<tr><td>Patch + fid&eacute;lit&eacute;</td><td><b class="s-ok">PASS</b> - 19/19 octets identiques</td><td>v&eacute;rification statique</td></tr>
+<tr><td>Manifeste archive</td><td><b class="s-ok">PASS</b> - 25/25 apr&egrave;s extraction</td><td>v&eacute;rification statique</td></tr>
+<tr><td>Coolify / TLS / stockage hors VPS / Stripe r&eacute;el / production</td><td><b class="s-no">NON VALID&Eacute;</b></td><td>hors p&eacute;rim&egrave;tre</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
 <section id="etats">
 <h2>04 · États d’avancement (prévu → production)</h2>
 <div class="notice"><b>Sept états distincts, jamais confondus.</b> <b>Prévu</b> = décidé/documenté (ADR, plan). <b>Développé</b> = code présent dans le dépôt. <b>Testé en simulation</b> = exercé avec transports externes simulés, mocks ou base isolée. <b>Testé réellement</b> = exercé contre un système réel (mail, DNS, panel, dépôt public, navigateur sur service réel). <b>Committé</b> = au moins un commit local. <b>Poussé</b> = présent sur <code>origin/main</code>. <b>Activé en production</b> = mis en service sur l’environnement de production de la plateforme.</div>
@@ -380,7 +468,7 @@ body.dark{background:#101b1a;color:#e0ede8}
 <tr><td>Revue V2 — 7 points des écarts (11/10)</td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-ok">✓ <span class="small">unit 180/180, e2e 20/20+12/12, parcours 26/26+33/33</span></td><td class="s-no">✗ <span class="small">simulateur loopback uniquement ; aucun Stripe réel</span></td><td class="s-no">✗ <span class="small">code non committé (livré en patch V3)</span></td><td class="s-no">✗</td><td class="s-no">✗</td></tr>
 <tr><td>Revue V3 — 3 écarts résiduels : dispatchs exclusifs, snapshot <code>checkConnection</code>, identité webhook durable (11/10)</td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-ok">✓ <span class="small">unit 1420/1420, e2e ciblés 87/87 socle ; migration additive sur bases isolées</span></td><td class="s-no">✗ <span class="small">Stripe test réel non exécuté (hors GO) ; simulateur loopback seul</span></td><td class="s-no">✗ <span class="small">code non committé (livré en patch V4)</span></td><td class="s-no">✗</td><td class="s-no">✗</td></tr>
 <tr><td>GO V5 — 2 défauts V4 fermés (réponse tardive, identité atomique) + dossier incident + garde migrations (11/10)</td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-ok">✓ <span class="small">unit 1429/1429, 4 specs paiement 136/136, e2e 87/87 socle ; garde refus testée sans migration</span></td><td class="s-no">✗ <span class="small">Stripe test réel non exécuté (hors GO) ; simulateur loopback seul</span></td><td class="s-no">✗ <span class="small">code non committé (livré en patch V5)</span></td><td class="s-no">✗</td><td class="s-no">✗</td></tr>
-<tr><td>GO V6 — reprise webhook sans identité durable + rectification dossier incident (11/10)</td><td class="s-ok">✓</td><td class="s-ok">✓</td><td class="s-ok">✓ <span class="small">unit 1434/1434, specs paiement 153/153, e2e 87/87 socle</span></td><td class="s-no">✗ <span class="small">Stripe test réel non exécuté (hors GO) ; simulateur loopback seul</span></td><td class="s-no">✗ <span class="small">code non committé (livré en patch V6)</span></td><td class="s-no">✗</td><td class="s-no">✗</td></tr>
+<tr><td>GO V6 - reprise webhook sans identité durable + rectification dossier incident (11/10)</td><td class="s-ok">V</td><td class="s-ok">V</td><td class="s-ok">V <span class="small">unit 1434/1434, specs paiement 153/153, e2e 87/87 socle</span></td><td class="s-no">? <span class="small">Stripe test réel non exécuté (hors GO) ; simulateur loopback seul</span></td><td class="s-ok">V <span class="small">463f0146</span></td><td class="s-ok">V <span class="small">origin/main = 463f0146</span></td><td class="s-no">?</td></tr>
 <tr><td>Activation plateforme en production</td><td class="s-ok">✓ <span class="small">prévu en fin de projet</span></td><td class="s-no">✗</td><td class="s-unk">?</td><td class="s-unk">?</td><td class="s-no">✗</td><td class="s-no">✗</td><td class="s-no">✗</td></tr>
 </tbody>
 </table>

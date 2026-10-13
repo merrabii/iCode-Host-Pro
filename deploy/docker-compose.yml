@@ -1,0 +1,242 @@
+# Code Diali — orchestration de déploiement (parcours : VPS dédié + projet
+# Coolify isolé). DÉFAUT = CONFIGURATION PRODUCTION : aucun service n'est
+# publié sur l'hôte (ni PostgreSQL, ni API, ni Web). Coolify = autorité unique
+# reverse proxy/HTTPS (routes du projet Coolify, jamais ce fichier en prod).
+#
+# Validation LAN : charger AUSSI docker-compose.lan.yml (override) :
+#   docker compose -f docker-compose.yml -f docker-compose.lan.yml up -d
+# L'override LAN publie API 3111 / Web 3112 / PG 5433 pour la CONSULTATION
+# depuis l'hôte. HONNÊTETÉ : cette override ne fournit AUCUNE isolation
+# réseau (egress ouvert). L'isolation egress = mode dédié sans ports :
+#   docker compose -f docker-compose.yml -f docker-compose.lan-internal.yml up -d
+#
+# RÈGLES :
+# - Aucune valeur secrète ici : env_file hors Git ou variables injectées.
+# - Aucun migrate/seed au démarrage : jobs explicites (profil "ops").
+# - Noms/volumes préfixés "cdiali-" : aucune collision avec une stack existante.
+# - x-api-env : ancre UNIQUE partagée par `api` ET `check-gates` — l'env du
+#   checker est constructuellement celui du service API (pas deux copies).
+
+name: code-diali
+
+x-api-env: &api-env
+  NODE_ENV: production
+  DATABASE_URL: postgresql://${PG_USER:?}:${PG_PASSWORD:?}@db:5432/${PG_DB:?}?schema=public
+  PORT: "3001"
+  JWT_SECRET: ${JWT_SECRET:?JWT_SECRET obligatoire}
+  ENCRYPTION_KEY: ${ENCRYPTION_KEY:?ENCRYPTION_KEY obligatoire}
+  PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:?PUBLIC_BASE_URL obligatoire (URL Web vue par le navigateur)}
+  WEB_ORIGIN: ${WEB_ORIGIN:?WEB_ORIGIN obligatoire (origine navigateur autorisée)}
+  # URL API vue par le NAVIGATEUR (pages de paiement hébergées, PUBLIC_API_BASE
+  # lue par payment-provider.service). Runtime.
+  PUBLIC_API_BASE: ${PUBLIC_API_BASE:-${NEXT_PUBLIC_API_URL:?NEXT_PUBLIC_API_URL obligatoire}}
+  # Derrière un reverse proxy local (Coolify/docker network) : uniquelocal =
+  # RFC1918 (réseaux docker) ; "true" est REFUSÉ par le code (forgeable).
+  TRUST_PROXY: ${TRUST_PROXY:-uniquelocal}
+  # Premiers démarrages — gates OFF explicites (GO §5). L'activation se fait
+  # ensuite par l'admin (base) ou par décision documentée (env).
+  PAYMENT_SIMULATOR_ENABLED: "false"
+  HOSTING_C2_ENABLED: "false"
+  HOSTING_C3_ENABLED: "false"
+  HOSTING_C4_ENABLED: "false"
+  ORDER_SWEEP_ENABLED: "false"
+  RENEWAL_SWEEP_ENABLED: "false"
+  RECONCILE_ENABLED: "false"
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${PG_USER:?PG_USER obligatoire}
+      POSTGRES_PASSWORD: ${PG_PASSWORD:?PG_PASSWORD obligatoire}
+      POSTGRES_DB: ${PG_DB:?PG_DB obligatoire}
+    volumes:
+      - cdiali_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+    expose:
+      - "5432"
+
+  api:
+    build:
+      context: ..
+      dockerfile: deploy/docker/api.Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      <<: *api-env
+    volumes:
+      - cdiali_storage:/repo/apps/api/storage
+      - cdiali_branding:/repo/apps/api/public/branding
+    expose:
+      - "3001"
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3001/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  web:
+    build:
+      context: ..
+      dockerfile: deploy/docker/web.Dockerfile
+      args:
+        # URL de l'API vue PAR LE CONTENEUR WEB (résolution DNS compose —
+        # jamais localhost entre conteneurs). FIGÉ AU BUILD (rebuild exigé
+        # pour tout changement — n'est PAS modifiable au runtime).
+        API_UPSTREAM: http://api:3001
+        # URL de l'API vue PAR LE NAVIGATEUR — INLINÉE AU BUILD dans le bundle
+        # Next (NEXT_PUBLIC_*) : la modifier au runtime ne change RIEN côté
+        # navigateur ; tout changement exige un REBUILD du service web.
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:?NEXT_PUBLIC_API_URL obligatoire (URL API vue par le navigateur — figée au build)}
+    restart: unless-stopped
+    depends_on:
+      - api
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      # Repli runtime interne pour les requêtes serveur du web :
+      API_UPSTREAM: http://api:3001
+    expose:
+      - "3000"
+
+  # Jobs "ops" — JAMAIS démarrés par un simple "docker compose up" (profile).
+
+  # Migration protégée :
+  #   docker compose run --rm migrate
+  migrate:
+    profiles: ["ops"]
+    build:
+      context: ..
+      dockerfile: deploy/docker/api.Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: ${DATABASE_URL_OPS:?DATABASE_URL_OPS obligatoire (URL de migration, jamais de repli .env)}
+      EXPECTED_DB_HOST: ${EXPECTED_DB_HOST:?EXPECTED_DB_HOST obligatoire}
+      EXPECTED_DB_PORT: ${EXPECTED_DB_PORT:-5432}
+      EXPECTED_DB_NAME: ${EXPECTED_DB_NAME:?EXPECTED_DB_NAME obligatoire}
+      BACKUP_DIR: /backups
+    volumes:
+      - ${BACKUP_HOST_DIR:?BACKUP_HOST_DIR obligatoire (dossier hôte de sauvegarde)}:/backups
+    entrypoint: ["bash", "/opt/code-diali/scripts/migrate-guarded.sh"]
+
+  # Gates premier démarrage — MÊME env que le service api (ancre x-api-env) :
+  #   docker compose run --rm check-gates --first-boot
+  check-gates:
+    profiles: ["ops"]
+    build:
+      context: ..
+      dockerfile: deploy/docker/api.Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      <<: *api-env
+    entrypoint: ["node", "/opt/code-diali/scripts/bootstrap-check.mjs"]
+
+  # Seed admin initial (ADR-017) — explicite uniquement :
+  #   docker compose run --rm -e ADMIN_EMAIL=... -e ADMIN_PASSWORD=... seed-admin
+  seed-admin:
+    profiles: ["ops"]
+    build:
+      context: ..
+      dockerfile: deploy/docker/api.Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://${PG_USER:?}:${PG_PASSWORD:?}@db:5432/${PG_DB:?}?schema=public
+    working_dir: /repo/apps/api
+    entrypoint: ["npx", "prisma", "db", "seed"]
+
+  # Sauvegarde (destination persistante = BACKUP_HOST_DIR sur l'hôte, montée
+  # en /backups — le conteneur éphémère du job peut être supprimé, les dumps
+  # restent sur l'hôte) :
+  #   docker compose run --rm backup
+  backup:
+    profiles: ["ops"]
+    build:
+      context: ..
+      dockerfile: deploy/docker/api.Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: ${DATABASE_URL_OPS:?DATABASE_URL_OPS obligatoire}
+      BACKUP_DIR: /backups
+      STORAGE_DIR: /repo/apps/api/storage
+      BRANDING_DIR: /repo/apps/api/public/branding
+      REQUIRE_VOLUME_MOUNTS: "1"
+    volumes:
+      - ${BACKUP_HOST_DIR:?BACKUP_HOST_DIR obligatoire}:/backups
+      - cdiali_storage:/repo/apps/api/storage
+      - cdiali_branding:/repo/apps/api/public/branding
+    entrypoint: ["bash", "/opt/code-diali/scripts/backup.sh"]
+
+  # Restauration isolée — N'EST PAS montée sur les volumes de l'app courante :
+  # les fichiers restaurés vont dans RESTORE_HOST_DIR (dossier hôte dédié) ;
+  # la base cible doit être NEUVE (EXPECTED_DB_NAME_RESTORE). La recopie vers
+  # les volumes live = procédure manuelle documentée, hors de ce job.
+  #
+  # COMMANDE CANONIQUE (URL via env, jamais dans les arguments visibles) :
+  #   RESTORE_MANIFEST=/restore/SHA256SUMS-XXX.txt \
+  #   docker compose run --rm restore \
+  #     /restore/db-XXX.dump ENV /restore/files-XXX.tar.gz /restore-out/target
+  #
+  # - "ENV" en 2e position = utiliser DATABASE_URL de l'environnement (ici
+  #   DATABASE_URL_RESTORE injecté ci-dessous) — le secret n'apparaît jamais
+  #   dans les arguments de la commande.
+  #   (Le placeholder "-" n'est PAS utilisable avec docker compose run, qui
+  #   l'interprète comme un flag ; "ENV" est le placeholder canonique.)
+  # - RESTORE_MANIFEST est transmis au conteneur via le pass-through
+  #   ci-dessous (host env → container env) — aucune valeur codée en dur.
+  # - Les sauvegardes sources (/restore) sont montées en LECTURE SEULE (:ro).
+  # - Les sorties (/restore-out) : dumps pré-restauration + fichiers restaurés
+  #   — montées durablement, survivent à la suppression du conteneur éphémère.
+  # - La destination des fichiers restaurés est /restore-out/target (sous-dossier
+  #   VIDE à créer par l'opérateur sur l'hôte, ou laissé au script).
+  restore:
+    profiles: ["ops"]
+    build:
+      context: ..
+      dockerfile: deploy/docker/api.Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: ${DATABASE_URL_RESTORE:?DATABASE_URL_RESTORE obligatoire (URL de la base cible NEUVE)}
+      EXPECTED_DB_HOST: ${EXPECTED_DB_HOST:?EXPECTED_DB_HOST obligatoire}
+      EXPECTED_DB_PORT: ${EXPECTED_DB_PORT:-5432}
+      EXPECTED_DB_NAME: ${EXPECTED_DB_NAME_RESTORE:?EXPECTED_DB_NAME_RESTORE obligatoire (base cible neuve)}
+      # Pass-through RESTORE_MANIFEST : la valeur est définie sur l'hôte
+      # (prefixe de la commande) et transmise au conteneur ici. Sans cette
+      # ligne, docker compose run ne la passerait PAS au conteneur.
+      RESTORE_MANIFEST: ${RESTORE_MANIFEST:-}
+      # Dumps pré-restauration écrits dans /restore-out (monté durablement).
+      BACKUP_DIR: /restore-out
+    volumes:
+      # Sauvegardes sources (dump + archive + manifeste) — LECTURE SEULE.
+      - ${RESTORE_HOST_DIR:?RESTORE_HOST_DIR obligatoire (dossier hôte de restauration dédié)}:/restore:ro
+      # Sorties de restauration (dumps pré-restauration + fichiers restaurés)
+      # — ECRITURE, persistantes sur l'hôte après rm du conteneur éphémère.
+      # Jamais monté sur les volumes de l'app courante.
+      - ${RESTORE_HOST_DIR:?RESTORE_HOST_DIR obligatoire}:/restore-out
+    entrypoint: ["bash", "/opt/code-diali/scripts/restore.sh"]
+
+volumes:
+  cdiali_pg:
+  cdiali_storage:
+  cdiali_branding:

@@ -1,0 +1,38 @@
+# Code Diali — OVERRIDE DE VALIDATION LAN (jamais chargé en production).
+#
+# Usage (VM de test uniquement) :
+#   docker compose -f docker-compose.yml -f docker-compose.lan.yml up -d
+#
+# Apport : publication LAN pour consultation depuis l'hôte —
+#   API 3111, Web 3112, PostgreSQL 5433.
+#
+# EGRESS (sortie Internet des conteneurs) — HONNÊTETÉ :
+# - Des flags OFF dans l'env ne SONT PAS une preuve de blocage des appels
+#   externes (le code pourrait encore appeler un provider si une branche
+#   les contourne). La preuve réseau = un TEST d'egress exécuté à la demande :
+#     docker compose run --rm --no-deps --entrypoint node api -e \
+#       "fetch('http://example.com').then(()=>{console.log('EGRESS_OPEN');process.exit(0)}).catch(e=>{console.log('EGRESS_BLOCKED '+(e.cause&&e.cause.code));process.exit(0)})"
+#   Le résultat (OPEN ou BLOCKED) doit être consigné dans le rapport — il
+#   dépend de la configuration de l'hôte/VPS, PAS de ce fichier.
+# - Un réseau `networks.default.internal: true` bloquerait l'egress au niveau
+#   Docker, mais avec Docker 29 il SUPPRIME aussi la publication des ports
+#   (docker port vide, HostConfig.NetworkMode sans proxy) : la consultation
+#   LAN devient impossible. Ce n'est donc PAS le défaut. Un override
+#   `docker-compose.lan-internal.yml` est fourni pour les campagnes de test
+#   d'egress SANS consultation hôte (services opérationnels uniquement
+#   l'intérieur du réseau).
+#
+# En production (fichier seul) : aucun port publié — Coolify publie HTTP/HTTPS.
+
+services:
+  db:
+    ports:
+      - "5433:5432"
+
+  api:
+    ports:
+      - "3111:3001"
+
+  web:
+    ports:
+      - "3112:3000"
