@@ -1,0 +1,121 @@
+# Code Diali — jobs ops PROTÉGÉS : migrate / backup / restore (GO V4).
+#
+# SÉPARATION RUNTIME / OPS :
+# - Ce fichier n'est JAMAIS lu par Coolify (Coolify ne charge que
+#   deploy/docker-compose.yml) — il peut donc conserver les gardes STRICTES
+#   ${VAR:?} que le validateur Coolify 4.4.6 refuse dans le fichier runtime.
+# - Il s'ajoute TOUJOURS au runtime (mêmes volumes/réseau/projet), jamais seul :
+#     deploy/scripts/ops.sh <migrate|backup|restore> [args]   (commande documentée)
+#     avancé : docker compose -f docker-compose.yml -f docker-compose.ops.yml run --rm migrate
+# - L'interpolation compose est globale au fichier : TOUTE commande chargeant
+#   ce fichier exige l'ensemble des variables ops ci-dessous (sauf
+#   RESTORE_MANIFEST : valeur par défaut surchargée en ligne, passée au
+#   conteneur, non testée au chargement — restore.sh la refuse s'il manque).
+#
+# AUCUN ${VAR:-/nonexistent} ICI : un répertoire hôte absent ou invalide est
+# refusé par preflight.sh --ops (via ops.sh) AVANT docker — docker ne crée
+# jamais de dossier parasite. Les chemins doivent exister sur l'hôte
+# (mkdir -p + chmod 700 avant la première utilisation).
+#
+# Profil "ops" conservé : un simple "docker compose up" ne lance jamais ces
+# jobs. `docker compose run --rm <service>` les cible malgré le profil.
+
+services:
+  # Migration protégée (identité SQL + sauvegarde préalable) :
+  #   ./scripts/ops.sh migrate
+  migrate:
+    profiles: ["ops"]
+    build:
+      context: ..
+      dockerfile: deploy/docker/api.Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: ${DATABASE_URL_OPS:?DATABASE_URL_OPS obligatoire}
+      EXPECTED_DB_HOST: ${EXPECTED_DB_HOST:?EXPECTED_DB_HOST obligatoire}
+      EXPECTED_DB_PORT: ${EXPECTED_DB_PORT:-5432}
+      EXPECTED_DB_NAME: ${EXPECTED_DB_NAME:?EXPECTED_DB_NAME obligatoire}
+      BACKUP_DIR: /backups
+    volumes:
+      - ${BACKUP_HOST_DIR:?BACKUP_HOST_DIR obligatoire}:/backups
+    entrypoint: ["bash", "/opt/code-diali/scripts/migrate-guarded.sh"]
+
+  # Sauvegarde (destination persistante = BACKUP_HOST_DIR sur l'hôte, montée
+  # en /backups — le conteneur éphémère du job peut être supprimé, les dumps
+  # restent sur l'hôte) :
+  #   ./scripts/ops.sh backup
+  backup:
+    profiles: ["ops"]
+    build:
+      context: ..
+      dockerfile: deploy/docker/api.Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: ${DATABASE_URL_OPS:?DATABASE_URL_OPS obligatoire}
+      BACKUP_DIR: /backups
+      STORAGE_DIR: /repo/apps/api/storage
+      BRANDING_DIR: /repo/apps/api/public/branding
+      REQUIRE_VOLUME_MOUNTS: "1"
+    volumes:
+      - ${BACKUP_HOST_DIR:?BACKUP_HOST_DIR obligatoire}:/backups
+      - cdiali_storage:/repo/apps/api/storage
+      - cdiali_branding:/repo/apps/api/public/branding
+    entrypoint: ["bash", "/opt/code-diali/scripts/backup.sh"]
+
+  # Restauration isolée — N'EST PAS montée sur les volumes de l'app courante :
+  # les fichiers restaurés vont dans RESTORE_HOST_DIR (dossier hôte dédié) ;
+  # la base cible doit être NEUVE (EXPECTED_DB_NAME_RESTORE). La recopie vers
+  # les volumes live = procédure manuelle documentée, hors de ce job.
+  #
+  # COMMANDE CANONIQUE (URL via env, jamais dans les arguments visibles) :
+  #   RESTORE_MANIFEST=/restore/SHA256SUMS-XXX.txt \
+  #   ./scripts/ops.sh restore \
+  #     /restore/db-XXX.dump ENV /restore/files-XXX.tar.gz /restore-out/target
+  #
+  # - "ENV" en 2e position = utiliser DATABASE_URL de l'environnement (ici
+  #   DATABASE_URL_RESTORE injecté ci-dessous) — le secret n'apparaît jamais
+  #   dans les arguments de la commande.
+  #   (Le placeholder "-" n'est PAS utilisable avec docker compose run, qui
+  #   l'interprète comme un flag ; "ENV" est le placeholder canonique.)
+  # - RESTORE_MANIFEST est transmis au conteneur via le pass-through
+  #   ci-dessous (host env → container env) — valeur par défaut venue du
+  #   .env, surchargée par le préfixe de la commande. Sans cette ligne,
+  #   docker compose run ne la passerait PAS au conteneur.
+  # - Les sauvegardes sources (/restore) sont montées en LECTURE SEULE (:ro).
+  # - Les sorties (/restore-out) : dumps pré-restauration + fichiers restaurés
+  #   — montées durablement, survivent à la suppression du conteneur éphémère.
+  # - La destination des fichiers restaurés est /restore-out/target (sous-dossier
+  #   VIDE à créer par l'opérateur sur l'hôte, ou laissé au script).
+  restore:
+    profiles: ["ops"]
+    build:
+      context: ..
+      dockerfile: deploy/docker/api.Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: ${DATABASE_URL_RESTORE:?DATABASE_URL_RESTORE obligatoire}
+      EXPECTED_DB_HOST: ${EXPECTED_DB_HOST:?EXPECTED_DB_HOST obligatoire}
+      EXPECTED_DB_PORT: ${EXPECTED_DB_PORT:-5432}
+      EXPECTED_DB_NAME: ${EXPECTED_DB_NAME_RESTORE:?EXPECTED_DB_NAME_RESTORE obligatoire}
+      # Pass-through RESTORE_MANIFEST : valeur par défaut du .env, surchargée
+      # par l'opérateur en ligne. Le contrôle d'existence appartient à
+      # preflight.sh --ops (hôte) et à restore.sh (conteneur, avant écriture).
+      RESTORE_MANIFEST: ${RESTORE_MANIFEST:-}
+      # Dumps pré-restauration écrits dans /restore-out (monté durablement).
+      BACKUP_DIR: /restore-out
+    volumes:
+      # Sauvegardes sources (dump + archive + manifeste) — LECTURE SEULE.
+      - ${RESTORE_HOST_DIR:?RESTORE_HOST_DIR obligatoire}:/restore:ro
+      # Sorties de restauration (dumps pré-restauration + fichiers restaurés)
+      # — ECRITURE, persistantes sur l'hôte après rm du conteneur éphémère.
+      # Jamais monté sur les volumes de l'app courante.
+      - ${RESTORE_HOST_DIR:?RESTORE_HOST_DIR obligatoire}:/restore-out
+    entrypoint: ["bash", "/opt/code-diali/scripts/restore.sh"]

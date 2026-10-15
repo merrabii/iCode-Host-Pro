@@ -57,6 +57,7 @@ COPY deploy/scripts /opt/code-diali/scripts
 WORKDIR /repo/apps/api
 EXPOSE 3001
 # Démarrage simple. Jamais de migrate/seed implicite (décision GO §2/§4).
-# Migrations : docker compose run --rm api bash /opt/code-diali/scripts/migrate-guarded.sh
-# Seed admin : docker compose run --rm api npx prisma db seed (explicite, env ADMIN_* fournies).
+# Migrations : ./scripts/ops.sh migrate (preflight + docker compose run,
+# garde migrate-guarded.sh : identité SQL + sauvegarde préalable).
+# Seed admin : ./scripts/ops.sh seed-admin -e ADMIN_EMAIL=.. -e ADMIN_PASSWORD=..
 CMD ["node", "dist/src/main.js"]

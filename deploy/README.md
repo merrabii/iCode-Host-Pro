@@ -15,7 +15,9 @@ migrations protégées, sauvegarde/restauration et contrôles de démarrage.
 
 `docker-compose.yml` **seul** = configuration **production** : aucun `ports:`
 (ni PostgreSQL, ni API, ni Web). Coolify est l'autorité unique reverse
-proxy/HTTPS (projet isolé) et publie via ses propres routes.
+proxy/HTTPS (projet isolé) et publie via ses propres routes. Coolify ne charge
+**que** ce fichier : `docker-compose.ops.yml` (gardes `${VAR:?}` strictes) et
+les overrides LAN ne sont **jamais** lus lors d'un déploiement Coolify.
 
 **Validation LAN uniquement** (VM de test) : charger l'override dédié —
 
@@ -67,6 +69,41 @@ Aucun secret dans les images, arguments de build, dépôt ou journaux : voir
 `deploy/.env.example`. Copier vers `deploy/.env` (mode `0600`) hors Git, ou
 injecter via Coolify.
 
+## Contrôles préalables — exécution réelle, pas déclarative (GO V4)
+
+Deux garde-fous, deux chemins d'exécution **démontrés** (tests V4) :
+
+| Quand | Mécanisme | Refus |
+|---|---|---|
+| Tout démarrage / redéploiement (`docker compose up`, y compris **déploiement Coolify officiel**) | service one-shot `preflight` du `docker-compose.yml` : `db` en dépend (`service_completed_successfully`), `api` de `db`, `web` de `api` — il reçoit les **mêmes** `${VAR:-}` interpolés que les services | variable runtime manquante ou vide = exit 1 = `docker compose up` échoue = **aucun service ne démarre** (stack existante laissée en l'état) |
+| Chaque commande ops (`scripts/ops.sh`) | `preflight.sh --ops` exécuté **avant** tout `docker compose run` | vars ops/restauration manquantes ou chemins hôte invalides = refus = **aucun conteneur lancé, aucune écriture, aucune base touchée** |
+
+- **Runtime exigé** : `PG_USER`, `PG_PASSWORD`, `PG_DB`, `JWT_SECRET`,
+  `ENCRYPTION_KEY`, `PUBLIC_BASE_URL`, `WEB_ORIGIN`, `NEXT_PUBLIC_API_URL`.
+- **`--ops` exige en plus** (toute la suite ops est refusée si incomplète) :
+  `DATABASE_URL_OPS`, `EXPECTED_DB_HOST`, `EXPECTED_DB_NAME`, `BACKUP_HOST_DIR`,
+  `DATABASE_URL_RESTORE`, `EXPECTED_DB_NAME_RESTORE`, `RESTORE_HOST_DIR`,
+  `RESTORE_MANIFEST`, **plus la validité des chemins hôte**
+  `BACKUP_HOST_DIR` / `RESTORE_HOST_DIR` : absolu, **existant**, répertoire,
+  ni `/` ni `/nonexistent` — les créer d'abord
+  (`mkdir -p ... && chmod 700 ...`). docker **ne crée jamais** de dossier
+  parasite (aucun `${VAR:-/nonexistent}` dans les fichiers compose).
+- **Source des valeurs** : environnement du processus, sinon `deploy/.env`
+  (chargé explicitement par `preflight.sh`, mêmes règles que docker compose :
+  l'env gagne ; doublons dans le fichier = **dernière ligne** ; une variable
+  **définie mais vide** reste un échec — aucun repli silencieux).
+- **Codes retour** : `0` conforme, `1` configuration invalide (aucune opération
+  exécutée), `2` usage invalide.
+- **`scripts/ops.sh`** est la commande officielle des jobs : exige
+  `COMPOSE_PROJECT_NAME` (projet cible : UUID Coolify en preprod,
+  `code-diali` en local — **jamais deviné**), charge le compose ops avec les
+  gardes `${VAR:?}`, accepte `OPS_EXTRA_COMPOSE_FILES` (fichiers compose
+  supplémentaires, ex. pins d'images d'un arbre préprod).
+
+```bash
+./scripts/ops.sh preflight      # readiness complète de la suite ops, sans rien lancer
+```
+
 ## Premiers démarrages (gates OFF — GO §5)
 
 Le compose pose d'emblée (ancre `x-api-env`, **partagée avec check-gates**) :
@@ -82,8 +119,8 @@ schéma `cardTopupEnabled=true`). Les **deux** gates carte sont contrôlées
 DB → env → défauts, identique au code).
 
 ```bash
-docker compose run --rm check-gates                    # contrôle courant
-docker compose run --rm check-gates --first-boot       # premier démarrage
+./scripts/ops.sh check-gates                    # contrôle courant
+./scripts/ops.sh check-gates --first-boot       # premier démarrage
 ```
 
 **Honnêteté du contrôle** : le checker lit **son** environnement de processus
@@ -96,7 +133,7 @@ conforme).
 ## Migration (jamais au démarrage)
 
 ```bash
-docker compose run --rm migrate
+./scripts/ops.sh migrate
 ```
 
 Le script exige `DATABASE_URL_OPS` + `EXPECTED_DB_HOST/PORT/NAME`, vérifie
@@ -112,7 +149,7 @@ base/hôte/port inattendus. Limite documentée, jamais présentée comme verrou.
 ## Admin initial (seed ADR-017)
 
 ```bash
-docker compose run --rm -e ADMIN_EMAIL=... -e ADMIN_PASSWORD=... seed-admin
+./scripts/ops.sh seed-admin -e ADMIN_EMAIL=... -e ADMIN_PASSWORD=...
 ```
 
 Le seed est **idempotent** : crée l'ADMIN si absent ; sinon le **promeut**
@@ -122,7 +159,7 @@ connu : `name` écrasé en « Platform Admin ». Aucune fixture importée.
 ## Sauvegarde (job ops dédié, destination persistante)
 
 ```bash
-docker compose run --rm backup
+./scripts/ops.sh backup
 ```
 
 - Job `backup` **explicite** (profil `ops`) : monte `BACKUP_HOST_DIR` (hôte) en
@@ -167,7 +204,7 @@ dans les arguments visibles (URL via env, `ENV` = repli sur `DATABASE_URL`) :
 #
 # 2. Exécuter (URL cible = DATABASE_URL_RESTORE via env, jamais en argument) :
 RESTORE_MANIFEST=/restore/SHA256SUMS-XXX.txt \
-docker compose run --rm restore \
+./scripts/ops.sh restore \
   /restore/db-XXX.dump ENV /restore/files-XXX.tar.gz /restore-out/target
 ```
 
@@ -183,6 +220,11 @@ docker compose run --rm restore \
 
 > **Note** : le placeholder `ENV` (et non `-`) est requis car `docker compose run`
 > interprète `-` comme un flag et ne le transmet pas au conteneur.
+
+> **Garde-fou (GO V4)** : `ops.sh` exécute `preflight.sh --ops` **avant**
+> `docker compose` (vars restauration + existence de `RESTORE_HOST_DIR`) ;
+> `restore.sh` recontrôle lui-même manifeste, cible et base vierge **avant
+> toute écriture**. Refus = code retour, sans conteneur et sans effet.
 
 ### Garanties du job
 
@@ -221,7 +263,10 @@ masqué (`|| true` absent sur les chmod critiques).
 
 1. `docker compose stop api web`
 2. `docker compose build api web` (depuis l'arbre du SHA autorisé)
-3. `docker compose up -d` (+ override LAN le cas échéant)
+3. `docker compose up -d` (+ override LAN le cas échéant) — le service
+   `preflight` s'exécute **avant** db/api/web : une variable runtime manquante
+   bloque la mise à jour **avant** toute recréation de conteneur (exit 1,
+   message listant les manques).
 4. Vérifier : `docker compose ps`, `GET /api/health` (200 + `database ok`)
 
 **Jamais** de `git checkout`/rebuild dans le répertoire d'un service actif.
@@ -229,25 +274,32 @@ masqué (`|| true` absent sur les chmod critiques).
 données) ; la **restauration de données** est distincte, réservée à une
 corruption avérée.
 
-## Validation Docker vs intégration Coolify
+## Validation Docker, intégration Coolify, production
 
-Cette stack prouve le packaging, les migrations protégées, la persistance, la
-sauvegarde/restauration **isolée** et les gates — **pas** le reverse
-proxy/TLS/CHE Coolify. L'intégration Coolify reste à faire sur le VPS
-(checklist production, catégorie infrastructure réelle). **Production non
-autorisée** par ce lot.
+Cette stack prouve le packaging, les migrations protégées, la persistance et la
+sauvegarde/restauration **isolée**. L'intégration Coolify est **réalisée et
+démontrée sur la préproduction** (déploiement officiel sans retouche manuelle,
+garde `preflight` exécutée à chaque déploiement — preuves GO V3/V4 : HTTPS,
+health, gates OFF). Le reverse proxy/TLS côté préproduction = proxy Caddy
+dédié de la recette (jamais ce fichier). **Production non autorisée** par ce
+lot : le déploiement réel de la plateforme suit la checklist de production
+(catégorie infrastructure réelle, CLAUDE.md §Rappel).
 
 ## Commandes de référence (depuis `deploy/`)
+
+`ops.sh` exige `COMPOSE_PROJECT_NAME` (env ou `.env`) — projet cible. Chaque
+commande ops exécute d'abord `preflight.sh` (refus = exit 1, sans conteneur).
 
 | Action | Commande |
 |---|---|
 | Démarrer (LAN) | `docker compose -f docker-compose.yml -f docker-compose.lan.yml up -d` |
-| Démarrer (prod) | `docker compose up -d` (aucun port publié) |
+| Démarrer (prod) | `docker compose up -d` (aucun port publié ; `preflight` exécuté en premier) |
 | Démarrer (isolation egress) | `docker compose -f docker-compose.yml -f docker-compose.lan-internal.yml up -d` (aucun port, egress bloqué) |
 | État | `docker compose ps` |
 | Arrêter | `docker compose down` (**sans** `-v`) |
-| Migrer | `docker compose run --rm migrate` |
-| Seed admin | `docker compose run --rm -e ADMIN_EMAIL=.. -e ADMIN_PASSWORD=.. seed-admin` |
-| Gates | `docker compose run --rm check-gates --first-boot` |
-| Sauvegarder | `docker compose run --rm backup` |
-| Restaurer | `RESTORE_MANIFEST=/restore/SHA256SUMS-XXX.txt docker compose run --rm restore /restore/db-XXX.dump ENV /restore/files-XXX.tar.gz /restore-out/target` |
+| Préflight (suite ops) | `./scripts/ops.sh preflight` |
+| Migrer | `./scripts/ops.sh migrate` |
+| Seed admin | `./scripts/ops.sh seed-admin -e ADMIN_EMAIL=.. -e ADMIN_PASSWORD=..` |
+| Gates | `./scripts/ops.sh check-gates --first-boot` |
+| Sauvegarder | `./scripts/ops.sh backup` |
+| Restaurer | `RESTORE_MANIFEST=/restore/SHA256SUMS-XXX.txt ./scripts/ops.sh restore /restore/db-XXX.dump ENV /restore/files-XXX.tar.gz /restore-out/target` |

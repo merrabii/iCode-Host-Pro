@@ -17,11 +17,19 @@
 # - x-api-env : ancre UNIQUE partagée par `api` ET `check-gates` — l'env du
 #   checker est constructuellement celui du service API (pas deux copies).
 #
-# COMPATIBILITÉ COOLIFY (GO V3) : ce fichier n'utilise JAMAIS ${VAR:?} — le
-# validateur Coolify 4.4.6 ne le supporte pas. Les valeurs obligatoires sont
-# vérifiées par deploy/scripts/preflight.sh AVANT tout docker compose up/run,
-# et par les scripts ops (migrate-guarded.sh, backup.sh, restore.sh) qui
-# refusent explicitement toute opération si un paramètre manque.
+# COMPATIBILITÉ COOLIFY + GARDES RÉELLEMENT EXÉCUTÉES (GO V4) :
+# - Ce fichier n'utilise JAMAIS ${VAR:?} — le validateur Coolify 4.4.6 ne le
+#   supporte pas — et ne contient AUCUN montage ${VAR:-/nonexistent}.
+# - Les valeurs obligatoires sont vérifiées par le service one-shot
+#   `preflight` (deploy/scripts/preflight.sh) qui s'exécute AVANT db/api/web
+#   (depends_on: condition: service_completed_successfully) sur les MÊMES
+#   valeurs ${VAR:-} interpolées : config manquante = exit 1 = docker compose
+#   up échoue = AUCUN service ne démarre. C'est ce chemin qu'emprunte un
+#   déploiement Coolify officiel — aucune retouche manuelle.
+# - Les jobs ops à montage hôte (migrate/backup/restore) sont dans
+#   docker-compose.ops.yml (gardes ${VAR:?} strictes, jamais lu par Coolify)
+#   et sont lancés par deploy/scripts/ops.sh, qui exécute preflight.sh --ops
+#   (vars ops + restauration + validité des chemins hôte) avant tout conteneur.
 
 name: code-diali
 
@@ -50,9 +58,37 @@ x-api-env: &api-env
   RECONCILE_ENABLED: "false"
 
 services:
+  # Contrôle préalable RÉELLEMENT EXÉCUTÉ à chaque démarrage (GO V4).
+  # - One-shot : exit 0 = conforme ; exit 1 = docker compose up échoue, db/api/web
+  #   ne démarrent pas (déploiement Coolify refusé tel quel, stack existante en
+  #   place non modifiée).
+  # - Env = les MÊMES ${VAR:-} que db/api/web (interpolation du même fichier) :
+  #   ce qui est testé est constructuellement ce qui est distribué. Un espace
+  #   réservé vide est un échec (comme l'aurait été ${VAR:?} interdit ici).
+  # - Rebuilt à chaque build (image du projet : <projet>_preflight), aucun
+  #   argument de build, aucune écriture, contrôle seul.
+  preflight:
+    build:
+      context: ..
+      dockerfile: deploy/docker/api.Dockerfile
+    restart: "no"
+    entrypoint: ["bash", "/opt/code-diali/scripts/preflight.sh"]
+    environment:
+      PG_USER: ${PG_USER:-}
+      PG_PASSWORD: ${PG_PASSWORD:-}
+      PG_DB: ${PG_DB:-}
+      JWT_SECRET: ${JWT_SECRET:-}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
+      WEB_ORIGIN: ${WEB_ORIGIN:-}
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-}
+
   db:
     image: postgres:16-alpine
     restart: unless-stopped
+    depends_on:
+      preflight:
+        condition: service_completed_successfully
     environment:
       POSTGRES_USER: ${PG_USER:-}
       POSTGRES_PASSWORD: ${PG_PASSWORD:-}
@@ -113,33 +149,16 @@ services:
     expose:
       - "3000"
 
-  # Jobs "ops" — JAMAIS démarrés par un simple "docker compose up" (profile).
-  # Les volumes hôte utilisent ${VAR:-/nonexistent} (compatibilité Coolify) ;
-  # les scripts ops refusent explicitement si le répertoire est absent.
-
-  # Migration protégée :
-  #   docker compose run --rm migrate
-  migrate:
-    profiles: ["ops"]
-    build:
-      context: ..
-      dockerfile: deploy/docker/api.Dockerfile
-    depends_on:
-      db:
-        condition: service_healthy
-    environment:
-      NODE_ENV: production
-      DATABASE_URL: ${DATABASE_URL_OPS:-}
-      EXPECTED_DB_HOST: ${EXPECTED_DB_HOST:-}
-      EXPECTED_DB_PORT: ${EXPECTED_DB_PORT:-5432}
-      EXPECTED_DB_NAME: ${EXPECTED_DB_NAME:-}
-      BACKUP_DIR: /backups
-    volumes:
-      - ${BACKUP_HOST_DIR:-/nonexistent}:/backups
-    entrypoint: ["bash", "/opt/code-diali/scripts/migrate-guarded.sh"]
+  # Jobs ops SANS montage hôte — restent ici car `check-gates` partage
+  # l'ancre x-api-env avec `api` (les ancres YAML ne traversent PAS deux
+  # fichiers compose). Profil "ops" : jamais démarrés par un simple
+  # "docker compose up". Lancement documenté : deploy/scripts/ops.sh
+  # (preflight runtime exécuté avant chaque commande).
+  # Les jobs migrate/backup/restore (montage hôte + gardes ${VAR:?} strictes)
+  # vivent dans docker-compose.ops.yml.
 
   # Gates premier démarrage — MÊME env que le service api (ancre x-api-env) :
-  #   docker compose run --rm check-gates --first-boot
+  #   ./scripts/ops.sh check-gates --first-boot
   check-gates:
     profiles: ["ops"]
     build:
@@ -153,7 +172,7 @@ services:
     entrypoint: ["node", "/opt/code-diali/scripts/bootstrap-check.mjs"]
 
   # Seed admin initial (ADR-017) — explicite uniquement :
-  #   docker compose run --rm -e ADMIN_EMAIL=... -e ADMIN_PASSWORD=... seed-admin
+  #   ./scripts/ops.sh seed-admin -e ADMIN_EMAIL=... -e ADMIN_PASSWORD=...
   seed-admin:
     profiles: ["ops"]
     build:
@@ -167,82 +186,6 @@ services:
       DATABASE_URL: postgresql://${PG_USER:-}:${PG_PASSWORD:-}@db:5432/${PG_DB:-}?schema=public
     working_dir: /repo/apps/api
     entrypoint: ["npx", "prisma", "db", "seed"]
-
-  # Sauvegarde (destination persistante = BACKUP_HOST_DIR sur l'hôte, montée
-  # en /backups — le conteneur éphémère du job peut être supprimé, les dumps
-  # restent sur l'hôte) :
-  #   docker compose run --rm backup
-  backup:
-    profiles: ["ops"]
-    build:
-      context: ..
-      dockerfile: deploy/docker/api.Dockerfile
-    depends_on:
-      db:
-        condition: service_healthy
-    environment:
-      NODE_ENV: production
-      DATABASE_URL: ${DATABASE_URL_OPS:-}
-      BACKUP_DIR: /backups
-      STORAGE_DIR: /repo/apps/api/storage
-      BRANDING_DIR: /repo/apps/api/public/branding
-      REQUIRE_VOLUME_MOUNTS: "1"
-    volumes:
-      - ${BACKUP_HOST_DIR:-/nonexistent}:/backups
-      - cdiali_storage:/repo/apps/api/storage
-      - cdiali_branding:/repo/apps/api/public/branding
-    entrypoint: ["bash", "/opt/code-diali/scripts/backup.sh"]
-
-  # Restauration isolée — N'EST PAS montée sur les volumes de l'app courante :
-  # les fichiers restaurés vont dans RESTORE_HOST_DIR (dossier hôte dédié) ;
-  # la base cible doit être NEUVE (EXPECTED_DB_NAME_RESTORE). La recopie vers
-  # les volumes live = procédure manuelle documentée, hors de ce job.
-  #
-  # COMMANDE CANONIQUE (URL via env, jamais dans les arguments visibles) :
-  #   RESTORE_MANIFEST=/restore/SHA256SUMS-XXX.txt \
-  #   docker compose run --rm restore \
-  #     /restore/db-XXX.dump ENV /restore/files-XXX.tar.gz /restore-out/target
-  #
-  # - "ENV" en 2e position = utiliser DATABASE_URL de l'environnement (ici
-  #   DATABASE_URL_RESTORE injecté ci-dessous) — le secret n'apparaît jamais
-  #   dans les arguments de la commande.
-  #   (Le placeholder "-" n'est PAS utilisable avec docker compose run, qui
-  #   l'interprète comme un flag ; "ENV" est le placeholder canonique.)
-  # - RESTORE_MANIFEST est transmis au conteneur via le pass-through
-  #   ci-dessous (host env → container env) — aucune valeur codée en dur.
-  # - Les sauvegardes sources (/restore) sont montées en LECTURE SEULE (:ro).
-  # - Les sorties (/restore-out) : dumps pré-restauration + fichiers restaurés
-  #   — montées durablement, survivent à la suppression du conteneur éphémère.
-  # - La destination des fichiers restaurés est /restore-out/target (sous-dossier
-  #   VIDE à créer par l'opérateur sur l'hôte, ou laissé au script).
-  restore:
-    profiles: ["ops"]
-    build:
-      context: ..
-      dockerfile: deploy/docker/api.Dockerfile
-    depends_on:
-      db:
-        condition: service_healthy
-    environment:
-      NODE_ENV: production
-      DATABASE_URL: ${DATABASE_URL_RESTORE:-}
-      EXPECTED_DB_HOST: ${EXPECTED_DB_HOST:-}
-      EXPECTED_DB_PORT: ${EXPECTED_DB_PORT:-5432}
-      EXPECTED_DB_NAME: ${EXPECTED_DB_NAME_RESTORE:-}
-      # Pass-through RESTORE_MANIFEST : la valeur est définie sur l'hôte
-      # (prefixe de la commande) et transmise au conteneur ici. Sans cette
-      # ligne, docker compose run ne la passerait PAS au conteneur.
-      RESTORE_MANIFEST: ${RESTORE_MANIFEST:-}
-      # Dumps pré-restauration écrits dans /restore-out (monté durablement).
-      BACKUP_DIR: /restore-out
-    volumes:
-      # Sauvegardes sources (dump + archive + manifeste) — LECTURE SEULE.
-      - ${RESTORE_HOST_DIR:-/nonexistent}:/restore:ro
-      # Sorties de restauration (dumps pré-restauration + fichiers restaurés)
-      # — ECRITURE, persistantes sur l'hôte après rm du conteneur éphémère.
-      # Jamais monté sur les volumes de l'app courante.
-      - ${RESTORE_HOST_DIR:-/nonexistent}:/restore-out
-    entrypoint: ["bash", "/opt/code-diali/scripts/restore.sh"]
 
 volumes:
   cdiali_pg:
