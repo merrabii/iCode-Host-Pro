@@ -79,6 +79,63 @@
 - [x] Incident migrations **préservé et documenté** : `docs/DOSSIER-INCIDENT-MIGRATIONS.md`
       (restauration complète jamais présentée comme démontrée ; garde bloquante motivée).
 
+## A3. Préproduction réelle — GO 13/10 + GO V2 14/10 + GO V3 15/10/2026 (VM dédiée 172.31.47.238, Coolify 4.4.6)
+
+> **Catégorie : cible de test dédiée (préproduction), PAS la production.** Rapport unique :
+> `recette/RAPPORT-GO-PREPRODUCTION.md` (V3, final, rectifie V1/V2) ; journal : `recette/ETAT-REPRISE.md`
+> ; archive `REVUE-PREPRODUCTION-CODE-DIALI-V3.zip` (Bureau, final). Branche dediee poussee ; **aucun merge/push de main, aucune activation**.
+> aucune activation.
+
+- [x] **Intégration Coolify RÉELLE validée** (annule le « jamais fait » antérieur pour la
+      préproduction) : app dockercompose liée à git, SHA épinglé `dc747bc…`, projet isolé,
+      proxy Coolify « Custom (None) » (apache2:80 préservé), déploiements #5/#6/#8 DONE.
+- [x] **Migration protégée sur préprod** : `migrate-guarded.sh` → `MIGRATE_EXIT=0`,
+      **66 migrations**, base vierge confirmée avant.
+- [x] **Gates premiers pas** : NON CONFORME initial (`cardTopupEnabled=true`, défaut de
+      migration) → remédiation par l'**API admin** (voie sanctionnée) → **CONFORME** ;
+      re-CONFORME après le deploy final.
+- [x] **Seed admin réel** (`Admin ensured`, ADR-017, credentials hors fixture) + login
+      **201** ; 1 user.
+- [x] **Santé + catalogue + paiements** : health 200 `database ok`, web 200 marque « Code
+      Diali », `/api/public/products` 200, `payment-capabilities` **tous false**.
+- [x] **Redémarrage contrôlé** de la stack préprod → persistance + login OK.
+- [x] **Sauvegarde + restauration sur préprod** : dump 178 123 o (SHA-256, 0600) →
+      restauration `RESTORE_EXIT=0` vers base **neuve** `cd_preprod_restore`
+      (**59 tables / 1 user = live**), source préservée.
+- [x] **Consultation navigateur validée via TUNNEL SSH temporaire (127.0.0.1:13000) —
+      15/15 PASS** (V1) : vrai formulaire login → `/manager`, cookie `ihp_refresh`
+      httpOnly+Secure+Lax, refresh **201**, 14 appels API 2xx, 0 5xx, 0 requête hors
+      tunnel, 0 URL morte, `/api/brand` 200. Preuves : `recette/tunnel/` + procédure
+      `recette/ouvrir-tunnel-preprod.ps1`.
+- [x] **Accès LAN direct `3211`/`3212` = BLOQUÉ** (V1, limitation Coolify 4.4.6 dockercompose+
+      git sans commit) — signalé BLOQUÉ, jamais PASS.
+- [x] **Accès direct HTTPS sans tunnel — PASS 14/14** (GO V2) : reverse proxy Caddy dédié
+      hors Coolify (`preprod-proxy`), host 3212→80 + 3443→443 (cert auto-signé SAN IP),
+      `reverse_proxy web:3000` par DNS Docker ; envs Coolify alignés HTTPS via API
+      supportée (DELETE+POST) ; split SSR/client (delta `brand-data.ts` préparé, patch
+      bundle temporaire, fix = git push) ; login UI → `/manager`, cookie Secure+httpOnly+Lax
+      domaine `172.31.47.238`, refresh 201, rechargement session maintenue, 20 API 2xx,
+      0 5xx, 0 hôte étranger, branding SSR réel. Preuves : `recette/direct/` + 6 captures.
+- [x] **Interventions Coolify internes documentées** (GO V2) : parsers.php patch toujours
+      actif (non retiré — retrait = commit git interdit), psql chiffré remplacé par
+      DELETE+POST API supportée, remplacements supportés identifiés. ETAT-REPRISE §GO V2.
+- [x] **Redéploiement contrôlé post-V2 sans tunnel ni réapplication parsers.php** :
+      `force_rebuild` → nouvelles conteneurs `…20261014T091551`, accès revérifié 14/14.
+- [x] **Gates paiements préservés après V2** : `payment-methods` = `[]`, `simulate-payment`
+      = 400 (refus attendu).
+
+- [x] **Fix SSR durable (V3)** : `brand-data.ts` commit+pousse (`4b18d83`) - SSR resout
+      `http://api:3001` via `API_UPSTREAM`, **aucun patch temporaire conteneur**.
+- [x] **Compose Coolify-compatible (V3)** : plus aucun `${VAR:?}` ; refus dans `preflight.sh`
+      + scripts ops.
+- [x] **Deploiement SANS parsers.php patch (V3)** : parsers.php original (md5 = backup) ->
+      `POST start` -> finished, conteneurs `...20261015T032516`, HTTPS 200 - le patch interne
+      Coolify **nest plus requis**.
+- [x] **Branche dediee poussee (V3)** : `feat/preprod-reproductible-v3` = `4b18d83`, 0/0,
+      arbre propre ; `main` = `dc747bc` **non merge, non poussee de nouvelle valeur**.
+- [x] **Acces direct 14/14 post-V3** : reverifie apres re-deploy sans patch
+      (`recette/direct/verify.json`).
+
 ---
 
 # B. OPÉRATIONS NON EXÉCUTÉES (à faire sur cible — cases vides volontairement)
@@ -96,8 +153,8 @@
 
 - [ ] **VPS dédié identifié** (séparé des serveurs d'apps clients — CLAUDE.md §3) :
       accès SSH configuré **localement en sécurité** (jamais de mot de passe dans le chat
-      ou dans un document versionné). *La VM de test 172.20.116.6 (GO 12/10) n'est PAS ce
-      VPS.*
+      ou dans un document versionné). *Les VMs de test 172.20.116.6 (GO 12/10) et
+      172.31.47.238 (préproduction GO 13/10) ne sont PAS ce VPS.*
 - [ ] **Domaine public** décidé ; DNS pointant vers le VPS ; HTTPS opérationnel
       (**autorité unique = le projet Coolify isolé** — décision GO ; `deploy/README.md`
       explique le retrait des `ports:` de validation au profit des routes Coolify).
@@ -197,9 +254,11 @@
       compte test n'existe pas.
 - [ ] Parcours **virement** (justificatif → validation admin) exécuté de bout en bout en
       recette (statut actuel : implémenté, exercice complet **non revendiqué**).
-- [ ] Provisioning **réel** (serveur hébergement réel) — **jamais fait** au sens : aucune
-      validation d'intégration Coolify sur VPS dédié ; la VM de test 12/10 prouve le
-      packaging Docker **sans Coolify installée** (catégorie infrastructure simulée).
+- [x] **Validation d'intégration Coolify** : **acquise sur préproduction** (GO 13/10, VM
+      172.31.47.238 — Coolify 4.4.6, app dockercompose @SHA, migrate/gates/seed/backup/
+      restore/tunnel navigateur 15/15, voir A3). **Restant** : validation sur le **VPS de
+      production réel** (domaine, secrets, HTTPS) — case B1/B3 ; provisionning d'un serveur
+      d'apps **client** réel = jamais fait (hors périmètre de ce GO).
 - [ ] **Installateur web** + **commande serveur vierge** : à développer puis testés **en
       fin de projet** (CLAUDE.md §Rappel) — sur base neuve, jamais sur les bases clientes.
 - [ ] Aucune opération déployée sur le/des serveur(s) d'apps clients ; `icode_host_pro`

@@ -75,6 +75,47 @@ distinctes — voir `deploy/README.md`).
 
 ---
 
+## 0ter. Préproduction réelle — EXÉCUTÉE et VALIDÉE (GO 13/10 + GO V2 14/10 + GO V3 15/10/2026) **[V]**
+
+Le GO « PRÉPRODUCTION CODE DIALI » (13/10) a déployé **via Coolify 4.4.6** (projet isolé sur la VM
+172.31.47.238, app `uawjvxk573pyx13v6o8bgxpp`, SHA épinglé `dc747bcda9f8…`) l'intégralité du
+parcours du §0bis **sur une vraie instance Coolify** ; le **GO V2** (14/10) a établi l'**accès
+direct durable sans tunnel** et documenté les **interventions Coolify internes**.
+
+| Étape | Verdict | Preuve |
+|---|---|---|
+| Déploiement dockercompose+git (clone @SHA, images `*_api/_web:dc747bc…`) | **[V] PASS** | deploys #5/#6/#8 DONE (Coolify API) |
+| `migrate-guarded.sh` — 66 migrations sur base vierge | **[V] PASS** | `MIGRATE_EXIT=0` |
+| `check-gates --first-boot` — paiements OFF | **[V] PASS** | 1er passage NON CONFORME (`cardTopupEnabled`) → PATCH admin (voie sanctionnée) → CONFORME |
+| `seed-admin` (ADR-017, credentials hors fixture) | **[V] PASS** | `Admin ensured (role=ADMIN)` |
+| Santé web/API/DB + marque + catalogue + capacités paiement | **[V] PASS** | health 200/ok, web 200, `cardAvailable:false` |
+| Redémarrage contrôlé de la stack | **[V] PASS** | 3 conteneurs → health/login/web OK |
+| Sauvegarde + restauration (base isolée neuve, source préservée) | **[V] PASS** | dump 178 123 o ; `cd_preprod_restore` 59/59 tables |
+| **Consultation navigateur via TUNNEL SSH (127.0.0.1:13000)** — V1 | **[V] PASS 15/15** | `recette/tunnel/verify.json` + 4 captures |
+| **Accès LAN direct 3211/3212** — V1 | **[V] BLOQUÉ** | limitation Coolify 4.4.6 : `ports_mappings` non appliqué pour app dockercompose+git sans commit (jamais PASS) |
+| **Accès direct HTTPS sans tunnel** (reverse proxy Caddy hors Coolify) — V2 | **[V] PASS 14/14** | `recette/direct/verify.json` + 6 captures ; `https://172.31.47.238:3443` |
+| **Interventions Coolify internes documentées** — V2 | **[V] PASS** | parsers.php patch (non retiré) + psql remplacé par DELETE+POST API ; ETAT-REPRISE §GO V2 |
+| **Redéploiement contrôlé post-V2** (sans tunnel, sans réapplication parsers.php) | **[V] PASS** | `force_rebuild` → nouvelles conteneurs, accès revérifié 14/14 |
+| **Gates paiements préservés après V2** | **[V] PASS** | `payment-methods` = `[]` ; `simulate-payment` = 400 |
+| **Fix SSR durable (`API_UPSTREAM` split) — V3** | **[V] PASS** | commit `4b18d83` ; bundle résout `http://api:3001`, aucun patch conteneur |
+| **Compose Coolify-compatible (plus aucun `${VAR:?}`) — V3** | **[V] PASS** | `${VAR:-…}` partout ; refus dans `preflight.sh` + scripts ops |
+| **Redéploiement SANS parsers.php patch — V3** | **[V] PASS** | parsers.php original, `POST start` → finished, conteneurs `…20261015T032516` |
+| **Branche dédiée poussée (V3)** | **[V] PASS** | `feat/preprod-reproductible-v3` = `4b18d83`, 0/0 ; `main` inchangée |
+| Branding SSR réel (pas de repli silencieux) — V2 | **[V] PASS** (workaround) | patch bundle temporaire → `http://api:3001` ; **fix définitif = git push delta `brand-data.ts`** |
+
+**Implication pour le plan** : la **validation d'intégration Coolify annoncée manquante** au
+§0bis est désormais **acquise sur préproduction** (catégorie « VM de test dédiée »), la
+production (VPS + domaine + secrets) restant entièrement à faire (§8.1). L'**accès direct
+HTTPS** (`https://172.31.47.238:3443`) remplace le tunnel SSH comme voie principale de
+consultation ; le tunnel reste en secours. Le **fix SSR définitif** a été **committé et poussé
+dans le GO V3** (branche `feat/preprod-reproductible-v3`, `4b18d83`) avec le compose
+Coolify-compatible — la préproduction se déploie **sans parsers.php patch ni patch bundle**.
+Rapport unique : `recette/RAPPORT-GO-PREPRODUCTION.md` ; journal complet :
+`recette/ETAT-REPRISE.md` (blocs « GO V2 » et « GO V3 »). Branche dédiée poussée (V3) ;
+`main` ni merge ni poussée de nouvelle valeur.
+
+---
+
 ## 1. Inventaire vérifié (source = commit `463f0146`)
 
 ### 1.1 Composants et mécanismes réellement présents
