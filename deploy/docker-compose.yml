@@ -16,20 +16,26 @@
 # - Noms/volumes préfixés "cdiali-" : aucune collision avec une stack existante.
 # - x-api-env : ancre UNIQUE partagée par `api` ET `check-gates` — l'env du
 #   checker est constructuellement celui du service API (pas deux copies).
+#
+# COMPATIBILITÉ COOLIFY (GO V3) : ce fichier n'utilise JAMAIS ${VAR:?} — le
+# validateur Coolify 4.4.6 ne le supporte pas. Les valeurs obligatoires sont
+# vérifiées par deploy/scripts/preflight.sh AVANT tout docker compose up/run,
+# et par les scripts ops (migrate-guarded.sh, backup.sh, restore.sh) qui
+# refusent explicitement toute opération si un paramètre manque.
 
 name: code-diali
 
 x-api-env: &api-env
   NODE_ENV: production
-  DATABASE_URL: postgresql://${PG_USER:?}:${PG_PASSWORD:?}@db:5432/${PG_DB:?}?schema=public
+  DATABASE_URL: postgresql://${PG_USER:-}:${PG_PASSWORD:-}@db:5432/${PG_DB:-}?schema=public
   PORT: "3001"
-  JWT_SECRET: ${JWT_SECRET:?JWT_SECRET obligatoire}
-  ENCRYPTION_KEY: ${ENCRYPTION_KEY:?ENCRYPTION_KEY obligatoire}
-  PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:?PUBLIC_BASE_URL obligatoire (URL Web vue par le navigateur)}
-  WEB_ORIGIN: ${WEB_ORIGIN:?WEB_ORIGIN obligatoire (origine navigateur autorisée)}
+  JWT_SECRET: ${JWT_SECRET:-}
+  ENCRYPTION_KEY: ${ENCRYPTION_KEY:-}
+  PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
+  WEB_ORIGIN: ${WEB_ORIGIN:-}
   # URL API vue par le NAVIGATEUR (pages de paiement hébergées, PUBLIC_API_BASE
   # lue par payment-provider.service). Runtime.
-  PUBLIC_API_BASE: ${PUBLIC_API_BASE:-${NEXT_PUBLIC_API_URL:?NEXT_PUBLIC_API_URL obligatoire}}
+  PUBLIC_API_BASE: ${PUBLIC_API_BASE:-${NEXT_PUBLIC_API_URL:-}}
   # Derrière un reverse proxy local (Coolify/docker network) : uniquelocal =
   # RFC1918 (réseaux docker) ; "true" est REFUSÉ par le code (forgeable).
   TRUST_PROXY: ${TRUST_PROXY:-uniquelocal}
@@ -48,9 +54,9 @@ services:
     image: postgres:16-alpine
     restart: unless-stopped
     environment:
-      POSTGRES_USER: ${PG_USER:?PG_USER obligatoire}
-      POSTGRES_PASSWORD: ${PG_PASSWORD:?PG_PASSWORD obligatoire}
-      POSTGRES_DB: ${PG_DB:?PG_DB obligatoire}
+      POSTGRES_USER: ${PG_USER:-}
+      POSTGRES_PASSWORD: ${PG_PASSWORD:-}
+      POSTGRES_DB: ${PG_DB:-}
     volumes:
       - cdiali_pg:/var/lib/postgresql/data
     healthcheck:
@@ -95,7 +101,7 @@ services:
         # URL de l'API vue PAR LE NAVIGATEUR — INLINÉE AU BUILD dans le bundle
         # Next (NEXT_PUBLIC_*) : la modifier au runtime ne change RIEN côté
         # navigateur ; tout changement exige un REBUILD du service web.
-        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:?NEXT_PUBLIC_API_URL obligatoire (URL API vue par le navigateur — figée au build)}
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-}
     restart: unless-stopped
     depends_on:
       - api
@@ -108,6 +114,8 @@ services:
       - "3000"
 
   # Jobs "ops" — JAMAIS démarrés par un simple "docker compose up" (profile).
+  # Les volumes hôte utilisent ${VAR:-/nonexistent} (compatibilité Coolify) ;
+  # les scripts ops refusent explicitement si le répertoire est absent.
 
   # Migration protégée :
   #   docker compose run --rm migrate
@@ -121,13 +129,13 @@ services:
         condition: service_healthy
     environment:
       NODE_ENV: production
-      DATABASE_URL: ${DATABASE_URL_OPS:?DATABASE_URL_OPS obligatoire (URL de migration, jamais de repli .env)}
-      EXPECTED_DB_HOST: ${EXPECTED_DB_HOST:?EXPECTED_DB_HOST obligatoire}
+      DATABASE_URL: ${DATABASE_URL_OPS:-}
+      EXPECTED_DB_HOST: ${EXPECTED_DB_HOST:-}
       EXPECTED_DB_PORT: ${EXPECTED_DB_PORT:-5432}
-      EXPECTED_DB_NAME: ${EXPECTED_DB_NAME:?EXPECTED_DB_NAME obligatoire}
+      EXPECTED_DB_NAME: ${EXPECTED_DB_NAME:-}
       BACKUP_DIR: /backups
     volumes:
-      - ${BACKUP_HOST_DIR:?BACKUP_HOST_DIR obligatoire (dossier hôte de sauvegarde)}:/backups
+      - ${BACKUP_HOST_DIR:-/nonexistent}:/backups
     entrypoint: ["bash", "/opt/code-diali/scripts/migrate-guarded.sh"]
 
   # Gates premier démarrage — MÊME env que le service api (ancre x-api-env) :
@@ -156,7 +164,7 @@ services:
         condition: service_healthy
     environment:
       NODE_ENV: production
-      DATABASE_URL: postgresql://${PG_USER:?}:${PG_PASSWORD:?}@db:5432/${PG_DB:?}?schema=public
+      DATABASE_URL: postgresql://${PG_USER:-}:${PG_PASSWORD:-}@db:5432/${PG_DB:-}?schema=public
     working_dir: /repo/apps/api
     entrypoint: ["npx", "prisma", "db", "seed"]
 
@@ -174,13 +182,13 @@ services:
         condition: service_healthy
     environment:
       NODE_ENV: production
-      DATABASE_URL: ${DATABASE_URL_OPS:?DATABASE_URL_OPS obligatoire}
+      DATABASE_URL: ${DATABASE_URL_OPS:-}
       BACKUP_DIR: /backups
       STORAGE_DIR: /repo/apps/api/storage
       BRANDING_DIR: /repo/apps/api/public/branding
       REQUIRE_VOLUME_MOUNTS: "1"
     volumes:
-      - ${BACKUP_HOST_DIR:?BACKUP_HOST_DIR obligatoire}:/backups
+      - ${BACKUP_HOST_DIR:-/nonexistent}:/backups
       - cdiali_storage:/repo/apps/api/storage
       - cdiali_branding:/repo/apps/api/public/branding
     entrypoint: ["bash", "/opt/code-diali/scripts/backup.sh"]
@@ -217,10 +225,10 @@ services:
         condition: service_healthy
     environment:
       NODE_ENV: production
-      DATABASE_URL: ${DATABASE_URL_RESTORE:?DATABASE_URL_RESTORE obligatoire (URL de la base cible NEUVE)}
-      EXPECTED_DB_HOST: ${EXPECTED_DB_HOST:?EXPECTED_DB_HOST obligatoire}
+      DATABASE_URL: ${DATABASE_URL_RESTORE:-}
+      EXPECTED_DB_HOST: ${EXPECTED_DB_HOST:-}
       EXPECTED_DB_PORT: ${EXPECTED_DB_PORT:-5432}
-      EXPECTED_DB_NAME: ${EXPECTED_DB_NAME_RESTORE:?EXPECTED_DB_NAME_RESTORE obligatoire (base cible neuve)}
+      EXPECTED_DB_NAME: ${EXPECTED_DB_NAME_RESTORE:-}
       # Pass-through RESTORE_MANIFEST : la valeur est définie sur l'hôte
       # (prefixe de la commande) et transmise au conteneur ici. Sans cette
       # ligne, docker compose run ne la passerait PAS au conteneur.
@@ -229,11 +237,11 @@ services:
       BACKUP_DIR: /restore-out
     volumes:
       # Sauvegardes sources (dump + archive + manifeste) — LECTURE SEULE.
-      - ${RESTORE_HOST_DIR:?RESTORE_HOST_DIR obligatoire (dossier hôte de restauration dédié)}:/restore:ro
+      - ${RESTORE_HOST_DIR:-/nonexistent}:/restore:ro
       # Sorties de restauration (dumps pré-restauration + fichiers restaurés)
       # — ECRITURE, persistantes sur l'hôte après rm du conteneur éphémère.
       # Jamais monté sur les volumes de l'app courante.
-      - ${RESTORE_HOST_DIR:?RESTORE_HOST_DIR obligatoire}:/restore-out
+      - ${RESTORE_HOST_DIR:-/nonexistent}:/restore-out
     entrypoint: ["bash", "/opt/code-diali/scripts/restore.sh"]
 
 volumes:

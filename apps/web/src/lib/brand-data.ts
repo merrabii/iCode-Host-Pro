@@ -1,6 +1,14 @@
 import { defaultBrandView, type BrandView } from '@/config/brand';
 
-const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
+// SSR: prefer API_UPSTREAM (internal Docker URL, http://api:3001) — no TLS.
+// NEXT_PUBLIC_API_URL (browser URL, https://…) is inlined at build time and
+// serves the client fetch (brand-provider). Without this split, the SSR fetch
+// fails on a self-signed cert and branding silently falls back to defaults
+// (forbidden in preproduction direct-access).
+const API =
+  process.env.API_UPSTREAM ||
+  process.env.NEXT_PUBLIC_API_URL ||
+  'http://localhost:3001';
 
 /** Normalise la réponse de /api/brand (résiliente aux champs manquants). */
 function normalize(raw: unknown): BrandView {

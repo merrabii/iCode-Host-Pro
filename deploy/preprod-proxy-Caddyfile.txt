@@ -1,0 +1,20 @@
+# Code Diali — Caddyfile pour le reverse proxy préproduction (GO V3).
+#
+# Ce fichier est monté en /etc/caddy/Caddyfile dans le conteneur preprod-proxy.
+# Il ne contient AUCUN secret (le cert auto-signé est monté depuis /certs).
+#
+# Copier vers /home/mourad/preprod-proxy/Caddyfile sur la VM préproduction.
+
+{
+  admin off
+  auto_https off
+}
+
+:80 {
+  reverse_proxy web:3000
+}
+
+:443 {
+  tls /certs/server.crt /certs/server.key
+  reverse_proxy web:3000
+}
