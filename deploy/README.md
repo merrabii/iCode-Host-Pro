@@ -163,7 +163,7 @@ connu : `name` écrasé en « Platform Admin ». Aucune fixture importée.
 ```
 
 - Job `backup` **explicite** (profil `ops`) : monte `BACKUP_HOST_DIR` (hôte) en
-  `/backups` **et** les volumes `cdiali_storage`/`cdiali_branding` (avec
+  `/backups` **et** les volumes `cdiali-storage`/`cdiali-branding` (avec
   `REQUIRE_VOLUME_MOUNTS=1` : un volume absent/non monté = **erreur**, jamais
   une « sauvegarde complète » ; dossiers **présents et vides** = cas normal).
 - **Persistance** : les dumps survivent à la suppression du conteneur

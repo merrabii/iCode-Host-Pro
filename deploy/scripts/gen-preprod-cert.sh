@@ -13,7 +13,7 @@
 
 set -euo pipefail
 
-IP="${1:-172.31.47.238}"
+IP="${1:-172.17.79.197}"
 CERT_DIR="/home/mourad/preprod-proxy/certs"
 DAYS=3650
 

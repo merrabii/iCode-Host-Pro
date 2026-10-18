@@ -63,8 +63,8 @@ services:
       REQUIRE_VOLUME_MOUNTS: "1"
     volumes:
       - ${BACKUP_HOST_DIR:?BACKUP_HOST_DIR obligatoire}:/backups
-      - cdiali_storage:/repo/apps/api/storage
-      - cdiali_branding:/repo/apps/api/public/branding
+      - cdiali-storage:/repo/apps/api/storage
+      - cdiali-branding:/repo/apps/api/public/branding
     entrypoint: ["bash", "/opt/code-diali/scripts/backup.sh"]
 
   # Restauration isolée — N'EST PAS montée sur les volumes de l'app courante :

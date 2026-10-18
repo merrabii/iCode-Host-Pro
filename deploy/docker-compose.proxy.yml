@@ -5,14 +5,7 @@
 #
 # USAGE (sur la VM préproduction) :
 #   # 1. Générer le certificat auto-signé (une seule fois) :
-#   mkdir -p /home/mourad/preprod-proxy/{certs,caddy_config,caddy_data}
-#   openssl req -x509 -newkey rsa:4096 -nodes -days 3650 \
-#     -keyout /home/mourad/preprod-proxy/certs/server.key \
-#     -out /home/mourad/preprod-proxy/certs/server.crt \
-#     -subj "/CN=172.31.47.238" \
-#     -addext "subjectAltName=IP:172.31.47.238"
-#   chmod 600 /home/mourad/preprod-proxy/certs/server.key
-#   chmod 644 /home/mourad/preprod-proxy/certs/server.crt
+#   ./deploy/scripts/gen-preprod-cert.sh 172.17.79.197
 #
 #   # 2. Placer le Caddyfile (voir fichier fourni) :
 #   #    /home/mourad/preprod-proxy/Caddyfile
@@ -27,8 +20,11 @@
 #   3212 → 80  (HTTP, redirection vers HTTPS non configurée — accès direct)
 #   3443 → 443 (HTTPS, cert auto-signé)
 #
-# RÉSEAU : rejoint le réseau de la stack préprod (uawjvxk573pyx13v6o8bgxpp)
-# pour résoudre `web` par DNS Docker. Aucune IP conteneur n'est figée.
+# RÉSEAU : rejoint le réseau de la stack préprod (nom ci-dessous) pour résoudre
+# `web` par DNS Docker. Aucune IP conteneur n'est figée. Le nom du réseau est
+# celui créé par Coolify pour le projet cible (UUID projet Coolify).
+# Adapter PREPROD_NETWORK à l'UUID du projet Coolify avant `up -d`
+# (ou via variable d'environnement PREPROD_NETWORK).
 #
 # PostgreSQL n'est PAS publié. L'API n'est PAS publiée directement.
 # Le web gère /api/* via le rewrite API_UPSTREAM=http://api:3001.
@@ -56,4 +52,4 @@ services:
 networks:
   preprod:
     external: true
-    name: uawjvxk573pyx13v6o8bgxpp
+    name: ${PREPROD_NETWORK:-6qnkc7gldvm06jn8ct5zdmyx}

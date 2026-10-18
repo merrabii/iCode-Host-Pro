@@ -94,7 +94,13 @@ services:
       POSTGRES_PASSWORD: ${PG_PASSWORD:-}
       POSTGRES_DB: ${PG_DB:-}
     volumes:
-      - cdiali_pg:/var/lib/postgresql/data
+      # Clés en HYPHENS (et non underscores) : compose 5.5 (artefact Coolify)
+      # normalise les clés « cdiali_pg » en « cdiali-pg » alors que compose 5.6
+      # local (ops.sh) les conservait tels quels → DEUX volumes distincts, le
+      # second restait vierge → crash P2021 (table absente) au redéploiement
+      # (incident du 18/10/2026). Avec des hyphens, les deux chemins convergent
+      # sur le même volume : clé = nom réellement monté partout.
+      - cdiali-pg:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
       interval: 5s
@@ -114,8 +120,8 @@ services:
     environment:
       <<: *api-env
     volumes:
-      - cdiali_storage:/repo/apps/api/storage
-      - cdiali_branding:/repo/apps/api/public/branding
+      - cdiali-storage:/repo/apps/api/storage
+      - cdiali-branding:/repo/apps/api/public/branding
     expose:
       - "3001"
     healthcheck:
@@ -188,6 +194,6 @@ services:
     entrypoint: ["npx", "prisma", "db", "seed"]
 
 volumes:
-  cdiali_pg:
-  cdiali_storage:
-  cdiali_branding:
+  cdiali-pg:
+  cdiali-storage:
+  cdiali-branding:
