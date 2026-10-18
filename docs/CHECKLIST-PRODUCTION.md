@@ -136,6 +136,50 @@
 - [x] **Acces direct 14/14 post-V3** : reverifie apres re-deploy sans patch
       (`recette/direct/verify.json`).
 
+## A4. Reprise GO V4 sur nouvelle VM — suites livrées (GO 15/10 + mesures du 18/10/2026)
+
+> Nouvelle VM Ubuntu dédiée (l'ancienne a planté). Cible courante : **`172.17.79.197`**
+> (changement d'IP en cours de lot après la cible initiale `172.17.66.79` ; les anciennes
+> IPs de l'historique restent telles quelles dans les sections antérieures).
+
+- [x] **Accès direct HTTPS rétabli sur la nouvelle IP** : `https://172.17.79.197:3443` → 200
+      et `/api/health` = `{"status":"ok","database":"ok"}` ; `http://172.17.79.197:3212` → 200.
+- [x] **Certificat régénéré pour la nouvelle IP** : CN=`172.17.79.197`, SHA-256
+      `60:34:26:31:6F:8A:44:9B:74:E2:92:67:77:55:84:55:EA:A5:9A:07:CC:6A:E1:E7:E5:DB:DF:77:25:8E:CF:8E`
+      ; **import manuel côté utilisateur** requis (procédure fournie, aucune installation
+      silencieuse — la confiance navigateur reste une limite assumée).
+- [x] **Envs actifs alignés** : `PUBLIC_BASE_URL`, `WEB_ORIGIN`, `PUBLIC_API_BASE`,
+      `NEXT_PUBLIC_API_URL` = `https://172.17.79.197:3443` (backup `deploy/.env.bak-20261018`).
+- [x] **Correctif durable des volumes (incident 18/10)** : clés `cdiali_pg/storage/branding`
+      → `cdiali-pg/storage/branding` dans le compose runtime + compose ops + README ;
+      validé `docker compose config` (local + VM) puis **commit `6f852b1` poussé** ;
+      **CI SUCCESS** sur ce SHA (run `39122461784`, 18/10).
+- [x] **Gardes — tests négatifs réels** : N1 `up` sans `JWT_SECRET` → exit 1 ; N2 `migrate`
+      avec `EXPECTED_DB_NAME` faux → **exit 3** (refus identité SQL, 0 backup, 0 migration) ;
+      N3 `BACKUP_HOST_DIR=/nonexistent` → exit 1 ; N4 `RESTORE_MANIFEST` vide → exit 1 ;
+      N5 entrées invalides → exit 2/2 ; volumes live inchangés ; aucun résidu guardtest.
+      Preuves : `recette/logs/gardes-negatifs-20261018.txt` + analyse
+      `recette/logs/incident-n2-reconciliation-20261018.md`.
+- [x] **Branding SSR avec valeur distincte puis restauration** : marqueur
+      `SSR-MARQUEUR-20261018` rendu dans `<title>` **côté serveur** (curl sans JS) puis
+      restauration explicite (PATCH valeurs initiales) vérifiée API + HTML.
+      Preuve : `recette/branding/ssr-branding-20261018.txt`.
+- [x] **Accès direct navigateur — 14/14 PASS sur la nouvelle IP**
+      (`recette/direct/verify.json` + 6 captures ; `verify-direct.mjs` adapté
+      `CDP_BASE` + host dynamique).
+- [x] **Patch complet UTF-8 sans BOM applicable et fidèle à HEAD** :
+      `recette/delta-dc747bc-a-6f852b1.patch` (113 455 o, 16 fichiers, +914/−148) ;
+      `git apply --check` = **0** sur worktree `dc747bc`.
+- [x] **État CI identifié précisément** : 4/4 runs de la branche `feat/**` = `success`
+      (dernier : `6f852b1`, run `39122461784` le 18/10/2026) — lecture via API GitHub
+      (`gh` absent).
+- [x] **Incident réseau documenté et réparé** : pendant N2, un `docker compose run` du
+      chemin ops a **réconcilié** les conteneurs db/preflight Coolify (dérive de labels
+      `working_dir` panel vs ops) → db basculée sur le réseau `_default` → API `degraded`
+      ~13 min ; réparé sans recréation (`docker network connect --alias db`), données
+      intactes (66 migrations, 59 tables). **Risque résiduel** : divergence d'ownership
+      panel/ops — correctif durable **proposé, à décider** (voir le rapport V4).
+
 ---
 
 # B. OPÉRATIONS NON EXÉCUTÉES (à faire sur cible — cases vides volontairement)

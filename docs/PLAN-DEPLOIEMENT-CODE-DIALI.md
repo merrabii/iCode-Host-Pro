@@ -116,6 +116,41 @@ Rapport unique : `recette/RAPPORT-GO-PREPRODUCTION.md` ; journal complet :
 
 ---
 
+## 0quater. Reprise GO V4 sur nouvelle VM — EXÉCUTÉE (GO 15/10, suites 18/10/2026) **[V]**
+
+L'ancienne VM ayant planté (GO 15/10, `recette/GO-V4-REPRISE-NOUVELLE-VM-20261015.md`),
+le lot a été repris sur une **VM Ubuntu dédiée** sans repartir de zéro. La VM a changé
+d'adresse en cours de lot : cible initiale `172.17.66.79` → **cible courante
+`172.17.79.197`** (les anciennes IPs de l'historique documentaire ne sont **pas**
+remplacées — les adresses figées dans le texte antérieur décrivent l'état de leur date).
+
+| Élément | Résultat (18/10/2026) | Preuve |
+|---|---|---|
+| Accès direct HTTPS (sans tunnel) | **[V] PASS** — `https://172.17.79.197:3443` → 200, `/api/health` = `ok/ok` ; `http://172.17.79.197:3212` → 200 | mesures curl + batterie navigateur |
+| Certificat auto-signé nouvelle IP | **[V] PASS** — CN=`172.17.79.197`, SHA-256 `60:34:26:31:6F:8A:44:9B:74:E2:92:67:77:55:84:55:EA:A5:9A:07:CC:6A:E1:E7:E5:DB:DF:77:25:8E:CF:8E` ; **import navigateur manuel requis** (procédure fournie, aucune installation silencieuse) | `preprod-proxy/certs/server.crt` |
+| Envs actifs alignés sur la nouvelle IP | **[V] PASS** — `PUBLIC_BASE_URL`, `WEB_ORIGIN`, `PUBLIC_API_BASE`, `NEXT_PUBLIC_API_URL` = `https://172.17.79.197:3443` (backup `deploy/.env.bak-20261018`) | `.env` VM |
+| Correctif durable volumes (incident 18/10) | **[V] PASS** — clés `cdiali_pg/storage/branding` → `cdiali-pg/storage/branding` (compose runtime + ops + README) ; `docker compose config` validé local + VM ; **commit `6f852b1` poussé**, CI **SUCCESS** | `git show 6f852b1`, run CI `39122461784` |
+| Gardes — tests négatifs | **[V] PASS** — N1 exit 1, N2 **exit 3** (refus identité SQL), N3 exit 1, N4 exit 1, N5 exit 2/2 ; volumes live inchangés ; 0 restes guardtest | `recette/logs/gardes-negatifs-20261018.txt` |
+| Branding SSR (valeur distincte puis restauration) | **[V] PASS** — marqueur `SSR-MARQUEUR-20261018` visible dans `<title>` servi **sans JS** ; restauration explicite API + HTML = valeurs initiales | `recette/branding/ssr-branding-20261018.txt` |
+| Accès direct navigateur (batterie) | **[V] PASS 14/14** sur `https://172.17.79.197:3443` (`verify-direct.mjs` adapté `CDP_BASE`/host dynamique) | `recette/direct/verify.json` + 6 PNG |
+| Patch complet UTF-8 sans BOM, applicable, fidèle à HEAD | **[V] PASS** — `recette/delta-dc747bc-a-6f852b1.patch` (113 455 o, 16 fichiers, +914/−148) ; `git apply --check` = **0** sur worktree `dc747bc` | `recette/logs/delta-ci-20261018.txt` |
+| État CI identifié | **[V] PASS** — 4/4 runs `feat/**` = `success`, dont `6f852b1` le 18/10 (run `39122461784`) | API GitHub Actions |
+| Incident « réconciliation réseau » (N2) | **[V] documenté + réparé** — `docker compose run` ops a remplacé le conteneur db live (dérive labels panel/ops) → API `degraded` ~13 min ; réparé **sans recréation** (`network connect --alias db`), données intactes (66 migrations, 59 tables, 0 backup, 0 migration) ; **risque résiduel** : divergences d'ownership panel/ops — correctif durable **à décider** | `recette/logs/incident-n2-reconciliation-20261018.md` |
+
+**Règles GO V4 conservées** : aucune modification interne Coolify, aucune écriture SQL dans sa
+configuration (SELECT uniquement) ; aucun appel Stripe/DNS/SMTP réel ; aucun merge ni push de
+`main` (`dc747bc` intacte) ; stash `stash@{0}` préservé ; accès opérateur SSH par mot de
+passé **en session uniquement** (jamais en commande persistante, script projet, journal ou
+Git ; mécanisme askpass éphémère hors dépôt, supprimé en fin d'opération) ; sans Playwright
+(la batterie de recette = harnais Edge headless CDP) ; `recette/` exclu de git.
+
+**Risque hôte non résolu (lecture seule)** : événements d'erreur d'E/S disque Hyper-V des
+16–17/10/2026 (`Harddisk1\DR4`/`DR1`, resets `RaidPort0`, LBA `0x6b974a0`) — **documentés,
+jamais réparés** (interdit par le GO) ; ne pas conclure que la réinstallation Ubuntu a
+résolu un problème de stockage hôte.
+
+---
+
 ## 1. Inventaire vérifié (source = commit `463f0146`)
 
 ### 1.1 Composants et mécanismes réellement présents
