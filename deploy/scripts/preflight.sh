@@ -23,10 +23,16 @@
 # - Variables restauration : DATABASE_URL_RESTORE, EXPECTED_DB_NAME_RESTORE,
 #   RESTORE_HOST_DIR, RESTORE_MANIFEST (la revue V4 exigeait leur présence
 #   dans --ops : toute la suite ops est refusée tant qu'elle est incomplète) ;
-# - Validité des chemins hôte BACKUP_HOST_DIR / RESTORE_HOST_DIR : absolu,
-#   existant, répertoire, ni « / » ni « /nonexistent ». Un chemin absent ou
-#   invalide = refus AVANT tout conteneur — docker ne crée jamais de dossier
-#   parasite (pas de ${VAR:-/nonexistent} dans les fichiers compose).
+# - OPS_NETWORK (GO V5) : réseau docker EXTERNE où vit la base — sans lui,
+#   aucun job ops ne peut atteindre db sans basculer de réseau ;
+# - Validité des chemins hôte BACKUP_HOST_DIR / RESTORE_HOST_DIR via
+#   scripts/paths.sh (GO V5) : absolu, existant, répertoire, CANONICALISÉ
+#   (realpath) et re-refus si la forme réelle vaut « / » ou échoie dans
+#   /nonexistent, /proc, /sys, /dev, /etc — couvre « /tmp/.. », « // » et
+#   liens symboliques vers « / ». Un chemin absent ou invalide = refus AVANT
+#   tout conteneur — docker ne crée jamais de dossier parasite (pas de
+#   ${VAR:-/nonexistent} dans les fichiers compose). ops.sh re-canonicalise et
+#   EXPORTE les chemins avant docker : le montage EST le chemin validé.
 # - EXPECTED_DB_PORT reste facultatif (défaut 5432 côté compose et script).
 #
 # Usage :
@@ -56,7 +62,15 @@ ENV_FILE="$DEPLOY_DIR/.env"
 # variable définie mais vide = échec, aucun repli silencieux). Implémentation
 # partagée avec ops.sh : scripts/envrc.sh (un seul code, deux usages).
 # shellcheck source=envrc.sh
-. "$SCRIPT_DIR/envrc.sh"
+. "$SCRIPT_DIR/envrc.sh" || {
+  echo "[preflight][ERREUR] chargement .env refusé (voir envrc ci-dessus) — aucune opération." >&2
+  exit 1
+}
+# shellcheck source=paths.sh
+. "$SCRIPT_DIR/paths.sh" || {
+  echo "[preflight][ERREUR] impossible de charger paths.sh — aucune opération." >&2
+  exit 1
+}
 
 # Variables obligatoires — runtime (services db/api/web, ancre x-api-env).
 RUNTIME_VARS=(
@@ -80,6 +94,7 @@ OPS_VARS=(
   EXPECTED_DB_NAME_RESTORE
   RESTORE_HOST_DIR
   RESTORE_MANIFEST
+  OPS_NETWORK
 )
 
 # Chemins hôte devant exister AVANT tout montage docker (jamais /nonexistent).
@@ -99,24 +114,11 @@ check_var() {
 
 check_host_dir() {
   local name="$1"
-  local v="${!name:-}"
-  [ -n "$v" ] || return 0 # déjà signalé par check_var
-  if [ "${v#/}" = "$v" ]; then
-    PROBLEMS+=("$name = '$v' : chemin hôte ABSOLU attendu")
-    return 0
-  fi
-  case "$v" in
-    / | /nonexistent)
-      PROBLEMS+=("$name = '$v' : chemin refusé ('/' ni '/nonexistent' ne sont jamais montés)")
-      return 0
-      ;;
-  esac
-  if [ ! -e "$v" ]; then
-    PROBLEMS+=("$name = '$v' : introuvable — créez-le d'abord (mkdir -p '$v' && chmod 700 '$v')")
-    return 0
-  fi
-  if [ ! -d "$v" ]; then
-    PROBLEMS+=("$name = '$v' : existe mais n'est pas un répertoire")
+  [ -n "${!name:-}" ] || return 0 # déjà signalé par check_var
+  if ! ih_paths_canon "$name" 2>/dev/null; then
+    # ih_paths_canon a détaillé la raison sur stderr (redirigé pour la
+    # collection) — message de synthèse sans valeur, puis abandon global.
+    PROBLEMS+=("chemin hôte invalide (ou non canonicalisable) : $name")
   fi
 }
 

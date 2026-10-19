@@ -1,26 +1,53 @@
-# Code Diali — jobs ops PROTÉGÉS : migrate / backup / restore (GO V4).
+# Code Diali — jobs ops PROTÉGÉS : migrate / backup / restore (GO V4, durci GO V5).
 #
 # SÉPARATION RUNTIME / OPS :
 # - Ce fichier n'est JAMAIS lu par Coolify (Coolify ne charge que
 #   deploy/docker-compose.yml) — il peut donc conserver les gardes STRICTES
 #   ${VAR:?} que le validateur Coolify 4.4.6 refuse dans le fichier runtime.
-# - Il s'ajoute TOUJOURS au runtime (mêmes volumes/réseau/projet), jamais seul :
-#     deploy/scripts/ops.sh <migrate|backup|restore> [args]   (commande documentée)
-#     avancé : docker compose -f docker-compose.yml -f docker-compose.ops.yml run --rm migrate
-# - L'interpolation compose est globale au fichier : TOUTE commande chargeant
-#   ce fichier exige l'ensemble des variables ops ci-dessous (sauf
-#   RESTORE_MANIFEST : valeur par défaut surchargée en ligne, passée au
-#   conteneur, non testée au chargement — restore.sh la refuse s'il manque).
+# - Il s'ajoute TOUJOURS au runtime, jamais seul, TOUJOURS avec --no-deps
+#   (voir deploy/scripts/ops.sh) :
+#     deploy/scripts/ops.sh <migrate|backup|restore|check-gates|seed-admin> [args]
+#
+# CHEMIN OPS NON RÉCONCILIANT (GO V5 §2) :
+# - Aucun depends_on ici : le lancement passe obligatoirement par
+#   `docker compose run --no-deps` → compose ne crée/recrée/redémarre JAMAIS
+#   db/api/web/preflight (incident N2 impossible par construction, quel que
+#   soit le propriétaire des conteneurs live).
+# - Réseau UNIQUE `opslink` = EXTERNE `${OPS_NETWORK}` : le conteneur ops
+#   rejoint le réseau OÙ VIT db réellement (réseau du panel, jamais créé ni
+#   étiqueté par compose — external: true) ; il n'utilise pas le réseau
+#   implicite du projet. `OPS_NETWORK` est exigé par preflight.sh --ops
+#   AVANT toute commande compose.
+# - Vérification LIVE (lecture seule) avant lancement :
+#   deploy/scripts/ops-live-check.sh (projet/réseau/volumes/identité db).
+# - check-gates et seed-admin (définis dans le runtime) sont surchargés ci
+#   -dessous UNIQUEMENT pour leur joindre aussi opslink (ancres YAML non
+#   transmissibles entre fichiers : leur env reste celui du runtime).
 #
 # AUCUN ${VAR:-/nonexistent} ICI : un répertoire hôte absent ou invalide est
-# refusé par preflight.sh --ops (via ops.sh) AVANT docker — docker ne crée
-# jamais de dossier parasite. Les chemins doivent exister sur l'hôte
-# (mkdir -p + chmod 700 avant la première utilisation).
+# refusé par preflight.sh --ops + paths.sh (via ops.sh, avant docker) — docker
+# ne crée jamais de dossier parasite. ops.sh exporte les chemins
+# CANONICALISÉS : ce qui est monté EST le chemin validé.
 #
 # Profil "ops" conservé : un simple "docker compose up" ne lance jamais ces
 # jobs. `docker compose run --rm <service>` les cible malgré le profil.
 
+networks:
+  # Réseau EXTERNE unique des jobs ops — jamais créé/validé/étiqueté par
+  # compose (le réseau live est géré par le panel ou dédié aux tests isolés).
+  opslink:
+    name: ${OPS_NETWORK:?OPS_NETWORK obligatoire — réseau docker externe où vit la base}
+    external: true
+
 services:
+  # Surcharges de services runtime : même service, réseau ops ajouté.
+  # (Le merge compose conserve depends_on/env/build du fichier runtime ;
+  #  --no-deps empêche compose de suivre depends_on au lancement.)
+  check-gates:
+    networks: [opslink]
+  seed-admin:
+    networks: [opslink]
+
   # Migration protégée (identité SQL + sauvegarde préalable) :
   #   ./scripts/ops.sh migrate
   migrate:
@@ -28,9 +55,7 @@ services:
     build:
       context: ..
       dockerfile: deploy/docker/api.Dockerfile
-    depends_on:
-      db:
-        condition: service_healthy
+    networks: [opslink]
     environment:
       NODE_ENV: production
       DATABASE_URL: ${DATABASE_URL_OPS:?DATABASE_URL_OPS obligatoire}
@@ -51,9 +76,7 @@ services:
     build:
       context: ..
       dockerfile: deploy/docker/api.Dockerfile
-    depends_on:
-      db:
-        condition: service_healthy
+    networks: [opslink]
     environment:
       NODE_ENV: production
       DATABASE_URL: ${DATABASE_URL_OPS:?DATABASE_URL_OPS obligatoire}
@@ -84,21 +107,16 @@ services:
   #   l'interprète comme un flag ; "ENV" est le placeholder canonique.)
   # - RESTORE_MANIFEST est transmis au conteneur via le pass-through
   #   ci-dessous (host env → container env) — valeur par défaut venue du
-  #   .env, surchargée par le préfixe de la commande. Sans cette ligne,
-  #   docker compose run ne la passerait PAS au conteneur.
+  #   .env, surchargée par le préfixe de la commande.
   # - Les sauvegardes sources (/restore) sont montées en LECTURE SEULE (:ro).
   # - Les sorties (/restore-out) : dumps pré-restauration + fichiers restaurés
   #   — montées durablement, survivent à la suppression du conteneur éphémère.
-  # - La destination des fichiers restaurés est /restore-out/target (sous-dossier
-  #   VIDE à créer par l'opérateur sur l'hôte, ou laissé au script).
   restore:
     profiles: ["ops"]
     build:
       context: ..
       dockerfile: deploy/docker/api.Dockerfile
-    depends_on:
-      db:
-        condition: service_healthy
+    networks: [opslink]
     environment:
       NODE_ENV: production
       DATABASE_URL: ${DATABASE_URL_RESTORE:?DATABASE_URL_RESTORE obligatoire}
