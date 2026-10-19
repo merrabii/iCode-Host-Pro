@@ -61,21 +61,27 @@ HEALTH="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}
 [ "$STATE" = "running" ] || fail "db '$DB' dans l'état '$STATE' (running attendu)"
 [ "$HEALTH" = "healthy" ] || fail "db '$DB' health '$HEALTH' (healthy attendu)"
 
-# Rattachement au réseau + IDENTITÉ compose de résolution « db » :
-# - attachement : l'id complet du conteneur doit figurer dans le réseau ;
-# - résolution « db » : sur ce moteur (Docker 29), les endpoints réseau ne
-#   portent PAS de champ Aliases (constat GO V5 — aucun conteneur n'en a) ;
-#   le DNS intégré lit les labels compose du conteneur (projet + service=db).
-#   Preuve empirique GO V5 (journal diag A3) :
-#     docker exec <api> getent hosts db → 10.0.2.3 (IP du conteneur db).
+# Rattachement au réseau + IDENTITÉ de résolution « db » (mesuré GO V5) :
+# - le DNS intégré résout « db » via l'ALIAS D'ENDPOINT du conteneur db sur
+#   OPS_NETWORK (vue conteneur .NetworkSettings.Networks.<net>.Aliases) ;
+#   les labels compose et /etc/hosts n'y sont POUR RIEN (preuves GO V5 :
+#   api /etc/hosts sans ligne db ; probe sans alias → « bad address »).
 docker network inspect "$NETWORK" -f '{{range $k,$v := .Containers}}{{println $k}}{{end}}' \
   | grep -q "^$DB_FULL\$" || fail "db '$DB' NON rattaché au réseau '$NETWORK'"
+AL="$(docker inspect -f '{{(index .NetworkSettings.Networks "'"${NETWORK}"'").Aliases}}' "$DB" 2>/dev/null || true)"
+[ -n "$AL" ] || fail "db '$DB' sans endpoint sur '$NETWORK' (résolution 'db' impossible)"
+_alias_ok=0
+for _a in $(printf '%s' "$AL" | tr -d '[]'); do
+  [ "$_a" = "db" ] && _alias_ok=1 && break
+done
+[ "$_alias_ok" -eq 1 ] ||
+  fail "db '$DB' sans alias d'endpoint 'db' sur '$NETWORK' (aliases: ${AL:-aucun}) — résolution 'db' impossible"
 _lbl_p="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$DB" 2>/dev/null || true)"
 [ "$_lbl_p" = "$PROJECT" ] ||
-  fail "db '$DB' sans label compose project='$PROJECT' (résolution 'db' via DNS compose impossible)"
+  fail "db '$DB' sans label compose project='$PROJECT'"
 _lbl_s="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.service"}}' "$DB" 2>/dev/null || true)"
 [ "$_lbl_s" = "db" ] ||
-  fail "db '$DB' sans label compose service='db' (résolution 'db' via DNS compose impossible)"
+  fail "db '$DB' sans label compose service='db'"
 
 # Volume projet monté par db (identité de stockage — au moins un volume
 # préfixé <project>_).
@@ -97,5 +103,5 @@ for svc in api web preflight; do
   fi
 done
 
-echo "[live-check] OK --db : projet '$PROJECT', réseau '$NETWORK', db=$DB (running/healthy, rattachée, labels compose projet+service db, volume projet). Lecture seule effectuée."
+echo "[live-check] OK --db : projet '$PROJECT', réseau '$NETWORK', db=$DB (running/healthy, rattachée, alias endpoint 'db', labels compose, volume projet). Lecture seule effectuée."
 exit 0
