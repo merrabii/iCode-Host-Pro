@@ -18,6 +18,11 @@
 # 5. envrc.sh : parité compose vérifiée sur le .env, refus explicite des
 #    syntaxes non reproduites ; le .env n'est jamais exécuté ; aucun secret
 #    journalisé (noms de variables seulement).
+# 6. --build avant chaque job (finition V5) : l'image du job est reconstruite
+#    depuis l'ARBRE COURANT → les scripts embarqués correspondent toujours à la
+#    version choisie, jamais à une image périmée d'une version antérieure.
+#    Reconstruction explicite (cache BuildKit si rien n'a changé) et bornée à
+#    l'image du job : aucun service live créé, recréé ni redémarré.
 #
 # Usage :
 #   ./scripts/ops.sh preflight                    # readiness complète (--ops)
@@ -161,6 +166,21 @@ done
 COMPOSE=(docker compose --project-directory "$DEPLOY_DIR" -f "$RUNTIME_COMPOSE" -f "$OPS_COMPOSE")
 COMPOSE+=("${EXTRA_FILES[@]+"${EXTRA_FILES[@]}"}")
 
-echo "[ops] $JOB : preflight --ops + live-check OK — lancement --no-deps (COMPOSE_PROJECT_NAME=${COMPOSE_PROJECT_NAME}, OPS_NETWORK=${OPS_NETWORK})."
-exec "${COMPOSE[@]}" run --rm --no-deps "${ENV_FLAGS[@]+"${ENV_FLAGS[@]}"}" "$JOB" \
+# VERSION DES JOBS (finition V5) : `--build` AVANT chaque job = l'image du job
+# est (re)construite depuis l'ARBRE COURANT → les scripts embarqués
+# (/opt/code-diali/scripts, COPY deploy/scripts de api.Dockerfile) proviennent
+# TOUJOURS de la version choisie, même après une mise à jour de clone —
+# jamais d'une image périmée d'une version antérieure. Reconstruction
+# EXPLICITE et maîtrisée : BuildKit (couche cache intacte = coût nul si rien
+# n'a changé ; script modifié = la couche qui le contient est reconstruite).
+# Jamais de service live touché : `--build` ne construit QUE l'image du job
+# ciblé, `--no-deps` ne lance QUE le conteneur éphémère du job.
+_OPS_VER=""
+if command -v git >/dev/null 2>&1 &&
+  git -C "$DEPLOY_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  _OPS_VER=", version=$(git -C "$DEPLOY_DIR" rev-parse --short HEAD 2>/dev/null || echo 'inconnue')"
+fi
+
+echo "[ops] $JOB : preflight --ops + live-check OK — lancement --build --no-deps (COMPOSE_PROJECT_NAME=${COMPOSE_PROJECT_NAME}, OPS_NETWORK=${OPS_NETWORK}${_OPS_VER})."
+exec "${COMPOSE[@]}" run --rm --build --no-deps "${ENV_FLAGS[@]+"${ENV_FLAGS[@]}"}" "$JOB" \
   "${CONTAINER_ARGS[@]+"${CONTAINER_ARGS[@]}"}"

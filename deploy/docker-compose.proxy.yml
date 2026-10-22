@@ -3,18 +3,27 @@
 # Ce proxy fournit l'accès direct HTTPS sans tunnel SSH, hors Coolify.
 # Il résout `web` par DNS Docker (aucune IP conteneur figée).
 #
-# USAGE (sur la VM préproduction) :
-#   # 1. Générer le certificat auto-signé (une seule fois) :
-#   ./deploy/scripts/gen-preprod-cert.sh 172.17.79.197
-#
-#   # 2. Placer le Caddyfile (voir fichier fourni) :
-#   #    /home/mourad/preprod-proxy/Caddyfile
-#
-#   # 3. Démarrer le proxy :
-#   docker compose -f deploy/docker-compose.proxy.yml up -d
-#
-#   # 4. Arrêter le proxy :
-#   docker compose -f deploy/docker-compose.proxy.yml down
+# USAGE (sur la VM préproduction) — CHEMINS & RÉSEAU CONFIGURABLES, AUCUN REPLI :
+#   # 1) Renseigner dans deploy/.env (ou l'environnement du processus) :
+#   #      PREPROD_NETWORK=<réseau externe du projet cible — en preprod l'UUID
+#   #        projet Coolify, visible via label com.docker.compose.project des
+#   #        conteneurs du projet ; en local <COMPOSE_PROJECT_NAME>_default>
+#   #      PREPROD_PROXY_DIR=<dossier hôte proxy — ex. /home/mourad/preprod-proxy>
+#   #    config absente = refus compose avec message clair (jamais de valeur
+#   #    en dur, jamais de repli sur l'UUID d'une VM de test).
+#   # 2) Générer le certificat auto-signé (IP ou domaine = argument OBLIGATOIRE),
+#   #    en transmettant la valeur explicitement — le script ne lit PAS deploy/.env :
+#   #      PREPROD_PROXY_DIR="/chemin/choisi/preprod-proxy" \
+#   #        bash ./deploy/scripts/gen-preprod-cert.sh <IP-ou-domaine>
+#   #    (dossier des certs configurable : CERT_DIR, défaut $PREPROD_PROXY_DIR/certs ;
+#   #     valeur à garder IDENTIQUE à PREPROD_PROXY_DIR de deploy/.env, car Compose
+#   #     monte ensuite $PREPROD_PROXY_DIR/certs dans /certs du proxy)
+#   # 3) Placer le Caddyfile (modèle : recette preprod-proxy-Caddyfile.txt) :
+#   #      $PREPROD_PROXY_DIR/Caddyfile
+#   # 4) Démarrer le proxy :
+#   #      docker compose -f deploy/docker-compose.proxy.yml up -d
+#   # 5) Arrêter le proxy :
+#   #      docker compose -f deploy/docker-compose.proxy.yml down
 #
 # PORTS :
 #   3212 → 80  (HTTP, redirection vers HTTPS non configurée — accès direct)
@@ -23,8 +32,8 @@
 # RÉSEAU : rejoint le réseau de la stack préprod (nom ci-dessous) pour résoudre
 # `web` par DNS Docker. Aucune IP conteneur n'est figée. Le nom du réseau est
 # celui créé par Coolify pour le projet cible (UUID projet Coolify).
-# Adapter PREPROD_NETWORK à l'UUID du projet Coolify avant `up -d`
-# (ou via variable d'environnement PREPROD_NETWORK).
+# PREPROD_NETWORK est OBLIGATOIRE (gardé ${VAR:?}) : config absente = refus
+# compose avec message clair — aucun UUID en dur, aucun repli silencieux.
 #
 # PostgreSQL n'est PAS publié. L'API n'est PAS publiée directement.
 # Le web gère /api/* via le rewrite API_UPSTREAM=http://api:3001.
@@ -44,12 +53,12 @@ services:
       - "3212:80"
       - "3443:443"
     volumes:
-      - /home/mourad/preprod-proxy/Caddyfile:/etc/caddy/Caddyfile:ro
-      - /home/mourad/preprod-proxy/certs:/certs:ro
-      - /home/mourad/preprod-proxy/caddy_config:/config
-      - /home/mourad/preprod-proxy/caddy_data:/data
+      - ${PREPROD_PROXY_DIR:?PREPROD_PROXY_DIR obligatoire — dossier hôte du proxy (ex. /home/mourad/preprod-proxy)}/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ${PREPROD_PROXY_DIR:?PREPROD_PROXY_DIR obligatoire — dossier hôte du proxy (ex. /home/mourad/preprod-proxy)}/certs:/certs:ro
+      - ${PREPROD_PROXY_DIR:?PREPROD_PROXY_DIR obligatoire — dossier hôte du proxy (ex. /home/mourad/preprod-proxy)}/caddy_config:/config
+      - ${PREPROD_PROXY_DIR:?PREPROD_PROXY_DIR obligatoire — dossier hôte du proxy (ex. /home/mourad/preprod-proxy)}/caddy_data:/data
 
 networks:
   preprod:
     external: true
-    name: ${PREPROD_NETWORK:-6qnkc7gldvm06jn8ct5zdmyx}
+    name: ${PREPROD_NETWORK:?PREPROD_NETWORK obligatoire — réseau externe du projet cible (labels docker, ex. UUID projet Coolify)}
